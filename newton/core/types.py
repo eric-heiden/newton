@@ -50,6 +50,11 @@ Vec3 = list[float] | tuple[float, float, float] | wp.vec3
 """A 3D vector represented as a list or tuple of 3 floats."""
 Vec4 = list[float] | tuple[float, float, float, float] | wp.vec4
 """A 4D vector represented as a list or tuple of 4 floats."""
+Vec6 = list[float] | tuple[float, float, float, float] | wp.vec6
+"""
+A 6D vector represented as a list or tuple of 6 floats.
+If used to represent twists or wrenches, the first 3 elements are linear components and the last 3 are angular components.
+"""
 Quat = list[float] | tuple[float, float, float, float] | wp.quat
 """A quaternion represented as a list or tuple of 4 floats (in XYZW order)."""
 Mat33 = list[float] | wp.mat33

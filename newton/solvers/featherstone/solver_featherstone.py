@@ -429,11 +429,11 @@ class FeatherstoneSolver(SolverBase):
                             model.joint_q_start,
                             model.joint_qd_start,
                             model.joint_dof_dim,
-                            model.joint_dof_mode,
                             state_in.joint_q,
                             state_in.joint_qd,
                             control.joint_f,
-                            control.joint_target,
+                            control.joint_target_pos,
+                            control.joint_target_vel,
                             model.joint_target_ke,
                             model.joint_target_kd,
                             model.joint_limit_lower,
@@ -600,8 +600,6 @@ class FeatherstoneSolver(SolverBase):
                                 device=model.device,
                             )
 
-                        # print("joint_target:")
-                        # print(control.joint_target.numpy())
                         # print("joint_tau:")
                         # print(state_aug.joint_tau.numpy())
                         # print("H:")

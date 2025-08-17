@@ -41,13 +41,16 @@ class Control:
         applied in world frame (same as :attr:`newton.State.body_f`).
         """
 
-        self.joint_target: wp.array | None = None
+        self.joint_target_pos: wp.array | None = None
         """
-        Array of joint targets with shape ``(joint_dof_count,)`` and type ``float``.
-        Joint targets define the target position or target velocity for each actuation-driven degree of freedom,
-        depending on the corresponding joint control mode, see :attr:`newton.Model.joint_dof_mode`.
+        Array of joint position targets with shape ``(joint_dof_count,)`` and type ``float``.
+        Joint targets define the target position for each actuation-driven degree of freedom.
+        """
 
-        The joint targets are defined for any joint type, except for free joints.
+        self.joint_target_vel: wp.array | None = None
+        """
+        Array of joint velocity targets with shape ``(joint_dof_count,)`` and type ``float``.
+        Joint targets define the target position for each actuation-driven degree of freedom.
         """
 
         self.tri_activations: wp.array | None = None

@@ -190,8 +190,6 @@ class Model:
         """Generalized joint velocities used for state initialization, shape [joint_dof_count], float."""
         self.joint_f = None
         """Generalized joint forces used for state initialization, shape [joint_dof_count], float."""
-        self.joint_target = None
-        """Generalized joint target inputs, shape [joint_dof_count], float."""
         self.joint_type = None
         """Joint type, shape [joint_count], int."""
         self.joint_parent = None
@@ -208,6 +206,10 @@ class Model:
         """Joint axis in child frame, shape [joint_dof_count, 3], float."""
         self.joint_armature = None
         """Armature for each joint axis (used by :class:`~newton.solvers.MuJoCoSolver` and :class:`~newton.solvers.FeatherstoneSolver`), shape [joint_dof_count], float."""
+        self.joint_target_pos = None
+        """Joint position target, shape [joint_dof_count], float."""
+        self.joint_target_vel = None
+        """Joint velocity target, shape [joint_dof_count], float."""
         self.joint_target_ke = None
         """Joint stiffness, shape [joint_dof_count], float."""
         self.joint_target_kd = None
@@ -220,10 +222,8 @@ class Model:
         """Joint friction coefficient, shape [joint_dof_count], float."""
         self.joint_dof_dim = None
         """Number of linear and angular dofs per joint, shape [joint_count, 2], int."""
-        self.joint_dof_mode = None
-        """Control mode for each joint dof, shape [joint_dof_count], int."""
         self.joint_enabled = None
-        """Controls which joint is simulated (bodies become disconnected if False), shape [joint_count], int."""
+        """Controls which joint is simulated (bodies become disconnected if False), shape [joint_count], bool."""
         self.joint_limit_lower = None
         """Joint lower position limits, shape [joint_dof_count], float."""
         self.joint_limit_upper = None
@@ -339,18 +339,18 @@ class Model:
         self.attribute_frequency["joint_qd"] = "joint_dof"
         self.attribute_frequency["joint_f"] = "joint_dof"
         self.attribute_frequency["joint_armature"] = "joint_dof"
-        self.attribute_frequency["joint_target"] = "joint_dof"
         self.attribute_frequency["joint_axis"] = "joint_dof"
+        self.attribute_frequency["joint_target_pos"] = "joint_dof"
+        self.attribute_frequency["joint_target_vel"] = "joint_dof"
         self.attribute_frequency["joint_target_ke"] = "joint_dof"
         self.attribute_frequency["joint_target_kd"] = "joint_dof"
-        self.attribute_frequency["joint_dof_mode"] = "joint_dof"
         self.attribute_frequency["joint_limit_lower"] = "joint_dof"
         self.attribute_frequency["joint_limit_upper"] = "joint_dof"
         self.attribute_frequency["joint_limit_ke"] = "joint_dof"
         self.attribute_frequency["joint_limit_kd"] = "joint_dof"
         self.attribute_frequency["joint_effort_limit"] = "joint_dof"
-        self.attribute_frequency["joint_friction"] = "joint_dof"
         self.attribute_frequency["joint_velocity_limit"] = "joint_dof"
+        self.attribute_frequency["joint_friction"] = "joint_dof"
 
         # attributes per shape
         self.attribute_frequency["shape_transform"] = "shape"
@@ -412,7 +412,8 @@ class Model:
             requires_grad = self.requires_grad
         if clone_variables:
             if self.joint_count:
-                c.joint_target = wp.clone(self.joint_target, requires_grad=requires_grad)
+                c.joint_target_pos = wp.clone(self.joint_target_pos, requires_grad=requires_grad)
+                c.joint_target_vel = wp.clone(self.joint_target_vel, requires_grad=requires_grad)
                 c.joint_f = wp.clone(self.joint_f, requires_grad=requires_grad)
             if self.tri_count:
                 c.tri_activations = wp.clone(self.tri_activations, requires_grad=requires_grad)
@@ -421,7 +422,8 @@ class Model:
             if self.muscle_count:
                 c.muscle_activations = wp.clone(self.muscle_activations, requires_grad=requires_grad)
         else:
-            c.joint_target = self.joint_target
+            c.joint_target_pos = self.joint_target_pos
+            c.joint_target_vel = self.joint_target_vel
             c.joint_f = self.joint_f
             c.tri_activations = self.tri_activations
             c.tet_activations = self.tet_activations

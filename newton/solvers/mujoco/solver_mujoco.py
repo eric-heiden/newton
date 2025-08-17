@@ -1635,7 +1635,6 @@ class MuJoCoSolver(SolverBase):
         joint_type = model.joint_type.numpy()
         joint_axis = model.joint_axis.numpy()
         joint_dof_dim = model.joint_dof_dim.numpy()
-        joint_dof_mode = model.joint_dof_mode.numpy()
         joint_target_kd = model.joint_target_kd.numpy()
         joint_target_ke = model.joint_target_ke.numpy()
         joint_qd_start = model.joint_qd_start.numpy()

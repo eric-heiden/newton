@@ -41,20 +41,12 @@ def get_joint_dof_count(joint_type: int, num_axes: int) -> tuple[int, int]:
     return dof_count, coord_count
 
 
-# Joint axis control mode types
-JOINT_MODE_NONE = wp.constant(0)
-JOINT_MODE_TARGET_POSITION = wp.constant(1)
-JOINT_MODE_TARGET_VELOCITY = wp.constant(2)
-
 __all__ = [
     "JOINT_BALL",
     "JOINT_D6",
     "JOINT_DISTANCE",
     "JOINT_FIXED",
     "JOINT_FREE",
-    "JOINT_MODE_NONE",
-    "JOINT_MODE_TARGET_POSITION",
-    "JOINT_MODE_TARGET_VELOCITY",
     "JOINT_PRISMATIC",
     "JOINT_REVOLUTE",
     "get_joint_dof_count",

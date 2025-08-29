@@ -2245,6 +2245,7 @@ class SolverMuJoCo(SolverBase):
         )
 
         self.mj_model = spec.compile()
+        self.spec = spec
 
         self.mj_data = mujoco.MjData(self.mj_model)
 

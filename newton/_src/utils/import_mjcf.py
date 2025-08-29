@@ -48,7 +48,7 @@ def parse_mjcf(
     no_class_as_colliders: bool = True,
     force_show_colliders: bool = False,
     enable_self_collisions: bool = False,
-    ignore_inertial_definitions: bool = True,
+    ignore_inertial_definitions: bool = False,
     ensure_nonstatic_links: bool = True,
     static_link_mass: float = 1e-2,
     collapse_fixed_joints: bool = False,
@@ -196,10 +196,7 @@ def parse_mjcf(
         return attrib
 
     axis_xform = wp.transform(wp.vec3(0.0), quat_between_axes(up_axis, builder.up_axis))
-    if xform is None:
-        xform = axis_xform
-    else:
-        xform = wp.transform(*xform) * axis_xform
+    xform *= axis_xform
 
     def parse_float(attrib, key, default) -> float:
         if key in attrib:
@@ -551,15 +548,17 @@ def parse_mjcf(
             elif len(linear_axes) == 1 and len(angular_axes) == 0:
                 joint_type = JointType.PRISMATIC
 
-        if len(freejoint_tags) > 0 and parent == -1 and (base_joint is not None or floating is not None):
-            joint_pos = joint_pos[0] if len(joint_pos) > 0 else wp.vec3(0.0, 0.0, 0.0)
-            _xform = wp.transform(body_pos_for_joints + joint_pos, body_ori_for_joints)
+        joint_pos = joint_pos[0] if len(joint_pos) > 0 else wp.vec3(0.0, 0.0, 0.0)
+        joint_xform = wp.transform(body_pos_for_joints + joint_pos, body_ori_for_joints)
+        if parent == -1:
+            joint_xform = world_xform * joint_xform
 
+        if len(freejoint_tags) > 0 and parent == -1 and (base_joint is not None or floating is not None):
             if base_joint is not None:
                 # in case of a given base joint, the position is applied first, the rotation only
                 # after the base joint itself to not rotate its axis
-                base_parent_xform = wp.transform(_xform.p, wp.quat_identity())
-                base_child_xform = wp.transform((0.0, 0.0, 0.0), wp.quat_inverse(_xform.q))
+                base_parent_xform = wp.transform(joint_xform.p, wp.quat_identity())
+                base_child_xform = wp.transform((0.0, 0.0, 0.0), wp.quat_inverse(joint_xform.q))
                 if isinstance(base_joint, str):
                     axes = base_joint.lower().split(",")
                     axes = [ax.strip() for ax in axes]
@@ -593,10 +592,9 @@ def parse_mjcf(
             elif floating is not None and floating:
                 builder.add_joint_free(link, key="floating_base")
             else:
-                builder.add_joint_fixed(-1, link, parent_xform=_xform, key="fixed_base")
+                builder.add_joint_fixed(-1, link, parent_xform=joint_xform, key="fixed_base")
 
         else:
-            joint_pos = joint_pos[0] if len(joint_pos) > 0 else wp.vec3(0.0, 0.0, 0.0)
             if len(joint_name) == 0:
                 joint_name = [f"{body_name}_joint"]
             if joint_type == JointType.FREE:
@@ -614,7 +612,7 @@ def parse_mjcf(
                     linear_axes=linear_axes,
                     angular_axes=angular_axes,
                     key="_".join(joint_name),
-                    parent_xform=wp.transform(body_pos_for_joints + joint_pos, body_ori_for_joints),
+                    parent_xform=joint_xform,
                     child_xform=wp.transform(joint_pos, wp.quat_identity()),
                 )
 

@@ -162,6 +162,9 @@ class ModelBuilder:
         """The coefficient of restitution."""
         thickness: float = 1e-5
         """The thickness of the shape."""
+        contact_margin: float | None = None
+        """The contact margin for collision detection. If None, uses builder.rigid_contact_margin as default.
+        Note: contact_margin should be >= thickness for proper collision detection."""
         is_solid: bool = True
         """Indicates whether the shape is solid or hollow. Defaults to True."""
         collision_group: int = 1
@@ -480,6 +483,7 @@ class ModelBuilder:
         self.shape_material_ka = []
         self.shape_material_mu = []
         self.shape_material_restitution = []
+        self.shape_contact_margin = []
         # collision groups within collisions are handled
         self.shape_collision_group = []
         # radius to use for broadphase collision checking
@@ -610,6 +614,7 @@ class ModelBuilder:
         self.equality_constraint_polycoef = []
         self.equality_constraint_key = []
         self.equality_constraint_enabled = []
+        self.equality_constraint_world = []
 
         # Custom attributes (user-defined per-frequency arrays)
         self.custom_attributes: dict[str, ModelBuilder.CustomAttribute] = {}
@@ -735,11 +740,15 @@ class ModelBuilder:
 
         Joint attributes are processed based on their declared frequency:
         - JOINT frequency: Single value per joint
-        - JOINT_DOF frequency: List of values with length equal to joint DOF count
-        - JOINT_COORD frequency: List of values with length equal to joint coordinate count
+        - JOINT_DOF frequency: List or dict of values for each DOF
+        - JOINT_COORD frequency: List or dict of values for each coordinate
 
-        For DOF and COORD attributes, values must always be provided as lists with length
-        matching the joint's DOF or coordinate count.
+        For DOF and COORD attributes, values can be:
+        - A list with length matching the joint's DOF/coordinate count (all DOFs get values)
+        - A dict mapping DOF/coord indices to values (only specified indices get values, rest use defaults)
+        - For single-DOF joints with JOINT_DOF frequency: a single Warp vector/matrix value
+
+        When using dict format, unspecified indices will be filled with the attribute's default value during finalization.
 
         Args:
             joint_index: Index of the joint
@@ -764,7 +773,7 @@ class ModelBuilder:
                 )
 
             elif custom_attr.frequency == ModelAttributeFrequency.JOINT_DOF:
-                # List of values, one per DOF
+                # Values per DOF - can be list or dict
                 dof_start = self.joint_qd_start[joint_index]
                 if joint_index + 1 < len(self.joint_qd_start):
                     dof_end = self.joint_qd_start[joint_index + 1]
@@ -773,27 +782,45 @@ class ModelBuilder:
 
                 dof_count = dof_end - dof_start
 
-                if not isinstance(value, (list, tuple)):
-                    raise TypeError(
-                        f"JOINT_DOF attribute '{attr_key}' must be a list with length equal to joint DOF count ({dof_count})"
-                    )
+                # Check if value is a dict (mapping DOF index to value)
+                if isinstance(value, dict):
+                    # Dict format: only specified DOF indices have values, rest use defaults
+                    for dof_offset, dof_value in value.items():
+                        if not isinstance(dof_offset, int):
+                            raise TypeError(
+                                f"JOINT_DOF attribute '{attr_key}' dict keys must be integers (DOF indices), got {type(dof_offset)}"
+                            )
+                        if dof_offset < 0 or dof_offset >= dof_count:
+                            raise ValueError(
+                                f"JOINT_DOF attribute '{attr_key}' has invalid DOF index {dof_offset} (joint has {dof_count} DOFs)"
+                            )
+                        single_attr = {attr_key: dof_value}
+                        self._process_custom_attributes(
+                            entity_index=dof_start + dof_offset,
+                            custom_attrs=single_attr,
+                            expected_frequency=ModelAttributeFrequency.JOINT_DOF,
+                        )
+                else:
+                    # List format or single value for single-DOF joints
+                    value_sanitized = value
+                    if not isinstance(value_sanitized, (list, tuple)) and dof_count == 1:
+                        value_sanitized = [value_sanitized]
 
-                if len(value) != dof_count:
-                    raise ValueError(
-                        f"JOINT_DOF attribute '{attr_key}' has {len(value)} values but joint has {dof_count} DOFs"
-                    )
+                    actual = len(value_sanitized)
+                    if actual != dof_count:
+                        raise ValueError(f"JOINT_DOF '{attr_key}': got {actual}, expected {dof_count}")
 
-                # Apply each value to its corresponding DOF
-                for i, dof_value in enumerate(value):
-                    single_attr = {attr_key: dof_value}
-                    self._process_custom_attributes(
-                        entity_index=dof_start + i,
-                        custom_attrs=single_attr,
-                        expected_frequency=ModelAttributeFrequency.JOINT_DOF,
-                    )
+                    # Apply each value to its corresponding DOF
+                    for i, dof_value in enumerate(value_sanitized):
+                        single_attr = {attr_key: dof_value}
+                        self._process_custom_attributes(
+                            entity_index=dof_start + i,
+                            custom_attrs=single_attr,
+                            expected_frequency=ModelAttributeFrequency.JOINT_DOF,
+                        )
 
             elif custom_attr.frequency == ModelAttributeFrequency.JOINT_COORD:
-                # List of values, one per coordinate
+                # Values per coordinate - can be list or dict
                 coord_start = self.joint_q_start[joint_index]
                 if joint_index + 1 < len(self.joint_q_start):
                     coord_end = self.joint_q_start[joint_index + 1]
@@ -802,24 +829,43 @@ class ModelBuilder:
 
                 coord_count = coord_end - coord_start
 
-                if not isinstance(value, (list, tuple)):
-                    raise TypeError(
-                        f"JOINT_COORD attribute '{attr_key}' must be a list with length equal to joint coordinate count ({coord_count})"
-                    )
+                # Check if value is a dict (mapping coord index to value)
+                if isinstance(value, dict):
+                    # Dict format: only specified coord indices have values, rest use defaults
+                    for coord_offset, coord_value in value.items():
+                        if not isinstance(coord_offset, int):
+                            raise TypeError(
+                                f"JOINT_COORD attribute '{attr_key}' dict keys must be integers (coord indices), got {type(coord_offset)}"
+                            )
+                        if coord_offset < 0 or coord_offset >= coord_count:
+                            raise ValueError(
+                                f"JOINT_COORD attribute '{attr_key}' has invalid coord index {coord_offset} (joint has {coord_count} coordinates)"
+                            )
+                        single_attr = {attr_key: coord_value}
+                        self._process_custom_attributes(
+                            entity_index=coord_start + coord_offset,
+                            custom_attrs=single_attr,
+                            expected_frequency=ModelAttributeFrequency.JOINT_COORD,
+                        )
+                else:
+                    # List format or single value for single-coordinate joints
+                    value_sanitized = value
+                    if not isinstance(value_sanitized, (list, tuple)) and coord_count == 1:
+                        value_sanitized = [value_sanitized]
 
-                if len(value) != coord_count:
-                    raise ValueError(
-                        f"JOINT_COORD attribute '{attr_key}' has {len(value)} values but joint has {coord_count} coordinates"
-                    )
+                    if len(value_sanitized) != coord_count:
+                        raise ValueError(
+                            f"JOINT_COORD attribute '{attr_key}' has {len(value_sanitized)} values but joint has {coord_count} coordinates"
+                        )
 
-                # Apply each value to its corresponding coordinate
-                for i, coord_value in enumerate(value):
-                    single_attr = {attr_key: coord_value}
-                    self._process_custom_attributes(
-                        entity_index=coord_start + i,
-                        custom_attrs=single_attr,
-                        expected_frequency=ModelAttributeFrequency.JOINT_COORD,
-                    )
+                    # Apply each value to its corresponding coordinate
+                    for i, coord_value in enumerate(value_sanitized):
+                        single_attr = {attr_key: coord_value}
+                        self._process_custom_attributes(
+                            entity_index=coord_start + i,
+                            custom_attrs=single_attr,
+                            expected_frequency=ModelAttributeFrequency.JOINT_COORD,
+                        )
 
             else:
                 raise ValueError(
@@ -1469,6 +1515,32 @@ class ModelBuilder:
             articulation_groups = [self.current_world] * builder.articulation_count
             self.articulation_world.extend(articulation_groups)
 
+        # For equality constraints
+        if len(builder.equality_constraint_type) > 0:
+            constraint_worlds = [self.current_world] * len(builder.equality_constraint_type)
+            self.equality_constraint_world.extend(constraint_worlds)
+
+            # Remap body and joint indices in equality constraints
+            self.equality_constraint_type.extend(builder.equality_constraint_type)
+            self.equality_constraint_body1.extend(
+                [b + start_body_idx if b != -1 else -1 for b in builder.equality_constraint_body1]
+            )
+            self.equality_constraint_body2.extend(
+                [b + start_body_idx if b != -1 else -1 for b in builder.equality_constraint_body2]
+            )
+            self.equality_constraint_anchor.extend(builder.equality_constraint_anchor)
+            self.equality_constraint_torquescale.extend(builder.equality_constraint_torquescale)
+            self.equality_constraint_relpose.extend(builder.equality_constraint_relpose)
+            self.equality_constraint_joint1.extend(
+                [j + start_joint_idx if j != -1 else -1 for j in builder.equality_constraint_joint1]
+            )
+            self.equality_constraint_joint2.extend(
+                [j + start_joint_idx if j != -1 else -1 for j in builder.equality_constraint_joint2]
+            )
+            self.equality_constraint_polycoef.extend(builder.equality_constraint_polycoef)
+            self.equality_constraint_key.extend(builder.equality_constraint_key)
+            self.equality_constraint_enabled.extend(builder.equality_constraint_enabled)
+
         more_builder_attrs = [
             "articulation_key",
             "body_inertia",
@@ -1512,6 +1584,7 @@ class ModelBuilder:
             "shape_material_mu",
             "shape_material_restitution",
             "shape_collision_radius",
+            "shape_contact_margin",
             "particle_qd",
             "particle_mass",
             "particle_radius",
@@ -1530,17 +1603,6 @@ class ModelBuilder:
             "tet_poses",
             "tet_activations",
             "tet_materials",
-            "equality_constraint_type",
-            "equality_constraint_body1",
-            "equality_constraint_body2",
-            "equality_constraint_anchor",
-            "equality_constraint_torquescale",
-            "equality_constraint_relpose",
-            "equality_constraint_joint1",
-            "equality_constraint_joint2",
-            "equality_constraint_polycoef",
-            "equality_constraint_key",
-            "equality_constraint_enabled",
         ]
 
         for attr in more_builder_attrs:
@@ -1719,7 +1781,7 @@ class ModelBuilder:
             child_xform (Transform): The transform of the joint in the child body's local frame. If None, the identity transform is used.
             collision_filter_parent (bool): Whether to filter collisions between shapes of the parent and child bodies.
             enabled (bool): Whether the joint is enabled (not considered by :class:`SolverFeatherstone`).
-            custom_attributes: Dictionary of custom attribute keys (see :attr:`CustomAttribute.key`) to values. Note that custom attributes with frequency :attr:`ModelAttributeFrequency.JOINT_DOF` or :attr:`ModelAttributeFrequency.JOINT_COORD` require the respective values to be provided as lists with length equal to the joint's DOF or coordinate count. Custom attributes with frequency :attr:`ModelAttributeFrequency.JOINT` require a single value to be defined.
+            custom_attributes: Dictionary of custom attribute keys (see :attr:`CustomAttribute.key`) to values. Note that custom attributes with frequency :attr:`ModelAttributeFrequency.JOINT_DOF` or :attr:`ModelAttributeFrequency.JOINT_COORD` can be provided as: (1) lists with length equal to the joint's DOF or coordinate count, (2) dicts mapping DOF/coordinate indices to values, or (3) scalar values for single-DOF/single-coordinate joints (automatically expanded to lists). Custom attributes with frequency :attr:`ModelAttributeFrequency.JOINT` require a single value to be defined.
 
         Returns:
             The index of the added joint.
@@ -2297,6 +2359,7 @@ class ModelBuilder:
         self.equality_constraint_polycoef.append(polycoef or [0.0, 0.0, 0.0, 0.0, 0.0])
         self.equality_constraint_key.append(key)
         self.equality_constraint_enabled.append(enabled)
+        self.equality_constraint_world.append(self.current_world)
 
         return len(self.equality_constraint_type) - 1
 
@@ -2953,6 +3016,9 @@ class ModelBuilder:
         self.shape_material_ka.append(cfg.ka)
         self.shape_material_mu.append(cfg.mu)
         self.shape_material_restitution.append(cfg.restitution)
+        self.shape_contact_margin.append(
+            cfg.contact_margin if cfg.contact_margin is not None else self.rigid_contact_margin
+        )
         self.shape_collision_group.append(cfg.collision_group)
         self.shape_collision_radius.append(compute_shape_radius(type, scale, src))
         self.shape_world.append(self.current_world)
@@ -3089,6 +3155,77 @@ class ModelBuilder:
         return self.add_shape(
             body=body,
             type=GeoType.SPHERE,
+            xform=xform,
+            cfg=cfg,
+            scale=scale,
+            key=key,
+            custom_attributes=custom_attributes,
+        )
+
+    def add_shape_ellipsoid(
+        self,
+        body: int,
+        xform: Transform | None = None,
+        a: float = 1.0,
+        b: float = 0.75,
+        c: float = 0.5,
+        cfg: ShapeConfig | None = None,
+        as_site: bool = False,
+        key: str | None = None,
+        custom_attributes: dict[str, Any] | None = None,
+    ) -> int:
+        """Adds an ellipsoid collision shape or site to a body.
+
+        The ellipsoid is centered at its local origin as defined by `xform`, with semi-axes
+        `a`, `b`, `c` along the local X, Y, Z axes respectively.
+
+        Note:
+            Ellipsoid collision is handled by the unified GJK/MPR collision pipeline,
+            which provides accurate collision detection for all convex shape pairs.
+
+        Args:
+            body (int): The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
+            xform (Transform | None): The transform of the ellipsoid in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
+            a (float): The semi-axis of the ellipsoid along its local X-axis. Defaults to `1.0`.
+            b (float): The semi-axis of the ellipsoid along its local Y-axis. Defaults to `0.75`.
+            c (float): The semi-axis of the ellipsoid along its local Z-axis. Defaults to `0.5`.
+            cfg (ShapeConfig | None): The configuration for the shape's properties. If `None`, uses :attr:`default_shape_cfg` (or :attr:`default_site_cfg` when `as_site=True`). If `as_site=True` and `cfg` is provided, a copy is made and site invariants are enforced via `mark_as_site()`. Defaults to `None`.
+            as_site (bool): If `True`, creates a site (non-colliding reference point) instead of a collision shape. Defaults to `False`.
+            key (str | None): An optional unique key for identifying the shape. If `None`, a default key is automatically generated. Defaults to `None`.
+            custom_attributes: Dictionary of custom attribute names to values.
+
+        Returns:
+            int: The index of the newly added shape or site.
+
+        Example:
+            Create an ellipsoid with different semi-axes:
+
+            .. doctest::
+
+                builder = newton.ModelBuilder()
+                body = builder.add_body()
+
+                # Add an ellipsoid with semi-axes 1.0, 0.5, 0.25
+                builder.add_shape_ellipsoid(
+                    body=body,
+                    a=1.0,  # X semi-axis
+                    b=0.5,  # Y semi-axis
+                    c=0.25,  # Z semi-axis
+                )
+
+                # A sphere is a special case where a = b = c
+                builder.add_shape_ellipsoid(body=body, a=0.5, b=0.5, c=0.5)
+        """
+        if cfg is None:
+            cfg = self.default_site_cfg if as_site else self.default_shape_cfg
+        elif as_site:
+            cfg = cfg.copy()
+            cfg.mark_as_site()
+
+        scale = wp.vec3(a, b, c)
+        return self.add_shape(
+            body=body,
+            type=GeoType.ELLIPSOID,
             xform=xform,
             cfg=cfg,
             scale=scale,
@@ -4882,6 +5019,7 @@ class ModelBuilder:
             m.shape_material_restitution = wp.array(
                 self.shape_material_restitution, dtype=wp.float32, requires_grad=requires_grad
             )
+            m.shape_contact_margin = wp.array(self.shape_contact_margin, dtype=wp.float32, requires_grad=requires_grad)
 
             m.shape_collision_filter_pairs = set(self.shape_collision_filter_pairs)
             m.shape_collision_group = wp.array(self.shape_collision_group, dtype=wp.int32)
@@ -5101,6 +5239,7 @@ class ModelBuilder:
             m.equality_constraint_polycoef = wp.array(self.equality_constraint_polycoef, dtype=wp.float32)
             m.equality_constraint_key = self.equality_constraint_key
             m.equality_constraint_enabled = wp.array(self.equality_constraint_enabled, dtype=wp.bool)
+            m.equality_constraint_world = wp.array(self.equality_constraint_world, dtype=wp.int32)
 
             # counts
             m.joint_count = self.joint_count

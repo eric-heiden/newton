@@ -781,12 +781,14 @@ def convert_body_xforms_to_warp_kernel(
 def update_body_mass_ipos_kernel(
     body_com: wp.array(dtype=wp.vec3f),
     body_mass: wp.array(dtype=float),
+    body_gravcomp: wp.array(dtype=float),
     bodies_per_world: int,
     up_axis: int,
     body_mapping: wp.array(dtype=int),
     # outputs
     body_ipos: wp.array2d(dtype=wp.vec3f),
     body_mass_out: wp.array2d(dtype=float),
+    body_gravcomp_out: wp.array2d(dtype=float),
 ):
     tid = wp.tid()
     worldid = wp.tid() // bodies_per_world
@@ -803,6 +805,10 @@ def update_body_mass_ipos_kernel(
 
     # update mass
     body_mass_out[worldid, mjc_idx] = body_mass[tid]
+
+    # update gravcomp
+    if body_gravcomp:
+        body_gravcomp_out[worldid, mjc_idx] = body_gravcomp[tid]
 
 
 @wp.kernel
@@ -903,24 +909,122 @@ def update_axis_properties_kernel(
 
 
 @wp.kernel
-def update_dof_properties_kernel(
+def update_joint_dof_properties_kernel(
+    joint_qd_start: wp.array(dtype=wp.int32),
+    joint_dof_dim: wp.array2d(dtype=wp.int32),
+    joint_mjc_dof_start: wp.array(dtype=wp.int32),
+    dof_to_mjc_joint: wp.array(dtype=wp.int32),
     joint_armature: wp.array(dtype=float),
     joint_friction: wp.array(dtype=float),
-    dofs_per_world: int,
+    joint_limit_ke: wp.array(dtype=float),
+    joint_limit_kd: wp.array(dtype=float),
+    joint_limit_lower: wp.array(dtype=float),
+    joint_limit_upper: wp.array(dtype=float),
+    solimplimit: wp.array(dtype=vec5),
+    joint_stiffness: wp.array(dtype=float),
+    joint_damping: wp.array(dtype=float),
+    limit_margin: wp.array(dtype=float),
+    joints_per_world: int,
     # outputs
     dof_armature: wp.array2d(dtype=float),
     dof_frictionloss: wp.array2d(dtype=float),
+    jnt_solimp: wp.array2d(dtype=vec5),
+    jnt_solref: wp.array2d(dtype=wp.vec2),
+    jnt_stiffness: wp.array2d(dtype=float),
+    dof_damping: wp.array2d(dtype=float),
+    jnt_margin: wp.array2d(dtype=float),
+    jnt_range: wp.array2d(dtype=wp.vec2),
 ):
-    """Update DOF armature and friction loss values."""
+    """Update joint DOF properties including armature, friction loss, joint impedance limits, and solref.
+
+    This kernel properly maps Newton DOFs to MuJoCo DOFs using joint_mjc_dof_start.
+    For solimplimit and solref, we use dof_to_mjc_joint since jnt_solimp/jnt_solref are per-joint in MuJoCo.
+    If solimplimit is None, jnt_solimp won't be updated (MuJoCo defaults will be preserved).
+    """
     tid = wp.tid()
-    worldid = tid // dofs_per_world
-    dof_in_world = tid % dofs_per_world
+    worldid = tid // joints_per_world
+    joint_in_world = tid % joints_per_world
 
-    # update armature
-    dof_armature[worldid, dof_in_world] = joint_armature[tid]
+    lin_axis_count = joint_dof_dim[tid, 0]
+    ang_axis_count = joint_dof_dim[tid, 1]
 
-    # update friction loss
-    dof_frictionloss[worldid, dof_in_world] = joint_friction[tid]
+    if lin_axis_count + ang_axis_count == 0:
+        return
+
+    newton_dof_start = joint_qd_start[tid]
+    mjc_dof_start = joint_mjc_dof_start[joint_in_world]
+
+    # Get the DOF start for the template joint (world 0)
+    # dof_to_mjc_joint is only populated for template DOFs (first world)
+    template_joint_idx = joint_in_world
+    template_dof_start = joint_qd_start[template_joint_idx]
+
+    # update linear dofs
+    for i in range(lin_axis_count):
+        newton_dof_index = newton_dof_start + i
+        template_dof_index = template_dof_start + i
+        mjc_dof_index = mjc_dof_start + i
+        mjc_joint_index = dof_to_mjc_joint[template_dof_index]
+
+        # Update armature and friction (per DOF)
+        dof_armature[worldid, mjc_dof_index] = joint_armature[newton_dof_index]
+        dof_frictionloss[worldid, mjc_dof_index] = joint_friction[newton_dof_index]
+        # Update passive damping (per dof)
+        if joint_damping:
+            dof_damping[worldid, mjc_dof_index] = joint_damping[newton_dof_index]
+
+        # Update joint limit solref using negative convention (per joint)
+        if joint_limit_ke[newton_dof_index] > 0.0:
+            jnt_solref[worldid, mjc_joint_index] = wp.vec2(
+                -joint_limit_ke[newton_dof_index], -joint_limit_kd[newton_dof_index]
+            )
+
+        # Update solimplimit (per joint)
+        if solimplimit:
+            jnt_solimp[worldid, mjc_joint_index] = solimplimit[newton_dof_index]
+        # Update passive stiffness (per joint)
+        if joint_stiffness:
+            jnt_stiffness[worldid, mjc_joint_index] = joint_stiffness[newton_dof_index]
+        if limit_margin:
+            jnt_margin[worldid, mjc_joint_index] = limit_margin[newton_dof_index]
+
+        # update joint range (per joint)
+        jnt_range[worldid, mjc_joint_index] = wp.vec2(
+            joint_limit_lower[newton_dof_index], joint_limit_upper[newton_dof_index]
+        )
+
+    # update angular dofs
+    for i in range(ang_axis_count):
+        newton_dof_index = newton_dof_start + lin_axis_count + i
+        template_dof_index = template_dof_start + lin_axis_count + i
+        mjc_dof_index = mjc_dof_start + lin_axis_count + i
+        mjc_joint_index = dof_to_mjc_joint[template_dof_index]
+
+        # Update armature and friction (per DOF)
+        dof_armature[worldid, mjc_dof_index] = joint_armature[newton_dof_index]
+        dof_frictionloss[worldid, mjc_dof_index] = joint_friction[newton_dof_index]
+        # Update passive damping (per dof)
+        if joint_damping:
+            dof_damping[worldid, mjc_dof_index] = joint_damping[newton_dof_index]
+        # Update joint limit solref using negative convention (per joint)
+        if joint_limit_ke[newton_dof_index] > 0.0:
+            jnt_solref[worldid, mjc_joint_index] = wp.vec2(
+                -joint_limit_ke[newton_dof_index], -joint_limit_kd[newton_dof_index]
+            )
+
+        # Update solimplimit (per joint)
+        if solimplimit:
+            jnt_solimp[worldid, mjc_joint_index] = solimplimit[newton_dof_index]
+        # Update passive stiffness (per joint)
+        if joint_stiffness:
+            jnt_stiffness[worldid, mjc_joint_index] = joint_stiffness[newton_dof_index]
+        if limit_margin:
+            jnt_margin[worldid, mjc_joint_index] = limit_margin[newton_dof_index]
+
+        # update joint range (per joint)
+        jnt_range[worldid, mjc_joint_index] = wp.vec2(
+            joint_limit_lower[newton_dof_index], joint_limit_upper[newton_dof_index]
+        )
 
 
 @wp.kernel
@@ -932,17 +1036,17 @@ def update_joint_transforms_kernel(
     joint_original_axis: wp.array(dtype=wp.vec3),
     joint_child: wp.array(dtype=wp.int32),
     joint_type: wp.array(dtype=wp.int32),
-    joint_limit_ke: wp.array(dtype=float),
-    joint_limit_kd: wp.array(dtype=float),
-    joint_mjc_dof_start: wp.array(dtype=wp.int32),
+    dof_to_mjc_joint: wp.array(dtype=wp.int32),
     body_mapping: wp.array(dtype=wp.int32),
+    newton_body_to_mocap_index: wp.array(dtype=wp.int32),
     joints_per_world: int,
     # outputs
     joint_pos: wp.array2d(dtype=wp.vec3),
     joint_axis: wp.array2d(dtype=wp.vec3),
-    joint_solref: wp.array2d(dtype=wp.vec2),
     body_pos: wp.array2d(dtype=wp.vec3),
     body_quat: wp.array2d(dtype=wp.quat),
+    mocap_pos: wp.array2d(dtype=wp.vec3),
+    mocap_quat: wp.array2d(dtype=wp.quat),
 ):
     tid = wp.tid()
     worldid = tid // joints_per_world
@@ -955,43 +1059,49 @@ def update_joint_transforms_kernel(
 
     child_xform = joint_X_c[tid]
     parent_xform = joint_X_p[tid]
-    lin_axis_count = joint_dof_dim[tid, 0]
-    ang_axis_count = joint_dof_dim[tid, 1]
-    newton_dof_start = joint_dof_start[tid]
-    mjc_dof_start = joint_mjc_dof_start[joint_in_world]
-    if mjc_dof_start == -1:
-        # this should not happen
-        wp.printf("Joint %i has no MuJoCo DOF start index\n", joint_in_world)
-        return
-
-    # update linear dofs
-    for i in range(lin_axis_count):
-        newton_dof_index = newton_dof_start + i
-        axis = joint_original_axis[newton_dof_index]
-        ai = mjc_dof_start + i
-        joint_axis[worldid, ai] = wp.quat_rotate(child_xform.q, axis)
-        joint_pos[worldid, ai] = child_xform.p
-        # update joint limit solref using negative convention
-        if joint_limit_ke[newton_dof_index] > 0:
-            joint_solref[worldid, ai] = wp.vec2(-joint_limit_ke[newton_dof_index], -joint_limit_kd[newton_dof_index])
-
-    # update angular dofs
-    for i in range(ang_axis_count):
-        newton_dof_index = newton_dof_start + lin_axis_count + i
-        axis = joint_original_axis[newton_dof_index]
-        ai = mjc_dof_start + lin_axis_count + i
-        joint_axis[worldid, ai] = wp.quat_rotate(child_xform.q, axis)
-        joint_pos[worldid, ai] = child_xform.p
-        # update joint limit solref using negative convention
-        if joint_limit_ke[newton_dof_index] > 0:
-            joint_solref[worldid, ai] = wp.vec2(-joint_limit_ke[newton_dof_index], -joint_limit_kd[newton_dof_index])
 
     # update body pos and quat from parent joint transform
     child = joint_child[joint_in_world]  # Newton body id
     body_id = body_mapping[child]  # MuJoCo body id
     tf = parent_xform * wp.transform_inverse(child_xform)
-    body_pos[worldid, body_id] = tf.p
-    body_quat[worldid, body_id] = wp.quat(tf.q.w, tf.q.x, tf.q.y, tf.q.z)
+
+    # Check if this is a mocap body (fixed-base articulation)
+    # For mocap bodies, we need to update mocap_pos/mocap_quat instead of body_pos/body_quat
+    # mocap_index is -1 if not a mocap body
+    mocap_index = newton_body_to_mocap_index[child]
+    rotation = wp.quat(tf.q.w, tf.q.x, tf.q.y, tf.q.z)
+    if mocap_index >= 0:
+        mocap_pos[worldid, mocap_index] = tf.p
+        mocap_quat[worldid, mocap_index] = rotation
+    else:
+        body_pos[worldid, body_id] = tf.p
+        body_quat[worldid, body_id] = rotation
+
+    lin_axis_count = joint_dof_dim[tid, 0]
+    ang_axis_count = joint_dof_dim[tid, 1]
+
+    if lin_axis_count + ang_axis_count == 0:
+        return
+
+    newton_dof_start = joint_dof_start[tid]
+    template_dof_start = joint_dof_start[joint_in_world]
+    mjc_joint_index = dof_to_mjc_joint[template_dof_start]
+
+    # update linear dofs
+    for i in range(lin_axis_count):
+        newton_dof_index = newton_dof_start + i
+        axis = joint_original_axis[newton_dof_index]
+        ai = mjc_joint_index + i
+        joint_axis[worldid, ai] = wp.quat_rotate(child_xform.q, axis)
+        joint_pos[worldid, ai] = child_xform.p
+
+    # update angular dofs
+    for i in range(ang_axis_count):
+        newton_dof_index = newton_dof_start + lin_axis_count + i
+        axis = joint_original_axis[newton_dof_index]
+        ai = mjc_joint_index + lin_axis_count + i
+        joint_axis[worldid, ai] = wp.quat_rotate(child_xform.q, axis)
+        joint_pos[worldid, ai] = child_xform.p
 
 
 @wp.kernel(enable_backward=False)

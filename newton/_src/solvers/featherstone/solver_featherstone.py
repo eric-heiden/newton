@@ -16,7 +16,7 @@
 import warp as wp
 
 from ...core.types import override
-from ...sim import Contacts, Control, Model, State, eval_fk
+from ...sim import Contacts, Control, Model, State
 from ..semi_implicit.kernels_contact import (
     eval_body_contact,
     eval_particle_body_contact_forces,
@@ -35,11 +35,13 @@ from ..solver import SolverBase
 from .kernels import (
     compute_com_transforms,
     compute_spatial_inertia,
+    convert_body_force_com_to_origin,
     create_inertia_matrix_cholesky_kernel,
     create_inertia_matrix_kernel,
     eval_dense_cholesky_batched,
     eval_dense_gemm_batched,
     eval_dense_solve_batched,
+    eval_fk_with_velocity_conversion,
     eval_rigid_fk,
     eval_rigid_id,
     eval_rigid_jacobian,
@@ -120,8 +122,8 @@ class SolverFeatherstone(SolverBase):
 
         self._step = 0
 
-        self.compute_articulation_indices(model)
-        self.allocate_model_aux_vars(model)
+        self._compute_articulation_indices(model)
+        self._allocate_model_aux_vars(model)
 
         if self.use_tile_gemm:
             # create a custom kernel to evaluate the system matrix for this type
@@ -138,7 +140,7 @@ class SolverFeatherstone(SolverBase):
             # todo: should not be necessary?
             wp.load_module(device=wp.get_device())
 
-    def compute_articulation_indices(self, model):
+    def _compute_articulation_indices(self, model):
         # calculate total size and offsets of Jacobian and mass matrices for entire system
         if model.joint_count:
             self.J_size = 0
@@ -208,7 +210,7 @@ class SolverFeatherstone(SolverBase):
             self.articulation_dof_start = wp.array(articulation_dof_start, dtype=wp.int32, device=model.device)
             self.articulation_coord_start = wp.array(articulation_coord_start, dtype=wp.int32, device=model.device)
 
-    def allocate_model_aux_vars(self, model):
+    def _allocate_model_aux_vars(self, model):
         # allocate mass, Jacobian matrices, and other auxiliary variables pertaining to the model
         if model.joint_count:
             # system matrices
@@ -242,7 +244,7 @@ class SolverFeatherstone(SolverBase):
                 device=model.device,
             )
 
-    def allocate_state_aux_vars(self, model, target, requires_grad):
+    def _allocate_state_aux_vars(self, model, target, requires_grad):
         # allocate auxiliary variables that vary with state
         if model.body_count:
             # joints
@@ -300,7 +302,7 @@ class SolverFeatherstone(SolverBase):
         model = self.model
 
         if not getattr(state_aug, "_featherstone_augmented", False):
-            self.allocate_state_aux_vars(model, state_aug, requires_grad)
+            self._allocate_state_aux_vars(model, state_aug, requires_grad)
         if control is None:
             control = model.control(clone_variables=False)
 
@@ -313,6 +315,13 @@ class SolverFeatherstone(SolverBase):
 
             if state_in.body_count:
                 body_f = state_in.body_f
+                wp.launch(
+                    convert_body_force_com_to_origin,
+                    dim=model.body_count,
+                    inputs=[state_in.body_q, self.body_X_com],
+                    outputs=[body_f],
+                    device=model.device,
+                )
 
             # damped springs
             eval_spring_forces(model, state_in, particle_f)
@@ -384,6 +393,7 @@ class SolverFeatherstone(SolverBase):
                         state_in.body_q,
                         state_aug.body_q_com,
                         model.joint_X_p,
+                        model.body_world,
                         model.gravity,
                     ],
                     outputs=[
@@ -416,8 +426,11 @@ class SolverFeatherstone(SolverBase):
                             contacts.rigid_contact_normal,
                             contacts.rigid_contact_shape0,
                             contacts.rigid_contact_shape1,
-                            contacts.rigid_contact_thickness0,
-                            contacts.rigid_contact_thickness1,
+                            contacts.rigid_contact_margin0,
+                            contacts.rigid_contact_margin1,
+                            contacts.rigid_contact_stiffness,
+                            contacts.rigid_contact_damping,
+                            contacts.rigid_contact_friction,
                             True,
                             self.friction_smoothing,
                         ],
@@ -663,8 +676,8 @@ class SolverFeatherstone(SolverBase):
                     device=model.device,
                 )
 
-                # update maximal coordinates
-                eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+                # update maximal coordinates using FK with velocity conversion
+                eval_fk_with_velocity_conversion(model, state_out.joint_q, state_out.joint_qd, state_out)
 
             self.integrate_particles(model, state_in, state_out, dt)
 

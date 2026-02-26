@@ -11,7 +11,7 @@ name: Newton + Warp Nightly Builds
 # Workflow configuration variables
 env:
   AWS_REGION: us-east-2
-  AWS_INSTANCE_TYPE: g6e.2xlarge
+  AWS_INSTANCE_TYPE: g7e.2xlarge
   AWS_VOLUME_SIZE: 92
   AWS_VOLUME_TYPE: gp3
   AWS_SECURITY_GROUP_IDS: sg-07807c44e7f2a368a
@@ -28,19 +28,21 @@ jobs:
     name: Check for new warp-lang nightly build
     if: github.repository == 'newton-physics/newton'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       warp-updated: ${{ steps.check-update.outputs.warp-updated }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca
+        uses: astral-sh/setup-uv@681c641aba71e4a1c380be3ab5e12ad51f415867  # v7.1.6
         with:
           version: "0.9.0"
 
       - name: Update warp-lang in lock file
-        run: uv lock -P warp-lang
+        run: uv lock -P warp-lang --prerelease allow
 
       - name: Check if warp-lang version changed
         id: check-update
@@ -68,7 +70,7 @@ jobs:
       ec2-instance-id: ${{ steps.start-ec2-runner.outputs.ec2-instance-id }}
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708  # v5.1.1
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
@@ -89,14 +91,18 @@ jobs:
           echo "LATEST_AMI_ID=$LATEST_AMI_ID" >> "$GITHUB_ENV"
       - name: Start EC2 runner
         id: start-ec2-runner
-        uses: machulav/ec2-github-runner@a6dbcefcf8a31a861f5e078bb153ed332130c512
+        uses: machulav/ec2-github-runner@a6dbcefcf8a31a861f5e078bb153ed332130c512  # v2.4.3
         with:
           mode: start
           github-token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
-          ec2-image-id: ${{ env.LATEST_AMI_ID }}
           ec2-instance-type: ${{ env.AWS_INSTANCE_TYPE }}
-          subnet-id: subnet-051b9d2e71acf8047
-          security-group-id: ${{ env.AWS_SECURITY_GROUP_IDS }}
+          ec2-volume-size: ${{ env.AWS_VOLUME_SIZE }}
+          ec2-volume-type: ${{ env.AWS_VOLUME_TYPE }}
+          availability-zones-config: >
+            [
+              {"imageId": "${{ env.LATEST_AMI_ID }}", "subnetId": "subnet-051b9d2e71acf8047", "securityGroupId": "${{ env.AWS_SECURITY_GROUP_IDS }}"},
+              {"imageId": "${{ env.LATEST_AMI_ID }}", "subnetId": "subnet-0c98bd06abe8ee5eb", "securityGroupId": "${{ env.AWS_SECURITY_GROUP_IDS }}"}
+            ]
           aws-resource-tags: >
             [
               {"Key": "Name", "Value": "ec2-github-runner"},
@@ -108,14 +114,16 @@ jobs:
     name: Run Tests with Warp Nightly Build
     needs: start-runner
     runs-on: ${{ needs.start-runner.outputs.label }}
+    permissions:
+      contents: read
     env:
       HOME: /actions-runner
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca
+        uses: astral-sh/setup-uv@681c641aba71e4a1c380be3ab5e12ad51f415867  # v7.1.6
         with:
           version: "0.9.0"
 
@@ -123,14 +131,14 @@ jobs:
         run: uv python install
 
       - name: Update lock file with latest warp-lang nightly build
-        run: uv lock -P warp-lang
+        run: uv lock -P warp-lang --prerelease allow
 
       - name: Run Tests
         run: uv run --extra dev --extra torch-cu12 -m newton.tests --junit-report-xml rspec.xml
 
       - name: Test Summary
         if: ${{ !cancelled() }}
-        uses: test-summary/action@31493c76ec9e7aa675f1585d3ed6f1da69269a86
+        uses: test-summary/action@31493c76ec9e7aa675f1585d3ed6f1da69269a86  # v2.4
         with:
           paths: "rspec.xml"
           show: "fail"
@@ -147,14 +155,14 @@ jobs:
     if: always() && needs.start-runner.result != 'skipped' && github.repository == 'newton-physics/newton'
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708  # v5.1.1
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           role-duration-seconds: ${{ env.AWS_ROLE_DURATION }}
 
       - name: Stop EC2 runner
-        uses: machulav/ec2-github-runner@a6dbcefcf8a31a861f5e078bb153ed332130c512
+        uses: machulav/ec2-github-runner@a6dbcefcf8a31a861f5e078bb153ed332130c512  # v2.4.3
         with:
           mode: stop
           github-token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}

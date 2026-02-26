@@ -12,6 +12,8 @@ newton.geometry
    BroadPhaseAllPairs
    BroadPhaseExplicit
    BroadPhaseSAP
+   HydroelasticSDF
+   NarrowPhase
 
 .. rubric:: Functions
 
@@ -31,8 +33,13 @@ newton.geometry
    collide_sphere_capsule
    collide_sphere_cylinder
    collide_sphere_sphere
-   compute_shape_inertia
-   generate_terrain_grid
-   heightfield_to_mesh
-   remesh_mesh
+   compute_inertia_shape
+   create_empty_sdf_data
+   sdf_box
+   sdf_capsule
+   sdf_cone
+   sdf_cylinder
+   sdf_mesh
+   sdf_plane
+   sdf_sphere
    transform_inertia

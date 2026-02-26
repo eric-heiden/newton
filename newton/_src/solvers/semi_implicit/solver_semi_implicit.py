@@ -98,6 +98,24 @@ class SolverSemiImplicit(SolverBase):
         contacts: Contacts | None,
         dt: float,
     ):
+        """
+        Simulate the model for a given time step using the given control input.
+
+        Args:
+            state_in: The input state.
+            state_out: The output state.
+            control: The control input.
+                Defaults to `None` which means the control values from the
+                :class:`Model` are used.
+            contacts: The contact information.
+                Defaults to `None` which means no contacts are used.
+            dt: The time step (typically in seconds).
+
+        .. warning::
+            The ``eval_particle_contact`` kernel for particle-particle contact handling may corrupt the gradient computation
+            for simulations involving particle collisions.
+            To disable it, set :attr:`newton.Model.particle_grid` to `None` prior to calling :meth:`step`.
+        """
         with wp.ScopedTimer("simulate", False):
             particle_f = None
             body_f = None
@@ -113,6 +131,11 @@ class SolverSemiImplicit(SolverBase):
             if control is None:
                 control = model.control(clone_variables=False)
 
+            body_f_work = body_f
+            if body_f is not None and model.joint_count and control.joint_f is not None:
+                # Avoid accumulating joint_f into the persistent state body_f buffer.
+                body_f_work = wp.clone(body_f)
+
             # damped springs
             eval_spring_forces(model, state_in, particle_f)
 
@@ -126,7 +149,7 @@ class SolverSemiImplicit(SolverBase):
             eval_tetrahedra_forces(model, state_in, control, particle_f)
 
             # body joints
-            eval_body_joint_forces(model, state_in, control, body_f, self.joint_attach_ke, self.joint_attach_kd)
+            eval_body_joint_forces(model, state_in, control, body_f_work, self.joint_attach_ke, self.joint_attach_kd)
 
             # muscles
             if False:
@@ -140,15 +163,21 @@ class SolverSemiImplicit(SolverBase):
                 eval_triangle_contact_forces(model, state_in, particle_f)
 
             # body contacts
-            eval_body_contact_forces(model, state_in, contacts, friction_smoothing=self.friction_smoothing)
+            eval_body_contact_forces(
+                model, state_in, contacts, friction_smoothing=self.friction_smoothing, body_f_out=body_f_work
+            )
 
             # particle shape contact
             eval_particle_body_contact_forces(
-                model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=False
+                model, state_in, contacts, particle_f, body_f_work, body_f_in_world_frame=False
             )
 
             self.integrate_particles(model, state_in, state_out, dt)
 
-            self.integrate_bodies(model, state_in, state_out, dt, self.angular_damping)
-
-            return state_out
+            if body_f_work is body_f:
+                self.integrate_bodies(model, state_in, state_out, dt, self.angular_damping)
+            else:
+                body_f_prev = state_in.body_f
+                state_in.body_f = body_f_work
+                self.integrate_bodies(model, state_in, state_out, dt, self.angular_damping)
+                state_in.body_f = body_f_prev

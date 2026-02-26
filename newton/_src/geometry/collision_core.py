@@ -19,6 +19,7 @@ from typing import Any
 
 import warp as wp
 
+from ..core.types import vec5
 from .broad_phase_common import binary_search
 from .collision_convex import create_solve_convex_multi_contact, create_solve_convex_single_contact
 from .contact_data import ContactData
@@ -33,56 +34,19 @@ ENABLE_TILE_BVH_QUERY = True
 
 # Type definitions for multi-contact manifolds
 _mat53f = wp.types.matrix((5, 3), wp.float32)
-_vec5 = wp.types.vector(5, wp.float32)
 
 # Type definitions for single-contact mode
 _vec1 = wp.types.vector(1, wp.float32)
 
 
 @wp.func
-def build_pair_key2(shape_a: wp.uint32, shape_b: wp.uint32) -> wp.uint64:
-    """
-    Build a 64-bit key from two shape indices.
-    Upper 32 bits: shape_a
-    Lower 32 bits: shape_b
-    """
-    key = wp.uint64(shape_a)
-    key = key << wp.uint64(32)
-    key = key | wp.uint64(shape_b)
-    return key
-
-
-@wp.func
-def build_pair_key3(shape_a: wp.uint32, shape_b: wp.uint32, triangle_idx: wp.uint32) -> wp.uint64:
-    """
-    Build a 63-bit key from two shape indices and a triangle index (MSB is 0 for signed int64 compatibility).
-    Bit 63: 0 (reserved for sign bit)
-    Bits 62-43: shape_a (20 bits)
-    Bits 42-23: shape_b (20 bits)
-    Bits 22-0: triangle_idx (23 bits)
-
-    Max values: shape_a < 2^20 (1,048,576), shape_b < 2^20 (1,048,576), triangle_idx < 2^23 (8,388,608)
-    """
-    assert shape_a < wp.uint32(1048576), "shape_a must be < 2^20 (1,048,576)"
-    assert shape_b < wp.uint32(1048576), "shape_b must be < 2^20 (1,048,576)"
-    assert triangle_idx < wp.uint32(8388608), "triangle_idx must be < 2^23 (8,388,608)"
-
-    key = wp.uint64(shape_a & wp.uint32(0xFFFFF))  # Mask to 20 bits
-    key = key << wp.uint64(20)
-    key = key | wp.uint64(shape_b & wp.uint32(0xFFFFF))  # Mask to 20 bits
-    key = key << wp.uint64(23)
-    key = key | wp.uint64(triangle_idx & wp.uint32(0x7FFFFF))  # Mask to 23 bits
-    return key
-
-
-@wp.func
 def is_discrete_shape(shape_type: int) -> bool:
     """A discrete shape can be represented with a finite amount of flat polygon faces."""
     return (
-        shape_type == int(GeoType.BOX)
-        or shape_type == int(GeoType.CONVEX_MESH)
-        or shape_type == int(GeoTypeEx.TRIANGLE)
-        or shape_type == int(GeoType.PLANE)
+        shape_type == GeoType.BOX
+        or shape_type == GeoType.CONVEX_MESH
+        or shape_type == GeoTypeEx.TRIANGLE
+        or shape_type == GeoType.PLANE
     )
 
 
@@ -109,7 +73,7 @@ def project_point_onto_plane(point: wp.vec3, plane_point: wp.vec3, plane_normal:
 def compute_plane_normal_from_contacts(
     points: _mat53f,
     normal: wp.vec3,
-    signed_distances: _vec5,
+    signed_distances: vec5,
     count: int,
 ) -> wp.vec3:
     """
@@ -217,20 +181,20 @@ def post_process_axial_on_discrete_contact(
 
     # 1. Minkowski object processing for spheres and capsules
     # Adjust contact point and distance for sphere/capsule A
-    if type_a == int(GeoType.SPHERE) or type_a == int(GeoType.CAPSULE):
+    if type_a == GeoType.SPHERE or type_a == GeoType.CAPSULE:
         contact_data.contact_point_center = contact_data.contact_point_center + normal * (radius_eff_a * 0.5)
         contact_data.contact_distance = contact_data.contact_distance - radius_eff_a
 
     # Adjust contact point and distance for sphere/capsule B
-    if type_b == int(GeoType.SPHERE) or type_b == int(GeoType.CAPSULE):
+    if type_b == GeoType.SPHERE or type_b == GeoType.CAPSULE:
         contact_data.contact_point_center = contact_data.contact_point_center - normal * (radius_eff_b * 0.5)
         contact_data.contact_distance = contact_data.contact_distance - radius_eff_b
 
     # 2. Axial shape rolling stabilization (cylinders and cones on discrete surfaces)
     is_discrete_a = is_discrete_shape(type_a)
     is_discrete_b = is_discrete_shape(type_b)
-    is_axial_a = type_a == int(GeoType.CYLINDER) or type_a == int(GeoType.CONE)
-    is_axial_b = type_b == int(GeoType.CYLINDER) or type_b == int(GeoType.CONE)
+    is_axial_a = type_a == GeoType.CYLINDER or type_a == GeoType.CONE
+    is_axial_b = type_b == GeoType.CYLINDER or type_b == GeoType.CONE
 
     # Only process if we have discrete vs axial configuration
     if (is_discrete_a and is_axial_b) or (is_discrete_b and is_axial_a):
@@ -239,14 +203,14 @@ def post_process_axial_on_discrete_contact(
             shape_axis = wp.quat_rotate(rot_b, wp.vec3(0.0, 0.0, 1.0))
             shape_radius = shape_b.scale[0]
             shape_half_height = shape_b.scale[1]
-            is_cone = type_b == int(GeoType.CONE)
+            is_cone = type_b == GeoType.CONE
             shape_pos = pos_b_adjusted
             axial_normal = normal
         else:  # is_discrete_b and is_axial_a
             shape_axis = wp.quat_rotate(rot_a, wp.vec3(0.0, 0.0, 1.0))
             shape_radius = shape_a.scale[0]
             shape_half_height = shape_a.scale[1]
-            is_cone = type_a == int(GeoType.CONE)
+            is_cone = type_a == GeoType.CONE
             shape_pos = pos_a_adjusted
             axial_normal = -normal  # Flip normal for shape A
 
@@ -307,13 +271,12 @@ def create_compute_gjk_mpr_contacts(
         rot_b: wp.quat,
         pos_a_adjusted: wp.vec3,
         pos_b_adjusted: wp.vec3,
-        rigid_contact_margin: float,
+        rigid_gap: float,
         shape_a: int,
         shape_b: int,
-        thickness_a: float,
-        thickness_b: float,
+        margin_a: float,
+        margin_b: float,
         writer_data: Any,
-        pair_key: wp.uint64,
     ):
         """
         Compute contacts between two shapes using GJK/MPR algorithm and write them.
@@ -325,11 +288,11 @@ def create_compute_gjk_mpr_contacts(
             rot_b: Orientation of shape B
             pos_a_adjusted: Adjusted position of shape A
             pos_b_adjusted: Adjusted position of shape B
-            rigid_contact_margin: Contact margin for rigid bodies
+            rigid_gap: Contact gap for rigid bodies
             shape_a: Index of shape A
             shape_b: Index of shape B
-            thickness_a: Thickness of shape A
-            thickness_b: Thickness of shape B
+            margin_a: Per-shape margin offset for shape A (signed distance padding)
+            margin_b: Per-shape margin offset for shape B (signed distance padding)
             writer_data: Data structure for contact writer
         """
         data_provider = SupportMapDataProvider()
@@ -344,11 +307,11 @@ def create_compute_gjk_mpr_contacts(
         type_b = shape_b_data.shape_type
 
         # Special treatment for minkowski objects
-        if type_a == int(GeoType.SPHERE) or type_a == int(GeoType.CAPSULE):
+        if type_a == GeoType.SPHERE or type_a == GeoType.CAPSULE:
             radius_eff_a = shape_a_data.scale[0]
             shape_a_data.scale[0] = small_radius
 
-        if type_b == int(GeoType.SPHERE) or type_b == int(GeoType.CAPSULE):
+        if type_b == GeoType.SPHERE or type_b == GeoType.CAPSULE:
             radius_eff_b = shape_b_data.scale[0]
             shape_b_data.scale[0] = small_radius
 
@@ -356,12 +319,11 @@ def create_compute_gjk_mpr_contacts(
         contact_template = ContactData()
         contact_template.radius_eff_a = radius_eff_a
         contact_template.radius_eff_b = radius_eff_b
-        contact_template.thickness_a = thickness_a
-        contact_template.thickness_b = thickness_b
+        contact_template.margin_a = margin_a
+        contact_template.margin_b = margin_b
         contact_template.shape_a = shape_a
         contact_template.shape_b = shape_b
-        contact_template.margin = rigid_contact_margin
-        contact_template.feature_pair_key = pair_key
+        contact_template.margin = rigid_gap
 
         if wp.static(ENABLE_MULTI_CONTACT):
             wp.static(create_solve_convex_multi_contact(support_map, writer_func, post_process_contact))(
@@ -373,11 +335,11 @@ def create_compute_gjk_mpr_contacts(
                 pos_b_adjusted,
                 0.0,  # sum_of_contact_offsets - gap
                 data_provider,
-                rigid_contact_margin + radius_eff_a + radius_eff_b,
-                type_a == int(GeoType.SPHERE)
-                or type_b == int(GeoType.SPHERE)
-                or type_a == int(GeoType.ELLIPSOID)
-                or type_b == int(GeoType.ELLIPSOID),
+                rigid_gap + radius_eff_a + radius_eff_b,
+                type_a == GeoType.SPHERE
+                or type_b == GeoType.SPHERE
+                or type_a == GeoType.ELLIPSOID
+                or type_b == GeoType.ELLIPSOID,
                 writer_data,
                 contact_template,
             )
@@ -391,7 +353,7 @@ def create_compute_gjk_mpr_contacts(
                 pos_b_adjusted,
                 0.0,  # sum_of_contact_offsets - gap
                 data_provider,
-                rigid_contact_margin + radius_eff_a + radius_eff_b,
+                rigid_gap + radius_eff_a + radius_eff_b,
                 writer_data,
                 contact_template,
             )
@@ -430,30 +392,29 @@ def compute_tight_aabb_from_support(
 
     # Compute AABB extents by evaluating support function in local space
     # Dot products are done in local space to avoid expensive rotations
-    support_point = wp.vec3()
 
     # Max X: support along +local_x, dot in local space
-    support_point, _feature_id = support_map(shape_data, local_x, data_provider)
+    support_point = support_map(shape_data, local_x, data_provider)
     max_x = wp.dot(local_x, support_point)
 
     # Max Y: support along +local_y, dot in local space
-    support_point, _feature_id = support_map(shape_data, local_y, data_provider)
+    support_point = support_map(shape_data, local_y, data_provider)
     max_y = wp.dot(local_y, support_point)
 
     # Max Z: support along +local_z, dot in local space
-    support_point, _feature_id = support_map(shape_data, local_z, data_provider)
+    support_point = support_map(shape_data, local_z, data_provider)
     max_z = wp.dot(local_z, support_point)
 
     # Min X: support along -local_x, dot in local space
-    support_point, _feature_id = support_map(shape_data, -local_x, data_provider)
+    support_point = support_map(shape_data, -local_x, data_provider)
     min_x = wp.dot(local_x, support_point)
 
     # Min Y: support along -local_y, dot in local space
-    support_point, _feature_id = support_map(shape_data, -local_y, data_provider)
+    support_point = support_map(shape_data, -local_y, data_provider)
     min_y = wp.dot(local_y, support_point)
 
     # Min Z: support along -local_z, dot in local space
-    support_point, _feature_id = support_map(shape_data, -local_z, data_provider)
+    support_point = support_map(shape_data, -local_z, data_provider)
     min_z = wp.dot(local_z, support_point)
 
     # AABB in world space (add world position to extents)
@@ -506,7 +467,7 @@ def convert_infinite_plane_to_cube(
         - adjusted_position: The cube's center position (centered on other object projected to plane)
     """
     result = GenericShapeData()
-    result.shape_type = int(GeoType.BOX)
+    result.shape_type = GeoType.BOX
 
     # Size the cube based on the other object's bounding sphere radius
     # Make it large enough to always contain potential contact points
@@ -565,8 +526,8 @@ def check_infinite_plane_bsphere_overlap(
     scale_b = shape_data_b.scale
 
     # Check if either shape is an infinite plane
-    is_infinite_plane_a = (type_a == int(GeoType.PLANE)) and (scale_a[0] == 0.0 and scale_a[1] == 0.0)
-    is_infinite_plane_b = (type_b == int(GeoType.PLANE)) and (scale_b[0] == 0.0 and scale_b[1] == 0.0)
+    is_infinite_plane_a = (type_a == GeoType.PLANE) and (scale_a[0] == 0.0 and scale_a[1] == 0.0)
+    is_infinite_plane_b = (type_b == GeoType.PLANE) and (scale_b[0] == 0.0 and scale_b[1] == 0.0)
 
     # If neither is an infinite plane, return True (no culling)
     if not (is_infinite_plane_a or is_infinite_plane_b):
@@ -618,11 +579,11 @@ def create_find_contacts(writer_func: Any):
         is_infinite_plane_b: bool,
         bsphere_radius_a: float,
         bsphere_radius_b: float,
-        rigid_contact_margin: float,
+        rigid_gap: float,
         shape_a: int,
         shape_b: int,
-        thickness_a: float,
-        thickness_b: float,
+        margin_a: float,
+        margin_b: float,
         writer_data: Any,
     ):
         """
@@ -639,13 +600,16 @@ def create_find_contacts(writer_func: Any):
             is_infinite_plane_b: Whether shape B is an infinite plane
             bsphere_radius_a: Bounding sphere radius of shape A
             bsphere_radius_b: Bounding sphere radius of shape B
-            rigid_contact_margin: Contact margin for rigid bodies
+            rigid_gap: Contact gap for rigid bodies
             shape_a: Index of shape A
             shape_b: Index of shape B
-            thickness_a: Thickness of shape A
-            thickness_b: Thickness of shape B
+            margin_a: Per-shape margin offset for shape A (signed distance padding)
+            margin_b: Per-shape margin offset for shape B (signed distance padding)
             writer_data: Data structure for contact writer
         """
+        if writer_data.contact_count[0] >= writer_data.contact_max:
+            return
+
         # Convert infinite planes to cube proxies for GJK/MPR compatibility
         # Use the OTHER object's radius to properly size the cube
         # Only convert if it's an infinite plane (finite planes can be handled normally)
@@ -654,7 +618,7 @@ def create_find_contacts(writer_func: Any):
             # Position the cube based on the OTHER object's position (pos_b)
             # Note: convert_infinite_plane_to_cube modifies shape_data_a.shape_type to BOX
             shape_data_a, pos_a_adjusted = convert_infinite_plane_to_cube(
-                shape_data_a, quat_a, pos_a, pos_b, bsphere_radius_b + rigid_contact_margin
+                shape_data_a, quat_a, pos_a, pos_b, bsphere_radius_b + rigid_gap
             )
 
         pos_b_adjusted = pos_b
@@ -662,11 +626,8 @@ def create_find_contacts(writer_func: Any):
             # Position the cube based on the OTHER object's position (pos_a)
             # Note: convert_infinite_plane_to_cube modifies shape_data_b.shape_type to BOX
             shape_data_b, pos_b_adjusted = convert_infinite_plane_to_cube(
-                shape_data_b, quat_b, pos_b, pos_a, bsphere_radius_a + rigid_contact_margin
+                shape_data_b, quat_b, pos_b, pos_a, bsphere_radius_a + rigid_gap
             )
-
-        # Build pair key for contact matching
-        pair_key = build_pair_key2(wp.uint32(shape_a), wp.uint32(shape_b))
 
         # Compute and write contacts using GJK/MPR
         wp.static(create_compute_gjk_mpr_contacts(writer_func))(
@@ -676,13 +637,12 @@ def create_find_contacts(writer_func: Any):
             quat_b,
             pos_a_adjusted,
             pos_b_adjusted,
-            rigid_contact_margin,
+            rigid_gap,
             shape_a,
             shape_b,
-            thickness_a,
-            thickness_b,
+            margin_a,
+            margin_b,
             writer_data,
-            pair_key,
         )
 
     return find_contacts
@@ -711,6 +671,8 @@ def pre_contact_check(
     shape_pairs_mesh_plane_cumsum: wp.array(dtype=int),
     shape_pairs_mesh_plane_count: wp.array(dtype=int),
     mesh_plane_vertex_total_count: wp.array(dtype=int),
+    shape_pairs_mesh_mesh: wp.array(dtype=wp.vec2i),
+    shape_pairs_mesh_mesh_count: wp.array(dtype=int),
 ):
     """
     Perform pre-contact checks for early rejection and special case handling.
@@ -737,6 +699,8 @@ def pre_contact_check(
         shape_pairs_mesh_plane_cumsum: Cumulative sum array for mesh-plane vertices
         shape_pairs_mesh_plane_count: Counter for mesh-plane collision pairs
         mesh_plane_vertex_total_count: Total vertex count for mesh-plane collisions
+        shape_pairs_mesh_mesh: Output array for mesh-mesh collision pairs
+        shape_pairs_mesh_mesh_count: Counter for mesh-mesh collision pairs
 
     Returns:
         Tuple of (skip_pair, is_infinite_plane_a, is_infinite_plane_b, bsphere_radius_a, bsphere_radius_b)
@@ -747,12 +711,8 @@ def pre_contact_check(
 
     # Check if shapes are infinite planes (scale.x == 0 and scale.y == 0)
     # Scale is already in shape_data, no need for array lookup
-    is_infinite_plane_a = (type_a == int(GeoType.PLANE)) and (
-        shape_data_a.scale[0] == 0.0 and shape_data_a.scale[1] == 0.0
-    )
-    is_infinite_plane_b = (type_b == int(GeoType.PLANE)) and (
-        shape_data_b.scale[0] == 0.0 and shape_data_b.scale[1] == 0.0
-    )
+    is_infinite_plane_a = (type_a == GeoType.PLANE) and (shape_data_a.scale[0] == 0.0 and shape_data_a.scale[1] == 0.0)
+    is_infinite_plane_b = (type_b == GeoType.PLANE) and (shape_data_b.scale[0] == 0.0 and shape_data_b.scale[1] == 0.0)
 
     # Early return: both shapes are infinite planes
     if is_infinite_plane_a and is_infinite_plane_b:
@@ -779,7 +739,7 @@ def pre_contact_check(
 
     # Check for mesh vs infinite plane collision - special handling
     # After sorting, type_a <= type_b, so we only need to check one direction
-    if type_a == int(GeoType.PLANE) and type_b == int(GeoType.MESH):
+    if type_a == GeoType.PLANE and type_b == GeoType.MESH:
         # Check if plane is infinite (scale x and y are zero) - use scale from shape_data
         if shape_data_a.scale[0] == 0.0 and shape_data_a.scale[1] == 0.0:
             # Get mesh vertex count using the provided mesh_id
@@ -798,8 +758,16 @@ def pre_contact_check(
                     shape_pairs_mesh_plane_cumsum[mesh_plane_idx] = cumulative_count_inclusive
             return True, is_infinite_plane_a, is_infinite_plane_b, bsphere_radius_a, bsphere_radius_b
 
-    # Check for other mesh collisions - add to separate buffer for specialized handling
-    if type_a == int(GeoType.MESH) or type_b == int(GeoType.MESH):
+    # Check for mesh-mesh collisions - add to separate buffer for specialized handling
+    if type_a == GeoType.MESH and type_b == GeoType.MESH:
+        # Add to mesh-mesh collision buffer using atomic counter
+        mesh_mesh_pair_idx = wp.atomic_add(shape_pairs_mesh_mesh_count, 0, 1)
+        if mesh_mesh_pair_idx < shape_pairs_mesh_mesh.shape[0]:
+            shape_pairs_mesh_mesh[mesh_mesh_pair_idx] = pair
+        return True, is_infinite_plane_a, is_infinite_plane_b, bsphere_radius_a, bsphere_radius_b
+
+    # Check for other mesh collisions (mesh vs non-mesh) - add to separate buffer for specialized handling
+    if type_a == GeoType.MESH or type_b == GeoType.MESH:
         # Add to mesh collision buffer using atomic counter
         mesh_pair_idx = wp.atomic_add(shape_pairs_mesh_count, 0, 1)
         if mesh_pair_idx < shape_pairs_mesh.shape[0]:
@@ -811,6 +779,7 @@ def pre_contact_check(
 
 @wp.func
 def mesh_vs_convex_midphase(
+    idx_in_thread_block: int,
     mesh_shape: int,
     non_mesh_shape: int,
     X_mesh_ws: wp.transform,
@@ -819,7 +788,7 @@ def mesh_vs_convex_midphase(
     shape_type: wp.array(dtype=int),
     shape_data: wp.array(dtype=wp.vec4),
     shape_source_ptr: wp.array(dtype=wp.uint64),
-    rigid_contact_margin: float,
+    rigid_gap: float,
     triangle_pairs: wp.array(dtype=wp.vec3i),
     triangle_pairs_count: wp.array(dtype=int),
 ):
@@ -837,9 +806,9 @@ def mesh_vs_convex_midphase(
         X_ws: Non-mesh shape world-space transform
         mesh_id: Mesh BVH ID
         shape_type: Array of shape types
-        shape_data: Array of shape data (vec4: scale.xyz, thickness.w)
+        shape_data: Array of shape data (vec4: scale.xyz, margin.w)
         shape_source_ptr: Array of mesh/SDF source pointers
-        rigid_contact_margin: Contact margin for rigid bodies
+        rigid_gap: Contact gap for rigid bodies
         triangle_pairs: Output array for triangle pairs (mesh_shape, non_mesh_shape, tri_index)
         triangle_pairs_count: Counter for triangle pairs
     """
@@ -863,7 +832,7 @@ def mesh_vs_convex_midphase(
     generic_shape_data.auxiliary = wp.vec3(0.0, 0.0, 0.0)
 
     # For CONVEX_MESH, pack the mesh pointer
-    if geo_type == int(GeoType.CONVEX_MESH):
+    if geo_type == GeoType.CONVEX_MESH:
         generic_shape_data.auxiliary = pack_mesh_ptr(shape_source_ptr[non_mesh_shape])
 
     data_provider = SupportMapDataProvider()
@@ -874,7 +843,7 @@ def mesh_vs_convex_midphase(
     )
 
     # Add small margin for contact detection
-    margin_vec = wp.vec3(rigid_contact_margin, rigid_contact_margin, rigid_contact_margin)
+    margin_vec = wp.vec3(rigid_gap, rigid_gap, rigid_gap)
     aabb_lower = aabb_lower - margin_vec
     aabb_upper = aabb_upper + margin_vec
 
@@ -892,8 +861,20 @@ def mesh_vs_convex_midphase(
 
             # Add this triangle pair to the output buffer if valid
             # Store (mesh_shape, non_mesh_shape, tri_index) to guarantee mesh is always first
+            has_tri = 0
             if tri_index >= 0:
-                out_idx = wp.atomic_add(triangle_pairs_count, 0, 1)
+                has_tri = 1
+            count_tile = wp.tile(has_tri)
+            inclusive_scan = wp.tile_scan_inclusive(count_tile)
+            offset = 0
+            if idx_in_thread_block == wp.block_dim() - 1:
+                offset = wp.atomic_add(triangle_pairs_count, 0, inclusive_scan[wp.block_dim() - 1])
+            offset_broadcast_tile = wp.tile(offset)
+            offset_broadcast = offset_broadcast_tile[wp.block_dim() - 1]
+
+            if tri_index >= 0:
+                # out_idx = wp.atomic_add(triangle_pairs_count, 0, 1)
+                out_idx = offset_broadcast + inclusive_scan[idx_in_thread_block] - has_tri
                 if out_idx < triangle_pairs.shape[0]:
                     triangle_pairs[out_idx] = wp.vec3i(mesh_shape, non_mesh_shape, tri_index)
 
@@ -914,7 +895,7 @@ def mesh_vs_convex_midphase(
 def find_pair_from_cumulative_index(
     global_idx: int,
     cumulative_sums: wp.array(dtype=int),
-    num_pairs: int,
+    pair_count: int,
 ) -> tuple[int, int]:
     """
     Binary search to find which pair a global index belongs to.
@@ -925,14 +906,14 @@ def find_pair_from_cumulative_index(
     Args:
         global_idx: Global index to search for
         cumulative_sums: Array of inclusive cumulative sums (end indices for each pair)
-        num_pairs: Number of pairs
+        pair_count: Number of pairs
 
     Returns:
         Tuple of (pair_index, local_index_within_pair)
     """
     # Use binary_search to find first index where cumulative_sums[i] > global_idx
     # This gives us the bucket that contains global_idx
-    pair_idx = binary_search(cumulative_sums, global_idx, 0, num_pairs)
+    pair_idx = binary_search(cumulative_sums, global_idx, 0, pair_count)
 
     # Get cumulative start for this pair to calculate local index
     cumulative_start = int(0)
@@ -994,3 +975,101 @@ def get_triangle_shape_from_mesh(
     shape_data.auxiliary = v2_world - v0_world  # C - A
 
     return shape_data, v0_world
+
+
+# OBB collisions by Separating Axis Theorem
+@wp.func
+def get_box_axes(q: wp.quat) -> wp.mat33:
+    """Get the 3 local axes of a box from its quaternion rotation"""
+    # Box local axes (x, y, z)
+    local_x = wp.vec3(1.0, 0.0, 0.0)
+    local_y = wp.vec3(0.0, 1.0, 0.0)
+    local_z = wp.vec3(0.0, 0.0, 1.0)
+
+    # Rotate local axes to world space using warp's built-in method
+    axis_x = wp.quat_rotate(q, local_x)
+    axis_y = wp.quat_rotate(q, local_y)
+    axis_z = wp.quat_rotate(q, local_z)
+
+    return wp.matrix_from_rows(axis_x, axis_y, axis_z)
+
+
+@wp.func
+def project_box_onto_axis(transform: wp.transform, extents: wp.vec3, axis: wp.vec3) -> wp.vec2:
+    """Project a box onto an axis and return [min, max] projection values"""
+    # Get box axes and extents
+    axes = get_box_axes(wp.transform_get_rotation(transform))
+
+    # Project box center onto axis
+    center_proj = wp.dot(wp.transform_get_translation(transform), axis)
+
+    # Project each axis of the box onto the separating axis and get the extent
+    extent = 0.0
+    extent += extents[0] * wp.abs(wp.dot(axes[0], axis))  # x-axis contribution
+    extent += extents[1] * wp.abs(wp.dot(axes[1], axis))  # y-axis contribution
+    extent += extents[2] * wp.abs(wp.dot(axes[2], axis))  # z-axis contribution
+
+    return wp.vec2(center_proj - extent, center_proj + extent)
+
+
+@wp.func
+def test_axis_separation(
+    transform_a: wp.transform, extents_a: wp.vec3, transform_b: wp.transform, extents_b: wp.vec3, axis: wp.vec3
+) -> bool:
+    """Test if two boxes are separated along a given axis. Returns True if separated."""
+    # Normalize the axis (handle zero-length axes)
+    axis_len = wp.length(axis)
+    if axis_len < 1e-8:
+        return False  # Invalid axis, assume no separation
+
+    normalized_axis = axis / axis_len
+
+    # Project both boxes onto the axis
+    proj_a = project_box_onto_axis(transform_a, extents_a, normalized_axis)
+    proj_b = project_box_onto_axis(transform_b, extents_b, normalized_axis)
+
+    # Check if projections overlap - if no overlap, boxes are separated
+    return proj_a[1] < proj_b[0] or proj_b[1] < proj_a[0]
+
+
+@wp.func
+def sat_box_intersection(
+    transform_a: wp.transform, extents_a: wp.vec3, transform_b: wp.transform, extents_b: wp.vec3
+) -> bool:
+    """
+    Test if two oriented boxes intersect using the Separating Axis Theorem.
+
+    Args:
+        transform_a: Transform of first box (position and rotation)
+        extents_a: Half-extents of first box
+        transform_b: Transform of second box (position and rotation)
+        extents_b: Half-extents of second box
+
+    Returns:
+        bool: True if boxes intersect, False if separated
+    """
+    # Get the axes for both boxes
+    axes_a = get_box_axes(wp.transform_get_rotation(transform_a))
+    axes_b = get_box_axes(wp.transform_get_rotation(transform_b))
+
+    # Test the 15 potential separating axes
+
+    # Test face normals of box A (3 axes)
+    for i in range(3):
+        if test_axis_separation(transform_a, extents_a, transform_b, extents_b, axes_a[i]):
+            return False  # Boxes are separated
+
+    # Test face normals of box B (3 axes)
+    for i in range(3):
+        if test_axis_separation(transform_a, extents_a, transform_b, extents_b, axes_b[i]):
+            return False  # Boxes are separated
+
+    # Test cross products of edge directions (9 axes: 3x3 combinations)
+    for i in range(3):
+        for j in range(3):
+            cross_axis = wp.cross(axes_a[i], axes_b[j])
+            if test_axis_separation(transform_a, extents_a, transform_b, extents_b, cross_axis):
+                return False  # Boxes are separated
+
+    # If no separating axis found, boxes intersect
+    return True

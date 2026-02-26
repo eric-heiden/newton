@@ -38,14 +38,9 @@ import warp as wp
 import yaml
 
 import newton
-
-# Test: Disable CUDA-OpenGL interop to see if that fixes the issue
-import newton._src.viewer.gl.opengl as opengl_module
 import newton.examples
 import newton.utils
-from newton import State
-
-opengl_module.ENABLE_CUDA_INTEROP = False
+from newton import JointTargetMode, State
 
 
 @dataclass
@@ -262,6 +257,7 @@ class Example:
             builder.joint_target_ke[i + 6] = config["mjw_joint_stiffness"][i]
             builder.joint_target_kd[i + 6] = config["mjw_joint_damping"][i]
             builder.joint_armature[i + 6] = config["mjw_joint_armature"][i]
+            builder.joint_target_mode[i + 6] = int(JointTargetMode.POSITION)
 
         self.model = builder.finalize()
         self.model.set_gravity((0.0, 0.0, -9.81))
@@ -279,7 +275,7 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.model.collide(self.state_0)
+        self.contacts = self.model.contacts()
 
         # Set model in viewer
         self.viewer.set_model(self.model)
@@ -324,10 +320,10 @@ class Example:
 
     def simulate(self):
         """Simulate performs one frame's worth of updates."""
-        state_0_dict = self.state_0.__dict__
-        state_1_dict = self.state_1.__dict__
-        state_temp_dict = self.state_temp.__dict__
-        self.contacts = self.model.collide(self.state_0)
+        self.model.collide(self.state_0, self.contacts)
+
+        need_state_copy = self.use_cuda_graph and self.sim_substeps % 2 == 1
+
         for i in range(self.sim_substeps):
             self.state_0.clear_forces()
 
@@ -337,18 +333,12 @@ class Example:
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
             # Swap states - handle CUDA graph case specially
-            if i < self.sim_substeps - 1 or not self.use_cuda_graph:
+            if need_state_copy and i == self.sim_substeps - 1:
+                # Swap states by copying the state arrays for graph capture
+                self.state_0.assign(self.state_1)
+            else:
                 # We can just swap the state references
                 self.state_0, self.state_1 = self.state_1, self.state_0
-            elif self.use_cuda_graph:
-                # Swap states by copying the state arrays for graph capture
-                for key, value in state_0_dict.items():
-                    if isinstance(value, wp.array):
-                        if key not in state_temp_dict:
-                            state_temp_dict[key] = wp.empty_like(value)
-                        state_temp_dict[key].assign(value)
-                        state_0_dict[key].assign(state_1_dict[key])
-                        state_1_dict[key].assign(state_temp_dict[key])
 
     def reset(self):
         print("[INFO] Resetting example")
@@ -460,7 +450,10 @@ if __name__ == "__main__":
 
     if args.physx:
         if "physx" not in robot_config.policy_path or "physx_joint_names" not in config:
-            raise ValueError(f"PhysX policy/joint mapping not available for robot '{args.robot}'.")
+            physx_robots = [name for name, cfg in ROBOT_CONFIGS.items() if "physx" in cfg.policy_path]
+            print(f"[ERROR] PhysX policy not available for robot '{args.robot}'.")
+            print(f"[INFO] Robots with PhysX support: {physx_robots}")
+            exit(1)
         policy_path = f"{asset_directory}/{robot_config.policy_path['physx']}"
         mjc_to_physx, physx_to_mjc = find_physx_mjwarp_mapping(config["mjw_joint_names"], config["physx_joint_names"])
     else:

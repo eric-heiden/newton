@@ -76,10 +76,10 @@ def _add_single_joint(builder: newton.ModelBuilder, jt: int) -> None:
     child_xf = wp.transform((-0.05, 0.0, 0.0), wp.quat_from_axis_angle(wp.vec3(1, 0, 0), 0.5))
 
     # a 0.1-kg cube just so the body exists
-    child = builder.add_body(
+    child = builder.add_link(
         xform=wp.transform_identity(),
         mass=0.1,
-        key=f"body_{jt}",
+        label=f"body_{jt}",
     )
     builder.add_shape_box(
         body=child,
@@ -88,6 +88,8 @@ def _add_single_joint(builder: newton.ModelBuilder, jt: int) -> None:
         hy=0.05,
         hz=0.05,
     )
+
+    ji = builder.joint_count
 
     if jt == JointType.REVOLUTE:
         builder.add_joint_revolute(
@@ -143,6 +145,9 @@ def _add_single_joint(builder: newton.ModelBuilder, jt: int) -> None:
 
     else:
         raise ValueError(f"Unhandled joint type {jt}")
+
+    if ji == builder.joint_count - 1:
+        builder.add_articulation([ji])
 
 
 def _build_model_for_joint(jt: int, device):
@@ -220,7 +225,7 @@ def _fk_parity_for_joint(test, device, jt):
             model,
             1,
             objectives=[_NoopObjective()],
-            jacobian_mode=ik.IKJacobianMode.AUTODIFF,
+            jacobian_mode=ik.IKJacobianType.AUTODIFF,
         )
         ik_solver._fk_two_pass(model, joint_q, ik_solver.body_q, ik_solver.X_local, ik_solver.n_problems)
 

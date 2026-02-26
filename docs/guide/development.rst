@@ -22,13 +22,15 @@ When using uv, the `lockfile <https://docs.astral.sh/uv/concepts/projects/layout
 We maintain a lockfile in the root of the repository that pins exact versions of all dependencies and their transitive dependencies.
 
 Sometimes, a dependency in the lockfile needs to be updated to a newer version.
-This can be done by running ``uv lock --upgrade-package <package-name>``:
+This can be done by running ``uv lock -P <package-name>``:
 
 .. code-block:: console
 
-    uv lock --upgrade-package warp-lang
+    uv lock -P warp-lang --prerelease allow
 
-    uv lock --upgrade-package mujoco-warp
+    uv lock -P mujoco-warp
+
+The ``--prerelease allow`` flag is needed for dependencies that use pre-release versions (e.g. ``warp-lang``).
 
 uv also provides a command to update all dependencies in the lockfile:
 
@@ -91,6 +93,28 @@ Most tests run when the ``dev`` extras are installed. The tests that run example
             python -m pip install --extra-index-url https://download.pytorch.org/whl/cu128 -e .[dev,torch-cu12]
             # run tests
             python -m newton.tests
+
+Specific Newton examples can be tested in isolation via the ``-k`` argument:
+
+.. tab-set::
+    :sync-group: env
+
+    .. tab-item:: uv
+        :sync: uv
+        
+        .. code-block:: console
+
+            # test the basic_shapes example
+            uv run --extra dev -m newton.tests.test_examples -k test_basic.example_basic_shapes
+
+    .. tab-item:: venv
+        :sync: venv
+
+        .. code-block:: console
+
+            # test the basic_shapes example
+            python -m newton.tests.test_examples -k test_basic.example_basic_shapes
+
 
 To generate a coverage report:
 
@@ -224,6 +248,113 @@ To build the documentation locally, ensure you have the documentation dependenci
 
 The built documentation will be available in ``docs/_build/html``.
 
+.. note::
+
+    The documentation build requires `pandoc <https://pandoc.org/>`_ for converting Jupyter notebooks.
+    While ``pypandoc_binary`` is included in the ``[docs]`` dependencies, some systems may require
+    pandoc to be installed separately:
+
+    - **Ubuntu/Debian:** ``sudo apt-get install pandoc``
+    - **macOS:** ``brew install pandoc``
+    - **Windows:** Download from https://pandoc.org/installing.html or ``choco install pandoc``
+
+Serving the documentation locally
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+After building the documentation, you can serve it locally using the ``docs/serve.py`` script.
+This is particularly useful for testing interactive features like the Viser 3D visualizations
+in the tutorial notebooks, which require proper MIME types for WebAssembly and JavaScript modules.
+
+.. tab-set::
+    :sync-group: env
+
+    .. tab-item:: uv
+        :sync: uv
+
+        .. code-block:: console
+
+            uv run docs/serve.py
+
+    .. tab-item:: venv
+        :sync: venv
+
+        .. code:: console
+
+            python docs/serve.py
+
+Then open http://localhost:8000 in your browser. You can specify a custom port with ``--port``:
+
+.. code-block:: console
+
+    python docs/serve.py --port 8080
+
+.. note::
+
+    Using Python's built-in ``http.server`` or simply opening the HTML files directly
+    will not work correctly for the interactive Viser visualizations, as they require
+    specific CORS headers and MIME types that ``serve.py`` provides.
+
+Documentation Versioning
+------------------------
+
+Newton's documentation is versioned and hosted on GitHub Pages. Multiple versions
+are available simultaneously, with a version switcher dropdown in the navigation bar.
+
+**Published documentation URLs:**
+
+- **Latest stable release**: https://newton-physics.github.io/newton/stable/
+- **Development (main branch)**: https://newton-physics.github.io/newton/latest/
+- **Specific versions**: https://newton-physics.github.io/newton/1.0.0/ (etc.)
+
+How It Works
+^^^^^^^^^^^^
+
+The ``gh-pages`` branch contains versioned documentation in subdirectories:
+
+.. code-block:: text
+
+    /
+    ├── index.html      # Redirects to /stable/
+    ├── switcher.json   # Version manifest for dropdown
+    ├── stable/         # Copy of latest release
+    ├── latest/         # Dev docs from main branch
+    ├── 1.1.0/          # Release versions
+    └── 1.0.0/
+
+Two GitHub Actions workflows manage deployment:
+
+- **docs-dev.yml**: Deploys to ``/latest/`` on every push to ``main``
+- **docs-release.yml**: Deploys to ``/X.Y.Z/`` and updates ``/stable/`` on version tags
+
+Deploying Documentation
+^^^^^^^^^^^^^^^^^^^^^^^
+
+**Dev docs** are deployed automatically when changes are pushed to ``main``.
+
+**Release docs** are deployed when a version tag is pushed:
+
+.. code-block:: bash
+
+    git tag v1.0.0
+    git push origin v1.0.0
+
+Only strict semver tags (``vX.Y.Z``) trigger release deployments. Pre-release tags
+like ``v1.0.0-rc.1`` are ignored.
+
+Manual Operations
+^^^^^^^^^^^^^^^^^
+
+**Removing a version** (rare):
+
+1. Check out the ``gh-pages`` branch
+2. Delete the version directory (e.g., ``rm -rf 1.0.0``)
+3. Edit ``switcher.json`` to remove the entry
+4. Commit and push
+
+**Rebuilding all docs** (disaster recovery): Check out each version tag, build its
+docs with Sphinx, and deploy to the corresponding directory on ``gh-pages``. Update
+``switcher.json`` after each version using ``scripts/ci/update_docs_switcher.py``.
+
 Testing documentation code snippets
 -----------------------------------
 
@@ -291,9 +422,26 @@ If airspeed velocity has not been previously run on the machine, it will need to
 
 To run the benchmarks, run the following command from the root of the repository:
 
-.. code-block:: console
+.. tab-set::
+    :sync-group: shell
 
-    asv run --launch-method spawn main^!
+    .. tab-item:: Unix
+        :sync: unix
+
+        .. code-block:: console
+
+            asv run --launch-method spawn main^!
+
+    .. tab-item:: Windows
+        :sync: windows
+
+        .. code-block:: console
+
+            asv run --launch-method spawn main^^!
+
+.. note::
+
+    On Windows CMD, the ``^`` character is an escape character, so it must be doubled (``^^``) to be interpreted literally.
 
 The benchmarks discovered by airspeed velocity are in the ``asv/benchmarks`` directory. This command runs the
 benchmark code from the ``asv/benchmarks`` directory against the code state of the ``main`` branch. Note that
@@ -306,18 +454,44 @@ Tips for writing benchmarks
 Rather than running the entire benchmark suite, use the ``--bench BENCH, -b BENCH`` flag to filter the benchmarks
 to just the ones under development:
 
-.. code-block:: console
+.. tab-set::
+    :sync-group: shell
 
-    asv run --launch-method spawn main^! --bench example_anymal.PretrainedSimulate
+    .. tab-item:: Unix
+        :sync: unix
+
+        .. code-block:: console
+
+            asv run --launch-method spawn main^! --bench example_anymal.PretrainedSimulate
+
+    .. tab-item:: Windows
+        :sync: windows
+
+        .. code-block:: console
+
+            asv run --launch-method spawn main^^! --bench example_anymal.PretrainedSimulate
 
 The most time-consuming benchmarks are those that measure the time it takes to load and run one frame of the example
 starting from an empty kernel cache.
 These benchmarks have names ending with ``time_load``. It is sometimes convenient to exclude these benchmarks
 from running by using the following command:
 
-.. code-block:: console
+.. tab-set::
+    :sync-group: shell
 
-    asv run --launch-method spawn main^! -b '^(?!.*time_load$).*'
+    .. tab-item:: Unix
+        :sync: unix
+
+        .. code-block:: console
+
+            asv run --launch-method spawn main^! -b '^(?!.*time_load$).*'
+
+    .. tab-item:: Windows
+        :sync: windows
+
+        .. code-block:: console
+
+            asv run --launch-method spawn main^^! -b "^^(?!.*time_load$).*"
 
 While airspeed velocity has built-in mechanisms to determine automatically how to collect measurements,
 it is often useful to manually specify benchmark attributes like ``repeat`` and ``number`` to control the

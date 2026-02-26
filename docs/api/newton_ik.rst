@@ -9,9 +9,13 @@ newton.ik
    :toctree: _generated
    :nosignatures:
 
-   IKJacobianMode
-   IKJointLimitObjective
+   IKJacobianType
    IKObjective
-   IKPositionObjective
-   IKRotationObjective
+   IKObjectiveJointLimit
+   IKObjectivePosition
+   IKObjectiveRotation
+   IKOptimizer
+   IKOptimizerLBFGS
+   IKOptimizerLM
+   IKSampler
    IKSolver

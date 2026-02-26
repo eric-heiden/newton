@@ -18,7 +18,7 @@ import unittest
 import numpy as np
 
 import newton
-from newton._src.sim.joints import JOINT_LIMIT_UNLIMITED
+from newton._src.core.types import MAXVAL
 from newton._src.utils.import_urdf import parse_urdf
 
 
@@ -30,10 +30,11 @@ class TestJointLimits(unittest.TestCase):
         builder = newton.ModelBuilder()
 
         # Add a body
-        body = builder.add_body()
+        body = builder.add_link()
 
         # Add a revolute joint with default limits
-        builder.add_joint_revolute(parent=-1, child=body)
+        joint = builder.add_joint_revolute(parent=-1, child=body)
+        builder.add_articulation([joint])
 
         # Build model
         model = builder.finalize()
@@ -41,18 +42,19 @@ class TestJointLimits(unittest.TestCase):
         # Check that default limits are unlimited
         lower_limits = model.joint_limit_lower.numpy()
         upper_limits = model.joint_limit_upper.numpy()
-        self.assertEqual(lower_limits[0], -JOINT_LIMIT_UNLIMITED)
-        self.assertEqual(upper_limits[0], JOINT_LIMIT_UNLIMITED)
+        self.assertEqual(lower_limits[0], -MAXVAL)
+        self.assertEqual(upper_limits[0], MAXVAL)
 
     def test_limited_joint(self):
         """Test that limited joints work correctly."""
         builder = newton.ModelBuilder()
 
         # Add a body
-        body = builder.add_body()
+        body = builder.add_link()
 
         # Add a revolute joint with specific limits
-        builder.add_joint_revolute(parent=-1, child=body, limit_lower=-1.0, limit_upper=1.0)
+        joint = builder.add_joint_revolute(parent=-1, child=body, limit_lower=-1.0, limit_upper=1.0)
+        builder.add_articulation([joint])
 
         # Build model
         model = builder.finalize()
@@ -68,10 +70,11 @@ class TestJointLimits(unittest.TestCase):
         builder = newton.ModelBuilder()
 
         # Add a body
-        body = builder.add_body()
+        body = builder.add_link()
 
         # Add a revolute joint with only upper limit
-        builder.add_joint_revolute(parent=-1, child=body, limit_lower=-JOINT_LIMIT_UNLIMITED, limit_upper=2.0)
+        joint = builder.add_joint_revolute(parent=-1, child=body, limit_lower=-MAXVAL, limit_upper=2.0)
+        builder.add_articulation([joint])
 
         # Build model
         model = builder.finalize()
@@ -79,19 +82,20 @@ class TestJointLimits(unittest.TestCase):
         # Check lower is unlimited, upper is limited
         lower_limits = model.joint_limit_lower.numpy()
         upper_limits = model.joint_limit_upper.numpy()
-        self.assertEqual(lower_limits[0], -JOINT_LIMIT_UNLIMITED)
+        self.assertEqual(lower_limits[0], -MAXVAL)
         self.assertAlmostEqual(upper_limits[0], 2.0)
 
         # Test the other way - only lower limit
         builder2 = newton.ModelBuilder()
-        body2 = builder2.add_body()
-        builder2.add_joint_revolute(parent=-1, child=body2, limit_lower=-1.5, limit_upper=JOINT_LIMIT_UNLIMITED)
+        body2 = builder2.add_link()
+        joint2 = builder2.add_joint_revolute(parent=-1, child=body2, limit_lower=-1.5, limit_upper=MAXVAL)
+        builder2.add_articulation([joint2])
         model2 = builder2.finalize()
 
         lower_limits2 = model2.joint_limit_lower.numpy()
         upper_limits2 = model2.joint_limit_upper.numpy()
         self.assertAlmostEqual(lower_limits2[0], -1.5)
-        self.assertEqual(upper_limits2[0], JOINT_LIMIT_UNLIMITED)
+        self.assertEqual(upper_limits2[0], MAXVAL)
 
     def test_continuous_joint_from_urdf(self):
         """Test that continuous joints from URDF are unlimited."""
@@ -125,15 +129,15 @@ class TestJointLimits(unittest.TestCase):
         # Find the continuous joint (should be the first joint)
         lower_limits = model.joint_limit_lower.numpy()
         upper_limits = model.joint_limit_upper.numpy()
-        self.assertEqual(lower_limits[0], -JOINT_LIMIT_UNLIMITED)
-        self.assertEqual(upper_limits[0], JOINT_LIMIT_UNLIMITED)
+        self.assertEqual(lower_limits[0], -MAXVAL)
+        self.assertEqual(upper_limits[0], MAXVAL)
 
     def test_joint_d6_with_mixed_limits(self):
         """Test D6 joint with mixed limited and unlimited axes."""
         builder = newton.ModelBuilder()
 
         # Add a body
-        body = builder.add_body()
+        body = builder.add_link()
 
         # Create a D6 joint with:
         # - X translation: limited
@@ -142,28 +146,21 @@ class TestJointLimits(unittest.TestCase):
         # - X rotation: unlimited
         # - Y rotation: limited
         # - Z rotation: partially limited (only upper)
-        builder.add_joint_d6(
+        joint = builder.add_joint_d6(
             parent=-1,
             child=body,
             linear_axes=[
                 newton.ModelBuilder.JointDofConfig(axis=newton.Axis.X, limit_lower=-1.0, limit_upper=1.0),
-                newton.ModelBuilder.JointDofConfig(
-                    axis=newton.Axis.Y, limit_lower=-JOINT_LIMIT_UNLIMITED, limit_upper=JOINT_LIMIT_UNLIMITED
-                ),
-                newton.ModelBuilder.JointDofConfig(
-                    axis=newton.Axis.Z, limit_lower=-0.5, limit_upper=JOINT_LIMIT_UNLIMITED
-                ),
+                newton.ModelBuilder.JointDofConfig(axis=newton.Axis.Y, limit_lower=-MAXVAL, limit_upper=MAXVAL),
+                newton.ModelBuilder.JointDofConfig(axis=newton.Axis.Z, limit_lower=-0.5, limit_upper=MAXVAL),
             ],
             angular_axes=[
-                newton.ModelBuilder.JointDofConfig(
-                    axis=newton.Axis.X, limit_lower=-JOINT_LIMIT_UNLIMITED, limit_upper=JOINT_LIMIT_UNLIMITED
-                ),
+                newton.ModelBuilder.JointDofConfig(axis=newton.Axis.X, limit_lower=-MAXVAL, limit_upper=MAXVAL),
                 newton.ModelBuilder.JointDofConfig(axis=newton.Axis.Y, limit_lower=-np.pi / 4, limit_upper=np.pi / 4),
-                newton.ModelBuilder.JointDofConfig(
-                    axis=newton.Axis.Z, limit_lower=-JOINT_LIMIT_UNLIMITED, limit_upper=np.pi / 2
-                ),
+                newton.ModelBuilder.JointDofConfig(axis=newton.Axis.Z, limit_lower=-MAXVAL, limit_upper=np.pi / 2),
             ],
         )
+        builder.add_articulation([joint])
 
         model = builder.finalize()
 
@@ -175,20 +172,20 @@ class TestJointLimits(unittest.TestCase):
         self.assertAlmostEqual(lower_limits[0], -1.0)  # X limited
         self.assertAlmostEqual(upper_limits[0], 1.0)
 
-        self.assertEqual(lower_limits[1], -JOINT_LIMIT_UNLIMITED)  # Y unlimited
-        self.assertEqual(upper_limits[1], JOINT_LIMIT_UNLIMITED)
+        self.assertEqual(lower_limits[1], -MAXVAL)  # Y unlimited
+        self.assertEqual(upper_limits[1], MAXVAL)
 
         self.assertAlmostEqual(lower_limits[2], -0.5)  # Z partially limited
-        self.assertEqual(upper_limits[2], JOINT_LIMIT_UNLIMITED)
+        self.assertEqual(upper_limits[2], MAXVAL)
 
         # Check angular axes
-        self.assertEqual(lower_limits[3], -JOINT_LIMIT_UNLIMITED)  # X rot unlimited
-        self.assertEqual(upper_limits[3], JOINT_LIMIT_UNLIMITED)
+        self.assertEqual(lower_limits[3], -MAXVAL)  # X rot unlimited
+        self.assertEqual(upper_limits[3], MAXVAL)
 
         self.assertAlmostEqual(lower_limits[4], -np.pi / 4)  # Y rot limited
         self.assertAlmostEqual(upper_limits[4], np.pi / 4)
 
-        self.assertEqual(lower_limits[5], -JOINT_LIMIT_UNLIMITED)  # Z rot partially limited
+        self.assertEqual(lower_limits[5], -MAXVAL)  # Z rot partially limited
         self.assertAlmostEqual(upper_limits[5], np.pi / 2)
 
     def test_create_unlimited_joint_config(self):
@@ -197,8 +194,8 @@ class TestJointLimits(unittest.TestCase):
         config = newton.ModelBuilder.JointDofConfig.create_unlimited(newton.Axis.X)
 
         # Check limits are unlimited
-        self.assertEqual(config.limit_lower, -JOINT_LIMIT_UNLIMITED)
-        self.assertEqual(config.limit_upper, JOINT_LIMIT_UNLIMITED)
+        self.assertEqual(config.limit_lower, -MAXVAL)
+        self.assertEqual(config.limit_upper, MAXVAL)
 
         # Check other properties
         self.assertEqual(config.limit_ke, 0.0)
@@ -211,18 +208,17 @@ class TestJointLimits(unittest.TestCase):
         body = builder.add_body()
 
         # Add joint with unlimited limits
-        builder.add_joint_revolute(
-            parent=-1, child=body, limit_lower=-JOINT_LIMIT_UNLIMITED, limit_upper=JOINT_LIMIT_UNLIMITED
-        )
+        joint = builder.add_joint_revolute(parent=-1, child=body, limit_lower=-MAXVAL, limit_upper=MAXVAL)
+        builder.add_articulation([joint])
 
         model = builder.finalize()
 
         # Test robust comparisons
-        # These should work even if JOINT_LIMIT_UNLIMITED changes from wp.inf to a large finite value
+        # These should work even if MAXVAL changes from wp.inf to a large finite value
         lower_limits = model.joint_limit_lower.numpy()
         upper_limits = model.joint_limit_upper.numpy()
-        self.assertTrue(lower_limits[0] <= -JOINT_LIMIT_UNLIMITED)
-        self.assertTrue(upper_limits[0] >= JOINT_LIMIT_UNLIMITED)
+        self.assertTrue(lower_limits[0] <= -MAXVAL)
+        self.assertTrue(upper_limits[0] >= MAXVAL)
 
 
 if __name__ == "__main__":

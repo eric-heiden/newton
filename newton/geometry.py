@@ -29,16 +29,19 @@ from ._src.geometry import (
     collide_sphere_capsule,
     collide_sphere_cylinder,
     collide_sphere_sphere,
-    generate_terrain_grid,
-    heightfield_to_mesh,
 )
-from ._src.geometry.inertia import compute_shape_inertia, transform_inertia
-from ._src.geometry.utils import remesh_mesh
+from ._src.geometry.inertia import compute_inertia_shape, transform_inertia
+from ._src.geometry.kernels import sdf_box, sdf_capsule, sdf_cone, sdf_cylinder, sdf_mesh, sdf_plane, sdf_sphere
+from ._src.geometry.narrow_phase import NarrowPhase
+from ._src.geometry.sdf_hydroelastic import HydroelasticSDF
+from ._src.geometry.sdf_utils import create_empty_sdf_data
 
 __all__ = [
     "BroadPhaseAllPairs",
     "BroadPhaseExplicit",
     "BroadPhaseSAP",
+    "HydroelasticSDF",
+    "NarrowPhase",
     "collide_box_box",
     "collide_capsule_box",
     "collide_capsule_capsule",
@@ -51,9 +54,14 @@ __all__ = [
     "collide_sphere_capsule",
     "collide_sphere_cylinder",
     "collide_sphere_sphere",
-    "compute_shape_inertia",
-    "generate_terrain_grid",
-    "heightfield_to_mesh",
-    "remesh_mesh",
+    "compute_inertia_shape",
+    "create_empty_sdf_data",
+    "sdf_box",
+    "sdf_capsule",
+    "sdf_cone",
+    "sdf_cylinder",
+    "sdf_mesh",
+    "sdf_plane",
+    "sdf_sphere",
     "transform_inertia",
 ]

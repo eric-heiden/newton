@@ -1,0 +1,81 @@
+name: Auto merge to release-1.0
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+
+jobs:
+  cherry-pick-to-release:
+    # Only run when a PR is merged (not just closed) and has the 1.0-release label
+    if: >
+      github.event.pull_request.merged == true &&
+      contains(toJSON(github.event.pull_request.labels.*.name), '1.0-release')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Cherry-pick merge commit to release-1.0
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Fetch the release branch
+          git fetch origin release-1.0
+          git checkout release-1.0
+
+          # Attempt to cherry-pick the merge commit
+          if git cherry-pick --strategy=recursive -X theirs "${MERGE_SHA}"; then
+            git push origin release-1.0
+            echo "✅ Successfully cherry-picked PR #${PR_NUMBER} into release-1.0"
+          else
+            # If cherry-pick fails, abort and open an issue
+            git cherry-pick --abort || true
+
+            echo "❌ Cherry-pick failed for PR #${PR_NUMBER}. Creating a PR for manual resolution."
+
+            # Create a branch for manual resolution
+            BRANCH_NAME="auto-merge/release-1.0/pr-${PR_NUMBER}"
+            git checkout release-1.0
+            git checkout -b "${BRANCH_NAME}"
+
+            # Apply the changes with conflict markers
+            git cherry-pick --no-commit "${MERGE_SHA}" || true
+            git add -A
+            git commit --allow-empty -F - <<EOF
+Cherry-pick PR #${PR_NUMBER}: ${PR_TITLE} (conflicts need resolution)
+EOF
+            git push origin "${BRANCH_NAME}"
+
+            # Open a PR for manual conflict resolution
+            cat > /tmp/pr_body.md <<EOF
+Automatic cherry-pick of PR #${PR_NUMBER} (**${PR_TITLE}**) into \`release-1.0\` failed due to merge conflicts.
+
+Please resolve the conflicts manually and merge this PR.
+
+Original PR: #${PR_NUMBER}
+EOF
+            gh pr create \
+              --base release-1.0 \
+              --head "${BRANCH_NAME}" \
+              --title "🔀 Cherry-pick PR #${PR_NUMBER} into release-1.0 (conflicts)" \
+              --body-file /tmp/pr_body.md \
+              --label "1.0-release"
+          fi

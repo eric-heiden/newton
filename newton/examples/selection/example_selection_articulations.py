@@ -201,6 +201,7 @@ class Example:
             wp.launch(init_masks, dim=self.world_count, inputs=[self.mask_0, self.mask_1])
 
         self.viewer.set_model(self.model)
+        self.viewer.set_camera(wp.vec3(12.6, -7.6, 4.4), -12.4, -151.1)
 
         # reset all
         self.reset()

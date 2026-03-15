@@ -115,6 +115,7 @@ class Example:
 
         self.viewer.set_model(self.model, max_worlds=max_worlds)
         self.viewer.set_world_offsets((1.0, 0.0, 0.0))
+        self.viewer.set_camera(wp.vec3(-12.6, 2.4, 2.4), -12.7, -9.7)
 
         # Set camera to view the scene
         self.viewer.set_camera(

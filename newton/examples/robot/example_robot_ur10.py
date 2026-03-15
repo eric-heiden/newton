@@ -160,6 +160,7 @@ class Example:
         )
 
         self.viewer.set_model(self.model)
+        self.viewer.set_camera(wp.vec3(6.27, 1.1, 0.74), 4.6, 152.1)
 
         self.capture()
 

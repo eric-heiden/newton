@@ -163,6 +163,11 @@ class Example:
 
         # viewer
         self.viewer.set_model(self.model)
+        self.viewer.set_camera(
+            pos=wp.vec3(6.45, -4.60, 2.23),
+            pitch=-6.6,
+            yaw=143.3,
+        )
         if isinstance(self.viewer, newton.viewer.ViewerGL):
             self.viewer.register_ui_callback(self.render_ui, position="side")
         self.viewer.show_particles = True

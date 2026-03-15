@@ -111,6 +111,7 @@ class Example:
         self.contacts = self.model.contacts()
 
         self.viewer.set_model(self.model)
+        self.viewer.set_camera(wp.vec3(3.81, 2.65, 2.14), -11.9, -147.9)
 
         self.capture()
 

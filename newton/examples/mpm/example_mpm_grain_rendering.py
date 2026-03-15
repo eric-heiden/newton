@@ -62,6 +62,11 @@ class Example:
         )
 
         self.viewer.set_model(self.model)
+        self.viewer.set_camera(
+            pos=wp.vec3(5.09, -0.00, 1.29),
+            pitch=0.0,
+            yaw=180.0,
+        )
         self.viewer.show_particles = False
 
     def simulate(self):

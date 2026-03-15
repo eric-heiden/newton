@@ -107,6 +107,11 @@ class Example:
         self.solver = SolverImplicitMPM(self.model, mpm_options)
 
         self.viewer.set_model(self.model)
+        self.viewer.set_camera(
+            pos=wp.vec3(8.03, 6.54, 2.55),
+            pitch=-9.6,
+            yaw=-138.7,
+        )
 
         if isinstance(self.viewer, newton.viewer.ViewerGL):
             self.viewer.register_ui_callback(self.render_ui, position="side")

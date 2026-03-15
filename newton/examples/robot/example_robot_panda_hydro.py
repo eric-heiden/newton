@@ -314,7 +314,7 @@ class Example:
         self.viewer.set_model(self.model)
         self.viewer.picking_enabled = False  # Disable interactive picking for this example
         if hasattr(self.viewer, "renderer"):
-            self.viewer.set_camera(wp.vec3(0.5, 0.0, 0.5), -15, -140)
+            self.viewer.set_camera(wp.vec3(0.5, -0.1, 0.4), -14, -141)
             self.viewer.set_world_offsets(wp.vec3(1.0, 1.0, 0.0))
             self.viewer.show_hydro_contact_surface = self.show_isosurface
             self.viewer.register_ui_callback(self.render_ui, position="side")

@@ -102,6 +102,7 @@ class Example:
 
         self.viewer.set_model(self.model)
         self.viewer.set_world_offsets((3.0, 3.0, 0.0))
+        self.viewer.set_camera(wp.vec3(6.0, 3.65, 1.7), -8.0, -145.0)
 
         self.capture()
 

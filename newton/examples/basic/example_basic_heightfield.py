@@ -92,6 +92,7 @@ class Example:
         self.control = self.model.control()
 
         self.viewer.set_model(self.model)
+        self.viewer.set_camera(wp.vec3(8.26, -6.67, 4.97), -22.6, 142.1)
 
         self.capture()
 

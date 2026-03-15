@@ -93,6 +93,7 @@ class Example:
         self.contacts = self.model.contacts()
 
         self.viewer.set_model(self.model)
+        self.viewer.set_camera(wp.vec3(10.96, 2.17, 1.18), -12.3, -146.8)
 
         # put graph capture into it's own function
         self.capture()

@@ -169,7 +169,7 @@ class Example:
         )
 
         self.viewer.set_model(self.model)
-        self.viewer.set_camera(wp.vec3(-0.6, 0.6, 1.24), -42.0, -58.0)
+        self.viewer.set_camera(wp.vec3(0.8, 0.27, 0.62), -13.0, -133.2)
 
         # gravity arrays for swapping during simulation
         self.gravity_zero = wp.zeros(1, dtype=wp.vec3)

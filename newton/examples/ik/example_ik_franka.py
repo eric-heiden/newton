@@ -56,7 +56,7 @@ class Example:
 
         # Set camera to view the scene
         self.viewer.set_camera(
-            pos=wp.vec3(0.0, -2.0, 1.0),
+            pos=wp.vec3(0.0, -1.2, 0.8),
             pitch=0.0,
             yaw=90.0,
         )

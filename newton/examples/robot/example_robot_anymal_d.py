@@ -109,6 +109,7 @@ class Example:
 
         # ensure this is called at the end of the Example constructor
         self.viewer.set_model(self.model)
+        self.viewer.set_camera(wp.vec3(6.0, 3.65, 1.7), -8.0, -145.0)
 
         # put graph capture into it's own function
         self.capture()

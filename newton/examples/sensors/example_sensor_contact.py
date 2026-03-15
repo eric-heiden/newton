@@ -87,6 +87,7 @@ class Example:
         )
 
         self.viewer.set_model(self.model)
+        self.viewer.set_camera(wp.vec3(4.7, 0.0, 1.4), 45.0, -3.6)
 
         self.plates_touched = 2 * [False]
         self.shape_colors = {

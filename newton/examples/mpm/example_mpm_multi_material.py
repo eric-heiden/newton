@@ -83,6 +83,11 @@ class Example:
         self.particle_colors[mud_particles].fill_(wp.vec3(0.4, 0.25, 0.25))
 
         self.viewer.set_model(self.model)
+        self.viewer.set_camera(
+            pos=wp.vec3(2.87, 1.31, 1.04),
+            pitch=-12.5,
+            yaw=-155.6,
+        )
 
     def simulate(self):
         for _ in range(self.sim_substeps):

@@ -11,7 +11,6 @@ from ...sim.articulation import (
     compute_2d_rotational_dofs,
     compute_3d_rotational_dofs,
 )
-from ..semi_implicit.kernels_body import joint_force
 
 
 @wp.kernel
@@ -338,6 +337,47 @@ def jcalc_motion(
     return wp.spatial_vector()
 
 
+@wp.func
+def stable_joint_force(
+    q: float,
+    qd: float,
+    joint_target_pos: float,
+    joint_target_vel: float,
+    target_ke: float,
+    target_kd: float,
+    limit_lower: float,
+    limit_upper: float,
+    limit_ke: float,
+    limit_kd: float,
+    dt: float,
+) -> float:
+    """Implicit-PD joint drive used by reduced-coordinate solvers."""
+
+    target_f = 0.0
+    limit_f = 0.0
+
+    if target_ke > 0.0 or target_kd > 0.0:
+        denom = 1.0 + target_kd * dt + target_ke * dt * dt
+        target_ke_eff = target_ke / denom
+        target_kd_eff = (target_kd + target_ke * dt) / denom
+        target_f = target_ke_eff * (joint_target_pos - q) + target_kd_eff * (joint_target_vel - qd)
+
+    if q < limit_lower and (limit_ke > 0.0 or limit_kd > 0.0):
+        denom = 1.0 + limit_kd * dt + limit_ke * dt * dt
+        limit_ke_eff = limit_ke / denom
+        limit_kd_eff = (limit_kd + limit_ke * dt) / denom
+        limit_f = limit_ke_eff * (limit_lower - q) - limit_kd_eff * qd
+        target_f = 0.0
+    elif q > limit_upper and (limit_ke > 0.0 or limit_kd > 0.0):
+        denom = 1.0 + limit_kd * dt + limit_ke * dt * dt
+        limit_ke_eff = limit_ke / denom
+        limit_kd_eff = (limit_kd + limit_ke * dt) / denom
+        limit_f = limit_ke_eff * (limit_upper - q) - limit_kd_eff * qd
+        target_f = 0.0
+
+    return limit_f + target_f
+
+
 # computes joint space forces/torques in tau
 @wp.func
 def jcalc_tau(
@@ -359,6 +399,7 @@ def jcalc_tau(
     lin_axis_count: int,
     ang_axis_count: int,
     body_f_s: wp.spatial_vector,
+    dt: float,
     # outputs
     tau: wp.array(dtype=float),
 ):
@@ -403,7 +444,19 @@ def jcalc_tau(
             target_pos = joint_target_pos[j]
             target_vel = joint_target_vel[j]
 
-            drive_f = joint_force(q, qd, target_pos, target_vel, target_ke, target_kd, lower, upper, limit_ke, limit_kd)
+            drive_f = stable_joint_force(
+                q,
+                qd,
+                target_pos,
+                target_vel,
+                target_ke,
+                target_kd,
+                lower,
+                upper,
+                limit_ke,
+                limit_kd,
+                dt,
+            )
 
             # total torque / force on the joint
             t = -wp.dot(S_s, body_f_s) + drive_f + joint_f[j]
@@ -856,6 +909,7 @@ def eval_rigid_tau(
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     body_fb_s: wp.array(dtype=wp.spatial_vector),
     body_f_ext: wp.array(dtype=wp.spatial_vector),
+    dt: float,
     # outputs
     body_ft_s: wp.array(dtype=wp.spatial_vector),
     tau: wp.array(dtype=float),
@@ -906,6 +960,7 @@ def eval_rigid_tau(
             lin_axis_count,
             ang_axis_count,
             f_s,
+            dt,
             tau,
         )
 

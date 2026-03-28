@@ -6,9 +6,9 @@ import warp as wp
 
 from ...core.types import override
 from ...sim import BodyFlags, Contacts, Control, Model, State
+from ..contact import RigidContactResolver
 from ..flags import SolverNotifyFlags
 from ..semi_implicit.kernels_contact import (
-    eval_body_contact,
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
 )
@@ -108,6 +108,12 @@ class SolverFeatherstone(SolverBase):
         friction_smoothing: float = 1.0,
         use_tile_gemm: bool = False,
         fuse_cholesky: bool = True,
+        rigid_contact_method: str = "force",
+        impulse_contact_iterations: int = 3,
+        impulse_contact_baumgarte: float = 0.25,
+        impulse_contact_penetration_slop: float = 1.0e-3,
+        impulse_contact_restitution_scale: float = 0.0,
+        impulse_contact_restitution_velocity_threshold: float = 0.5,
     ):
         """
         Args:
@@ -125,6 +131,16 @@ class SolverFeatherstone(SolverBase):
         self.friction_smoothing = friction_smoothing
         self.use_tile_gemm = use_tile_gemm
         self.fuse_cholesky = fuse_cholesky
+        self.rigid_contact_resolver = RigidContactResolver(
+            model=model,
+            method=rigid_contact_method,
+            friction_smoothing=friction_smoothing,
+            impulse_iterations=impulse_contact_iterations,
+            impulse_baumgarte=impulse_contact_baumgarte,
+            impulse_penetration_slop=impulse_contact_penetration_slop,
+            impulse_restitution_scale=impulse_contact_restitution_scale,
+            impulse_restitution_velocity_threshold=impulse_contact_restitution_velocity_threshold,
+        )
 
         self._step = 0
         self._mass_matrix_dirty = False
@@ -354,13 +370,9 @@ class SolverFeatherstone(SolverBase):
 
             if state_in.body_count:
                 body_f = state_in.body_f
-                wp.launch(
-                    convert_body_force_com_to_origin,
-                    dim=model.body_count,
-                    inputs=[state_in.body_q, self.body_X_com],
-                    outputs=[body_f],
-                    device=model.device,
-                )
+
+            if model.joint_count:
+                eval_fk_with_velocity_conversion(model, state_in.joint_q, state_in.joint_qd, state_in)
 
             # damped springs
             eval_spring_forces(model, state_in, particle_f)
@@ -378,11 +390,13 @@ class SolverFeatherstone(SolverBase):
             eval_particle_contact_forces(model, state_in, particle_f)
 
             # particle shape contact
-            eval_particle_body_contact_forces(model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=True)
+            eval_particle_body_contact_forces(model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=False)
 
             # muscles
             if False:
                 eval_muscle_forces(model, state_in, control, body_f)
+
+            self.rigid_contact_resolver.resolve(state_in, contacts, dt, body_f_out=body_f)
 
             # ----------------------------
             # articulations
@@ -445,43 +459,20 @@ class SolverFeatherstone(SolverBase):
                     device=model.device,
                 )
 
-                if contacts is not None and contacts.rigid_contact_max:
-                    wp.launch(
-                        kernel=eval_body_contact,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[
-                            state_in.body_q,
-                            state_aug.body_v_s,
-                            model.body_com,
-                            model.shape_material_ke,
-                            model.shape_material_kd,
-                            model.shape_material_kf,
-                            model.shape_material_ka,
-                            model.shape_material_mu,
-                            model.shape_body,
-                            contacts.rigid_contact_count,
-                            contacts.rigid_contact_point0,
-                            contacts.rigid_contact_point1,
-                            contacts.rigid_contact_normal,
-                            contacts.rigid_contact_shape0,
-                            contacts.rigid_contact_shape1,
-                            contacts.rigid_contact_margin0,
-                            contacts.rigid_contact_margin1,
-                            contacts.rigid_contact_stiffness,
-                            contacts.rigid_contact_damping,
-                            contacts.rigid_contact_friction,
-                            True,
-                            self.friction_smoothing,
-                        ],
-                        outputs=[body_f],
-                        device=model.device,
-                    )
-
                 if self.has_kinematic_bodies and body_f is not None:
                     wp.launch(
                         zero_kinematic_body_forces,
                         dim=model.body_count,
                         inputs=[model.body_flags],
+                        outputs=[body_f],
+                        device=model.device,
+                    )
+
+                if body_f is not None:
+                    wp.launch(
+                        convert_body_force_com_to_origin,
+                        dim=model.body_count,
+                        inputs=[state_in.body_q, self.body_X_com],
                         outputs=[body_f],
                         device=model.device,
                     )
@@ -514,6 +505,7 @@ class SolverFeatherstone(SolverBase):
                             state_aug.joint_S_s,
                             state_aug.body_f_s,
                             body_f,
+                            dt,
                         ],
                         outputs=[
                             state_aug.body_ft_s,

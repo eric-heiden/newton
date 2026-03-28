@@ -5,12 +5,12 @@ import warp as wp
 
 from ...core.types import override
 from ...sim import Contacts, Control, Model, State
+from ..contact import RigidContactResolver
 from ..solver import SolverBase
 from .kernels_body import (
     eval_body_joint_forces,
 )
 from .kernels_contact import (
-    eval_body_contact_forces,
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
     eval_triangle_contact_forces,
@@ -74,6 +74,12 @@ class SolverSemiImplicit(SolverBase):
         joint_attach_ke: float = 1.0e4,
         joint_attach_kd: float = 1.0e2,
         enable_tri_contact: bool = True,
+        rigid_contact_method: str = "force",
+        impulse_contact_iterations: int = 3,
+        impulse_contact_baumgarte: float = 0.25,
+        impulse_contact_penetration_slop: float = 1.0e-3,
+        impulse_contact_restitution_scale: float = 0.0,
+        impulse_contact_restitution_velocity_threshold: float = 0.5,
     ):
         """
         Args:
@@ -83,6 +89,7 @@ class SolverSemiImplicit(SolverBase):
             joint_attach_ke: Joint attachment spring stiffness. Defaults to 1.0e4.
             joint_attach_kd: Joint attachment spring damping. Defaults to 1.0e2.
             enable_tri_contact: Enable triangle contact. Defaults to True.
+            rigid_contact_method: Rigid contact backend, either ``"force"`` or ``"impulse"``. Defaults to ``"force"``.
         """
         super().__init__(model=model)
         self.angular_damping = angular_damping
@@ -90,6 +97,16 @@ class SolverSemiImplicit(SolverBase):
         self.joint_attach_ke = joint_attach_ke
         self.joint_attach_kd = joint_attach_kd
         self.enable_tri_contact = enable_tri_contact
+        self.rigid_contact_resolver = RigidContactResolver(
+            model=model,
+            method=rigid_contact_method,
+            friction_smoothing=friction_smoothing,
+            impulse_iterations=impulse_contact_iterations,
+            impulse_baumgarte=impulse_contact_baumgarte,
+            impulse_penetration_slop=impulse_contact_penetration_slop,
+            impulse_restitution_scale=impulse_contact_restitution_scale,
+            impulse_restitution_velocity_threshold=impulse_contact_restitution_velocity_threshold,
+        )
 
     @override
     def step(
@@ -165,9 +182,7 @@ class SolverSemiImplicit(SolverBase):
                 eval_triangle_contact_forces(model, state_in, particle_f)
 
             # body contacts
-            eval_body_contact_forces(
-                model, state_in, contacts, friction_smoothing=self.friction_smoothing, body_f_out=body_f_work
-            )
+            self.rigid_contact_resolver.resolve(state_in, contacts, dt, body_f_out=body_f_work)
 
             # particle shape contact
             eval_particle_body_contact_forces(

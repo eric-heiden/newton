@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-03-29T13:44:14Z",
+  "runs": [
+    {
+      "schema_version": 1,
+      "timestamp_utc": "2026-03-29T13:44:14Z",
+      "git": {
+        "commit": "5d81d111589fb352247a572568a7a019ddc01ab9",
+        "commit_short": "5d81d11",
+        "branch": "solver-mabd",
+        "dirty": true
+      },
+      "environment": {
+        "python": "3.12.12",
+        "platform": "Windows-11-10.0.26200-SP0",
+        "machine": "AMD64",
+        "hostname": "HGW-PC",
+        "warp_version": "1.12.0",
+        "newton_version": "1.1.0.dev0",
+        "device": "cuda:0",
+        "cuda": true
+      },
+      "benchmark": {
+        "warmup_frames": 20,
+        "measure_frames": 60,
+        "solvers": [
+          "SolverXPBD",
+          "SolverMuJoCo",
+          "SolverMABD"
+        ],
+        "scenario_setup_seconds": 71.98147400000016
+      },
+      "scenario": {
+        "name": "g1_humanoid",
+        "description": "Unitree G1 standing benchmark derived from newton.examples robot_g1.",
+        "world_count": 1,
+        "frame_dt": 0.016666666666666666,
+        "sim_substeps": 6,
+        "sim_dt": 0.002777777777777778,
+        "use_mujoco_contacts": false
+      },
+      "results": [
+        {
+          "solver": "SolverXPBD",
+          "status": "ok",
+          "solver_options": {
+            "iterations": 8
+          },
+          "setup_seconds": 1.6694903999996313,
+          "warmup_seconds": 16.048011400001997,
+          "measure_seconds": 0.6405660999989777,
+          "frames_per_second": 93.66714848022046,
+          "substeps_per_second": 562.0028908813229,
+          "sim_seconds_per_second": 1.5611191413370078,
+          "mean_frame_ms": 10.676101666649629,
+          "mean_substep_ms": 1.7793502777749381
+        },
+        {
+          "solver": "SolverMuJoCo",
+          "status": "ok",
+          "solver_options": {
+            "use_mujoco_cpu": false,
+            "solver": "newton",
+            "integrator": "implicitfast",
+            "njmax": 300,
+            "nconmax": 150,
+            "cone": "elliptic",
+            "impratio": 100,
+            "iterations": 100,
+            "ls_iterations": 50,
+            "use_mujoco_contacts": false
+          },
+          "setup_seconds": 18.311095000000932,
+          "warmup_seconds": 69.7663278,
+          "measure_seconds": 2.709613900002296,
+          "frames_per_second": 22.143376220482615,
+          "substeps_per_second": 132.8602573228957,
+          "sim_seconds_per_second": 0.36905627034137695,
+          "mean_frame_ms": 45.16023166670493,
+          "mean_substep_ms": 7.526705277784155
+        },
+        {
+          "solver": "SolverMABD",
+          "status": "ok",
+          "solver_options": {},
+          "setup_seconds": 0.3544072000004235,
+          "warmup_seconds": 0.46480999999766937,
+          "measure_seconds": 0.4162566000013612,
+          "frames_per_second": 144.14185865113922,
+          "substeps_per_second": 864.8511519068352,
+          "sim_seconds_per_second": 2.4023643108523203,
+          "mean_frame_ms": 6.937610000022687,
+          "mean_substep_ms": 1.1562683333371144
+        }
+      ]
+    }
+  ]
+}

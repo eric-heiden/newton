@@ -11,8 +11,11 @@ from ...sim import Contacts, Model, State
 from .kernels import (
     add_scaled_spatial_vectors,
     add_spatial_vectors,
+    apply_warmstart_body_contact_impulses,
     eval_body_contact_impulses,
+    match_contact_warmstart,
     predict_body_contact_velocities,
+    store_contact_history,
 )
 
 
@@ -25,10 +28,15 @@ class RigidContactResolver:
         method: str = "force",
         friction_smoothing: float = 1.0,
         impulse_iterations: int = 3,
-        impulse_baumgarte: float = 0.25,
+        impulse_baumgarte: float = 0.1,
         impulse_penetration_slop: float = 1.0e-3,
         impulse_restitution_scale: float = 0.0,
         impulse_restitution_velocity_threshold: float = 0.5,
+        impulse_warmstart_scale: float = 0.0,
+        impulse_static_friction_velocity_threshold: float = 0.1,
+        impulse_static_friction_scale: float = 4.0,
+        impulse_static_friction_anchor_gain: float = 1.0,
+        impulse_static_friction_anchor_break_distance: float = 1.0e-2,
     ) -> None:
         self.model = model
         self.method = method
@@ -38,15 +46,35 @@ class RigidContactResolver:
         self.impulse_penetration_slop = impulse_penetration_slop
         self.impulse_restitution_scale = impulse_restitution_scale
         self.impulse_restitution_velocity_threshold = impulse_restitution_velocity_threshold
+        self.impulse_warmstart_scale = impulse_warmstart_scale
+        self.impulse_static_friction_velocity_threshold = impulse_static_friction_velocity_threshold
+        self.impulse_static_friction_scale = impulse_static_friction_scale
+        self.impulse_static_friction_anchor_gain = impulse_static_friction_anchor_gain
+        self.impulse_static_friction_anchor_break_distance = impulse_static_friction_anchor_break_distance
 
         self._validate_method()
 
+        self._history_capacity = 0
         if model.body_count:
             self.body_qd_predicted = wp.empty_like(model.body_qd, requires_grad=False)
             self.body_qd_work_a = wp.empty_like(model.body_qd, requires_grad=False)
             self.body_qd_work_b = wp.empty_like(model.body_qd, requires_grad=False)
             self.body_qd_delta = wp.zeros_like(model.body_qd, requires_grad=False)
             self.body_impulses = wp.zeros_like(model.body_qd, requires_grad=False)
+
+    def _ensure_history_buffers(self, contact_capacity: int) -> None:
+        if contact_capacity <= self._history_capacity:
+            return
+
+        self.prev_contact_point_id = wp.full(contact_capacity, -1, dtype=wp.int32, device=self.model.device)
+        self.prev_contact_impulse = wp.zeros(contact_capacity, dtype=wp.vec3, device=self.model.device)
+        self.prev_contact_anchor0 = wp.zeros(contact_capacity, dtype=wp.vec3, device=self.model.device)
+        self.prev_contact_anchor1 = wp.zeros(contact_capacity, dtype=wp.vec3, device=self.model.device)
+        self.warmstart_contact_impulse = wp.zeros(contact_capacity, dtype=wp.vec3, device=self.model.device)
+        self.contact_anchor0 = wp.zeros(contact_capacity, dtype=wp.vec3, device=self.model.device)
+        self.contact_anchor1 = wp.zeros(contact_capacity, dtype=wp.vec3, device=self.model.device)
+        self.prev_contact_count = wp.zeros(1, dtype=wp.int32, device=self.model.device)
+        self._history_capacity = contact_capacity
 
     def _validate_method(self) -> None:
         if self.method not in ("force", "impulse"):
@@ -83,6 +111,10 @@ class RigidContactResolver:
         if dt <= 0.0:
             return
 
+        self._ensure_history_buffers(contacts.rigid_contact_max)
+
+        inv_dt = 1.0 / dt
+
         wp.launch(
             kernel=predict_body_contact_velocities,
             dim=self.model.body_count,
@@ -102,14 +134,69 @@ class RigidContactResolver:
             device=self.model.device,
         )
 
-        self.body_qd_work_a.assign(self.body_qd_predicted)
-        self.body_qd_delta.zero_()
         self.body_impulses.zero_()
+        self.body_qd_delta.zero_()
+        contacts.rigid_contact_force.zero_()
+
+        wp.launch(
+            kernel=match_contact_warmstart,
+            dim=self._history_capacity,
+            inputs=[
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_point_id,
+                contacts.rigid_contact_point0,
+                contacts.rigid_contact_point1,
+                contacts.rigid_contact_offset0,
+                contacts.rigid_contact_offset1,
+                self.prev_contact_count,
+                self.prev_contact_point_id,
+                self.prev_contact_impulse,
+                self.prev_contact_anchor0,
+                self.prev_contact_anchor1,
+                self.impulse_warmstart_scale,
+            ],
+            outputs=[self.warmstart_contact_impulse, self.contact_anchor0, self.contact_anchor1],
+            device=self.model.device,
+        )
+
+        wp.launch(
+            kernel=apply_warmstart_body_contact_impulses,
+            dim=contacts.rigid_contact_max,
+            inputs=[
+                state.body_q,
+                self.model.body_com,
+                self.model.body_inv_mass,
+                self.model.body_inv_inertia,
+                self.model.body_flags,
+                self.model.shape_body,
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_point0,
+                contacts.rigid_contact_point1,
+                contacts.rigid_contact_normal,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                contacts.rigid_contact_margin0,
+                contacts.rigid_contact_margin1,
+                self.warmstart_contact_impulse,
+                self.impulse_penetration_slop,
+                inv_dt,
+            ],
+            outputs=[self.body_impulses, self.body_qd_delta, contacts.rigid_contact_force],
+            device=self.model.device,
+        )
+
+        wp.launch(
+            kernel=add_spatial_vectors,
+            dim=self.model.body_count,
+            inputs=[self.body_qd_predicted, self.body_qd_delta],
+            outputs=[self.body_qd_work_a],
+            device=self.model.device,
+        )
+
+        self.body_qd_delta.zero_()
 
         work_in = self.body_qd_work_a
         work_out = self.body_qd_work_b
-        inv_dt = 1.0 / dt
-
         for _ in range(self.impulse_iterations):
             self.body_qd_delta.zero_()
             wp.launch(
@@ -136,11 +223,19 @@ class RigidContactResolver:
                     contacts.rigid_contact_shape1,
                     contacts.rigid_contact_margin0,
                     contacts.rigid_contact_margin1,
+                    contacts.rigid_contact_offset0,
+                    contacts.rigid_contact_offset1,
+                    self.contact_anchor0,
+                    self.contact_anchor1,
                     contacts.rigid_contact_friction,
                     self.impulse_baumgarte,
                     self.impulse_penetration_slop,
                     self.impulse_restitution_scale,
                     self.impulse_restitution_velocity_threshold,
+                    self.impulse_static_friction_velocity_threshold,
+                    self.impulse_static_friction_scale,
+                    self.impulse_static_friction_anchor_gain,
+                    self.impulse_static_friction_anchor_break_distance,
                     dt,
                     inv_dt,
                 ],
@@ -161,5 +256,26 @@ class RigidContactResolver:
             dim=self.model.body_count,
             inputs=[body_f_out, self.body_impulses, inv_dt],
             outputs=[body_f_out],
+            device=self.model.device,
+        )
+
+        self.prev_contact_count.assign(contacts.rigid_contact_count)
+        wp.launch(
+            kernel=store_contact_history,
+            dim=self._history_capacity,
+            inputs=[
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_point_id,
+                contacts.rigid_contact_force,
+                self.contact_anchor0,
+                self.contact_anchor1,
+                dt,
+            ],
+            outputs=[
+                self.prev_contact_point_id,
+                self.prev_contact_impulse,
+                self.prev_contact_anchor0,
+                self.prev_contact_anchor1,
+            ],
             device=self.model.device,
         )

@@ -110,10 +110,15 @@ class SolverFeatherstone(SolverBase):
         fuse_cholesky: bool = True,
         rigid_contact_method: str = "force",
         impulse_contact_iterations: int = 3,
-        impulse_contact_baumgarte: float = 0.25,
+        impulse_contact_baumgarte: float = 0.1,
         impulse_contact_penetration_slop: float = 1.0e-3,
         impulse_contact_restitution_scale: float = 0.0,
         impulse_contact_restitution_velocity_threshold: float = 0.5,
+        impulse_contact_warmstart_scale: float = 0.0,
+        impulse_contact_static_friction_velocity_threshold: float = 0.1,
+        impulse_contact_static_friction_scale: float = 4.0,
+        impulse_contact_static_friction_anchor_gain: float = 1.0,
+        impulse_contact_static_friction_anchor_break_distance: float = 1.0e-2,
     ):
         """
         Args:
@@ -140,6 +145,11 @@ class SolverFeatherstone(SolverBase):
             impulse_penetration_slop=impulse_contact_penetration_slop,
             impulse_restitution_scale=impulse_contact_restitution_scale,
             impulse_restitution_velocity_threshold=impulse_contact_restitution_velocity_threshold,
+            impulse_warmstart_scale=impulse_contact_warmstart_scale,
+            impulse_static_friction_velocity_threshold=impulse_contact_static_friction_velocity_threshold,
+            impulse_static_friction_scale=impulse_contact_static_friction_scale,
+            impulse_static_friction_anchor_gain=impulse_contact_static_friction_anchor_gain,
+            impulse_static_friction_anchor_break_distance=impulse_contact_static_friction_anchor_break_distance,
         )
 
         self._step = 0

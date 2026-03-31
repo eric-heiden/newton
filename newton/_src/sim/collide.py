@@ -37,6 +37,7 @@ class ContactWriterData:
     shape_gap: wp.array(dtype=float)
     # Output arrays
     contact_count: wp.array(dtype=int)
+    out_point_id: wp.array(dtype=int)
     out_shape0: wp.array(dtype=int)
     out_shape1: wp.array(dtype=int)
     out_point0: wp.array(dtype=wp.vec3)
@@ -52,6 +53,26 @@ class ContactWriterData:
     out_stiffness: wp.array(dtype=float)
     out_damping: wp.array(dtype=float)
     out_friction: wp.array(dtype=float)
+
+
+@wp.func
+def _mix_contact_key(hash_value: wp.uint32, component: wp.uint32) -> wp.uint32:
+    return (hash_value ^ component) * wp.uint32(16777619)
+
+
+@wp.func
+def _make_contact_point_id(shape_a: int, shape_b: int, point0: wp.vec3, point1: wp.vec3) -> int:
+    quantization = 50.0
+    hash_value = wp.uint32(2166136261)
+    hash_value = _mix_contact_key(hash_value, wp.uint32(shape_a))
+    hash_value = _mix_contact_key(hash_value, wp.uint32(shape_b))
+    hash_value = _mix_contact_key(hash_value, wp.uint32(wp.int32(wp.round(point0[0] * quantization))))
+    hash_value = _mix_contact_key(hash_value, wp.uint32(wp.int32(wp.round(point0[1] * quantization))))
+    hash_value = _mix_contact_key(hash_value, wp.uint32(wp.int32(wp.round(point0[2] * quantization))))
+    hash_value = _mix_contact_key(hash_value, wp.uint32(wp.int32(wp.round(point1[0] * quantization))))
+    hash_value = _mix_contact_key(hash_value, wp.uint32(wp.int32(wp.round(point1[1] * quantization))))
+    hash_value = _mix_contact_key(hash_value, wp.uint32(wp.int32(wp.round(point1[2] * quantization))))
+    return wp.int32(hash_value & wp.uint32(0x7FFFFFFF))
 
 
 @wp.func
@@ -118,6 +139,12 @@ def write_contact(
     # Contact points are stored in body frames
     writer_data.out_point0[index] = wp.transform_point(X_bw_a, a_contact_world)
     writer_data.out_point1[index] = wp.transform_point(X_bw_b, b_contact_world)
+    writer_data.out_point_id[index] = _make_contact_point_id(
+        contact_data.shape_a,
+        contact_data.shape_b,
+        writer_data.out_point0[index],
+        writer_data.out_point1[index],
+    )
 
     contact_normal = contact_normal_a_to_b
 
@@ -781,6 +808,7 @@ class CollisionPipeline:
             writer_data.shape_body = model.shape_body
             writer_data.shape_gap = model.shape_gap
             writer_data.contact_count = contacts.rigid_contact_count
+            writer_data.out_point_id = contacts.rigid_contact_point_id
             writer_data.out_shape0 = contacts.rigid_contact_shape0
             writer_data.out_shape1 = contacts.rigid_contact_shape1
             writer_data.out_point0 = contacts.rigid_contact_point0

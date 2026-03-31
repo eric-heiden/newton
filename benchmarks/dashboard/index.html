@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Newton Solver Benchmarks</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    :root {
+      --bg: #f5f1e8;
+      --panel: #fffaf3;
+      --border: #d7c9b2;
+      --ink: #1f1f18;
+      --muted: #6d6458;
+      --accent: #0a6b62;
+      --accent-soft: #d6ece6;
+      --bad: #9b3022;
+      --bad-soft: #f5ddd8;
+      --good: #165a36;
+      --good-soft: #ddf1e3;
+      --shadow: 0 14px 40px rgba(31, 31, 24, 0.08);
+      --radius: 16px;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      --sans: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(10, 107, 98, 0.08), transparent 26rem),
+        radial-gradient(circle at bottom right, rgba(190, 96, 41, 0.1), transparent 24rem),
+        var(--bg);
+    }
+    main { max-width: 1360px; margin: 0 auto; padding: 32px 20px 48px; }
+    header { margin-bottom: 20px; }
+    h1 { margin: 0; font-size: clamp(2rem, 4vw, 3rem); letter-spacing: -0.04em; }
+    .subtitle { margin: 10px 0 0; max-width: 72ch; color: var(--muted); line-height: 1.5; }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+    .tabs { display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0; }
+    .tab {
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.55);
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 10px 16px;
+      cursor: pointer;
+      font-size: 0.96rem;
+    }
+    .tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .grid { display: grid; grid-template-columns: 1.25fr 0.95fr; gap: 18px; }
+    .card { padding: 18px; }
+    .card h2, .card h3 { margin: 0 0 8px; letter-spacing: -0.03em; }
+    .card p { margin: 0 0 10px; color: var(--muted); line-height: 1.45; }
+    .summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+    .summary-item { padding: 12px; border-radius: 12px; background: rgba(255, 255, 255, 0.6); border: 1px solid rgba(215, 201, 178, 0.8); }
+    .summary-label { color: var(--muted); font-size: 0.84rem; margin-bottom: 6px; }
+    .summary-value { font-family: var(--mono); font-size: 0.95rem; word-break: break-word; }
+    .plot { min-height: 360px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+    th, td { padding: 11px 12px; text-align: left; border-top: 1px solid rgba(215, 201, 178, 0.7); vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.08em; border-top: none; }
+    .status { display: inline-flex; border-radius: 999px; padding: 4px 10px; font-size: 0.82rem; font-weight: 700; letter-spacing: 0.03em; }
+    .status-ok { color: var(--good); background: var(--good-soft); }
+    .status-error { color: var(--bad); background: var(--bad-soft); }
+    .mono { font-family: var(--mono); }
+    .empty { padding: 28px; color: var(--muted); line-height: 1.6; }
+    .footer { margin-top: 18px; color: var(--muted); font-size: 0.9rem; }
+    @media (max-width: 960px) {
+      .grid { grid-template-columns: 1fr; }
+      .summary-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Newton Solver Benchmarks</h1>
+      <p class="subtitle">
+        Static benchmark dashboard generated from JSON run logs. Tabs map to scenario names, so
+        adding a new scenario only requires adding it to the benchmark runner and rerunning the script.
+      </p>
+    </header>
+    <section class="panel card">
+      <div id="tab-bar" class="tabs"></div>
+      <div id="empty-state" class="empty" hidden>
+        No benchmark runs were found. Run <span class="mono">benchmarks/run_solver_benchmarks.py</span>
+        to populate <span class="mono">benchmarks/results/runs</span> and regenerate this page.
+      </div>
+      <div id="scenario-view" hidden>
+        <div class="grid">
+          <section class="panel card">
+            <h2 id="scenario-title"></h2>
+            <p id="scenario-description"></p>
+            <div id="throughput-plot" class="plot"></div>
+          </section>
+          <section class="panel card">
+            <h3>Latest Run</h3>
+            <p>Per-solver throughput for the newest run in this scenario tab.</p>
+            <div id="latest-run-plot" class="plot"></div>
+          </section>
+        </div>
+        <div class="grid" style="margin-top: 18px;">
+          <section class="panel card">
+            <h3>Scenario Summary</h3>
+            <p>Metadata from the most recent run for this scenario.</p>
+            <div id="scenario-summary" class="summary-grid"></div>
+          </section>
+          <section class="panel card">
+            <h3>Run Notes</h3>
+            <p>Quick view of the benchmark configuration and where the data came from.</p>
+            <div id="scenario-notes" class="summary-grid"></div>
+          </section>
+        </div>
+        <section class="panel card" style="margin-top: 18px;">
+          <h3>Historical Runs</h3>
+          <p>Each solver result is listed independently so failed runs stay visible.</p>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Commit</th>
+                  <th>Solver</th>
+                  <th>Status</th>
+                  <th>Sim x Realtime</th>
+                  <th>Frame ms</th>
+                  <th>Setup s</th>
+                  <th>Scenario</th>
+                  <th>Notes</th>
+                </tr>
+              </thead>
+              <tbody id="runs-table-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+      <div class="footer" id="footer-text"></div>
+    </section>
+  </main>
+  <script>
+    const DASHBOARD_DATA = {
+  "schema_version": 1,
+  "generated_at_utc": "2026-03-29T13:44:14Z",
+  "runs": [
+    {
+      "schema_version": 1,
+      "timestamp_utc": "2026-03-29T13:44:14Z",
+      "git": {
+        "commit": "5d81d111589fb352247a572568a7a019ddc01ab9",
+        "commit_short": "5d81d11",
+        "branch": "solver-mabd",
+        "dirty": true
+      },
+      "environment": {
+        "python": "3.12.12",
+        "platform": "Windows-11-10.0.26200-SP0",
+        "machine": "AMD64",
+        "hostname": "HGW-PC",
+        "warp_version": "1.12.0",
+        "newton_version": "1.1.0.dev0",
+        "device": "cuda:0",
+        "cuda": true
+      },
+      "benchmark": {
+        "warmup_frames": 20,
+        "measure_frames": 60,
+        "solvers": [
+          "SolverXPBD",
+          "SolverMuJoCo",
+          "SolverMABD"
+        ],
+        "scenario_setup_seconds": 71.98147400000016
+      },
+      "scenario": {
+        "name": "g1_humanoid",
+        "description": "Unitree G1 standing benchmark derived from newton.examples robot_g1.",
+        "world_count": 1,
+        "frame_dt": 0.016666666666666666,
+        "sim_substeps": 6,
+        "sim_dt": 0.002777777777777778,
+        "use_mujoco_contacts": false
+      },
+      "results": [
+        {
+          "solver": "SolverXPBD",
+          "status": "ok",
+          "solver_options": {
+            "iterations": 8
+          },
+          "setup_seconds": 1.6694903999996313,
+          "warmup_seconds": 16.048011400001997,
+          "measure_seconds": 0.6405660999989777,
+          "frames_per_second": 93.66714848022046,
+          "substeps_per_second": 562.0028908813229,
+          "sim_seconds_per_second": 1.5611191413370078,
+          "mean_frame_ms": 10.676101666649629,
+          "mean_substep_ms": 1.7793502777749381
+        },
+        {
+          "solver": "SolverMuJoCo",
+          "status": "ok",
+          "solver_options": {
+            "use_mujoco_cpu": false,
+            "solver": "newton",
+            "integrator": "implicitfast",
+            "njmax": 300,
+            "nconmax": 150,
+            "cone": "elliptic",
+            "impratio": 100,
+            "iterations": 100,
+            "ls_iterations": 50,
+            "use_mujoco_contacts": false
+          },
+          "setup_seconds": 18.311095000000932,
+          "warmup_seconds": 69.7663278,
+          "measure_seconds": 2.709613900002296,
+          "frames_per_second": 22.143376220482615,
+          "substeps_per_second": 132.8602573228957,
+          "sim_seconds_per_second": 0.36905627034137695,
+          "mean_frame_ms": 45.16023166670493,
+          "mean_substep_ms": 7.526705277784155
+        },
+        {
+          "solver": "SolverMABD",
+          "status": "ok",
+          "solver_options": {},
+          "setup_seconds": 0.3544072000004235,
+          "warmup_seconds": 0.46480999999766937,
+          "measure_seconds": 0.4162566000013612,
+          "frames_per_second": 144.14185865113922,
+          "substeps_per_second": 864.8511519068352,
+          "sim_seconds_per_second": 2.4023643108523203,
+          "mean_frame_ms": 6.937610000022687,
+          "mean_substep_ms": 1.1562683333371144
+        }
+      ]
+    }
+  ]
+};
+    function formatNumber(value, digits = 3) {
+      if (value === null || value === undefined || Number.isNaN(value)) { return "n/a"; }
+      return Number(value).toFixed(digits);
+    }
+    function formatTimestamp(value) {
+      if (!value) { return "n/a"; }
+      return value.replace("T", " ").replace("Z", " UTC");
+    }
+    function scenarioNamesFromRuns(runs) {
+      return [...new Set(runs.map((run) => run.scenario.name))].sort();
+    }
+    function runsForScenario(name) {
+      return DASHBOARD_DATA.runs
+        .filter((run) => run.scenario.name === name)
+        .sort((left, right) => left.timestamp_utc.localeCompare(right.timestamp_utc));
+    }
+    function renderTabs(names, activeName) {
+      const tabBar = document.getElementById("tab-bar");
+      tabBar.innerHTML = "";
+      for (const name of names) {
+        const button = document.createElement("button");
+        button.className = "tab" + (name === activeName ? " active" : "");
+        button.textContent = name;
+        button.type = "button";
+        button.addEventListener("click", () => renderScenario(name));
+        tabBar.appendChild(button);
+      }
+    }
+    function setSummaryGrid(elementId, items) {
+      const container = document.getElementById(elementId);
+      container.innerHTML = "";
+      for (const item of items) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "summary-item";
+        wrapper.innerHTML =
+          "<div class=\"summary-label\">" + item.label + "</div>" +
+          "<div class=\"summary-value\">" + item.value + "</div>";
+        container.appendChild(wrapper);
+      }
+    }
+    function renderThroughputPlot(runs) {
+      const seriesBySolver = new Map();
+      for (const run of runs) {
+        const label = run.timestamp_utc.slice(0, 19).replace("T", " ") + " | " + (run.git.commit_short || "unknown");
+        for (const result of run.results) {
+          if (!seriesBySolver.has(result.solver)) {
+            seriesBySolver.set(result.solver, { x: [], y: [], customdata: [] });
+          }
+          if (result.status !== "ok") { continue; }
+          const series = seriesBySolver.get(result.solver);
+          series.x.push(label);
+          series.y.push(result.sim_seconds_per_second);
+          series.customdata.push([
+            run.git.commit || "unknown",
+            run.environment.hostname || "unknown",
+            run.scenario.world_count,
+            result.mean_frame_ms,
+          ]);
+        }
+      }
+      const traces = [...seriesBySolver.entries()].map(([solver, series]) => ({
+        type: "scatter",
+        mode: "lines+markers",
+        name: solver,
+        x: series.x,
+        y: series.y,
+        customdata: series.customdata,
+        hovertemplate:
+          "<b>%{fullData.name}</b><br>" +
+          "Run: %{x}<br>" +
+          "Commit: %{customdata[0]}<br>" +
+          "Host: %{customdata[1]}<br>" +
+          "Worlds: %{customdata[2]}<br>" +
+          "Sim x realtime: %{y:.3f}<br>" +
+          "Frame ms: %{customdata[3]:.3f}<extra></extra>",
+      }));
+      Plotly.newPlot(
+        "throughput-plot",
+        traces,
+        {
+          paper_bgcolor: "rgba(0,0,0,0)",
+          plot_bgcolor: "rgba(255,255,255,0.55)",
+          margin: { l: 55, r: 20, t: 20, b: 90 },
+          xaxis: { title: "Run", tickangle: -30 },
+          yaxis: { title: "Sim seconds / wall second", rangemode: "tozero" },
+          legend: { orientation: "h" },
+        },
+        { responsive: true, displayModeBar: false }
+      );
+    }
+    function renderLatestRunPlot(run) {
+      const okResults = run.results.filter((result) => result.status === "ok");
+      Plotly.newPlot(
+        "latest-run-plot",
+        [{
+          type: "bar",
+          x: okResults.map((result) => result.solver),
+          y: okResults.map((result) => result.sim_seconds_per_second),
+          marker: { color: ["#0a6b62", "#c9783a", "#2e5ea7", "#6e4d9b", "#7a8f2f"] },
+          hovertemplate: "<b>%{x}</b><br>Sim x realtime: %{y:.3f}<extra></extra>",
+        }],
+        {
+          paper_bgcolor: "rgba(0,0,0,0)",
+          plot_bgcolor: "rgba(255,255,255,0.55)",
+          margin: { l: 55, r: 20, t: 20, b: 60 },
+          xaxis: { title: "Solver" },
+          yaxis: { title: "Sim seconds / wall second", rangemode: "tozero" },
+        },
+        { responsive: true, displayModeBar: false }
+      );
+    }
+    function renderRunsTable(runs) {
+      const tbody = document.getElementById("runs-table-body");
+      tbody.innerHTML = "";
+      for (const run of [...runs].reverse()) {
+        for (const result of run.results) {
+          const row = document.createElement("tr");
+          const statusClass = result.status === "ok" ? "status-ok" : "status-error";
+          const note = result.error || "";
+          row.innerHTML =
+            "<td class=\"mono\">" + formatTimestamp(run.timestamp_utc) + "</td>" +
+            "<td class=\"mono\">" + (run.git.commit_short || "n/a") + "</td>" +
+            "<td class=\"mono\">" + result.solver + "</td>" +
+            "<td><span class=\"status " + statusClass + "\">" + result.status + "</span></td>" +
+            "<td class=\"mono\">" + formatNumber(result.sim_seconds_per_second, 3) + "</td>" +
+            "<td class=\"mono\">" + formatNumber(result.mean_frame_ms, 3) + "</td>" +
+            "<td class=\"mono\">" + formatNumber(result.setup_seconds, 3) + "</td>" +
+            "<td class=\"mono\">" + run.scenario.name + " / " + run.scenario.world_count + "</td>" +
+            "<td>" + note + "</td>";
+          tbody.appendChild(row);
+        }
+      }
+    }
+    function renderScenario(name) {
+      const runs = runsForScenario(name);
+      const latestRun = runs[runs.length - 1];
+      renderTabs(scenarioNamesFromRuns(DASHBOARD_DATA.runs), name);
+      document.getElementById("empty-state").hidden = true;
+      document.getElementById("scenario-view").hidden = false;
+      document.getElementById("scenario-title").textContent = name;
+      document.getElementById("scenario-description").textContent = latestRun.scenario.description;
+      setSummaryGrid("scenario-summary", [
+        { label: "Latest run", value: formatTimestamp(latestRun.timestamp_utc) },
+        { label: "Commit", value: latestRun.git.commit || "n/a" },
+        { label: "Branch", value: latestRun.git.branch || "n/a" },
+        { label: "Host", value: latestRun.environment.hostname || "n/a" },
+        { label: "Device", value: latestRun.environment.device || "n/a" },
+        { label: "World count", value: String(latestRun.scenario.world_count) },
+      ]);
+      setSummaryGrid("scenario-notes", [
+        { label: "Measure frames", value: String(latestRun.benchmark.measure_frames) },
+        { label: "Warmup frames", value: String(latestRun.benchmark.warmup_frames) },
+        { label: "Frame dt", value: formatNumber(latestRun.scenario.frame_dt, 6) },
+        { label: "Substeps", value: String(latestRun.scenario.sim_substeps) },
+        { label: "MuJoCo contacts", value: String(latestRun.scenario.use_mujoco_contacts) },
+        { label: "Generated", value: formatTimestamp(DASHBOARD_DATA.generated_at_utc) },
+      ]);
+      renderThroughputPlot(runs);
+      renderLatestRunPlot(latestRun);
+      renderRunsTable(runs);
+    }
+    function initializeDashboard() {
+      const names = scenarioNamesFromRuns(DASHBOARD_DATA.runs);
+      const footer = document.getElementById("footer-text");
+      footer.textContent =
+        "Dashboard generated " + formatTimestamp(DASHBOARD_DATA.generated_at_utc) +
+        " from " + DASHBOARD_DATA.runs.length + " logged benchmark run(s).";
+      if (names.length === 0) {
+        document.getElementById("empty-state").hidden = false;
+        document.getElementById("scenario-view").hidden = true;
+        renderTabs([], null);
+        return;
+      }
+      renderScenario(names[0]);
+    }
+    initializeDashboard();
+  </script>
+</body>
+</html>

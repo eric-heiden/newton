@@ -74,6 +74,7 @@ class SolverMABD(SolverBase):
     def __init__(
         self,
         model: Model,
+        *,
         angular_damping: float = 0.05,
         friction_smoothing: float = 1.0,
         enable_tri_contact: bool = True,
@@ -83,10 +84,15 @@ class SolverMABD(SolverBase):
         tile_block_dim: int = 128,
         rigid_contact_method: str = "impulse",
         impulse_contact_iterations: int = 4,
-        impulse_contact_baumgarte: float = 0.3,
+        impulse_contact_baumgarte: float = 0.1,
         impulse_contact_penetration_slop: float = 5.0e-4,
         impulse_contact_restitution_scale: float = 0.0,
         impulse_contact_restitution_velocity_threshold: float = 0.75,
+        impulse_contact_warmstart_scale: float = 0.0,
+        impulse_contact_static_friction_velocity_threshold: float = 0.1,
+        impulse_contact_static_friction_scale: float = 4.0,
+        impulse_contact_static_friction_anchor_gain: float = 1.0,
+        impulse_contact_static_friction_anchor_break_distance: float = 1.0e-2,
     ):
         super().__init__(model)
 
@@ -112,6 +118,11 @@ class SolverMABD(SolverBase):
             impulse_penetration_slop=impulse_contact_penetration_slop,
             impulse_restitution_scale=impulse_contact_restitution_scale,
             impulse_restitution_velocity_threshold=impulse_contact_restitution_velocity_threshold,
+            impulse_warmstart_scale=impulse_contact_warmstart_scale,
+            impulse_static_friction_velocity_threshold=impulse_contact_static_friction_velocity_threshold,
+            impulse_static_friction_scale=impulse_contact_static_friction_scale,
+            impulse_static_friction_anchor_gain=impulse_contact_static_friction_anchor_gain,
+            impulse_static_friction_anchor_break_distance=impulse_contact_static_friction_anchor_break_distance,
         )
 
         self._configure_tile_path()

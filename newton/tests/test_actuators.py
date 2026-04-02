@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 import warp as wp
 
+import newton
 from newton.actuators import (
     Actuator,
     ActuatorDCMotor,
@@ -102,6 +103,74 @@ class TestActuatorPDUnit(unittest.TestCase):
         self.assertEqual(resolved["kp"], 50.0)
         self.assertEqual(resolved["kd"], 0.0)
         self.assertEqual(resolved["constant_force"], 0.0)
+
+
+class TestExternalActuatorBuilderValidation(unittest.TestCase):
+    """Standalone builder regressions for external actuator indexing."""
+
+    def setUp(self):
+        wp.init()
+
+    @staticmethod
+    def _build_floating_base_chain() -> tuple[newton.ModelBuilder, int]:
+        builder = newton.ModelBuilder()
+        base = builder.add_link(label="base")
+        child = builder.add_link(label="child")
+        root = builder.add_joint_free(parent=-1, child=base, label="root")
+        hinge = builder.add_joint_revolute(parent=base, child=child, axis=(0.0, 0.0, 1.0), label="hinge")
+        builder.add_articulation([root, hinge], label="floating_robot")
+        return builder, hinge
+
+    def test_builder_rejects_position_feedback_on_floating_base_joint(self):
+        builder, hinge = self._build_floating_base_chain()
+        dof_index = builder.joint_qd_start[hinge]
+
+        self.assertNotEqual(builder.joint_q_start[hinge], dof_index)
+        builder.add_actuator(ActuatorPD, input_indices=[dof_index], kp=100.0, kd=0.0, max_force=200.0)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "shared DOF input indices for position and velocity feedback",
+        ):
+            builder.finalize(device="cpu")
+
+    def test_builder_rejects_integral_feedback_on_floating_base_joint(self):
+        builder, hinge = self._build_floating_base_chain()
+        dof_index = builder.joint_qd_start[hinge]
+
+        builder.add_actuator(
+            ActuatorPID,
+            input_indices=[dof_index],
+            kp=0.0,
+            ki=1.0,
+            kd=0.0,
+            integral_max=10.0,
+            max_force=200.0,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "shared DOF input indices for position and velocity feedback",
+        ):
+            builder.finalize(device="cpu")
+
+    def test_builder_allows_velocity_only_feedback_on_floating_base_joint(self):
+        builder, hinge = self._build_floating_base_chain()
+        dof_index = builder.joint_qd_start[hinge]
+
+        builder.add_actuator(ActuatorPD, input_indices=[dof_index], kp=0.0, kd=10.0, max_force=200.0)
+        builder.finalize(device="cpu")
+
+    def test_builder_allows_position_feedback_on_fixed_base_joint(self):
+        builder = newton.ModelBuilder()
+        child = builder.add_link(label="child")
+        hinge = builder.add_joint_revolute(parent=-1, child=child, axis=(0.0, 0.0, 1.0), label="hinge")
+        builder.add_articulation([hinge], label="fixed_robot")
+        dof_index = builder.joint_qd_start[hinge]
+
+        self.assertEqual(builder.joint_q_start[hinge], dof_index)
+        builder.add_actuator(ActuatorPD, input_indices=[dof_index], kp=100.0, kd=0.0, max_force=200.0)
+        builder.finalize(device="cpu")
 
 
 class TestActuatorDelayedPDUnit(unittest.TestCase):

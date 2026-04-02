@@ -1738,6 +1738,61 @@ class ModelBuilder:
         entry.output_indices.append(output_indices)
         entry.args.append(array_params)
 
+    @staticmethod
+    def _actuator_entry_uses_position_feedback(entry: ActuatorEntry) -> bool:
+        """Return whether an actuator entry reads joint position feedback."""
+        for args in entry.args:
+            if float(args.get("kp", 0.0)) != 0.0:
+                return True
+            if float(args.get("ki", 0.0)) != 0.0:
+                return True
+        return False
+
+    def _validate_external_actuator_indexing(self) -> None:
+        """Reject position-sensitive external actuators on joints without 1:1 q/qd indexing."""
+        if not self.actuator_entries or self.joint_dof_count == 0:
+            return
+
+        joint_q_start = copy.copy(self.joint_q_start)
+        joint_q_start.append(self.joint_coord_count)
+        joint_qd_start = copy.copy(self.joint_qd_start)
+        joint_qd_start.append(self.joint_dof_count)
+
+        dof_to_joint = np.full(self.joint_dof_count, -1, dtype=np.int32)
+        for joint_index, dof_start in enumerate(self.joint_qd_start):
+            dof_end = joint_qd_start[joint_index + 1]
+            dof_to_joint[dof_start:dof_end] = joint_index
+
+        for (actuator_class, _scalar_key), entry in self.actuator_entries.items():
+            if not self._actuator_entry_uses_position_feedback(entry):
+                continue
+
+            for actuator_input_indices in entry.input_indices:
+                for dof_index in actuator_input_indices:
+                    if dof_index < 0 or dof_index >= self.joint_dof_count:
+                        continue
+
+                    joint_index = int(dof_to_joint[dof_index])
+                    if joint_index < 0:
+                        continue
+
+                    q_start = joint_q_start[joint_index]
+                    qd_start = joint_qd_start[joint_index]
+                    coord_count = joint_q_start[joint_index + 1] - q_start
+                    dof_count = joint_qd_start[joint_index + 1] - qd_start
+                    if q_start == qd_start and coord_count == dof_count:
+                        continue
+
+                    joint_label = self.joint_label[joint_index]
+                    raise ValueError(
+                        f"{actuator_class.__name__} uses shared DOF input indices for position and velocity "
+                        f"feedback, but joint {joint_index} ('{joint_label}') has joint_q_start={q_start}, "
+                        f"joint_qd_start={qd_start}, joint_coord_count={coord_count}, "
+                        f"joint_dof_count={dof_count}. Position-sensitive external actuators currently require "
+                        f"1:1 joint_q/joint_qd indexing. Use kd-only velocity control, native joint drives, "
+                        f"or separate position/velocity index mappings."
+                    )
+
     def _stack_args_to_arrays(
         self,
         args_list: list[dict[str, Any]],
@@ -10297,6 +10352,7 @@ class ModelBuilder:
             )
 
             # Create actuators from accumulated entries
+            self._validate_external_actuator_indexing()
             m.actuators = []
             for (actuator_class, scalar_key), entry in self.actuator_entries.items():
                 input_indices = self._build_index_array(entry.input_indices, device)

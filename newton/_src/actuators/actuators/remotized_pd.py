@@ -71,6 +71,8 @@ class ActuatorRemotizedPD(ActuatorDelayedPD):
         lookup_angles: wp.array[float] | tuple[float, ...] | list[float],
         lookup_torques: wp.array[float] | tuple[float, ...] | list[float],
         constant_force: wp.array[float] | None = None,
+        *,
+        state_pos_indices: wp.array[wp.uint32] | None = None,
         state_pos_attr: str = "joint_q",
         state_vel_attr: str = "joint_qd",
         control_target_pos_attr: str = "joint_target_pos",
@@ -92,6 +94,7 @@ class ActuatorRemotizedPD(ActuatorDelayedPD):
             lookup_torques: Max output torques [N·m] corresponding to *lookup_angles*.
                 Shape ``(K,)``. Accepts ``wp.array``, ``tuple``, or ``list``.
             constant_force: Constant offsets [N or N·m]. Shape ``(N,)``. ``None`` to skip.
+            state_pos_indices: Coordinate indices for position state.
             state_pos_attr: Attribute on :class:`~newton.State` for positions.
             state_vel_attr: Attribute on :class:`~newton.State` for velocities.
             control_target_pos_attr: Attribute on :class:`~newton.Control` for target positions.
@@ -111,6 +114,7 @@ class ActuatorRemotizedPD(ActuatorDelayedPD):
             delay=delay,
             max_force=max_force_dummy,
             constant_force=constant_force,
+            state_pos_indices=state_pos_indices,
             state_pos_attr=state_pos_attr,
             state_vel_attr=state_vel_attr,
             control_target_pos_attr=control_target_pos_attr,
@@ -164,6 +168,7 @@ class ActuatorRemotizedPD(ActuatorDelayedPD):
                 delayed_pos,
                 delayed_vel,
                 delayed_act,
+                self.state_pos_indices,
                 self.input_indices,
                 self._sequential_indices,
                 output_indices,

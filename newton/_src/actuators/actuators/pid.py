@@ -70,6 +70,8 @@ class ActuatorPID(Actuator):
         max_force: wp.array[float],
         integral_max: wp.array[float],
         constant_force: wp.array[float] | None = None,
+        *,
+        state_pos_indices: wp.array[wp.uint32] | None = None,
         state_pos_attr: str = "joint_q",
         state_vel_attr: str = "joint_qd",
         control_target_pos_attr: str = "joint_target_pos",
@@ -88,6 +90,7 @@ class ActuatorPID(Actuator):
             max_force: Force limits [N or N·m]. Shape ``(N,)``.
             integral_max: Anti-windup limits. Shape ``(N,)``.
             constant_force: Constant offsets [N or N·m]. Shape ``(N,)``. ``None`` to skip.
+            state_pos_indices: Coordinate indices for position state.
             state_pos_attr: Attribute on :class:`~newton.State` for positions.
             state_vel_attr: Attribute on :class:`~newton.State` for velocities.
             control_target_pos_attr: Attribute on :class:`~newton.Control` for target positions.
@@ -95,7 +98,14 @@ class ActuatorPID(Actuator):
             control_input_attr: Attribute on :class:`~newton.Control` for control input. ``None`` to skip.
             control_output_attr: Attribute on :class:`~newton.Control` for output forces.
         """
-        super().__init__(input_indices, output_indices, control_output_attr)
+        if state_pos_indices is None:
+            raise ValueError("ActuatorPID requires explicit state_pos_indices for direct construction")
+        super().__init__(
+            input_indices,
+            output_indices,
+            state_pos_indices=state_pos_indices,
+            control_output_attr=control_output_attr,
+        )
 
         for name, arr in [
             ("kp", kp),
@@ -148,6 +158,7 @@ class ActuatorPID(Actuator):
                 getattr(sim_control, self.control_target_pos_attr),
                 getattr(sim_control, self.control_target_vel_attr),
                 control_input,
+                self.state_pos_indices,
                 self.input_indices,
                 self.input_indices,
                 output_indices,
@@ -178,7 +189,7 @@ class ActuatorPID(Actuator):
             inputs=[
                 getattr(sim_state, self.state_pos_attr),
                 getattr(sim_control, self.control_target_pos_attr),
-                self.input_indices,
+                self.state_pos_indices,
                 self.input_indices,
                 self.integral_max,
                 dt,

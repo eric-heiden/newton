@@ -35,7 +35,8 @@ def pd_controller_kernel(
     target_pos: wp.array[float],
     target_vel: wp.array[float],
     control_input: wp.array[float],
-    state_indices: wp.array[wp.uint32],
+    state_pos_indices: wp.array[wp.uint32],
+    state_vel_indices: wp.array[wp.uint32],
     target_indices: wp.array[wp.uint32],
     output_indices: wp.array[wp.uint32],
     kp: wp.array[float],
@@ -63,12 +64,13 @@ def pd_controller_kernel(
     Result is added to output.
     """
     i = wp.tid()
-    state_idx = state_indices[i]
+    state_pos_idx = state_pos_indices[i]
+    state_vel_idx = state_vel_indices[i]
     target_idx = target_indices[i]
     out_idx = output_indices[i]
 
-    position_error = target_pos[target_idx] - current_pos[state_idx]
-    velocity_error = target_vel[target_idx] - current_vel[state_idx]
+    position_error = target_pos[target_idx] - current_pos[state_pos_idx]
+    velocity_error = target_vel[target_idx] - current_vel[state_vel_idx]
 
     const_f = float(0.0)
     if constant_force:
@@ -81,7 +83,7 @@ def pd_controller_kernel(
     force = const_f + act + kp[i] * position_error + kd[i] * velocity_error
 
     if saturation_effort:
-        vel = current_vel[state_idx]
+        vel = current_vel[state_vel_idx]
         sat = saturation_effort[i]
         vel_lim = velocity_limit[i]
         max_f = max_force[i]
@@ -89,7 +91,7 @@ def pd_controller_kernel(
         min_torque = wp.clamp(sat * (-1.0 - vel / vel_lim), -max_f, 0.0)
         force = wp.clamp(force, min_torque, max_torque)
     elif lookup_size > 0:
-        torque_limit = _interp_1d(current_pos[state_idx], lookup_angles, lookup_torques, lookup_size)
+        torque_limit = _interp_1d(current_pos[state_pos_idx], lookup_angles, lookup_torques, lookup_size)
         force = wp.clamp(force, -torque_limit, torque_limit)
     else:
         force = wp.clamp(force, -max_force[i], max_force[i])
@@ -118,7 +120,8 @@ def pid_controller_kernel(
     target_pos: wp.array[float],
     target_vel: wp.array[float],
     control_input: wp.array[float],
-    state_indices: wp.array[wp.uint32],
+    state_pos_indices: wp.array[wp.uint32],
+    state_vel_indices: wp.array[wp.uint32],
     target_indices: wp.array[wp.uint32],
     output_indices: wp.array[wp.uint32],
     kp: wp.array[float],
@@ -133,12 +136,13 @@ def pid_controller_kernel(
 ):
     """PID control with anti-windup: f = clamp(constant + act + kp*(target_pos - q) + ki*integral + kd*(target_vel - v), ±max_force). Adds to output."""
     i = wp.tid()
-    state_idx = state_indices[i]
+    state_pos_idx = state_pos_indices[i]
+    state_vel_idx = state_vel_indices[i]
     target_idx = target_indices[i]
     out_idx = output_indices[i]
 
-    position_error = target_pos[target_idx] - current_pos[state_idx]
-    velocity_error = target_vel[target_idx] - current_vel[state_idx]
+    position_error = target_pos[target_idx] - current_pos[state_pos_idx]
+    velocity_error = target_vel[target_idx] - current_vel[state_vel_idx]
 
     integral = current_integral[i] + position_error * dt
     integral = wp.clamp(integral, -integral_max[i], integral_max[i])
@@ -161,7 +165,7 @@ def pid_controller_kernel(
 def pid_integral_state_kernel(
     current_pos: wp.array[float],
     target_pos: wp.array[float],
-    state_indices: wp.array[wp.uint32],
+    state_pos_indices: wp.array[wp.uint32],
     target_indices: wp.array[wp.uint32],
     integral_max: wp.array[float],
     dt: float,
@@ -170,10 +174,10 @@ def pid_integral_state_kernel(
 ):
     """Update PID integral state with anti-windup."""
     i = wp.tid()
-    state_idx = state_indices[i]
+    state_pos_idx = state_pos_indices[i]
     target_idx = target_indices[i]
 
-    position_error = target_pos[target_idx] - current_pos[state_idx]
+    position_error = target_pos[target_idx] - current_pos[state_pos_idx]
 
     integral = current_integral[i] + position_error * dt
     integral = wp.clamp(integral, -integral_max[i], integral_max[i])

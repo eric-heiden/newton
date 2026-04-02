@@ -52,6 +52,8 @@ class ActuatorPD(Actuator):
         kd: wp.array[float],
         max_force: wp.array[float],
         constant_force: wp.array[float] | None = None,
+        *,
+        state_pos_indices: wp.array[wp.uint32] | None = None,
         state_pos_attr: str = "joint_q",
         state_vel_attr: str = "joint_qd",
         control_target_pos_attr: str = "joint_target_pos",
@@ -68,6 +70,7 @@ class ActuatorPD(Actuator):
             kd: Derivative gains. Shape ``(N,)``.
             max_force: Force limits [N or N·m]. Shape ``(N,)``.
             constant_force: Constant offsets [N or N·m]. Shape ``(N,)``. ``None`` to skip.
+            state_pos_indices: Coordinate indices for position state.
             state_pos_attr: Attribute on :class:`~newton.State` for positions.
             state_vel_attr: Attribute on :class:`~newton.State` for velocities.
             control_target_pos_attr: Attribute on :class:`~newton.Control` for target positions.
@@ -75,7 +78,14 @@ class ActuatorPD(Actuator):
             control_input_attr: Attribute on :class:`~newton.Control` for control input. ``None`` to skip.
             control_output_attr: Attribute on :class:`~newton.Control` for output forces.
         """
-        super().__init__(input_indices, output_indices, control_output_attr)
+        if state_pos_indices is None:
+            raise ValueError("ActuatorPD requires explicit state_pos_indices for direct construction")
+        super().__init__(
+            input_indices,
+            output_indices,
+            state_pos_indices=state_pos_indices,
+            control_output_attr=control_output_attr,
+        )
 
         for name, arr in [("kp", kp), ("kd", kd), ("max_force", max_force)]:
             if len(arr) != self.num_actuators:
@@ -120,6 +130,7 @@ class ActuatorPD(Actuator):
                 getattr(sim_control, self.control_target_pos_attr),
                 getattr(sim_control, self.control_target_vel_attr),
                 control_input,
+                self.state_pos_indices,
                 self.input_indices,
                 self.input_indices,
                 output_indices,

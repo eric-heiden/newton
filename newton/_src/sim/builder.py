@@ -195,12 +195,13 @@ class ModelBuilder:
     class ActuatorEntry:
         """Stores accumulated indices and arguments for one actuator type + scalar params combo.
 
-        Each element in input_indices/output_indices represents one actuator.
+        Each element in input_indices/state_pos_indices/output_indices represents one actuator.
         For single-input actuators: [[idx1], [idx2], ...] → flattened to 1D array
         For multi-input actuators: [[idx1, idx2], [idx3, idx4], ...] → 2D array
         """
 
         input_indices: list[list[int]]  # Per-actuator input indices
+        state_pos_indices: list[list[int]]  # Per-actuator position-state indices
         output_indices: list[list[int]]  # Per-actuator output indices
         args: list[dict[str, Any]]  # Per-actuator array params (scalar params in dict key)
 
@@ -1679,6 +1680,7 @@ class ModelBuilder:
         actuator_class: type[Actuator],
         input_indices: list[int],
         output_indices: list[int] | None = None,
+        state_pos_indices: list[int] | None = None,
         **kwargs: Any,
     ) -> None:
         """Add an external actuator, independent of any ``UsdPhysics`` joint drives.
@@ -1694,12 +1696,15 @@ class ModelBuilder:
             input_indices: DOF indices this actuator reads from. Length 1 for single-input,
                 length > 1 for multi-input actuators.
             output_indices: DOF indices for writing output. Defaults to *input_indices*.
+            state_pos_indices: Coordinate indices for reading position state. Defaults
+                to the inferred mapping for *input_indices*.
             **kwargs: Actuator parameters (e.g., ``kp``, ``kd``, ``max_force``).
         """
+        resolved = actuator_class.resolve_arguments(kwargs)
+        if state_pos_indices is None:
+            state_pos_indices = self._infer_state_pos_indices(input_indices)
         if output_indices is None:
             output_indices = input_indices.copy()
-
-        resolved = actuator_class.resolve_arguments(kwargs)
 
         # Extract scalar params to form the entry key
         scalar_param_names = getattr(actuator_class, "SCALAR_PARAMS", set())
@@ -1709,7 +1714,7 @@ class ModelBuilder:
         entry_key = (actuator_class, scalar_key)
         entry = self.actuator_entries.setdefault(
             entry_key,
-            ModelBuilder.ActuatorEntry(input_indices=[], output_indices=[], args=[]),
+            ModelBuilder.ActuatorEntry(input_indices=[], state_pos_indices=[], output_indices=[], args=[]),
         )
 
         # Filter out scalar params from args (they're already in the key)
@@ -1724,6 +1729,14 @@ class ModelBuilder:
                     f"expected {expected_input_dim}, got {len(input_indices)}. "
                     f"All actuators of the same type must have the same number of inputs."
                 )
+        if entry.state_pos_indices:
+            expected_state_pos_dim = len(entry.state_pos_indices[0])
+            if len(state_pos_indices) != expected_state_pos_dim:
+                raise ValueError(
+                    f"State position indices dimension mismatch for {actuator_class.__name__}: "
+                    f"expected {expected_state_pos_dim}, got {len(state_pos_indices)}. "
+                    f"All actuators of the same type must have the same number of position-state inputs."
+                )
         if entry.output_indices:
             expected_output_dim = len(entry.output_indices[0])
             if len(output_indices) != expected_output_dim:
@@ -1735,8 +1748,43 @@ class ModelBuilder:
 
         # Each call adds one actuator with its input/output indices
         entry.input_indices.append(input_indices)
+        entry.state_pos_indices.append(state_pos_indices)
         entry.output_indices.append(output_indices)
         entry.args.append(array_params)
+
+    def _infer_state_pos_indices(self, input_indices: list[int]) -> list[int]:
+        """Map actuator DOF indices to position-coordinate indices."""
+        joint_q_start = [*self.joint_q_start, self.joint_coord_count]
+        joint_qd_start = [*self.joint_qd_start, self.joint_dof_count]
+
+        dof_to_joint = np.full(self.joint_dof_count, -1, dtype=np.int32)
+        for joint_index, dof_start in enumerate(self.joint_qd_start):
+            dof_to_joint[dof_start:joint_qd_start[joint_index + 1]] = joint_index
+
+        state_pos_indices: list[int] = []
+        for dof_index in input_indices:
+            if dof_index < 0 or dof_index >= self.joint_dof_count:
+                raise ValueError(f"Actuator input index {dof_index} is out of range for joint_dof_count={self.joint_dof_count}")
+
+            joint_index = int(dof_to_joint[dof_index])
+            if joint_index < 0:
+                raise ValueError(f"Could not resolve joint for actuator input index {dof_index}")
+
+            q_start = joint_q_start[joint_index]
+            qd_start = joint_qd_start[joint_index]
+            coord_count = joint_q_start[joint_index + 1] - q_start
+            dof_count = joint_qd_start[joint_index + 1] - qd_start
+            if coord_count != dof_count:
+                joint_label = self.joint_label[joint_index]
+                raise ValueError(
+                    f"Cannot infer state_pos_indices for joint {joint_index} ('{joint_label}') from DOF index {dof_index}: "
+                    f"joint_coord_count={coord_count}, joint_dof_count={dof_count}. "
+                    f"Pass state_pos_indices=... explicitly."
+                )
+
+            state_pos_indices.append(q_start + (dof_index - qd_start))
+
+        return state_pos_indices
 
     def _stack_args_to_arrays(
         self,
@@ -3266,11 +3314,13 @@ class ModelBuilder:
         for entry_key, sub_entry in builder.actuator_entries.items():
             entry = self.actuator_entries.setdefault(
                 entry_key,
-                ModelBuilder.ActuatorEntry(input_indices=[], output_indices=[], args=[]),
+                ModelBuilder.ActuatorEntry(input_indices=[], state_pos_indices=[], output_indices=[], args=[]),
             )
             # Offset indices by start_joint_dof_idx (each actuator's indices are a list)
             for idx_list in sub_entry.input_indices:
                 entry.input_indices.append([idx + start_joint_dof_idx for idx in idx_list])
+            for idx_list in sub_entry.state_pos_indices:
+                entry.state_pos_indices.append([idx + start_joint_coord_idx for idx in idx_list])
             for idx_list in sub_entry.output_indices:
                 entry.output_indices.append([idx + start_joint_dof_idx for idx in idx_list])
             entry.args.extend(sub_entry.args)
@@ -10300,12 +10350,14 @@ class ModelBuilder:
             m.actuators = []
             for (actuator_class, scalar_key), entry in self.actuator_entries.items():
                 input_indices = self._build_index_array(entry.input_indices, device)
+                state_pos_indices = self._build_index_array(entry.state_pos_indices, device)
                 output_indices = self._build_index_array(entry.output_indices, device)
                 param_arrays = self._stack_args_to_arrays(entry.args, device=device, requires_grad=requires_grad)
                 scalar_params = dict(scalar_key)
                 actuator = actuator_class(
                     input_indices=input_indices,
                     output_indices=output_indices,
+                    state_pos_indices=state_pos_indices,
                     **param_arrays,
                     **scalar_params,
                 )

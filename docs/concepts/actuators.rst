@@ -99,7 +99,9 @@ Stateful Actuators
 ^^^^^^^^^^^^^^^^^^
 
 Stateful actuators (PID, delayed, neural-network) require double-buffered
-state objects::
+state objects. Direct construction must pass ``state_pos_indices`` explicitly;
+builder-created actuators still infer it from ``input_indices`` when that
+mapping is unambiguous::
 
     from newton.actuators import ActuatorPID
 
@@ -107,6 +109,7 @@ state objects::
     pid_actuator = ActuatorPID(
         input_indices=indices,
         output_indices=indices,
+        state_pos_indices=indices,
         kp=wp.array([100.0, 100.0], dtype=wp.float32),
         ki=wp.array([10.0, 10.0], dtype=wp.float32),
         kd=wp.array([5.0, 5.0], dtype=wp.float32),

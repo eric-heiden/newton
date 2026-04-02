@@ -280,6 +280,32 @@ class TestActuatorBuilder(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "state_pos_indices"):
             builder.add_actuator(ActuatorPD, input_indices=[dof], kp=100.0)
 
+    def test_builder_raises_clear_error_for_legacy_actuator_classes(self):
+        """Test that builder surfaces a migration error for actuator classes without state_pos_indices."""
+
+        class LegacyActuator:
+            SCALAR_PARAMS = frozenset()
+
+            @staticmethod
+            def resolve_arguments(kwargs):
+                return kwargs
+
+            def __init__(self, input_indices, output_indices, kp):
+                self.input_indices = input_indices
+                self.output_indices = output_indices
+                self.kp = kp
+
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        joint = builder.add_joint_revolute(parent=-1, child=body, axis=newton.Axis.Z)
+        builder.add_articulation([joint])
+
+        dof = builder.joint_qd_start[joint]
+        builder.add_actuator(LegacyActuator, input_indices=[dof], kp=100.0)
+
+        with self.assertRaisesRegex(TypeError, "does not accept state_pos_indices"):
+            builder.finalize()
+
 
 @unittest.skipUnless(HAS_USD, "pxr not installed")
 class TestActuatorUSDParsing(unittest.TestCase):

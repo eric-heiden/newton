@@ -1759,12 +1759,14 @@ class ModelBuilder:
 
         dof_to_joint = np.full(self.joint_dof_count, -1, dtype=np.int32)
         for joint_index, dof_start in enumerate(self.joint_qd_start):
-            dof_to_joint[dof_start:joint_qd_start[joint_index + 1]] = joint_index
+            dof_to_joint[dof_start : joint_qd_start[joint_index + 1]] = joint_index
 
         state_pos_indices: list[int] = []
         for dof_index in input_indices:
             if dof_index < 0 or dof_index >= self.joint_dof_count:
-                raise ValueError(f"Actuator input index {dof_index} is out of range for joint_dof_count={self.joint_dof_count}")
+                raise ValueError(
+                    f"Actuator input index {dof_index} is out of range for joint_dof_count={self.joint_dof_count}"
+                )
 
             joint_index = int(dof_to_joint[dof_index])
             if joint_index < 0:
@@ -10354,13 +10356,23 @@ class ModelBuilder:
                 output_indices = self._build_index_array(entry.output_indices, device)
                 param_arrays = self._stack_args_to_arrays(entry.args, device=device, requires_grad=requires_grad)
                 scalar_params = dict(scalar_key)
-                actuator = actuator_class(
-                    input_indices=input_indices,
-                    output_indices=output_indices,
-                    state_pos_indices=state_pos_indices,
-                    **param_arrays,
-                    **scalar_params,
-                )
+                try:
+                    actuator = actuator_class(
+                        input_indices=input_indices,
+                        output_indices=output_indices,
+                        state_pos_indices=state_pos_indices,
+                        **param_arrays,
+                        **scalar_params,
+                    )
+                except TypeError as exc:
+                    if "state_pos_indices" not in str(exc):
+                        raise
+                    raise TypeError(
+                        f"{actuator_class.__name__} does not accept state_pos_indices. "
+                        "This usually means ModelBuilder is paired with a legacy actuator class. "
+                        "Switch to newton.actuators or update the actuator class to accept "
+                        "state_pos_indices."
+                    ) from exc
                 m.actuators.append(actuator)
 
             # Add custom attributes onto the model (with lazy evaluation)

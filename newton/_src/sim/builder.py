@@ -1738,25 +1738,13 @@ class ModelBuilder:
         entry.output_indices.append(output_indices)
         entry.args.append(array_params)
 
-    @staticmethod
-    def _actuator_entry_uses_position_feedback(entry: ActuatorEntry) -> bool:
-        """Return whether an actuator entry reads joint position feedback."""
-        for args in entry.args:
-            if float(args.get("kp", 0.0)) != 0.0:
-                return True
-            if float(args.get("ki", 0.0)) != 0.0:
-                return True
-        return False
-
     def _validate_external_actuator_indexing(self) -> None:
         """Reject position-sensitive external actuators on joints without 1:1 q/qd indexing."""
         if not self.actuator_entries or self.joint_dof_count == 0:
             return
 
-        joint_q_start = copy.copy(self.joint_q_start)
-        joint_q_start.append(self.joint_coord_count)
-        joint_qd_start = copy.copy(self.joint_qd_start)
-        joint_qd_start.append(self.joint_dof_count)
+        joint_q_start = [*self.joint_q_start, self.joint_coord_count]
+        joint_qd_start = [*self.joint_qd_start, self.joint_dof_count]
 
         dof_to_joint = np.full(self.joint_dof_count, -1, dtype=np.int32)
         for joint_index, dof_start in enumerate(self.joint_qd_start):
@@ -1764,7 +1752,7 @@ class ModelBuilder:
             dof_to_joint[dof_start:dof_end] = joint_index
 
         for (actuator_class, _scalar_key), entry in self.actuator_entries.items():
-            if not self._actuator_entry_uses_position_feedback(entry):
+            if not any(float(args.get("kp", 0.0)) != 0.0 or float(args.get("ki", 0.0)) != 0.0 for args in entry.args):
                 continue
 
             for actuator_input_indices in entry.input_indices:

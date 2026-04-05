@@ -119,6 +119,7 @@
 - Fix heightfield bounding-sphere radius underestimating Z extent for asymmetric height ranges (e.g. `min_z=0, max_z=10`)
 - Fix VBD self-contact barrier C2 discontinuity at `d = tau` caused by a factor-of-two error in the log-barrier coefficient
 - Fix fast inertia validation treating near-symmetric tensors within `np.allclose()` default tolerances as corrections, aligning CPU and GPU validation warnings
+- Keep XPBD particle-particle contacts finite when particles overlap exactly or have zero tangential slip
 
 ## [1.0.0] - 2026-03-10
 

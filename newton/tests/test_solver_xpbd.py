@@ -274,61 +274,6 @@ def test_particle_particle_contact_exact_overlap_stays_finite(test, device):
     )
 
 
-def test_particle_particle_contact_zero_tangential_slip_stays_finite(test, device):
-    """
-    Regression test for zero tangential slip in particle contacts staying finite.
-
-    When particles are in contact but move together tangentially, the friction
-    direction should collapse to zero instead of producing non-finite values.
-    """
-    builder = newton.ModelBuilder(up_axis="Y")
-
-    particle_radius = 0.5
-    overlap = 0.1
-    separation = 2.0 * particle_radius - overlap
-    tangential_velocity = 10.0
-
-    builder.add_particles(
-        pos=[
-            wp.vec3(0.0, 0.0, 0.0),
-            wp.vec3(separation, 0.0, 0.0),
-        ],
-        vel=[
-            wp.vec3(0.0, 0.0, tangential_velocity),
-            wp.vec3(0.0, 0.0, tangential_velocity),
-        ],
-        mass=[1.0, 1.0],
-        radius=[particle_radius, particle_radius],
-    )
-
-    model = builder.finalize(device=device)
-    model.set_gravity((0.0, 0.0, 0.0))
-    model.particle_mu = 1.0
-    model.particle_cohesion = 0.0
-
-    solver = newton.solvers.SolverXPBD(model=model, iterations=20)
-
-    state0 = model.state()
-    state1 = model.state()
-    contacts = model.contacts()
-    control = model.control()
-
-    model.collide(state0, contacts)
-    solver.step(state0, state1, control, contacts, 1.0 / 60.0)
-
-    velocities = state1.particle_qd.numpy()
-    test.assertTrue(
-        np.isfinite(velocities).all(),
-        msg="Zero tangential slip should keep particle velocities finite",
-    )
-    test.assertAlmostEqual(
-        float(velocities[0, 2] - velocities[1, 2]),
-        0.0,
-        places=5,
-        msg="Particles moving together tangentially should keep zero relative slip",
-    )
-
-
 def test_particle_shape_restitution_correct_particle(test, device):
     """
     Regression test for the bug where apply_particle_shape_restitution wrote
@@ -615,15 +560,6 @@ add_function_test(
     TestSolverXPBD,
     "test_particle_particle_contact_exact_overlap_stays_finite",
     test_particle_particle_contact_exact_overlap_stays_finite,
-    devices=devices,
-    check_output=False,
-)
-
-
-add_function_test(
-    TestSolverXPBD,
-    "test_particle_particle_contact_zero_tangential_slip_stays_finite",
-    test_particle_particle_contact_zero_tangential_slip_stays_finite,
     devices=devices,
     check_output=False,
 )

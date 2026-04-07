@@ -47,17 +47,21 @@ class Actuator:
         self,
         input_indices: wp.array[wp.uint32],
         output_indices: wp.array[wp.uint32],
+        *,
+        state_pos_indices: wp.array[wp.uint32] | None = None,
         control_output_attr: str = "joint_f",
     ):
         """Initialize actuator.
 
         Args:
-            input_indices: DOF indices for reading state and targets.
+            input_indices: DOF indices for reading velocity state and targets.
                 Shape ``(N,)`` for single input per actuator, ``(N, M)`` for
                 multiple inputs per actuator.
             output_indices: DOF indices for writing output forces.
                 Shape ``(N,)`` for single output per actuator, ``(N, K)`` for
                 multiple outputs per actuator.
+            state_pos_indices: Optional coordinate indices for reading position
+                state. Defaults to *input_indices*.
             control_output_attr: Attribute name on :class:`~newton.Control` for output.
         """
         self.input_indices = input_indices
@@ -69,6 +73,16 @@ class Actuator:
             raise ValueError(
                 f"output_indices length ({len(output_indices)}) must match input_indices length ({self.num_actuators})"
             )
+
+        if state_pos_indices is None:
+            state_pos_indices = input_indices
+        if len(state_pos_indices) != self.num_actuators:
+            raise ValueError(
+                f"state_pos_indices length ({len(state_pos_indices)}) must match input_indices length "
+                f"({self.num_actuators})"
+            )
+
+        self.state_pos_indices = state_pos_indices
 
         device = input_indices.device
         self._sequential_indices = wp.array(np.arange(self.num_actuators, dtype=np.uint32), device=device)

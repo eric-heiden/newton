@@ -51,6 +51,10 @@ class TestActuatorBuilder(unittest.TestCase):
         self.assertEqual(act.num_actuators, 3)
 
         np.testing.assert_array_equal(act.input_indices.numpy(), [dofs[0], dofs[1], dofs[1]])
+        np.testing.assert_array_equal(
+            act.state_pos_indices.numpy(),
+            [builder.joint_q_start[joints[0]], builder.joint_q_start[joints[1]], builder.joint_q_start[joints[1]]],
+        )
         np.testing.assert_array_equal(act.output_indices.numpy(), [dofs[0], dofs[1], dofs[2]])
         np.testing.assert_array_almost_equal(act.kp.numpy(), [50.0, 100.0, 150.0])
         np.testing.assert_array_almost_equal(act.kd.numpy(), [0.0, 10.0, 0.0])
@@ -207,6 +211,99 @@ class TestActuatorBuilder(unittest.TestCase):
             builder.add_actuator(ActuatorPD, input_indices=[dofs[1], dofs[2]], kp=200.0)
 
         self.assertIn("dimension mismatch", str(ctx.exception))
+
+    def test_revolute_builder_uses_joint_q_start_for_state_pos_indices(self):
+        """Test that builder stores q-space indices for single-DOF revolute joints."""
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        joint = builder.add_joint_revolute(parent=-1, child=body, axis=newton.Axis.Z)
+        builder.add_articulation([joint])
+
+        dof = builder.joint_qd_start[joint]
+        q_index = builder.joint_q_start[joint]
+        self.assertNotEqual(dof, q_index)
+        builder.add_actuator(ActuatorPD, input_indices=[dof], kp=100.0)
+
+        model = builder.finalize()
+        actuator = model.actuators[0]
+
+        np.testing.assert_array_equal(actuator.input_indices.numpy(), [dof])
+        np.testing.assert_array_equal(actuator.state_pos_indices.numpy(), [q_index])
+
+    def test_floating_base_builder_infers_shifted_state_pos_indices(self):
+        """Test that builder infers q-space indices for downstream joints under a floating root."""
+        builder = newton.ModelBuilder()
+        root = builder.add_body()
+        link = builder.add_body()
+        joint_root = builder.add_joint_free(parent=-1, child=root)
+        joint_hinge = builder.add_joint_revolute(parent=root, child=link, axis=newton.Axis.Z)
+        builder.add_articulation([joint_root, joint_hinge])
+
+        dof = builder.joint_qd_start[joint_hinge]
+        q_index = builder.joint_q_start[joint_hinge]
+        self.assertNotEqual(dof, q_index)
+
+        builder.add_actuator(ActuatorPD, input_indices=[dof], kp=100.0)
+        model = builder.finalize()
+        actuator = model.actuators[0]
+
+        np.testing.assert_array_equal(actuator.input_indices.numpy(), [dof])
+        np.testing.assert_array_equal(actuator.state_pos_indices.numpy(), [q_index])
+
+    def test_builder_preserves_explicit_state_pos_indices(self):
+        """Test that explicit state_pos_indices override builder inference."""
+        builder = newton.ModelBuilder()
+        root = builder.add_body()
+        link = builder.add_body()
+        joint_root = builder.add_joint_free(parent=-1, child=root)
+        joint_hinge = builder.add_joint_revolute(parent=root, child=link, axis=newton.Axis.Z)
+        builder.add_articulation([joint_root, joint_hinge])
+
+        dof = builder.joint_qd_start[joint_hinge]
+        override = builder.joint_q_start[joint_root]
+
+        builder.add_actuator(ActuatorPD, input_indices=[dof], state_pos_indices=[override], kp=100.0)
+        model = builder.finalize()
+        actuator = model.actuators[0]
+
+        np.testing.assert_array_equal(actuator.state_pos_indices.numpy(), [override])
+
+    def test_builder_requires_explicit_state_pos_indices_for_free_joint(self):
+        """Test that builder rejects ambiguous free-joint inference."""
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        joint = builder.add_joint_free(parent=-1, child=body)
+        builder.add_articulation([joint])
+
+        dof = builder.joint_qd_start[joint]
+        with self.assertRaisesRegex(ValueError, "state_pos_indices"):
+            builder.add_actuator(ActuatorPD, input_indices=[dof], kp=100.0)
+
+    def test_builder_raises_clear_error_for_legacy_actuator_classes(self):
+        """Test that builder surfaces a migration error for actuator classes without state_pos_indices."""
+
+        class LegacyActuator:
+            SCALAR_PARAMS = frozenset()
+
+            @staticmethod
+            def resolve_arguments(kwargs):
+                return kwargs
+
+            def __init__(self, input_indices, output_indices, kp):
+                self.input_indices = input_indices
+                self.output_indices = output_indices
+                self.kp = kp
+
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        joint = builder.add_joint_revolute(parent=-1, child=body, axis=newton.Axis.Z)
+        builder.add_articulation([joint])
+
+        dof = builder.joint_qd_start[joint]
+        builder.add_actuator(LegacyActuator, input_indices=[dof], kp=100.0)
+
+        with self.assertRaisesRegex(TypeError, "does not accept state_pos_indices"):
+            builder.finalize()
 
 
 @unittest.skipUnless(HAS_USD, "pxr not installed")

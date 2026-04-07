@@ -96,6 +96,8 @@ class ActuatorNetMLP(Actuator):
         input_idx: list[int] | None = None,
         network: Any = None,
         network_path: str | None = None,
+        *,
+        state_pos_indices: wp.array[wp.uint32] | None = None,
         state_pos_attr: str = "joint_q",
         state_vel_attr: str = "joint_qd",
         control_target_pos_attr: str = "joint_target_pos",
@@ -116,6 +118,7 @@ class ActuatorNetMLP(Actuator):
             network: Pre-trained network (``torch.nn.Module``). If ``None``, loaded from
                 *network_path*.
             network_path: Path to a TorchScript model file. Used when *network* is ``None``.
+            state_pos_indices: Coordinate indices for position state. Defaults to *input_indices*.
             state_pos_attr: Attribute on :class:`~newton.State` for joint positions.
             state_vel_attr: Attribute on :class:`~newton.State` for joint velocities.
             control_target_pos_attr: Attribute on :class:`~newton.Control` for target positions.
@@ -123,7 +126,12 @@ class ActuatorNetMLP(Actuator):
         """
         import torch
 
-        super().__init__(input_indices, output_indices, control_output_attr)
+        super().__init__(
+            input_indices,
+            output_indices,
+            state_pos_indices=state_pos_indices,
+            control_output_attr=control_output_attr,
+        )
 
         if len(max_force) != self.num_actuators:
             raise ValueError(f"max_force length ({len(max_force)}) must match num_actuators ({self.num_actuators})")
@@ -153,7 +161,10 @@ class ActuatorNetMLP(Actuator):
         else:
             raise ValueError("Either 'network' or 'network_path' must be provided")
 
-        self._torch_indices = torch.tensor(input_indices.numpy(), dtype=torch.long, device=self._torch_device)
+        self._torch_indices = torch.tensor(self.input_indices.numpy(), dtype=torch.long, device=self._torch_device)
+        self._torch_state_pos_indices = torch.tensor(
+            self.state_pos_indices.numpy(), dtype=torch.long, device=self._torch_device
+        )
 
         self.state_pos_attr = state_pos_attr
         self.state_vel_attr = state_vel_attr
@@ -175,7 +186,7 @@ class ActuatorNetMLP(Actuator):
         current_vel = wp.to_torch(getattr(sim_state, self.state_vel_attr))
         target_pos = wp.to_torch(getattr(sim_control, self.control_target_pos_attr))
 
-        pos_error = target_pos[self._torch_indices] - current_pos[self._torch_indices]
+        pos_error = target_pos[self._torch_indices] - current_pos[self._torch_state_pos_indices]
         vel = current_vel[self._torch_indices]
 
         # Write current values at index 0; state manager will roll this into history.

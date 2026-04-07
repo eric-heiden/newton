@@ -62,6 +62,7 @@ class TestActuatorPDUnit(unittest.TestCase):
         actuator = ActuatorPD(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([100.0, 100.0, 100.0], dtype=wp.float32),
             kd=wp.array([10.0, 10.0, 10.0], dtype=wp.float32),
             max_force=wp.array([50.0, 50.0, 50.0], dtype=wp.float32),
@@ -79,6 +80,7 @@ class TestActuatorPDUnit(unittest.TestCase):
         actuator = ActuatorPD(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([100.0, 100.0, 100.0], dtype=wp.float32),
             kd=wp.array([0.0, 0.0, 0.0], dtype=wp.float32),
             max_force=wp.array([1000.0, 1000.0, 1000.0], dtype=wp.float32),
@@ -98,6 +100,45 @@ class TestActuatorPDUnit(unittest.TestCase):
         actuator.step(sim_state, sim_control, None, None)
         forces = sim_control.joint_f.numpy()
         np.testing.assert_allclose(forces, [100.0, 200.0, 300.0], rtol=1e-5)
+
+    def test_pd_requires_state_pos_indices(self):
+        """Test that direct PD construction fails without position indices."""
+        indices = wp.array([0], dtype=wp.uint32)
+        with self.assertRaisesRegex(ValueError, "state_pos_indices"):
+            ActuatorPD(
+                input_indices=indices,
+                output_indices=indices,
+                kp=wp.array([100.0], dtype=wp.float32),
+                kd=wp.array([0.0], dtype=wp.float32),
+                max_force=wp.array([1000.0], dtype=wp.float32),
+            )
+
+    def test_pd_actuator_shifted_position_indices(self):
+        """Test that PD can read q from a shifted coordinate index."""
+        input_indices = wp.array([6], dtype=wp.uint32)
+        state_pos_indices = wp.array([7], dtype=wp.uint32)
+        actuator = ActuatorPD(
+            input_indices=input_indices,
+            output_indices=input_indices,
+            state_pos_indices=state_pos_indices,
+            kp=wp.array([10.0], dtype=wp.float32),
+            kd=wp.array([0.0], dtype=wp.float32),
+            max_force=wp.array([1000.0], dtype=wp.float32),
+        )
+
+        sim_state = MockSimState(
+            joint_q=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25], dtype=wp.float32),
+            joint_qd=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.25], dtype=wp.float32),
+            joint_target_vel=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=wp.float32),
+            joint_act=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=wp.float32),
+            joint_f=wp.zeros(7, dtype=wp.float32),
+        )
+
+        actuator.step(sim_state, sim_control, None, None)
+        self.assertAlmostEqual(sim_control.joint_f.numpy()[6], 10.0, places=5)
 
     def test_pd_actuator_resolve_arguments(self):
         """Test that resolve_arguments fills defaults correctly."""
@@ -119,6 +160,7 @@ class TestActuatorDelayedPDUnit(unittest.TestCase):
         actuator = ActuatorDelayedPD(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([100.0, 100.0], dtype=wp.float32),
             kd=wp.array([10.0, 10.0], dtype=wp.float32),
             delay=5,
@@ -137,6 +179,7 @@ class TestActuatorDelayedPDUnit(unittest.TestCase):
         actuator = ActuatorDelayedPD(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([100.0, 100.0], dtype=wp.float32),
             kd=wp.array([10.0, 10.0], dtype=wp.float32),
             delay=delay,
@@ -165,6 +208,7 @@ class TestActuatorDelayedPDUnit(unittest.TestCase):
         actuator = ActuatorDelayedPD(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([1.0], dtype=wp.float32),
             kd=wp.array([0.0], dtype=wp.float32),
             delay=delay,
@@ -220,6 +264,7 @@ class TestActuatorPIDUnit(unittest.TestCase):
         actuator = ActuatorPID(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([100.0, 100.0], dtype=wp.float32),
             ki=wp.array([10.0, 10.0], dtype=wp.float32),
             kd=wp.array([5.0, 5.0], dtype=wp.float32),
@@ -238,6 +283,7 @@ class TestActuatorPIDUnit(unittest.TestCase):
         actuator = ActuatorPID(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([100.0, 100.0], dtype=wp.float32),
             ki=wp.array([10.0, 10.0], dtype=wp.float32),
             kd=wp.array([5.0, 5.0], dtype=wp.float32),
@@ -249,6 +295,51 @@ class TestActuatorPIDUnit(unittest.TestCase):
         self.assertIsInstance(state, ActuatorPID.State)
         self.assertEqual(state.integral.shape[0], num_dofs)
         np.testing.assert_array_equal(state.integral.numpy(), [0.0, 0.0])
+
+    def test_pid_requires_state_pos_indices(self):
+        """Test that direct PID construction fails without position indices."""
+        indices = wp.array([0], dtype=wp.uint32)
+        with self.assertRaisesRegex(ValueError, "state_pos_indices"):
+            ActuatorPID(
+                input_indices=indices,
+                output_indices=indices,
+                kp=wp.array([100.0], dtype=wp.float32),
+                ki=wp.array([10.0], dtype=wp.float32),
+                kd=wp.array([0.0], dtype=wp.float32),
+                max_force=wp.array([1000.0], dtype=wp.float32),
+                integral_max=wp.array([100.0], dtype=wp.float32),
+            )
+
+    def test_pid_actuator_shifted_position_indices(self):
+        """Test that PID can read q from a shifted coordinate index."""
+        input_indices = wp.array([6], dtype=wp.uint32)
+        state_pos_indices = wp.array([7], dtype=wp.uint32)
+        actuator = ActuatorPID(
+            input_indices=input_indices,
+            output_indices=input_indices,
+            state_pos_indices=state_pos_indices,
+            kp=wp.array([10.0], dtype=wp.float32),
+            ki=wp.array([0.0], dtype=wp.float32),
+            kd=wp.array([0.0], dtype=wp.float32),
+            max_force=wp.array([1000.0], dtype=wp.float32),
+            integral_max=wp.array([100.0], dtype=wp.float32),
+        )
+
+        state_a = actuator.state()
+        state_b = actuator.state()
+        sim_state = MockSimState(
+            joint_q=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25], dtype=wp.float32),
+            joint_qd=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.25], dtype=wp.float32),
+            joint_target_vel=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=wp.float32),
+            joint_act=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=wp.float32),
+            joint_f=wp.zeros(7, dtype=wp.float32),
+        )
+
+        actuator.step(sim_state, sim_control, state_a, state_b, dt=0.01)
+        self.assertAlmostEqual(sim_control.joint_f.numpy()[6], 10.0, places=5)
 
 
 class TestActuatorDCMotorUnit(unittest.TestCase):
@@ -263,6 +354,7 @@ class TestActuatorDCMotorUnit(unittest.TestCase):
         actuator = ActuatorDCMotor(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([100.0, 100.0], dtype=wp.float32),
             kd=wp.array([10.0, 10.0], dtype=wp.float32),
             max_force=wp.array([50.0, 50.0], dtype=wp.float32),
@@ -292,6 +384,7 @@ class TestActuatorDCMotorUnit(unittest.TestCase):
         actuator = ActuatorDCMotor(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([100.0], dtype=wp.float32),
             kd=wp.array([0.0], dtype=wp.float32),
             max_force=wp.array([200.0], dtype=wp.float32),
@@ -320,6 +413,7 @@ class TestActuatorDCMotorUnit(unittest.TestCase):
         actuator = ActuatorDCMotor(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([1000.0], dtype=wp.float32),
             kd=wp.array([0.0], dtype=wp.float32),
             max_force=wp.array([200.0], dtype=wp.float32),
@@ -348,6 +442,7 @@ class TestActuatorDCMotorUnit(unittest.TestCase):
         actuator = ActuatorDCMotor(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([1000.0], dtype=wp.float32),
             kd=wp.array([0.0], dtype=wp.float32),
             max_force=wp.array([200.0], dtype=wp.float32),
@@ -376,6 +471,7 @@ class TestActuatorDCMotorUnit(unittest.TestCase):
         actuator = ActuatorDCMotor(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([1000.0], dtype=wp.float32),
             kd=wp.array([0.0], dtype=wp.float32),
             max_force=wp.array([200.0], dtype=wp.float32),
@@ -398,6 +494,35 @@ class TestActuatorDCMotorUnit(unittest.TestCase):
         force = sim_control.joint_f.numpy()[0]
         self.assertAlmostEqual(force, 150.0, places=3)
 
+    def test_dc_motor_shifted_position_indices(self):
+        """Test that DC motor uses shifted position indices for PD error."""
+        input_indices = wp.array([6], dtype=wp.uint32)
+        state_pos_indices = wp.array([7], dtype=wp.uint32)
+        actuator = ActuatorDCMotor(
+            input_indices=input_indices,
+            output_indices=input_indices,
+            state_pos_indices=state_pos_indices,
+            kp=wp.array([10.0], dtype=wp.float32),
+            kd=wp.array([0.0], dtype=wp.float32),
+            max_force=wp.array([1000.0], dtype=wp.float32),
+            saturation_effort=wp.array([1000.0], dtype=wp.float32),
+            velocity_limit=wp.array([10.0], dtype=wp.float32),
+        )
+
+        sim_state = MockSimState(
+            joint_q=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25], dtype=wp.float32),
+            joint_qd=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=wp.float32),
+        )
+        sim_control = MockSimControl(
+            joint_target_pos=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.25], dtype=wp.float32),
+            joint_target_vel=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=wp.float32),
+            joint_act=wp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=wp.float32),
+            joint_f=wp.zeros(7, dtype=wp.float32),
+        )
+
+        actuator.step(sim_state, sim_control, None, None)
+        self.assertAlmostEqual(sim_control.joint_f.numpy()[6], 10.0, places=5)
+
 
 class TestActuatorRemotizedPDUnit(unittest.TestCase):
     """Tests for ActuatorRemotizedPD."""
@@ -419,6 +544,7 @@ class TestActuatorRemotizedPDUnit(unittest.TestCase):
         actuator = ActuatorRemotizedPD(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([100.0, 100.0], dtype=wp.float32),
             kd=wp.array([10.0, 10.0], dtype=wp.float32),
             delay=3,
@@ -446,6 +572,7 @@ class TestActuatorRemotizedPDUnit(unittest.TestCase):
         actuator = ActuatorRemotizedPD(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([1000.0], dtype=wp.float32),
             kd=wp.array([0.0], dtype=wp.float32),
             delay=delay,
@@ -485,6 +612,7 @@ class TestActuatorRemotizedPDUnit(unittest.TestCase):
         actuator = ActuatorRemotizedPD(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([1000.0], dtype=wp.float32),
             kd=wp.array([0.0], dtype=wp.float32),
             delay=delay,
@@ -527,6 +655,7 @@ class TestActuatorRemotizedPDUnit(unittest.TestCase):
         actuator = ActuatorRemotizedPD(
             input_indices=indices,
             output_indices=indices,
+            state_pos_indices=indices,
             kp=wp.array([100.0], dtype=wp.float32),
             kd=wp.array([0.0], dtype=wp.float32),
             delay=delay,

@@ -52,8 +52,16 @@ class Example:
         #   simulation (centimeter scale)
         self.add_cloth = True
         self.add_robot = True
+        self.show_trajectory = getattr(args, "show_trajectory", False)
+        self.show_targets = getattr(args, "show_targets", False)
+        self.pause_on_keyframe = getattr(args, "pause_on_keyframe", False)
+        self._current_keyframe = 0
+        self._keyframe_elapsed = 0.0
+        self._ee_error = 0.0
+        self._finger_error = 0.0
+        self._keyframe_advanced = False
         self.sim_substeps = 10
-        self.iterations = 10
+        self.iterations = 5
         self.fps = 60
         self.frame_dt = 1 / self.fps
         self.sim_dt = self.frame_dt / self.sim_substeps
@@ -101,8 +109,8 @@ class Example:
             self.dof_qd_per_world = franka.joint_dof_count
 
         # add a table (cm scale)
-        self.table_hx_cm = 60.0
-        self.table_hy_cm = 60.0
+        self.table_hx_cm = 40.0
+        self.table_hy_cm = 40.0
         self.table_hz_cm = 10.0
         self.table_pos_cm = wp.vec3(0.0, -50.0, 10.0)
         self.table_shape_idx = self.scene.shape_count
@@ -238,6 +246,22 @@ class Example:
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(wp.vec3(-0.6, 0.6, 1.24), -42.0, -58.0)
+        if hasattr(self.viewer, "register_ui_callback"):
+            self.viewer.register_ui_callback(self.render_ui, position="side")
+
+        # Pre-allocate visualization arrays
+        n_targets = len(self.targets)
+        target_positions_cm = self.targets[:, :3]
+        self.viz_target_points = wp.array((target_positions_cm * self.viz_scale).astype(np.float32), dtype=wp.vec3)
+        self.viz_target_radii = wp.array(np.full(n_targets, 0.008, dtype=np.float32))
+        self.viz_target_colors = wp.array(np.tile([0.2, 1.0, 0.2], (n_targets, 1)).astype(np.float32), dtype=wp.vec3)
+        max_frames = getattr(args, "num_frames", 4800)
+        self.viz_trajectory_points = wp.zeros(max_frames, dtype=wp.vec3)
+        self.viz_trajectory_radii = wp.array(np.full(max_frames, 0.003, dtype=np.float32))
+        self.viz_trajectory_colors = wp.array(
+            np.tile([1.0, 0.2, 0.2], (max_frames, 1)).astype(np.float32), dtype=wp.vec3
+        )
+        self.trajectory_count = 0
 
         # Visualization state for meter-scale rendering
         self.viz_state = self.model.state()
@@ -327,7 +351,7 @@ class Example:
         builder.add_urdf(
             str(asset_path / "urdf" / "fr3_franka_hand.urdf"),
             xform=wp.transform(
-                (-35.0, -15.0, 20.0),
+                (-50.0, -50.0, 0.0),
                 wp.quat_identity(),
             ),
             floating=False,
@@ -337,50 +361,67 @@ class Example:
             force_show_colliders=False,
         )
         builder.joint_q[:6] = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307]
+        builder.joint_q[7] = 3.2  # left finger open (0.8 * 4.0 cm)
+        builder.joint_q[8] = 3.2  # right finger open (0.8 * 4.0 cm)
 
+        # Gripper activation as a fraction of the finger joint range (0-1).
+        # Scaled by the joint upper limit (4 cm at scale=100) to get finger
+        # positions: close = 0.4 cm/finger, open = 3.2 cm/finger.
         clamp_close_activation_val = 0.1
         clamp_open_activation_val = 0.8
 
         self.robot_key_poses = np.array(
             [
                 # translation_duration, gripper transform (3D position [cm], 4D quaternion), gripper activation
-                # top left
-                [4.5, 31.0, -60.0, 19.5, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
-                [1, 31.0, -60.0, 20.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
-                [2, 26.0, -60.0, 26.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
-                [2, 12.0, -60.0, 31.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
-                [3, -6.0, -60.0, 31.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
-                [1, -6.0, -60.0, 31.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
-                # bottom left
-                [2, 15.0, -33.0, 31.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
-                [3, 15.0, -33.0, 21.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
-                [3, 15.0, -33.0, 21.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
-                [2, 15.0, -33.0, 28.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
-                [3, -2.0, -33.0, 28.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
-                [1, -2.0, -33.0, 28.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
-                [1, -2.0, -33.0, 30.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                # top left (tilted gripper for +x reachability)
+                [6.5, 31.0, -60.0, 23.0, 0.9239, 0, 0.3827, 0, clamp_open_activation_val],
+                [2, 31.0, -60.0, 21.25, 0.9239, 0, 0.3827, 0, clamp_open_activation_val],
+                [2, 31.0, -60.0, 21.25, 0.9239, 0, 0.3827, 0, clamp_close_activation_val],
+                [2, 26.0, -60.0, 26.0, 0.9239, 0, 0.3827, 0, clamp_close_activation_val],
+                [2, 12.0, -60.0, 31.0, 0.9239, 0, 0.3827, 0, clamp_close_activation_val],
+                [3, -6.0, -60.0, 31.0, 0.9239, 0, 0.3827, 0, clamp_close_activation_val],
+                [1, -6.0, -60.0, 31.0, 0.9239, 0, 0.3827, 0, clamp_open_activation_val],
+                [1, -6.0, -60.0, 35.0, 0.9239, 0, 0.3827, 0, clamp_open_activation_val],
+                # bottom left (tilted gripper for +x reachability)
+                [2, 15.0, -33.0, 31.0, 0.9239, 0, 0.3827, 0, clamp_open_activation_val],
+                [3, 15.0, -33.0, 21.25, 0.9239, 0, 0.3827, 0, clamp_open_activation_val],
+                [2, 15.0, -33.0, 21.25, 0.9239, 0, 0.3827, 0, clamp_open_activation_val],
+                [2, 15.0, -33.0, 21.25, 0.9239, 0, 0.3827, 0, clamp_close_activation_val],
+                [2, 15.0, -33.0, 28.0, 0.9239, 0, 0.3827, 0, clamp_close_activation_val],
+                [3, -2.0, -33.0, 28.0, 0.9239, 0, 0.3827, 0, clamp_close_activation_val],
+                [1, -2.0, -33.0, 31.0, 0.9239, 0, 0.3827, 0, clamp_close_activation_val],
+                [1, -2.0, -33.0, 31.0, 0.9239, 0, 0.3827, 0, clamp_open_activation_val],
+                [1, -2.0, -33.0, 35.0, 0.9239, 0, 0.3827, 0, clamp_open_activation_val],
                 # top right
                 [2, -28.0, -60.0, 28.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
-                [2, -28.0, -60.0, 20.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
-                [2, -28.0, -60.0, 20.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [2, -28.0, -60.0, 21.25, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [2, -28.0, -60.0, 21.25, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [2, -28.0, -60.0, 21.25, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
                 [2, -18.0, -60.0, 31.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
                 [3, 5.0, -60.0, 31.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
                 [1, 5.0, -60.0, 31.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [1, 5.0, -60.0, 35.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
                 # bottom right
-                [3, -18.0, -30.0, 20.5, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
-                [3, -18.0, -30.0, 20.5, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [3, -18.0, -30.0, 21.25, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [2, -18.0, -30.0, 21.25, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [2, -18.0, -30.0, 21.25, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
                 [2, -3.0, -30.0, 31.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
                 [3, -3.0, -30.0, 31.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
-                [2, -3.0, -30.0, 31.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
-                # bottom
-                [2, 0.0, -20.0, 30.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
-                [2, 0.0, -20.0, 19.5, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
-                [2, 0.0, -20.0, 19.5, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
-                [2, 0.0, -20.0, 35.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
-                [1, 0.0, -30.0, 35.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
-                [1.5, 0.0, -30.0, 35.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
-                [1.5, 0.0, -40.0, 35.0, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
-                [1.5, 0.0, -40.0, 35.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [1, -3.0, -30.0, 31.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [1, -3.0, -30.0, 35.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                # bottom (tilted gripper toward +y for reachability)
+                [2, 0.0, -20.0, 30.0, 0.6533, 0.6533, 0.2706, -0.2706, clamp_open_activation_val],
+                [2, 0.0, -20.0, 21.25, 0.6533, 0.6533, 0.2706, -0.2706, clamp_open_activation_val],
+                [2, 0.0, -20.0, 21.25, 0.6533, 0.6533, 0.2706, -0.2706, clamp_open_activation_val],
+                [1, 0.0, -20.0, 21.25, 0.6533, 0.6533, 0.2706, -0.2706, clamp_close_activation_val],
+                [2, 0.0, -20.0, 21.25, 0.6533, 0.6533, 0.2706, -0.2706, clamp_close_activation_val],
+                [2, 0.0, -20.0, 35.0, 0.6533, 0.6533, 0.2706, -0.2706, clamp_close_activation_val],
+                [1, 0.0, -30.0, 35.0, 0.6533, 0.6533, 0.2706, -0.2706, clamp_close_activation_val],
+                [1.5, 0.0, -30.0, 35.0, 0.6533, 0.6533, 0.2706, -0.2706, clamp_close_activation_val],
+                [1.5, 0.0, -40.0, 35.0, 0.6533, 0.6533, 0.2706, -0.2706, clamp_close_activation_val],
+                [1, 0.0, -40.0, 31.0, 0.6533, 0.6533, 0.2706, -0.2706, clamp_close_activation_val],
+                [1.5, 0.0, -40.0, 31.0, 0.6533, 0.6533, 0.2706, -0.2706, clamp_open_activation_val],
+                [1, 0.0, -40.0, 35.0, 0.6533, 0.6533, 0.2706, -0.2706, clamp_open_activation_val],
                 [2, -28.0, -60.0, 28.0, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
             ],
             dtype=np.float32,
@@ -396,19 +437,56 @@ class Example:
         # (see fr3_franka_hand.urdf).  Without this rotation the IK drives
         # toward link8's frame and the gripper ends up with a constant
         # 45-degree yaw offset from the desired orientation.
-        self.ee_link_offset = wp.vec3(0.0, 0.0, 22.0)
-        self.ee_link_rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), -np.pi / 4.0 + np.pi / 2.0)
+        self.ee_link_offset = wp.vec3(0.0, 0.0, 21.04)
+        self.ee_link_rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), -np.pi / 4.0)
 
     def generate_control_joint_qd(self, state_in: State):
+        # Deferred pause: if a keyframe advanced last frame, pause now
+        # so the viewer shows the state *before* the new keyframe starts.
+        if self._keyframe_advanced:
+            self._current_keyframe += 1
+            self._keyframe_elapsed = 0.0
+            self._keyframe_advanced = False
+
         # After the key poses sequence ends, hold position with zero velocity
-        if self.sim_time >= self.robot_key_poses_time[-1]:
+        if self._current_keyframe >= len(self.targets):
             self.target_joint_qd.zero_()
             return
 
-        current_interval = np.searchsorted(self.robot_key_poses_time, self.sim_time)
-        target = self.targets[current_interval]
+        # Compute EE tip error and finger error for convergence check
+        body_q_np = state_in.body_q.numpy()
+        ee_tf = body_q_np[self.endeffector_id]
+        ee_xform = wp.transform(*ee_tf)
+        ee_tip = wp.transform_point(ee_xform, self.ee_link_offset)
+        target_pos = self.targets[self._current_keyframe][:3]
+        self._ee_error = float(np.linalg.norm(np.array([ee_tip[0], ee_tip[1], ee_tip[2]]) - target_pos))
 
-        # Update IK targets from current key pose
+        current_q = state_in.joint_q.numpy()
+        finger_target = float(self.targets[self._current_keyframe][-1]) * 4.0
+        self._finger_error = max(abs(current_q[-2] - finger_target), abs(current_q[-1] - finger_target))
+
+        # Advance to next keyframe only when the soft time limit has elapsed,
+        # the EE tip has converged, AND the fingers have reached their target.
+        soft_limit = float(self.transition_duration[self._current_keyframe])
+        if self._keyframe_elapsed >= soft_limit and self._ee_error < 0.1 and self._finger_error < 0.1:
+            self._keyframe_advanced = True
+            if self.pause_on_keyframe and hasattr(self.viewer, "_paused"):
+                self.viewer._paused = True
+            return
+
+        self._keyframe_elapsed += self.frame_dt
+
+        current_interval = self._current_keyframe
+
+        # Interpolate toward the current keyframe target using elapsed time
+        # as a fraction of the soft time limit.
+        alpha = float(np.clip(self._keyframe_elapsed / soft_limit, 0.0, 1.0))
+
+        target_cur = self.targets[current_interval]
+        target_prev = self.targets[current_interval - 1] if current_interval > 0 else target_cur
+        target = (1.0 - alpha) * target_prev + alpha * target_cur
+
+        # Update IK targets from interpolated pose
         self.pos_obj.set_target_position(0, wp.vec3(float(target[0]), float(target[1]), float(target[2])))
         self.rot_obj.set_target_rotation(
             0, wp.vec4(float(target[3]), float(target[4]), float(target[5]), float(target[6]))
@@ -426,9 +504,11 @@ class Example:
         target_q = ik_flat.numpy()
         delta_q = target_q - current_q
 
-        # Apply gripper finger control (finger positions in cm)
-        delta_q[-2] = target[-1] * 4.0 - current_q[-2]
-        delta_q[-1] = target[-1] * 4.0 - current_q[-1]
+        # Apply gripper finger control. Activation values (0-1) are scaled to
+        # the finger joint range (0-4 cm at scale=100).
+        finger_pos_target = target[-1] * 4.0
+        delta_q[-2] = 1.0 * (finger_pos_target - current_q[-2])
+        delta_q[-1] = 1.0 * (finger_pos_target - current_q[-1])
 
         self.target_joint_qd.assign(delta_q)
 
@@ -503,6 +583,21 @@ class Example:
         self.model.shape_transform = self.viz_shape_transform
         self.model.shape_scale = self.viz_shape_scale
 
+        # Accumulate EE tip position for trajectory visualization (circular buffer)
+        if self.add_robot:
+            ee_body_q = self.viz_state.body_q.numpy()[self.endeffector_id]
+            ee_xform = wp.transform(*ee_body_q)
+            tip_pos = wp.transform_point(ee_xform, self.ee_link_offset * self.viz_scale)
+            buf_size = self.viz_trajectory_points.shape[0]
+            idx = self.trajectory_count % buf_size
+            wp.copy(
+                self.viz_trajectory_points,
+                wp.array([tip_pos], dtype=wp.vec3),
+                dest_offset=idx,
+                count=1,
+            )
+            self.trajectory_count += 1
+
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.viz_state)
         # Render the table box manually at meter scale
@@ -513,11 +608,37 @@ class Example:
             self.table_viz_xform,
             self.table_viz_color,
         )
+        if self.show_trajectory and self.trajectory_count > 0:
+            n = min(self.trajectory_count, self.viz_trajectory_points.shape[0])
+            self.viewer.log_points(
+                "/ee_trajectory",
+                self.viz_trajectory_points[:n],
+                radii=self.viz_trajectory_radii[:n],
+                colors=self.viz_trajectory_colors[:n],
+            )
+        if self.show_targets:
+            self.viewer.log_points(
+                "/targets",
+                self.viz_target_points,
+                radii=self.viz_target_radii,
+                colors=self.viz_target_colors,
+            )
         self.viewer.end_frame()
 
         # Restore simulation shape data
         self.model.shape_transform = self.sim_shape_transform
         self.model.shape_scale = self.sim_shape_scale
+
+    def render_ui(self, imgui):
+        _changed, self.show_trajectory = imgui.checkbox("Show Trajectory", self.show_trajectory)
+        _changed, self.show_targets = imgui.checkbox("Show Targets", self.show_targets)
+        _changed, self.pause_on_keyframe = imgui.checkbox("Pause on Keyframe", self.pause_on_keyframe)
+        imgui.text(f"EE error: {self._ee_error:.2f} cm")
+        imgui.text(f"Finger error: {self._finger_error:.3f} cm")
+        imgui.text(f"Keyframe: {self._current_keyframe} / {len(self.targets)}")
+        imgui.text(f"Elapsed: {self._keyframe_elapsed:.2f} s")
+        if self._current_keyframe < len(self.transition_duration):
+            imgui.text(f"Soft limit: {self.transition_duration[self._current_keyframe]:.1f} s")
 
     def test_final(self):
         p_lower = wp.vec3(-36.0, -95.0, -5.0)
@@ -543,7 +664,10 @@ class Example:
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
     parser = newton.examples.create_parser()
-    parser.set_defaults(num_frames=3850)
+    parser.set_defaults(num_frames=4800)
+    parser.add_argument("--show-trajectory", action="store_true", help="Draw EE tip trajectory as spheres")
+    parser.add_argument("--show-targets", action="store_true", help="Draw keyframe target positions as spheres")
+    parser.add_argument("--pause-on-keyframe", action="store_true", help="Pause viewer at each keyframe transition")
     viewer, args = newton.examples.init(parser)
 
     # Create example and run

@@ -10,8 +10,8 @@ from typing import Any
 import warp as wp
 
 from ...core.types import vec5
-from ...math import velocity_at_point
 from ...sim import BodyFlags, EqType, JointTargetMode, JointType
+from ...sim.articulation import com_twist_to_point_velocity, origin_twist_to_com_twist
 
 
 def _import_contact_force_fn():
@@ -494,7 +494,8 @@ def convert_mj_coords_to_warp_kernel(
         joint_q[wq_i + 6] = rot[3]
 
         # MuJoCo qvel: linear velocity of body ORIGIN (world frame), angular velocity (body frame)
-        # Newton joint_qd: linear velocity of CoM (world frame), angular velocity (world frame)
+        # Newton's MuJoCo FREE-root bridge uses a CoM/world twist. More generally,
+        # descendant FREE/DISTANCE joint_qd remains expressed in the joint parent frame.
         #
         # Relationship: v_com = v_origin + ω x com_offset_world
         # where com_offset_world = quat_rotate(body_rotation, body_com)
@@ -597,7 +598,8 @@ def convert_warp_coords_to_mj_kernel(
         qpos[worldid, q_i + 5] = rot_wxyz[2]
         qpos[worldid, q_i + 6] = rot_wxyz[3]
 
-        # Newton joint_qd: linear velocity of CoM (world frame), angular velocity (world frame)
+        # Newton's MuJoCo FREE-root bridge uses a CoM/world twist. More generally,
+        # descendant FREE/DISTANCE joint_qd remains expressed in the joint parent frame.
         # MuJoCo qvel: linear velocity of body ORIGIN (world frame), angular velocity (body frame)
         #
         # Relationship: v_origin = v_com - ω x com_offset_world
@@ -720,6 +722,213 @@ def sync_qpos0_kernel(
                 springref = dof_springref[wqd_i + i]
             qpos0[worldid, q_i + i] = ref
             qpos_spring[worldid, q_i + i] = springref
+
+
+@wp.kernel
+def build_ref_q_kernel(
+    joint_type: wp.array[wp.int32],
+    joint_q_start: wp.array[wp.int32],
+    joint_qd_start: wp.array[wp.int32],
+    joint_dof_dim: wp.array2d[wp.int32],
+    joint_child: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    dof_ref: wp.array[wp.float32],
+    # output
+    ref_q: wp.array[wp.float32],
+):
+    """Build reference joint coordinates from joint types and ``dof_ref``.
+
+    Iterates over joints ``[j]``. Produces joint coordinates in Newton
+    convention (xyzw quaternions) suitable for ``eval_articulation_fk``.
+    Per joint type:
+
+    - **FREE / DISTANCE**: position and quaternion [xyzw] from ``body_q``
+      of the child body.
+    - **BALL**: identity quaternion [xyzw].
+    - **PRISMATIC / REVOLUTE / D6**: copies ``dof_ref`` values [m or rad]
+      (or zero when ``dof_ref`` is ``None``).
+    - **FIXED** and others: no DOFs, no writes.
+
+    Args:
+        joint_type: Joint type enum per joint, shape ``[joint_count]``.
+        joint_q_start: Start index into ``ref_q`` for each joint,
+            shape ``[joint_count]``.
+        joint_qd_start: Start index into ``dof_ref`` for each joint,
+            shape ``[joint_count]``.
+        joint_dof_dim: Positional and rotational DOF counts per joint,
+            shape ``[joint_count, 2]``.
+        joint_child: Child body index per joint, shape ``[joint_count]``.
+        body_q: Body transforms [m], shape ``[body_count]``,
+            dtype ``wp.transform``.
+        dof_ref: Reference DOF values [m or rad], shape ``[joint_dof_count]``.
+            May be ``None``, in which case zeros are used.
+        ref_q: *(output)* Reference joint coordinates [m or rad],
+            shape ``[joint_coord_count]``.
+    """
+    j = wp.tid()
+    jtype = joint_type[j]
+    q_start = joint_q_start[j]
+    qd_start = joint_qd_start[j]
+
+    if jtype == JointType.FREE or jtype == JointType.DISTANCE:
+        child = joint_child[j]
+        bq = body_q[child]
+        pos = wp.transform_get_translation(bq)
+        rot = wp.transform_get_rotation(bq)
+        ref_q[q_start + 0] = pos[0]
+        ref_q[q_start + 1] = pos[1]
+        ref_q[q_start + 2] = pos[2]
+        ref_q[q_start + 3] = rot[0]
+        ref_q[q_start + 4] = rot[1]
+        ref_q[q_start + 5] = rot[2]
+        ref_q[q_start + 6] = rot[3]
+    elif jtype == JointType.BALL:
+        ref_q[q_start + 0] = 0.0
+        ref_q[q_start + 1] = 0.0
+        ref_q[q_start + 2] = 0.0
+        ref_q[q_start + 3] = 1.0
+    elif jtype == JointType.PRISMATIC or jtype == JointType.REVOLUTE or jtype == JointType.D6:
+        coord_count = joint_dof_dim[j, 0] + joint_dof_dim[j, 1]
+        for k in range(coord_count):
+            ref_val = float(0.0)
+            if dof_ref:
+                ref_val = dof_ref[qd_start + k]
+            ref_q[q_start + k] = ref_val
+
+
+@wp.kernel
+def update_connect_constraint_rel_body_poses_at_qref_kernel(
+    eq_constraint_type: wp.array[wp.int32],
+    eq_constraint_body1: wp.array[wp.int32],
+    eq_constraint_body2: wp.array[wp.int32],
+    ref_body_q: wp.array[wp.transform],
+    # outputs
+    q_rel_out: wp.array[wp.quat],
+    t_rel_out: wp.array[wp.vec3],
+):
+    """Compute relative body transforms for CONNECT constraints at the reference pose.
+
+    Iterates over equality constraints ``[i]``. For each CONNECT constraint,
+    computes ``q_rel`` and ``t_rel`` from the reference body poses such that::
+
+        anchor2 = quat_rotate(q_rel, anchor1) + t_rel
+
+    where ``q_rel = inv(q2) * q1`` and
+    ``t_rel = quat_rotate(inv(q2), pos1 - pos2)``.
+
+    These values are constant for a given reference configuration, so when
+    ``anchor1`` changes at runtime ``anchor2`` can be recomputed without
+    re-running forward kinematics. Non-CONNECT constraints are skipped.
+
+    Args:
+        eq_constraint_type: Constraint type enum per constraint,
+            shape ``[equality_constraint_count]``.
+        eq_constraint_body1: First body index per constraint (-1 for world),
+            shape ``[equality_constraint_count]``.
+        eq_constraint_body2: Second body index per constraint (-1 for world),
+            shape ``[equality_constraint_count]``.
+        ref_body_q: Body transforms at the reference pose [m],
+            shape ``[body_count]``, dtype ``wp.transform``.
+        q_rel_out: *(output)* Relative rotation ``inv(q2) * q1`` per
+            constraint, shape ``[equality_constraint_count]``,
+            dtype ``wp.quat``.
+        t_rel_out: *(output)* Relative translation [m] per constraint,
+            shape ``[equality_constraint_count]``, dtype ``wp.vec3``.
+    """
+    i = wp.tid()
+
+    if eq_constraint_type[i] != EqType.CONNECT:
+        return
+
+    body1 = eq_constraint_body1[i]
+    body2 = eq_constraint_body2[i]
+
+    # Extract world-space pose for body1
+    if body1 == -1:
+        pos1 = wp.vec3(0.0, 0.0, 0.0)
+        q1 = wp.quat_identity()
+    else:
+        tf1 = ref_body_q[body1]
+        pos1 = wp.transform_get_translation(tf1)
+        q1 = wp.transform_get_rotation(tf1)
+
+    # Extract world-space pose for body2
+    if body2 == -1:
+        pos2 = wp.vec3(0.0, 0.0, 0.0)
+        q2 = wp.quat_identity()
+    else:
+        tf2 = ref_body_q[body2]
+        pos2 = wp.transform_get_translation(tf2)
+        q2 = wp.transform_get_rotation(tf2)
+
+    # q_rel = inv(q2) * q1
+    # t = quat_rotate(inv(q2), pos1 - pos2)
+    q2_inv = wp.quat_inverse(q2)
+    q_rel_out[i] = q2_inv * q1
+    t_rel_out[i] = wp.quat_rotate(q2_inv, pos1 - pos2)
+
+
+@wp.kernel
+def update_connect_constraint_anchors_kernel(
+    mjc_eq_to_newton_eq: wp.array2d[wp.int32],
+    eq_constraint_type: wp.array[wp.int32],
+    eq_constraint_anchor: wp.array[wp.vec3],
+    connect_anchor2_q: wp.array[wp.quat],
+    connect_anchor2_t: wp.array[wp.vec3],
+    # output
+    eq_data_out: wp.array2d[vec11],
+):
+    """Write CONNECT constraint anchors into MuJoCo ``eq_data``.
+
+    Iterates over MuJoCo equality constraints ``[world, eq]``. For each
+    CONNECT constraint, copies ``anchor1`` [m] from Newton into
+    ``eq_data[0:3]`` and computes::
+
+        anchor2 = quat_rotate(q_rel, anchor1) + t_rel
+
+    into ``eq_data[3:6]``. Non-CONNECT constraints and unmapped entries
+    (``newton_eq < 0``) are skipped.
+
+    Args:
+        mjc_eq_to_newton_eq: Mapping from MuJoCo ``[world, eq]`` to Newton
+            equality constraint index, shape ``[world_count, neq]``.
+            Negative values indicate unmapped entries.
+        eq_constraint_type: Constraint type enum per Newton constraint,
+            shape ``[equality_constraint_count]``.
+        eq_constraint_anchor: Anchor position on body 1 [m] per Newton
+            constraint, shape ``[equality_constraint_count]``,
+            dtype ``wp.vec3``.
+        connect_anchor2_q: Precomputed relative rotation per constraint,
+            shape ``[equality_constraint_count]``, dtype ``wp.quat``.
+        connect_anchor2_t: Precomputed relative translation [m] per
+            constraint, shape ``[equality_constraint_count]``,
+            dtype ``wp.vec3``.
+        eq_data_out: *(output)* MuJoCo equality constraint data,
+            shape ``[world_count, neq]``, dtype ``vec11``.
+            Slots ``[0:3]`` receive ``anchor1`` and ``[3:6]`` receive
+            ``anchor2``.
+    """
+    world, mjc_eq = wp.tid()
+    newton_eq = mjc_eq_to_newton_eq[world, mjc_eq]
+    if newton_eq < 0:
+        return
+
+    if eq_constraint_type[newton_eq] != EqType.CONNECT:
+        return
+
+    anchor = eq_constraint_anchor[newton_eq]
+    q = connect_anchor2_q[newton_eq]
+    t = connect_anchor2_t[newton_eq]
+    anchor2 = wp.quat_rotate(q, anchor) + t
+
+    data = eq_data_out[world, mjc_eq]
+    data[0] = anchor[0]
+    data[1] = anchor[1]
+    data[2] = anchor[2]
+    data[3] = anchor2[0]
+    data[4] = anchor2[1]
+    data[5] = anchor2[2]
+    eq_data_out[world, mjc_eq] = data
 
 
 def create_convert_mjw_contacts_to_newton_kernel():
@@ -1088,27 +1297,31 @@ def eval_single_articulation_fk(
         # transform from world to child body frame
         X_wc = X_wcj * wp.transform_inverse(X_cj)
 
+        x_child_origin = wp.transform_get_translation(X_wc)
         v_parent_origin = wp.vec3()
         w_parent = wp.vec3()
         if parent >= 0:
             v_wp = body_qd[parent]
             w_parent = wp.spatial_bottom(v_wp)
-            v_parent_origin = velocity_at_point(
-                v_wp, wp.transform_get_translation(X_wc) - wp.transform_get_translation(X_wp)
-            )
+            v_parent_origin = com_twist_to_point_velocity(v_wp, X_wp, body_com[parent], x_child_origin)
 
-        linear_joint_anchor = wp.transform_vector(X_wpj, wp.spatial_top(v_j))
+        linear_joint_world = wp.transform_vector(X_wpj, wp.spatial_top(v_j))
         angular_joint_world = wp.transform_vector(X_wpj, wp.spatial_bottom(v_j))
-        child_origin_offset_world = wp.transform_get_translation(X_wc) - wp.transform_get_translation(X_wcj)
-        linear_joint_origin = linear_joint_anchor + wp.cross(angular_joint_world, child_origin_offset_world)
+        if type == JointType.FREE or type == JointType.DISTANCE:
+            linear_joint_origin = linear_joint_world - wp.cross(
+                angular_joint_world, wp.transform_vector(X_wc, body_com[child])
+            )
+        else:
+            child_origin_offset_world = x_child_origin - wp.transform_get_translation(X_wcj)
+            linear_joint_origin = linear_joint_world + wp.cross(angular_joint_world, child_origin_offset_world)
 
-        v_wc = wp.spatial_vector(
+        v_wc_origin = wp.spatial_vector(
             v_parent_origin + linear_joint_origin,
             w_parent + angular_joint_world,
         )  # spatial vector with (linear, angular) ordering
 
         body_q[child] = X_wc
-        body_qd[child] = v_wc
+        body_qd[child] = origin_twist_to_com_twist(v_wc_origin, X_wc, body_com[child])
 
 
 @wp.kernel
@@ -2165,10 +2378,9 @@ def convert_qfrc_actuator_from_mj_kernel(
     """Convert MuJoCo qfrc_actuator [nworld, nv] into Newton flat DOF array.
 
     Uses the same joint-based DOF mapping as the coordinate conversion
-    kernels.  For free joints the wrench is transformed from MuJoCo's
-    (origin, body-frame) convention to Newton's (CoM, world-frame)
-    convention (dual of the velocity transform).  Ball and other joints
-    are copied directly.
+    kernels. For free joints the wrench is transformed from MuJoCo's
+    (origin, body-frame) convention to the CoM/world convention used on the
+    MuJoCo side of Newton. Ball and other joints are copied directly.
     """
     worldid, jntid = wp.tid()
 

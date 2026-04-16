@@ -154,6 +154,7 @@ def parse_mjcf(
     armature_scale: float = 1.0,
     scale: float = 1.0,
     hide_visuals: bool = False,
+    visual_stl_cleanup: bool = False,
     parse_visuals_as_colliders: bool = False,
     parse_meshes: bool = True,
     parse_sites: bool = True,
@@ -260,6 +261,11 @@ def parse_mjcf(
         armature_scale: Scaling factor to apply to the MJCF-defined joint armature values.
         scale: The scaling factor to apply to the imported mechanism.
         hide_visuals: If True, hide visual shapes after loading them (affects visibility, not loading).
+        visual_stl_cleanup: If True, weld near-duplicate vertices and recompute smooth normals
+            for STL meshes loaded for visual geoms. Collision meshes and non-STL formats are not
+            modified. STL's triangle-soup layout (no shared vertex indices, no authored normals or
+            UVs) causes visible faceting that benefits from welding; other formats typically
+            preserve authored topology/normals/UVs that welding would incorrectly collapse.
         parse_visuals_as_colliders: If True, the geometry defined under the `visual_classes` tags is used for collision handling instead of the `collider_classes` geometries.
         parse_meshes: Whether geometries of type `"mesh"` should be parsed. If False, geometries of type `"mesh"` are ignored.
         parse_sites: Whether sites (non-colliding reference points) should be parsed. If False, sites are ignored.
@@ -866,12 +872,22 @@ def parse_mjcf(
                 # get maxhullvert value from mesh assets
                 maxhullvert = mesh_assets[geom_attrib["mesh"]].get("maxhullvert", mesh_maxhullvert)
 
+                # Vertex welding + smooth-normal regeneration is only applied to STL visual meshes:
+                # STL stores each triangle as its own triplet of vertices (no shared indices, no authored
+                # normals or UVs), so welding near-duplicates is safe and fixes visible faceting. Other
+                # mesh formats (OBJ, DAE, glTF, USD) carry authored connectivity, normals, and UVs that
+                # welding would incorrectly collapse across intentional seams.
                 m_meshes = load_meshes_from_file(
                     stl_file,
                     scale=scaling,
                     maxhullvert=maxhullvert,
                     override_color=material_color,
                     override_texture=texture,
+                    weld_vertices_epsilon=(
+                        1.0e-6
+                        if just_visual and visual_stl_cleanup and os.path.splitext(stl_file)[1].lower() == ".stl"
+                        else None
+                    ),
                 )
                 for m_mesh in m_meshes:
                     if m_mesh.texture is not None and m_mesh.uvs is None:

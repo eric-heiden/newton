@@ -126,6 +126,139 @@ class TestImportMjcfBasic(unittest.TestCase):
                 self.assertEqual(meshes[1].maxhullvert, 128)
                 self.assertEqual(meshes[2].maxhullvert, 64)  # Default value
 
+    def _write_visual_stl_mjcf(self, tmpdir):
+        """Write a minimal MJCF scene whose only geom is a visual STL wedge."""
+        stl_content = """solid wedge
+  facet normal 0 0 1
+    outer loop
+      vertex 0 0 0
+      vertex 1 0 0
+      vertex 0 1 0
+    endloop
+  endfacet
+  facet normal 1 0 0
+    outer loop
+      vertex 0 0 0.0000005
+      vertex 0 1 0.0000005
+      vertex 0 0 1
+    endloop
+  endfacet
+endsolid wedge
+"""
+        mjcf_content = """<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<mujoco model=\"wedge_test\">
+    <default>
+        <default class=\"visual\"/>
+    </default>
+    <asset>
+        <mesh name=\"wedge\" file=\"wedge.stl\"/>
+    </asset>
+    <worldbody>
+        <body>
+            <geom type=\"mesh\" mesh=\"wedge\" class=\"visual\"/>
+        </body>
+    </worldbody>
+</mujoco>
+"""
+        stl_path = os.path.join(tmpdir, "wedge.stl")
+        mjcf_path = os.path.join(tmpdir, "wedge.xml")
+        with open(stl_path, "w") as f:
+            f.write(stl_content)
+        with open(mjcf_path, "w") as f:
+            f.write(mjcf_content)
+        return mjcf_path
+
+    def test_mjcf_visual_stl_cleanup_can_be_enabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mjcf_path = self._write_visual_stl_mjcf(tmpdir)
+
+            builder = newton.ModelBuilder()
+            builder.add_mjcf(mjcf_path, up_axis="Z", visual_stl_cleanup=True)
+
+            mesh = builder.shape_source[0]
+            # Near-duplicate corners at z=0 and z=0.0000005 should be welded.
+            self.assertEqual(mesh.vertices.shape[0], 4)
+
+            expected_smooth_normal = np.array([1.0, 0.0, 1.0], dtype=np.float32)
+            expected_smooth_normal /= np.linalg.norm(expected_smooth_normal)
+            for shared_position in (
+                np.array([0.0, 0.0, 0.0], dtype=np.float32),
+                np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            ):
+                matching_indices = np.nonzero(np.all(np.isclose(mesh.vertices, shared_position), axis=1))[0]
+                self.assertEqual(len(matching_indices), 1)
+                np.testing.assert_allclose(
+                    mesh.normals[matching_indices[0]], expected_smooth_normal, atol=1.0e-5
+                )
+
+    def test_mjcf_visual_stl_cleanup_is_disabled_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mjcf_path = self._write_visual_stl_mjcf(tmpdir)
+
+            builder = newton.ModelBuilder()
+            builder.add_mjcf(mjcf_path, up_axis="Z")
+
+            mesh = builder.shape_source[0]
+            # Without cleanup, the two near-duplicate corners at z=0 and z=0.0000005
+            # remain split and retain their per-facet normals.
+            self.assertEqual(mesh.vertices.shape[0], 6)
+            origin_indices = np.nonzero(
+                np.isclose(mesh.vertices[:, 0], 0.0)
+                & np.isclose(mesh.vertices[:, 1], 0.0)
+                & (mesh.vertices[:, 2] < 1.0e-3)
+            )[0]
+            self.assertEqual(len(origin_indices), 2)
+            found_normals = {tuple(np.round(mesh.normals[i], 6)) for i in origin_indices}
+            self.assertIn((0.0, 0.0, 1.0), found_normals)
+            self.assertIn((1.0, 0.0, 0.0), found_normals)
+
+    def test_mjcf_visual_stl_cleanup_ignores_collision_meshes(self):
+        # If the same STL wedge is loaded as a collision geom (default `no_class_as_colliders`),
+        # cleanup must not modify it even when `visual_stl_cleanup=True`.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stl_content = """solid wedge
+  facet normal 0 0 1
+    outer loop
+      vertex 0 0 0
+      vertex 1 0 0
+      vertex 0 1 0
+    endloop
+  endfacet
+  facet normal 1 0 0
+    outer loop
+      vertex 0 0 0.0000005
+      vertex 0 1 0.0000005
+      vertex 0 0 1
+    endloop
+  endfacet
+endsolid wedge
+"""
+            mjcf_content = """<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<mujoco model=\"wedge_col\">
+    <asset>
+        <mesh name=\"wedge\" file=\"wedge.stl\"/>
+    </asset>
+    <worldbody>
+        <body>
+            <geom type=\"mesh\" mesh=\"wedge\"/>
+        </body>
+    </worldbody>
+</mujoco>
+"""
+            stl_path = os.path.join(tmpdir, "wedge.stl")
+            mjcf_path = os.path.join(tmpdir, "wedge_col.xml")
+            with open(stl_path, "w") as f:
+                f.write(stl_content)
+            with open(mjcf_path, "w") as f:
+                f.write(mjcf_content)
+
+            builder = newton.ModelBuilder()
+            builder.add_mjcf(mjcf_path, up_axis="Z", visual_stl_cleanup=True)
+
+            mesh = builder.shape_source[0]
+            # Collision mesh: welding must be skipped even though the flag was set.
+            self.assertEqual(mesh.vertices.shape[0], 6)
+
     def test_inertia_rotation(self):
         """Test that inertia tensors are properly rotated using sandwich product R @ I @ R.T"""
 

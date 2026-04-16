@@ -2175,7 +2175,11 @@ class ModelBuilder:
             scale: The scaling factor to apply to the imported mechanism.
             hide_visuals: If True, hide visual shapes.
             visual_stl_cleanup: If True, weld near-duplicate vertices and recompute smooth normals
-                for STL meshes loaded from ``<visual>`` tags. Collision meshes are not modified.
+                for STL meshes loaded from ``<visual>`` tags. Collision meshes and non-STL formats
+                are not modified. STL's triangle-soup layout (no shared vertex indices, no authored
+                normals or UVs) causes visible faceting that benefits from welding; other formats
+                typically preserve authored topology/normals/UVs that welding would incorrectly
+                collapse.
             parse_visuals_as_colliders: If True, the geometry defined under the `<visual>` tags is used for collision handling instead of the `<collision>` geometries.
             up_axis: The up axis of the URDF. This is used to transform the URDF to the builder's up axis. It also determines the up axis of capsules and cylinders in the URDF. The default is Z.
             force_show_colliders: If True, the collision shapes are always shown, even if there are visual shapes.
@@ -2454,6 +2458,7 @@ class ModelBuilder:
         armature_scale: float = 1.0,
         scale: float = 1.0,
         hide_visuals: bool = False,
+        visual_stl_cleanup: bool = False,
         parse_visuals_as_colliders: bool = False,
         parse_meshes: bool = True,
         parse_sites: bool = True,
@@ -2559,6 +2564,11 @@ class ModelBuilder:
             armature_scale: Scaling factor to apply to the MJCF-defined joint armature values.
             scale: The scaling factor to apply to the imported mechanism.
             hide_visuals: If True, hide visual shapes after loading them (affects visibility, not loading).
+            visual_stl_cleanup: If True, weld near-duplicate vertices and recompute smooth normals
+                for STL meshes loaded for visual geoms. Collision meshes and non-STL formats are not
+                modified. STL's triangle-soup layout (no shared vertex indices, no authored normals
+                or UVs) causes visible faceting that benefits from welding; other formats typically
+                preserve authored topology/normals/UVs that welding would incorrectly collapse.
             parse_visuals_as_colliders: If True, the geometry defined under the `visual_classes` tags is used for collision handling instead of the `collider_classes` geometries.
             parse_meshes: Whether geometries of type `"mesh"` should be parsed. If False, geometries of type `"mesh"` are ignored.
             parse_sites: Whether sites (non-colliding reference points) should be parsed. If False, sites are ignored.
@@ -2599,6 +2609,7 @@ class ModelBuilder:
             armature_scale=armature_scale,
             scale=scale,
             hide_visuals=hide_visuals,
+            visual_stl_cleanup=visual_stl_cleanup,
             parse_visuals_as_colliders=parse_visuals_as_colliders,
             parse_meshes=parse_meshes,
             parse_sites=parse_sites,

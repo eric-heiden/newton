@@ -159,7 +159,10 @@ def parse_urdf(
         scale: The scaling factor to apply to the imported mechanism.
         hide_visuals: If True, hide visual shapes.
         visual_stl_cleanup: If True, weld near-duplicate vertices and recompute smooth normals
-            for STL meshes loaded from ``<visual>`` tags. Collision meshes are not modified.
+            for STL meshes loaded from ``<visual>`` tags. Collision meshes and non-STL formats are
+            not modified. STL's triangle-soup layout (no shared vertex indices, no authored normals
+            or UVs) causes visible faceting that benefits from welding; other formats typically
+            preserve authored topology/normals/UVs that welding would incorrectly collapse.
         parse_visuals_as_colliders: If True, the geometry defined under the `<visual>` tags is used for collision handling instead of the `<collision>` geometries.
         up_axis: The up axis of the URDF. This is used to transform the URDF to the builder's up axis. It also determines the up axis of capsules and cylinders in the URDF. The default is Z.
         force_show_colliders: If True, the collision shapes are always shown, even if there are visual shapes.

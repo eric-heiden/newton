@@ -180,6 +180,15 @@ def weld_vertices_by_position(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Weld near-duplicate vertices and remap triangle indices.
 
+    This is intended for cleaning up triangle-soup meshes such as STL, which store
+    each facet as an independent triplet of vertices (3x duplication of every shared
+    corner, no shared vertex indices, no authored normals, no UVs). Welding those
+    duplicates is required to recover smooth shading and well-formed connectivity.
+    Applying it to formats that carry authored topology, normals, or UVs (OBJ, DAE,
+    glTF, USD) is unsafe because it can collapse intentional seams and discard
+    authored attributes. Callers should gate use of this helper on the source mesh
+    format and on the absence of authored UVs/normals.
+
     Args:
         mesh_vertices: Vertex positions, shape ``[vertex_count, 3]``.
         mesh_faces: Triangle indices, shape ``[face_count, 3]``.
@@ -526,7 +535,14 @@ def load_meshes_from_file(
         override_color: Optional base color override (RGB).
         override_texture: Optional texture path/URL or image override.
         weld_vertices_epsilon: Optional position tolerance for welding
-            near-duplicate vertices before constructing the mesh.
+            near-duplicate vertices before constructing the mesh. Intended for
+            triangle-soup formats (notably STL) that duplicate every facet's corners
+            and carry no authored normals or UVs. Welding is automatically skipped
+            for sub-meshes that have UVs, because doing so could collapse authored
+            UV seams. Callers should also gate this on the source file extension —
+            do not enable it for formats (OBJ, DAE, glTF, USD) that preserve
+            authored topology/normals/UVs, since welding would merge vertices
+            across intentional seams.
 
     Returns:
         List of Mesh objects.

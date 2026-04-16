@@ -175,6 +175,45 @@ def smooth_vertex_normals_by_position(
     return accum[inverse]
 
 
+def weld_vertices_by_position(
+    mesh_vertices: np.ndarray, mesh_faces: np.ndarray, eps: float = 1.0e-6
+) -> tuple[np.ndarray, np.ndarray]:
+    """Weld near-duplicate vertices and remap triangle indices.
+
+    Args:
+        mesh_vertices: Vertex positions, shape ``[vertex_count, 3]``.
+        mesh_faces: Triangle indices, shape ``[face_count, 3]``.
+        eps: Position tolerance used to bucket vertices for welding.
+
+    Returns:
+        A tuple of ``(vertices, faces)`` with duplicate vertices removed.
+        Degenerate faces created by welding are dropped.
+    """
+    if eps <= 0.0:
+        raise ValueError("eps must be positive.")
+
+    vertices = np.asarray(mesh_vertices, dtype=np.float32).reshape(-1, 3)
+    faces = np.asarray(mesh_faces, dtype=np.int32).reshape(-1, 3)
+    if len(vertices) == 0 or len(faces) == 0:
+        return vertices, faces
+
+    _, unique_indices, inverse = np.unique(
+        np.round(vertices / eps).astype(np.int64), axis=0, return_index=True, return_inverse=True
+    )
+    unique_order = np.argsort(unique_indices)
+    canonical_to_welded = np.empty(len(unique_indices), dtype=np.int32)
+    canonical_to_welded[unique_order] = np.arange(len(unique_order), dtype=np.int32)
+
+    welded_vertices = vertices[unique_indices[unique_order]]
+    welded_faces = canonical_to_welded[inverse[faces]]
+    nondegenerate = (
+        (welded_faces[:, 0] != welded_faces[:, 1])
+        & (welded_faces[:, 1] != welded_faces[:, 2])
+        & (welded_faces[:, 0] != welded_faces[:, 2])
+    )
+    return welded_vertices, welded_faces[nondegenerate]
+
+
 # Default number of segments for mesh generation
 default_num_segments = 32
 
@@ -476,6 +515,7 @@ def load_meshes_from_file(
     maxhullvert: int,
     override_color: np.ndarray | list[float] | tuple[float, float, float] | None = None,
     override_texture: np.ndarray | str | None = None,
+    weld_vertices_epsilon: float | None = None,
 ) -> list[Mesh]:
     """Load meshes from a file using trimesh and capture texture data if present.
 
@@ -485,6 +525,8 @@ def load_meshes_from_file(
         maxhullvert: Maximum vertices for convex hull approximation.
         override_color: Optional base color override (RGB).
         override_texture: Optional texture path/URL or image override.
+        weld_vertices_epsilon: Optional position tolerance for welding
+            near-duplicate vertices before constructing the mesh.
 
     Returns:
         List of Mesh objects.
@@ -659,14 +701,23 @@ def load_meshes_from_file(
 
             sub_vertices = mesh_vertices[used]
             sub_normals = mesh_normals[used] if mesh_normals is not None else None
+            sub_uvs = mesh_uvs[used] if mesh_uvs is not None else None
+            if weld_vertices_epsilon is not None and sub_uvs is None:
+                sub_vertices, remapped_faces = weld_vertices_by_position(
+                    sub_vertices, remapped_faces, eps=weld_vertices_epsilon
+                )
+                sub_normals = None
+
             force_smooth = False
             if mat_metallic is not None and mat_metallic > 0.0:
                 force_smooth = True
             if mat_roughness is not None and mat_roughness < 0.6:
                 force_smooth = True
             if sub_normals is None or force_smooth:
-                sub_normals = smooth_vertex_normals_by_position(sub_vertices, remapped_faces)
-            sub_uvs = mesh_uvs[used] if mesh_uvs is not None else None
+                if weld_vertices_epsilon is not None and sub_uvs is None:
+                    sub_normals = compute_vertex_normals(sub_vertices, remapped_faces)
+                else:
+                    sub_normals = smooth_vertex_normals_by_position(sub_vertices, remapped_faces)
 
             meshes.append(
                 Mesh(
@@ -799,18 +850,15 @@ def load_meshes_from_file(
             if color is None and base_color is not None:
                 color = base_color
 
-        meshes.append(
-            Mesh(
-                vertices,
-                faces.flatten(),
-                normals=normals,
-                uvs=uvs,
-                maxhullvert=maxhullvert,
-                color=color,
-                texture=texture,
-                roughness=roughness,
-                metallic=metallic,
-            )
+        add_mesh_from_faces(
+            faces,
+            mat_color=color,
+            mat_roughness=roughness,
+            mat_metallic=metallic,
+            mesh_vertices=vertices,
+            mesh_normals=normals,
+            mesh_uvs=uvs,
+            mesh_texture=texture,
         )
 
     return meshes

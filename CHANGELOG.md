@@ -12,6 +12,7 @@
 - Add `ViewerBase.log_arrows()` for arrow rendering (wide line + arrowhead) in the GL viewer with a dedicated geometry shader
 - Add `enable_multiccd` parameter to `SolverMuJoCo` for multi-CCD contact generation (up to 4 contact points per geom pair)
 - Add `ViewerViser.log_scalar()` for live scalar time-series plots via uPlot
+- Add `visual_stl_cleanup` to `ModelBuilder.add_urdf()` for welding near-duplicate STL visual vertices and recomputing smooth normals
 
 ### Changed
 

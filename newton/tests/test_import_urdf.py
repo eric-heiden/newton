@@ -63,6 +63,25 @@ f 1 5 6
 f 1 6 2
 """
 
+MESH_STL_NEAR_DUPLICATE = """
+solid wedge
+  facet normal 0 0 1
+    outer loop
+      vertex 0 0 0
+      vertex 1 0 0
+      vertex 0 1 0
+    endloop
+  endfacet
+  facet normal 1 0 0
+    outer loop
+      vertex 0 0 0.0000005
+      vertex 0 1 0.0000005
+      vertex 0 0 1
+    endloop
+  endfacet
+endsolid wedge
+"""
+
 INERTIAL_URDF = """
 <robot name="inertial_test">
     <link name="base_link">
@@ -252,6 +271,46 @@ class TestImportUrdfBasic(unittest.TestCase):
                 assert_np_equal(builder.shape_transform[0][:], np.array([1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]))
                 assert builder.shape_source[0].vertices.shape[0] == 8
                 assert builder.shape_source[0].indices.shape[0] == 3 * 12
+
+    def test_visual_stl_cleanup_can_be_enabled(self):
+        builder = newton.ModelBuilder()
+        parse_urdf(
+            MESH_URDF.format(filename="wedge.stl"),
+            builder,
+            {"wedge.stl": MESH_STL_NEAR_DUPLICATE},
+            up_axis="Z",
+            visual_stl_cleanup=True,
+        )
+
+        mesh = builder.shape_source[0]
+        self.assertEqual(mesh.vertices.shape[0], 4)
+        expected = np.array([1.0, 0.0, 1.0], dtype=np.float32)
+        expected /= np.linalg.norm(expected)
+
+        for shared_position in (
+            np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),
+        ):
+            matching_indices = np.nonzero(np.all(np.isclose(mesh.vertices, shared_position), axis=1))[0]
+            self.assertEqual(len(matching_indices), 1)
+            np.testing.assert_allclose(mesh.normals[matching_indices[0]], expected, atol=1.0e-5)
+
+    def test_visual_stl_cleanup_is_disabled_by_default(self):
+        builder = newton.ModelBuilder()
+        parse_urdf(MESH_URDF.format(filename="wedge.stl"), builder, {"wedge.stl": MESH_STL_NEAR_DUPLICATE}, up_axis="Z")
+
+        mesh = builder.shape_source[0]
+        self.assertEqual(mesh.vertices.shape[0], 6)
+        origin_indices = np.nonzero(
+            np.isclose(mesh.vertices[:, 0], 0.0) & np.isclose(mesh.vertices[:, 1], 0.0) & (mesh.vertices[:, 2] < 1.0e-3)
+        )[0]
+        self.assertEqual(len(origin_indices), 2)
+        np.testing.assert_allclose(
+            mesh.normals[origin_indices[0]], np.array([0.0, 0.0, 1.0], dtype=np.float32), atol=1.0e-6
+        )
+        np.testing.assert_allclose(
+            mesh.normals[origin_indices[1]], np.array([1.0, 0.0, 0.0], dtype=np.float32), atol=1.0e-6
+        )
 
     def test_inertial_params_urdf(self):
         builder = newton.ModelBuilder()

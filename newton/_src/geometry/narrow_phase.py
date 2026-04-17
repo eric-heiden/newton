@@ -1596,29 +1596,52 @@ class NarrowPhase:
 
             self.gjk_candidate_pairs_count = c[gjk_idx : gjk_idx + 1]
             self.shape_pairs_sdf_sdf_count = c[sdf_sdf_idx : sdf_sdf_idx + 1]
-            self.shape_pairs_mesh_count = c[mesh_like_idx : mesh_like_idx + 1] if has_mesh_like else None
-            self.triangle_pairs_count = c[mesh_like_idx + 1 : mesh_like_idx + 2] if has_mesh_like else None
-            self.shape_pairs_mesh_plane_count = c[mesh_only_idx : mesh_only_idx + 1] if has_meshes else None
-            self.mesh_plane_vertex_total_count = c[mesh_only_idx + 1 : mesh_only_idx + 2] if has_meshes else None
-            self.shape_pairs_mesh_mesh_count = c[mesh_only_idx + 2 : mesh_only_idx + 3] if has_meshes else None
+
+            # Warp deterministic launch currently requires intercepted atomic targets
+            # to resolve to real array objects at runtime. When mesh / heightfield
+            # features are absent, these buffers are still kernel arguments but their
+            # code paths stay unreachable. Use tiny sentinel arrays instead of None so
+            # deterministic mode can still launch the kernel safely.
+            self._dummy_counter = wp.zeros(1, dtype=wp.int32, device=device)
+            self._dummy_vec2i = wp.zeros(1, dtype=wp.vec2i, device=device)
+            self._dummy_vec3i = wp.zeros(1, dtype=wp.vec3i, device=device)
+            self._dummy_int = wp.zeros(1, dtype=wp.int32, device=device)
+
+            self.shape_pairs_mesh_count = (
+                c[mesh_like_idx : mesh_like_idx + 1] if has_mesh_like else self._dummy_counter
+            )
+            self.triangle_pairs_count = (
+                c[mesh_like_idx + 1 : mesh_like_idx + 2] if has_mesh_like else self._dummy_counter
+            )
+            self.shape_pairs_mesh_plane_count = (
+                c[mesh_only_idx : mesh_only_idx + 1] if has_meshes else self._dummy_counter
+            )
+            self.mesh_plane_vertex_total_count = (
+                c[mesh_only_idx + 1 : mesh_only_idx + 2] if has_meshes else self._dummy_counter
+            )
+            self.shape_pairs_mesh_mesh_count = (
+                c[mesh_only_idx + 2 : mesh_only_idx + 3] if has_meshes else self._dummy_counter
+            )
 
             # Pair and work buffers
             self.gjk_candidate_pairs = wp.zeros(max_candidate_pairs, dtype=wp.vec2i, device=device)
 
             self.shape_pairs_mesh = (
-                wp.zeros(max_candidate_pairs, dtype=wp.vec2i, device=device) if has_mesh_like else None
+                wp.zeros(max_candidate_pairs, dtype=wp.vec2i, device=device) if has_mesh_like else self._dummy_vec2i
             )
             self.triangle_pairs = (
-                wp.zeros(max_triangle_pairs, dtype=wp.vec3i, device=device) if has_meshes or has_heightfields else None
+                wp.zeros(max_triangle_pairs, dtype=wp.vec3i, device=device)
+                if has_meshes or has_heightfields
+                else self._dummy_vec3i
             )
             self.shape_pairs_mesh_plane = (
-                wp.zeros(max_candidate_pairs, dtype=wp.vec2i, device=device) if has_meshes else None
+                wp.zeros(max_candidate_pairs, dtype=wp.vec2i, device=device) if has_meshes else self._dummy_vec2i
             )
             self.shape_pairs_mesh_plane_cumsum = (
-                wp.zeros(max_candidate_pairs, dtype=wp.int32, device=device) if has_meshes else None
+                wp.zeros(max_candidate_pairs, dtype=wp.int32, device=device) if has_meshes else self._dummy_int
             )
             self.shape_pairs_mesh_mesh = (
-                wp.zeros(max_candidate_pairs, dtype=wp.vec2i, device=device) if has_meshes else None
+                wp.zeros(max_candidate_pairs, dtype=wp.vec2i, device=device) if has_meshes else self._dummy_vec2i
             )
 
             self.empty_tangent = None

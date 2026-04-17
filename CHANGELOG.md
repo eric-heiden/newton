@@ -4,6 +4,7 @@
 
 ### Added
 
+- Add `scripts/benchmarks/solver_mujoco_determinism.py` to benchmark SolverMuJoCo determinism, runtime, and memory with `use_mujoco_contacts=False`, and emit a standalone HTML report with embedded Plotly plots
 - Add `SolverXPBD.update_contacts()` to populate `contacts.force` with per-contact spatial forces (linear force and torque) derived from XPBD constraint impulses
 - Raise process priority automatically in `--benchmark` mode for more stable measurements; add `--realtime` for maximum priority.
 - Add `TRIANGLE_PRISM` support-function type for heightfield triangles, extruding 1 m along the heightfield's local -Z so GJK/MPR naturally resolves shapes on the back side

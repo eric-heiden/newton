@@ -26,7 +26,7 @@ from ...sim import (
     State,
 )
 from ...sim.contacts import GENERATION_SENTINEL as _GENERATION_SENTINEL
-from ...sim.graph_coloring import color_graph, plot_graph
+from ...sim.graph_coloring import plot_graph
 from ...utils import topological_sort
 from ...utils.benchmark import event_scope
 from ...utils.import_utils import string_to_warp
@@ -3652,15 +3652,26 @@ class SolverMuJoCo(SolverBase):
         ]
         shape_color = np.zeros(model.shape_count, dtype=np.int32)
         if len(graph_edges) > 0:
-            color_groups = color_graph(
-                num_nodes=num_shapes,
-                graph_edge_indices=wp.array(graph_edges, dtype=wp.int32),
-                balance_colors=False,
-            )
-            num_colors = 0
-            for group in color_groups:
-                num_colors += 1
-                shape_color[selected_shapes[group]] = num_colors
+            adjacency = [set() for _ in range(num_shapes)]
+            for i, j in graph_edges:
+                adjacency[i].add(j)
+                adjacency[j].add(i)
+
+            color_groups: list[list[int]] = []
+            assigned = np.full(num_shapes, -1, dtype=np.int32)
+            ordered_nodes = sorted(range(num_shapes), key=lambda node: (-len(adjacency[node]), node))
+            for node in ordered_nodes:
+                used_colors = {assigned[neighbor] for neighbor in adjacency[node] if assigned[neighbor] >= 0}
+                color = 0
+                while color in used_colors:
+                    color += 1
+                assigned[node] = color
+                while len(color_groups) <= color:
+                    color_groups.append([])
+                color_groups[color].append(node)
+
+            for color, group in enumerate(color_groups, start=1):
+                shape_color[selected_shapes[group]] = color
             if visualize_graph:
                 plot_graph(
                     vertices=np.arange(num_shapes),
@@ -4120,6 +4131,7 @@ class SolverMuJoCo(SolverBase):
             GeoType.CYLINDER: mujoco.mjtGeom.mjGEOM_CYLINDER,
             GeoType.BOX: mujoco.mjtGeom.mjGEOM_BOX,
             GeoType.ELLIPSOID: mujoco.mjtGeom.mjGEOM_ELLIPSOID,
+            GeoType.CONE: mujoco.mjtGeom.mjGEOM_CYLINDER,
             GeoType.MESH: mujoco.mjtGeom.mjGEOM_MESH,
             GeoType.CONVEX_MESH: mujoco.mjtGeom.mjGEOM_MESH,
         }

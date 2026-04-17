@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import html
+import io
 import json
 import resource
 import statistics
@@ -597,132 +599,33 @@ def aggregate_results(result_files: list[Path]) -> dict[str, Any]:
     return {"raw_results": raw_results, "rows": rows}
 
 
-def _plotly_div(div_id: str, figure_json: str) -> str:
-    escaped = html.escape(figure_json)
-    return f'<div id="{div_id}" class="plot"></div><script>Plotly.newPlot("{div_id}", JSON.parse({json.dumps(figure_json)}).data, JSON.parse({json.dumps(figure_json)}).layout, {{responsive:true}});</script>'
-
-
-def render_report(aggregate: dict[str, Any], output_path: Path) -> Path:
-    import plotly.graph_objects as go  # noqa: PLC0415
-    from plotly.subplots import make_subplots  # noqa: PLC0415
-    import plotly.io as pio  # noqa: PLC0415
-
-    rows = sorted(aggregate["rows"], key=lambda row: (row["scenario"], row["mode"]))
-    scenarios = list(dict.fromkeys(row["scenario"] for row in rows))
-    modes = list(MODES.keys())
-    mode_labels = {
+def _mode_labels() -> dict[str, str]:
+    return {
         "baseline": "baseline",
         "pipeline": "pipeline-only",
         "global": "global-only",
         "combined": "combined",
     }
-    colors = {
+
+
+def _mode_colors() -> dict[str, str]:
+    return {
         "baseline": "#9aa4b2",
         "pipeline": "#f59e0b",
         "global": "#2563eb",
         "combined": "#10b981",
     }
-    row_map = {(row["scenario"], row["mode"]): row for row in rows}
 
-    runtime_fig = go.Figure()
-    for mode in modes:
-        runtime_fig.add_trace(
-            go.Bar(
-                name=mode_labels[mode],
-                x=scenarios,
-                y=[row_map[(scenario, mode)]["mean_step_ms"] for scenario in scenarios],
-                error_y={"type": "data", "array": [row_map[(scenario, mode)]["stdev_step_ms"] for scenario in scenarios]},
-                marker_color=colors[mode],
-            )
-        )
-    runtime_fig.update_layout(
-        title="Runtime per simulation substep",
-        template="plotly_white",
-        barmode="group",
-        height=460,
-        xaxis_title="Scenario",
-        yaxis_title="ms / substep",
-    )
 
-    memory_fig = make_subplots(rows=1, cols=2, subplot_titles=("Peak host RSS", "Warp GPU mempool high watermark"))
-    for mode in modes:
-        memory_fig.add_trace(
-            go.Bar(
-                name=mode_labels[mode],
-                x=scenarios,
-                y=[row_map[(scenario, mode)]["mean_peak_rss_mb"] for scenario in scenarios],
-                marker_color=colors[mode],
-                showlegend=True,
-            ),
-            row=1,
-            col=1,
-        )
-        memory_fig.add_trace(
-            go.Bar(
-                name=mode_labels[mode],
-                x=scenarios,
-                y=[row_map[(scenario, mode)]["mean_warp_mempool_high_mb"] for scenario in scenarios],
-                marker_color=colors[mode],
-                showlegend=False,
-            ),
-            row=1,
-            col=2,
-        )
-    memory_fig.update_layout(template="plotly_white", height=460, title="Memory footprint")
-    memory_fig.update_yaxes(title_text="MiB", row=1, col=1)
-    memory_fig.update_yaxes(title_text="MiB", row=1, col=2)
+def _figure_to_data_uri(fig: Any) -> str:
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=180, bbox_inches="tight")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
 
-    heatmap_fig = go.Figure(
-        data=go.Heatmap(
-            z=[
-                [
-                    1.0
-                    if row_map[(scenario, mode)]["state_stepwise_identical"] and row_map[(scenario, mode)]["contact_stepwise_identical"]
-                    else 0.0
-                    for mode in modes
-                ]
-                for scenario in scenarios
-            ],
-            x=[mode_labels[mode] for mode in modes],
-            y=scenarios,
-            text=[
-                [
-                    "state+contacts stable"
-                    if row_map[(scenario, mode)]["state_stepwise_identical"] and row_map[(scenario, mode)]["contact_stepwise_identical"]
-                    else f"diverges @ {row_map[(scenario, mode)]['first_divergent_step']}"
-                    for mode in modes
-                ]
-                for scenario in scenarios
-            ],
-            texttemplate="%{text}",
-            colorscale=[[0.0, "#ef4444"], [1.0, "#10b981"]],
-            showscale=False,
-        )
-    )
-    heatmap_fig.update_layout(title="Reproducibility pass/fail across repeated runs", template="plotly_white", height=360)
 
-    trace_fig = go.Figure()
-    for scenario in scenarios:
-        combined_row = row_map[(scenario, "combined")]
-        trace = combined_row["contact_count_trace_example"]
-        stride = max(1, len(trace) // 120)
-        trace_fig.add_trace(
-            go.Scatter(
-                name=scenario,
-                x=list(range(0, len(trace), stride)),
-                y=trace[::stride],
-                mode="lines",
-            )
-        )
-    trace_fig.update_layout(
-        title="Combined-mode contact count traces (example repeat)",
-        template="plotly_white",
-        height=420,
-        xaxis_title="substep",
-        yaxis_title="rigid contact count",
-    )
-
-    table_header = [
+def _table_html(rows: list[dict[str, Any]], mode_labels: dict[str, str]) -> str:
+    header = [
         "scenario",
         "mode",
         "stepwise state",
@@ -732,25 +635,153 @@ def render_report(aggregate: dict[str, Any], output_path: Path) -> Path:
         "peak RSS MiB",
         "Warp mempool MiB",
     ]
-    table_cells = [
-        [row["scenario"] for row in rows],
-        [mode_labels[row["mode"]] for row in rows],
-        ["yes" if row["state_stepwise_identical"] else "no" for row in rows],
-        ["yes" if row["contact_stepwise_identical"] else "no" for row in rows],
-        [row["first_divergent_step"] if row["first_divergent_step"] is not None else "—" for row in rows],
-        [f"{row['mean_step_ms']:.3f}" for row in rows],
-        [f"{row['mean_peak_rss_mb']:.1f}" for row in rows],
-        [f"{row['mean_warp_mempool_high_mb']:.1f}" for row in rows],
-    ]
-    table_fig = go.Figure(
-        data=[
-            go.Table(
-                header={"values": table_header, "fill_color": "#111827", "font": {"color": "white", "size": 13}},
-                cells={"values": table_cells, "fill_color": "#f9fafb", "align": "left", "font": {"size": 12}},
-            )
+    parts = ["<table><thead><tr>"]
+    parts.extend(f"<th>{html.escape(col)}</th>" for col in header)
+    parts.append("</tr></thead><tbody>")
+    for row in rows:
+        cells = [
+            row["scenario"],
+            mode_labels[row["mode"]],
+            "yes" if row["state_stepwise_identical"] else "no",
+            "yes" if row["contact_stepwise_identical"] else "no",
+            "—" if row["first_divergent_step"] is None else str(row["first_divergent_step"]),
+            f"{row['mean_step_ms']:.3f}",
+            f"{row['mean_peak_rss_mb']:.1f}",
+            f"{row['mean_warp_mempool_high_mb']:.1f}",
+        ]
+        parts.append("<tr>")
+        parts.extend(f"<td>{html.escape(cell)}</td>" for cell in cells)
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
+def _build_runtime_matplotlib(
+    scenarios: list[str],
+    modes: list[str],
+    mode_labels: dict[str, str],
+    colors: dict[str, str],
+    row_map: dict[tuple[str, str], dict[str, Any]],
+) -> Any:
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    x = np.arange(len(scenarios))
+    width = 0.18
+    fig, ax = plt.subplots(figsize=(12, 4.8))
+    for idx, mode in enumerate(modes):
+        vals = [row_map[(scenario, mode)]["mean_step_ms"] for scenario in scenarios]
+        errs = [row_map[(scenario, mode)]["stdev_step_ms"] for scenario in scenarios]
+        ax.bar(x + (idx - 1.5) * width, vals, width, yerr=errs, label=mode_labels[mode], color=colors[mode], capsize=3)
+    ax.set_title("Runtime per simulation substep")
+    ax.set_ylabel("ms / substep")
+    ax.set_xticks(x)
+    ax.set_xticklabels(scenarios, rotation=15, ha="right")
+    ax.legend(ncol=4, fontsize=9)
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+def _build_memory_matplotlib(
+    scenarios: list[str],
+    modes: list[str],
+    mode_labels: dict[str, str],
+    colors: dict[str, str],
+    row_map: dict[tuple[str, str], dict[str, Any]],
+) -> Any:
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    x = np.arange(len(scenarios))
+    width = 0.18
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4.8))
+    for idx, mode in enumerate(modes):
+        rss = [row_map[(scenario, mode)]["mean_peak_rss_mb"] for scenario in scenarios]
+        mempool = [row_map[(scenario, mode)]["mean_warp_mempool_high_mb"] for scenario in scenarios]
+        offset = (idx - 1.5) * width
+        axes[0].bar(x + offset, rss, width, label=mode_labels[mode], color=colors[mode])
+        axes[1].bar(x + offset, mempool, width, label=mode_labels[mode], color=colors[mode])
+    axes[0].set_title("Peak host RSS")
+    axes[1].set_title("Warp GPU mempool high watermark")
+    for ax in axes:
+        ax.set_xticks(x)
+        ax.set_xticklabels(scenarios, rotation=15, ha="right")
+        ax.set_ylabel("MiB")
+        ax.grid(axis="y", alpha=0.25)
+    axes[0].legend(ncol=2, fontsize=9)
+    fig.tight_layout()
+    return fig
+
+
+def _build_heatmap_matplotlib(
+    scenarios: list[str],
+    modes: list[str],
+    mode_labels: dict[str, str],
+    row_map: dict[tuple[str, str], dict[str, Any]],
+) -> Any:
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+    from matplotlib.colors import ListedColormap  # noqa: PLC0415
+
+    z = np.array(
+        [
+            [
+                1.0
+                if row_map[(scenario, mode)]["state_stepwise_identical"] and row_map[(scenario, mode)]["contact_stepwise_identical"]
+                else 0.0
+                for mode in modes
+            ]
+            for scenario in scenarios
         ]
     )
-    table_fig.update_layout(height=760, margin={"l": 10, "r": 10, "t": 20, "b": 10})
+    fig, ax = plt.subplots(figsize=(8, 4.6))
+    ax.imshow(z, cmap=ListedColormap(["#ef4444", "#10b981"]), aspect="auto", vmin=0, vmax=1)
+    ax.set_title("Reproducibility pass/fail across repeated runs")
+    ax.set_xticks(np.arange(len(modes)))
+    ax.set_xticklabels([mode_labels[mode] for mode in modes], rotation=20, ha="right")
+    ax.set_yticks(np.arange(len(scenarios)))
+    ax.set_yticklabels(scenarios)
+    for i, scenario in enumerate(scenarios):
+        for j, mode in enumerate(modes):
+            row = row_map[(scenario, mode)]
+            text = "stable" if z[i, j] else f"@ {row['first_divergent_step']}"
+            ax.text(j, i, text, ha="center", va="center", color="white", fontsize=9, fontweight="bold")
+    fig.tight_layout()
+    return fig
+
+
+def _build_trace_matplotlib(
+    scenarios: list[str],
+    row_map: dict[tuple[str, str], dict[str, Any]],
+) -> Any:
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    fig, ax = plt.subplots(figsize=(12, 4.8))
+    for scenario in scenarios:
+        trace = row_map[(scenario, "combined")]["contact_count_trace_example"]
+        stride = max(1, len(trace) // 120)
+        ax.plot(list(range(0, len(trace), stride)), trace[::stride], label=scenario, linewidth=2)
+    ax.set_title("Combined-mode contact count traces (example repeat)")
+    ax.set_xlabel("substep")
+    ax.set_ylabel("rigid contact count")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    return fig
+
+
+def render_report(aggregate: dict[str, Any], output_path: Path) -> Path:
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    rows = sorted(aggregate["rows"], key=lambda row: (row["scenario"], row["mode"]))
+    scenarios = list(dict.fromkeys(row["scenario"] for row in rows))
+    modes = list(MODES.keys())
+    mode_labels = _mode_labels()
+    colors = _mode_colors()
+    row_map = {(row["scenario"], row["mode"]): row for row in rows}
+
+    runtime_fig = _build_runtime_matplotlib(scenarios, modes, mode_labels, colors, row_map)
+    memory_fig = _build_memory_matplotlib(scenarios, modes, mode_labels, colors, row_map)
+    heatmap_fig = _build_heatmap_matplotlib(scenarios, modes, mode_labels, row_map)
+    trace_fig = _build_trace_matplotlib(scenarios, row_map)
 
     total_rows = len(rows)
     stable_rows = sum(
@@ -764,7 +795,7 @@ def render_report(aggregate: dict[str, Any], output_path: Path) -> Path:
         ("Scenario/mode cells", str(total_rows)),
         ("Fully reproducible cells", str(stable_rows)),
         ("Combined-mode passes", f"{combined_stable} / {len(scenarios)}"),
-        ("Fastest cell", f"{fastest['scenario']} / {mode_labels[fastest['mode']]}") ,
+        ("Fastest cell", f"{fastest['scenario']} / {mode_labels[fastest['mode']]}"),
     ]
     summary_html = "".join(
         f'<div class="card"><div class="label">{html.escape(title)}</div><div class="value">{html.escape(value)}</div></div>'
@@ -783,14 +814,11 @@ def render_report(aggregate: dict[str, Any], output_path: Path) -> Path:
         ]
     )
 
-    # full_html=False already returns the inline Plotly loader snippet; older/newer
-    # Plotly versions do not wrap it in <body> tags consistently, so embed it as-is.
-    plotly_bundle = pio.to_html(go.Figure(), include_plotlyjs="inline", full_html=False)
-    runtime_div = _plotly_div("runtime_plot", runtime_fig.to_json())
-    memory_div = _plotly_div("memory_plot", memory_fig.to_json())
-    heatmap_div = _plotly_div("heatmap_plot", heatmap_fig.to_json())
-    trace_div = _plotly_div("trace_plot", trace_fig.to_json())
-    table_div = _plotly_div("table_plot", table_fig.to_json())
+    runtime_uri = _figure_to_data_uri(runtime_fig)
+    memory_uri = _figure_to_data_uri(memory_fig)
+    heatmap_uri = _figure_to_data_uri(heatmap_fig)
+    trace_uri = _figure_to_data_uri(trace_fig)
+    table_html = _table_html(rows, mode_labels)
 
     html_text = f"""
 <!DOCTYPE html>
@@ -808,10 +836,14 @@ def render_report(aggregate: dict[str, Any], output_path: Path) -> Path:
     .card {{ background: white; border-radius: 14px; padding: 16px; box-shadow: 0 10px 24px rgba(0,0,0,0.06); }}
     .label {{ font-size: 13px; color: #6b7280; margin-bottom: 8px; }}
     .value {{ font-size: 24px; font-weight: 700; }}
-    .section {{ background: white; border-radius: 16px; padding: 18px; margin: 16px 0; box-shadow: 0 10px 24px rgba(0,0,0,0.06); }}
+    .section {{ background: white; border-radius: 16px; padding: 18px; margin: 16px 0; box-shadow: 0 10px 24px rgba(0,0,0,0.06); overflow-x: auto; }}
     .footer {{ margin-top: 30px; color: #6b7280; font-size: 13px; }}
-    .plot {{ width: 100%; min-height: 320px; }}
+    .plot-img {{ width: 100%; height: auto; display: block; border-radius: 10px; }}
     ul {{ line-height: 1.55; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 14px; background: #fff; }}
+    th, td {{ border: 1px solid #e5e7eb; padding: 8px 10px; text-align: left; vertical-align: top; }}
+    th {{ background: #111827; color: #fff; position: sticky; top: 0; }}
+    tbody tr:nth-child(even) {{ background: #f9fafb; }}
   </style>
 </head>
 <body>
@@ -823,19 +855,19 @@ def render_report(aggregate: dict[str, Any], output_path: Path) -> Path:
       <h2>Experiment notes</h2>
       {intro}
     </div>
-    <div class=\"section\"><h2>Reproducibility summary table</h2>{table_div}</div>
-    <div class=\"section\"><h2>Runtime</h2>{runtime_div}</div>
-    <div class=\"section\"><h2>Memory</h2>{memory_div}</div>
-    <div class=\"section\"><h2>Reproducibility heatmap</h2>{heatmap_div}</div>
-    <div class=\"section\"><h2>Contact-count traces</h2>{trace_div}</div>
+    <div class=\"section\"><h2>Reproducibility summary table</h2>{table_html}</div>
+    <div class=\"section\"><h2>Runtime</h2><img class=\"plot-img\" alt=\"Runtime plot\" src=\"{runtime_uri}\" /></div>
+    <div class=\"section\"><h2>Memory</h2><img class=\"plot-img\" alt=\"Memory plot\" src=\"{memory_uri}\" /></div>
+    <div class=\"section\"><h2>Reproducibility heatmap</h2><img class=\"plot-img\" alt=\"Reproducibility heatmap\" src=\"{heatmap_uri}\" /></div>
+    <div class=\"section\"><h2>Contact-count traces</h2><img class=\"plot-img\" alt=\"Contact count traces\" src=\"{trace_uri}\" /></div>
     <div class=\"footer\">Generated from {len(aggregate['raw_results'])} subprocess runs.</div>
   </div>
-  {plotly_bundle}
 </body>
 </html>
 """
     _ensure_parent(output_path)
     output_path.write_text(html_text, encoding="utf-8")
+    plt.close("all")
     return output_path
 
 
@@ -932,8 +964,12 @@ def main() -> None:
         return
     if args.command == "render-report":
         results_dir = Path(args.results_dir)
-        result_files = [path for path in sorted(results_dir.glob("*.json")) if path.name != "aggregate.json"]
-        aggregate = aggregate_results(result_files)
+        aggregate_path = results_dir / "aggregate.json"
+        if aggregate_path.exists():
+            aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
+        else:
+            result_files = [path for path in sorted(results_dir.glob("*__repeat*.json"))]
+            aggregate = aggregate_results(result_files)
         report_path = render_report(aggregate, Path(args.report))
         print(json.dumps({"report": str(report_path)}, indent=2))
         return

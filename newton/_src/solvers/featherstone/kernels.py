@@ -1083,6 +1083,174 @@ def eval_rigid_id(
         )
 
 
+@wp.func
+def convert_joint_qd_public_to_internal_single(
+    joint_id: int,
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    body_q: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+    joint_qd_public: wp.array[float],
+    # outputs
+    joint_qd_internal: wp.array[float],
+):
+    """Single-joint version of :func:`convert_free_distance_joint_qd_public_to_internal`.
+
+    Reads ``body_q`` / ``body_q_com`` that were just written by the fused
+    FK+ID kernel. For non FREE/DISTANCE joints this is a plain copy.
+    """
+    qd_start = joint_qd_start[joint_id]
+    qd_end = joint_qd_start[joint_id + 1]
+    jtype = joint_type[joint_id]
+
+    if jtype != JointType.FREE and jtype != JointType.DISTANCE:
+        for i in range(qd_start, qd_end):
+            joint_qd_internal[i] = joint_qd_public[i]
+        return
+
+    parent = joint_parent[joint_id]
+    child = joint_child[joint_id]
+
+    X_wpj = joint_X_p[joint_id]
+    if parent >= 0:
+        X_wpj = body_q[parent] * X_wpj
+
+    q_p = wp.transform_get_rotation(X_wpj)
+    x_anchor_world = wp.transform_get_translation(X_wpj)
+    x_child_com_world = wp.transform_get_translation(body_q_com[child])
+    r_child_com_parent = wp.quat_rotate_inv(q_p, x_child_com_world - x_anchor_world)
+
+    v_com_parent = wp.vec3(
+        joint_qd_public[qd_start + 0],
+        joint_qd_public[qd_start + 1],
+        joint_qd_public[qd_start + 2],
+    )
+    omega_parent = wp.vec3(
+        joint_qd_public[qd_start + 3],
+        joint_qd_public[qd_start + 4],
+        joint_qd_public[qd_start + 5],
+    )
+    v_internal_parent = v_com_parent - wp.cross(omega_parent, r_child_com_parent)
+
+    joint_qd_internal[qd_start + 0] = v_internal_parent[0]
+    joint_qd_internal[qd_start + 1] = v_internal_parent[1]
+    joint_qd_internal[qd_start + 2] = v_internal_parent[2]
+    joint_qd_internal[qd_start + 3] = omega_parent[0]
+    joint_qd_internal[qd_start + 4] = omega_parent[1]
+    joint_qd_internal[qd_start + 5] = omega_parent[2]
+
+
+@wp.kernel
+def eval_rigid_fk_id(
+    articulation_start: wp.array[int],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd_public: wp.array[float],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_X_com: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    body_I_m: wp.array[wp.spatial_matrix],
+    body_world: wp.array[wp.int32],
+    gravity: wp.array[wp.vec3],
+    # outputs
+    body_q: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+    joint_qd_internal: wp.array[float],
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_I_s: wp.array[wp.spatial_matrix],
+    body_v_s: wp.array[wp.spatial_vector],
+    body_f_s: wp.array[wp.spatial_vector],
+    body_a_s: wp.array[wp.spatial_vector],
+):
+    """Fused forward kinematics + inverse dynamics pass.
+
+    For each articulation, walk joints in topological order and, per joint:
+      1. Compute ``body_q[child]`` and ``body_q_com[child]`` (FK).
+      2. Convert the public FREE/DISTANCE joint speed to the internal
+         parent-anchor twist (or copy for other joint types).
+      3. Accumulate the link velocity, acceleration, spatial inertia and the
+         Coriolis/gravity body force (ID).
+
+    Since joints are processed in topological order, ``body_q[parent]`` has
+    already been written when joint ``i`` is visited. This removes the need
+    for a standalone pre-step ``eval_rigid_fk`` launch and keeps the public
+    ``test_featherstone_free_descendant_joint_f_does_not_require_prefk``
+    contract without requiring a caller-side :func:`newton.eval_fk`.
+    """
+    # one thread per-articulation
+    index = wp.tid()
+
+    start = articulation_start[index]
+    end = articulation_start[index + 1]
+
+    for i in range(start, end):
+        # 1. Forward kinematics for joint ``i`` — writes body_q/body_q_com
+        # of ``joint_child[i]`` using the (already-written) parent pose.
+        compute_link_transform(
+            i,
+            joint_type,
+            joint_parent,
+            joint_child,
+            joint_q_start,
+            joint_qd_start,
+            joint_q,
+            joint_X_p,
+            joint_X_c,
+            body_X_com,
+            joint_axis,
+            joint_dof_dim,
+            body_q,
+            body_q_com,
+        )
+
+        # 2. Convert public joint_qd -> internal for this joint using the
+        # freshly-written body_q / body_q_com.
+        convert_joint_qd_public_to_internal_single(
+            i,
+            joint_type,
+            joint_parent,
+            joint_child,
+            joint_qd_start,
+            joint_X_p,
+            body_q,
+            body_q_com,
+            joint_qd_public,
+            joint_qd_internal,
+        )
+
+        # 3. Inverse-dynamics pass for joint ``i``.
+        compute_link_velocity(
+            i,
+            joint_type,
+            joint_parent,
+            joint_child,
+            joint_qd_start,
+            joint_qd_internal,
+            joint_axis,
+            joint_dof_dim,
+            body_I_m,
+            body_q,
+            body_q_com,
+            joint_X_p,
+            body_world,
+            gravity,
+            joint_S_s,
+            body_I_s,
+            body_v_s,
+            body_f_s,
+            body_a_s,
+        )
+
+
 @wp.kernel
 def eval_rigid_tau(
     articulation_start: wp.array[int],

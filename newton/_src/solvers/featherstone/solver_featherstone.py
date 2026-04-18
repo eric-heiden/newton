@@ -29,7 +29,6 @@ from .kernels import (
     convert_body_force_com_to_origin,
     convert_free_distance_joint_f_public_to_internal,
     convert_free_distance_joint_qd_internal_to_public,
-    convert_free_distance_joint_qd_public_to_internal,
     copy_kinematic_joint_state,
     correct_free_distance_body_pose_from_world_twist,
     create_inertia_matrix_cholesky_kernel,
@@ -39,8 +38,7 @@ from .kernels import (
     eval_dense_solve_batched,
     eval_fk_with_velocity_conversion,
     eval_fk_with_velocity_conversion_from_joint_starts,
-    eval_rigid_fk,
-    eval_rigid_id,
+    eval_rigid_fk_id,
     eval_rigid_jacobian,
     eval_rigid_mass,
     eval_rigid_tau,
@@ -403,11 +401,25 @@ class SolverFeatherstone(SolverBase):
 
         with wp.ScopedTimer("simulate", False):
             if model.joint_count:
-                # Keep articulated body poses current before any body/world-frame
-                # force accumulation. Generalized-coordinate callers should not
-                # need an explicit pre-step eval_fk() for FREE/DISTANCE wrenches.
+                # Fused forward kinematics + inverse dynamics.
+                #
+                # Walks every articulation joint in topological order and, per
+                # joint, writes ``state_in.body_q`` / ``state_aug.body_q_com``
+                # (FK), converts the public joint velocity to the internal
+                # parent-anchor twist (``state_aug.joint_qd_internal_in``), and
+                # accumulates the link velocity/inertia/force (ID). This
+                # subsumes the previous stand-alone pre-step ``eval_rigid_fk``
+                # launch *and* the separate
+                # ``convert_free_distance_joint_qd_public_to_internal`` launch
+                # into a single kernel. It also preserves the
+                # ``test_featherstone_free_descendant_joint_f_does_not_require_prefk``
+                # contract: generalized-coordinate callers do not need an
+                # explicit ``newton.eval_fk()`` before :meth:`step`, because
+                # every downstream kernel that reads ``body_q`` runs after
+                # this fused launch.
+                state_aug.body_f_s.zero_()
                 wp.launch(
-                    eval_rigid_fk,
+                    eval_rigid_fk_id,
                     dim=model.articulation_count,
                     inputs=[
                         model.articulation_start,
@@ -417,13 +429,26 @@ class SolverFeatherstone(SolverBase):
                         model.joint_q_start,
                         model.joint_qd_start,
                         state_in.joint_q,
+                        state_in.joint_qd,
                         model.joint_X_p,
                         model.joint_X_c,
                         self.body_X_com,
                         model.joint_axis,
                         model.joint_dof_dim,
+                        self.body_I_m,
+                        model.body_world,
+                        model.gravity,
                     ],
-                    outputs=[state_in.body_q, state_aug.body_q_com],
+                    outputs=[
+                        state_in.body_q,
+                        state_aug.body_q_com,
+                        state_aug.joint_qd_internal_in,
+                        state_aug.joint_S_s,
+                        state_aug.body_I_s,
+                        state_aug.body_v_s,
+                        state_aug.body_f_s,
+                        state_aug.body_a_s,
+                    ],
                     device=model.device,
                 )
                 if step_in_place and self.descendant_free_distance_joint_indices is not None:
@@ -439,6 +464,9 @@ class SolverFeatherstone(SolverBase):
             if state_in.body_count:
                 body_f = state_aug.body_f_ext
                 wp.copy(body_f, state_in.body_f)
+                # ``state_in.body_q`` is now consistent with ``state_in.joint_q``
+                # thanks to the fused FK+ID launch above, so these body-force
+                # conversions can safely read ``body_q``.
                 wp.launch(
                     convert_body_force_com_to_origin,
                     dim=model.body_count,
@@ -488,23 +516,9 @@ class SolverFeatherstone(SolverBase):
             # articulations
 
             if model.joint_count:
-                wp.launch(
-                    convert_free_distance_joint_qd_public_to_internal,
-                    dim=model.joint_count,
-                    inputs=[
-                        model.joint_type,
-                        model.joint_parent,
-                        model.joint_child,
-                        model.joint_qd_start,
-                        model.joint_X_p,
-                        state_in.body_q,
-                        model.body_com,
-                        state_in.joint_qd,
-                    ],
-                    outputs=[state_aug.joint_qd_internal_in],
-                    device=model.device,
-                )
-
+                # FREE/DISTANCE control wrenches are routed through body_f; this
+                # copies non-FREE/DISTANCE joint forces into joint_f_internal and
+                # zeroes the FREE/DISTANCE slots.
                 wp.launch(
                     convert_free_distance_joint_f_public_to_internal,
                     dim=model.joint_count,
@@ -514,41 +528,6 @@ class SolverFeatherstone(SolverBase):
                         control.joint_f,
                     ],
                     outputs=[state_aug.joint_f_internal],
-                    device=model.device,
-                )
-
-                # print("body_X_sc:")
-                # print(state_in.body_q.numpy())
-
-                # evaluate joint inertias, motion vectors, and forces
-                state_aug.body_f_s.zero_()
-
-                wp.launch(
-                    eval_rigid_id,
-                    dim=model.articulation_count,
-                    inputs=[
-                        model.articulation_start,
-                        model.joint_type,
-                        model.joint_parent,
-                        model.joint_child,
-                        model.joint_qd_start,
-                        state_aug.joint_qd_internal_in,
-                        model.joint_axis,
-                        model.joint_dof_dim,
-                        self.body_I_m,
-                        state_in.body_q,
-                        state_aug.body_q_com,
-                        model.joint_X_p,
-                        model.body_world,
-                        model.gravity,
-                    ],
-                    outputs=[
-                        state_aug.joint_S_s,
-                        state_aug.body_I_s,
-                        state_aug.body_v_s,
-                        state_aug.body_f_s,
-                        state_aug.body_a_s,
-                    ],
                     device=model.device,
                 )
 

@@ -32,6 +32,12 @@ from ...utils.benchmark import event_scope
 from ...utils.import_utils import string_to_warp
 from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
+from .contacts_from_distance import (
+    ContactsFromDistance,
+    _CFDState,
+    apply_cfd_to_mjw_model,
+    restore_cfd_original,
+)
 from .kernels import (
     _snapshot_nacon_count,
     apply_mjc_body_f_kernel,
@@ -2793,6 +2799,7 @@ class SolverMuJoCo(SolverBase):
         use_mujoco_contacts: bool = True,
         include_sites: bool = True,
         skip_visual_only_geoms: bool = True,
+        cfd: ContactsFromDistance | None = None,
     ):
         """
         Solver options (e.g., ``impratio``) follow this resolution priority:
@@ -2832,6 +2839,15 @@ class SolverMuJoCo(SolverBase):
             use_mujoco_contacts: If True, use the MuJoCo contact solver. If False, use the Newton contact solver (newton contacts must be passed in through the step function in that case).
             include_sites: If ``True`` (default), Newton shapes marked with ``ShapeFlags.SITE`` are exported as MuJoCo sites. Sites are non-colliding reference points used for sensor attachment, debugging, or as frames of reference. If ``False``, sites are skipped during export. Defaults to ``True``.
             skip_visual_only_geoms: If ``True`` (default), geometries used only for visualization (i.e. not involved in collision) are excluded from the exported MuJoCo spec. This avoids mismatches with models that use explicit ``<contact>`` definitions for collision geometry.
+            cfd: Optional :class:`~newton.solvers.ContactsFromDistance`
+                configuration that enables the Contacts From Distance gradient
+                surrogate from Paulus et al. (arXiv:2506.14186). When
+                provided, all MuJoCo collision geoms are rewritten with
+                extended margins and softened ``solref``/``solimp`` so the
+                constraint solver produces small virtual contact forces for
+                signed distances ``0 < r <= cfd.width``. Setting to ``None``
+                (default) preserves stock MuJoCo behavior. Requires
+                ``use_mujoco_contacts=True``.
         """
         super().__init__(model)
 
@@ -2972,6 +2988,11 @@ class SolverMuJoCo(SolverBase):
         self._last_nacon_count: wp.array[wp.int32] | None = None
         self._last_contacts_id: int | None = None
 
+        self.cfd: ContactsFromDistance | None = None
+        """Active :class:`~newton.solvers.ContactsFromDistance` configuration, or ``None`` if CFD is disabled."""
+        self._cfd_state: _CFDState | None = None
+        """Snapshot of the unmodified per-geom contact parameters used to restore stock values."""
+
         with wp.ScopedTimer("convert_model_to_mujoco", active=False):
             self._convert_to_mjc(
                 model,
@@ -3009,9 +3030,111 @@ class SolverMuJoCo(SolverBase):
         if self.mjw_model is not None:
             self.mjw_model.opt.run_collision_detection = use_mujoco_contacts
 
+        self._install_cfd(cfd)
+
     @event_scope
     def _mujoco_warp_step(self):
         self._mujoco_warp.step(self.mjw_model, self.mjw_data)
+
+    def _install_cfd(self, cfd: ContactsFromDistance | None) -> None:
+        """Install or update the Contacts From Distance surrogate.
+
+        Takes (or refreshes) a snapshot of the unmodified per-geom contact
+        parameters, then rewrites the MuJoCo-warp model with CFD-softened
+        values. Passing ``cfd=None`` or a disabled :class:`ContactsFromDistance`
+        restores the stock values and clears internal state.
+        """
+        if self.use_mujoco_cpu:
+            # CFD currently targets the mujoco_warp (GPU) path only. Silently
+            # skip on the CPU backend so users experimenting on laptops still
+            # get a functioning solver; a warning is emitted only when the
+            # user explicitly asked for CFD.
+            if cfd is not None and cfd.enabled:
+                warnings.warn(
+                    "ContactsFromDistance is ignored when use_mujoco_cpu=True",
+                    stacklevel=2,
+                )
+            self.cfd = None
+            self._cfd_state = None
+            return
+
+        if self.mjw_model is None:
+            self.cfd = None
+            self._cfd_state = None
+            return
+
+        active = cfd if (cfd is not None and cfd.enabled) else None
+        if active is None:
+            # Restore stock values if CFD was previously installed.
+            if self._cfd_state is not None:
+                restore_cfd_original(self.mjw_model, self._cfd_state, self.model.device)
+            self.cfd = None
+            self._cfd_state = None
+            return
+
+        if not self._use_mujoco_contacts:
+            raise ValueError(
+                "ContactsFromDistance requires use_mujoco_contacts=True on SolverMuJoCo."
+            )
+
+        if active.straight_through:
+            warnings.warn(
+                "ContactsFromDistance.straight_through=True is accepted but not yet "
+                "implemented end-to-end; CFD parameters are applied directly. "
+                "Set straight_through=False to silence this warning.",
+                stacklevel=2,
+            )
+
+        # Snapshot originals (before any CFD modifications) and apply.
+        if self._cfd_state is None:
+            self._cfd_state = _CFDState(
+                self.mjw_model.geom_margin,
+                self.mjw_model.geom_solref,
+                self.mjw_model.geom_solimp,
+            )
+        else:
+            # Previous CFD was installed: restore before re-snapshotting so we
+            # never capture already-modified values as "originals".
+            restore_cfd_original(self.mjw_model, self._cfd_state, self.model.device)
+            self._cfd_state.refresh(
+                self.mjw_model.geom_margin,
+                self.mjw_model.geom_solref,
+                self.mjw_model.geom_solimp,
+            )
+
+        self.cfd = active
+        apply_cfd_to_mjw_model(self.mjw_model, self._cfd_state, active, self.model.device)
+
+    def _refresh_cfd_snapshot(self) -> None:
+        """Re-snapshot unmodified per-geom params after ``_update_geom_properties``.
+
+        Must be called right after MuJoCo-warp's per-geom buffers are rewritten
+        (e.g. by :meth:`notify_model_changed` with ``SHAPE_PROPERTIES``) but
+        before CFD is re-applied.
+        """
+        if self._cfd_state is None or self.mjw_model is None:
+            return
+        self._cfd_state.refresh(
+            self.mjw_model.geom_margin,
+            self.mjw_model.geom_solref,
+            self.mjw_model.geom_solimp,
+        )
+
+    def _reapply_cfd(self) -> None:
+        """Re-apply CFD parameters after a snapshot refresh."""
+        if self.cfd is None or self._cfd_state is None or self.mjw_model is None:
+            return
+        apply_cfd_to_mjw_model(self.mjw_model, self._cfd_state, self.cfd, self.model.device)
+
+    def set_cfd(self, cfd: ContactsFromDistance | None) -> None:
+        """Enable, update, or disable Contacts From Distance at runtime.
+
+        Args:
+            cfd: New configuration. Passing ``None`` (or a
+                :class:`~newton.solvers.ContactsFromDistance` with
+                ``enabled=False``) restores stock MuJoCo contact behavior.
+        """
+        self._install_cfd(cfd)
 
     @event_scope
     @override
@@ -3194,9 +3317,19 @@ class SolverMuJoCo(SolverBase):
             need_const_0 = True
             need_length_range = True
         if flags & SolverNotifyFlags.SHAPE_PROPERTIES:
+            # Restore stock per-geom params before the shared update kernel
+            # overwrites them — otherwise CFD's softened solref/solimp would
+            # get persisted as the new "original" baseline. After the update,
+            # refresh the snapshot and re-apply CFD.
+            cfd_was_active = self.cfd is not None and self._cfd_state is not None
+            if cfd_was_active:
+                restore_cfd_original(self.mjw_model, self._cfd_state, self.model.device)
             self._update_geom_properties()
             self._update_pair_properties()
             self._invalidate_contact_fast_path()
+            if cfd_was_active:
+                self._refresh_cfd_snapshot()
+                self._reapply_cfd()
         if flags & SolverNotifyFlags.MODEL_PROPERTIES:
             self._update_model_properties()
         if flags & SolverNotifyFlags.CONSTRAINT_PROPERTIES:

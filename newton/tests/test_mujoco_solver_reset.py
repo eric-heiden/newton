@@ -71,7 +71,9 @@ class TestSolverMuJoCoReset(unittest.TestCase):
         state_out = model.state()
         return model, solver, state_in, state_out
 
-    def _settle(self, solver: SolverMuJoCo, state_0: newton.State, state_1: newton.State, n: int = 30, dt: float = 1e-3):
+    def _settle(
+        self, solver: SolverMuJoCo, state_0: newton.State, state_1: newton.State, n: int = 30, dt: float = 1e-3
+    ):
         """Step the solver so ``qacc_warmstart`` accumulates a non-zero value."""
         control = solver.model.control()
         contacts = solver.model.contacts()
@@ -82,7 +84,7 @@ class TestSolverMuJoCoReset(unittest.TestCase):
 
     def test_reset_all_worlds_clears_qacc_warmstart(self):
         """reset() with world_mask=None zeroes qacc_warmstart in every world."""
-        model, solver, state_0, state_1 = self._make_solver()
+        _model, solver, state_0, state_1 = self._make_solver()
 
         state_0, state_1 = self._settle(solver, state_0, state_1, n=40)
         pre = solver.mjw_data.qacc_warmstart.numpy()
@@ -144,7 +146,7 @@ class TestSolverMuJoCoReset(unittest.TestCase):
         stored ``qacc_warmstart`` reflects the pre-teleport configuration.
         Calling reset() before stepping suppresses this kick.
         """
-        model, solver, state_0, state_1 = self._make_solver()
+        _model, solver, state_0, state_1 = self._make_solver()
         state_0, state_1 = self._settle(solver, state_0, state_1, n=40)
 
         # Freeze the currently-settled state so both branches start from the
@@ -165,7 +167,7 @@ class TestSolverMuJoCoReset(unittest.TestCase):
         qd_no_reset = state_1.joint_qd.numpy().copy()
 
         # --- Branch B: teleport then reset() then step ---
-        model_b, solver_b, sb_0, sb_1 = self._make_solver()
+        _model_b, solver_b, sb_0, sb_1 = self._make_solver()
         sb_0, sb_1 = self._settle(solver_b, sb_0, sb_1, n=40)
         sb_0.joint_q.assign(joint_q)
         sb_0.joint_qd.assign(joint_qd)
@@ -221,7 +223,7 @@ class TestSolverMuJoCoReset(unittest.TestCase):
 
     def test_reset_all_worlds_cpu(self):
         """CPU backend full reset clears qacc_warmstart and writes qpos/qvel."""
-        model, solver, state_0, state_1 = self._make_solver(use_mujoco_cpu=True, single_world=True)
+        _model, solver, state_0, state_1 = self._make_solver(use_mujoco_cpu=True, single_world=True)
 
         # CPU backend operates on a single MjData; step a few times so the
         # solver accumulates nontrivial state, then reset.

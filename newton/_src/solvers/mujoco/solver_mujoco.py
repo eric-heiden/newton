@@ -3081,18 +3081,12 @@ class SolverMuJoCo(SolverBase):
         model = self.model
         if world_mask is not None:
             if not isinstance(world_mask, wp.array):
-                raise TypeError(
-                    "world_mask must be a warp.array with dtype wp.bool, "
-                    f"got {type(world_mask).__name__}"
-                )
+                raise TypeError(f"world_mask must be a warp.array with dtype wp.bool, got {type(world_mask).__name__}")
             if world_mask.dtype != wp.bool:
-                raise TypeError(
-                    f"world_mask must have dtype wp.bool, got {world_mask.dtype}"
-                )
+                raise TypeError(f"world_mask must have dtype wp.bool, got {world_mask.dtype}")
             if world_mask.shape != (model.world_count,):
                 raise ValueError(
-                    "world_mask must have shape (world_count,) = "
-                    f"({model.world_count},), got {world_mask.shape}"
+                    f"world_mask must have shape (world_count,) = ({model.world_count},), got {world_mask.shape}"
                 )
 
         if self.use_mujoco_cpu:

@@ -45,6 +45,7 @@ from .kernels import (
     convert_rigid_forces_from_mj_kernel,
     convert_solref,
     convert_warp_coords_to_mj_kernel,
+    convert_warp_coords_to_mj_masked_kernel,
     create_convert_mjw_contacts_to_newton_kernel,
     create_inverse_shape_mapping_kernel,
     eval_articulation_fk,
@@ -3039,6 +3040,175 @@ class SolverMuJoCo(SolverBase):
 
             self._update_newton_state(self.model, state_out, self.mjw_data, state_prev=state_in)
         self._step += 1
+
+    @event_scope
+    def reset(self, state_in: State, state_out: State, world_mask: wp.array | None = None) -> None:
+        """Reset the solver's internal state, optionally per-world.
+
+        This clears per-world MuJoCo data that persists across :meth:`step`
+        calls (``qacc_warmstart``, ``qacc``, ``qfrc_applied``, ``xfrc_applied``,
+        ``ctrl``, ``act``, ``act_dot``, cached sensors, contacts, equality
+        activations, mocap state, accumulated ``time``/``energy``) and then
+        overlays the joint coordinates and velocities supplied by ``state_in``.
+        ``state_out`` is populated with the post-reset Newton snapshot (joint
+        coords, body poses, and body velocities).
+
+        The primary motivation is to avoid spurious velocity kicks after bodies
+        are teleported on a settled scene — see
+        `Isaac Lab #5359 <https://github.com/isaac-sim/IsaacLab/issues/5359>`_,
+        where a converged ``qacc_warmstart`` combined with the new pose
+        produces integrator corrections on the order of ~3 cm/s that then
+        compound unboundedly.
+
+        Args:
+            state_in: Newton state supplying the target joint coordinates and
+                velocities for the worlds being reset.
+            state_out: Newton state populated with the post-reset snapshot.
+            world_mask: Optional per-world boolean mask of shape
+                ``(world_count,)`` and dtype ``wp.bool``. Entries set to
+                ``True`` are reset; entries set to ``False`` retain their
+                prior MuJoCo data. If ``None`` every world is reset.
+
+        Notes:
+            * The MuJoCo CPU backend (``use_mujoco_cpu=True``) only supports
+              full resets. Passing a ``world_mask`` raises
+              :class:`NotImplementedError` because ``mujoco.mj_resetData`` is
+              not per-world.
+            * After the reset, ``mujoco_warp.fwd_position`` is called so the
+              derived kinematics (body transforms, site poses, etc.) used by
+              ``state_out`` are consistent with the overlaid ``qpos``.
+        """
+        model = self.model
+        if world_mask is not None:
+            if not isinstance(world_mask, wp.array):
+                raise TypeError(
+                    "world_mask must be a warp.array with dtype wp.bool, "
+                    f"got {type(world_mask).__name__}"
+                )
+            if world_mask.dtype != wp.bool:
+                raise TypeError(
+                    f"world_mask must have dtype wp.bool, got {world_mask.dtype}"
+                )
+            if world_mask.shape != (model.world_count,):
+                raise ValueError(
+                    "world_mask must have shape (world_count,) = "
+                    f"({model.world_count},), got {world_mask.shape}"
+                )
+
+        if self.use_mujoco_cpu:
+            self._reset_mujoco_cpu(state_in, state_out, world_mask)
+        else:
+            self._reset_mujoco_warp(state_in, state_out, world_mask)
+
+    def _reset_mujoco_warp(
+        self,
+        state_in: State,
+        state_out: State,
+        world_mask: wp.array | None,
+    ) -> None:
+        """Reset the MuJoCo Warp data, optionally restricted to masked worlds."""
+        model = self.model
+        with wp.ScopedDevice(model.device):
+            # mujoco_warp.reset_data accepts an optional bool mask. When the
+            # mask is None, every world is reset (qpos <- qpos0, qvel <- 0,
+            # qacc_warmstart <- 0, ...).
+            self._mujoco_warp.reset_data(self.mjw_model, self.mjw_data, reset=world_mask)
+
+            # Overlay the caller's joint coords/velocities on the reset worlds.
+            # reset_data already populated qpos with qpos0, so for an all-world
+            # reset we still want to respect the user's state_in — callers may
+            # have updated joint_q between steps.
+            self._apply_state_to_mjwarp_qpos_qvel(state_in, world_mask)
+
+            # Force the next contact conversion to take the full path because
+            # reset_data has zeroed nacon and contact buffers.
+            self._invalidate_contact_fast_path()
+
+            # Refresh derived kinematics (body_xpos/xquat, site_xpos, ...) so
+            # _update_newton_state sees the new pose — without this the body
+            # transforms lag behind the new qpos.
+            self._mujoco_warp.fwd_position(self.mjw_model, self.mjw_data)
+
+        self._update_newton_state(model, state_out, self.mjw_data, state_prev=state_in)
+
+    def _apply_state_to_mjwarp_qpos_qvel(
+        self,
+        state_in: State,
+        world_mask: wp.array | None,
+    ) -> None:
+        """Write state_in.joint_q / joint_qd into mjw_data.qpos / qvel.
+
+        If ``world_mask`` is ``None`` every world is overwritten, otherwise
+        only worlds whose mask entry is ``True`` are touched.
+        """
+        model = self.model
+        nworld = self.mjw_data.nworld
+        joints_per_world = model.joint_count // nworld
+        mujoco_attrs = getattr(model, "mujoco", None)
+        dof_ref = getattr(mujoco_attrs, "dof_ref", None) if mujoco_attrs is not None else None
+
+        if world_mask is None:
+            wp.launch(
+                convert_warp_coords_to_mj_kernel,
+                dim=(nworld, joints_per_world),
+                inputs=[
+                    state_in.joint_q,
+                    state_in.joint_qd,
+                    joints_per_world,
+                    model.joint_type,
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_child,
+                    model.body_com,
+                    dof_ref,
+                    self.mj_q_start,
+                    self.mj_qd_start,
+                ],
+                outputs=[self.mjw_data.qpos, self.mjw_data.qvel],
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                convert_warp_coords_to_mj_masked_kernel,
+                dim=(nworld, joints_per_world),
+                inputs=[
+                    state_in.joint_q,
+                    state_in.joint_qd,
+                    joints_per_world,
+                    model.joint_type,
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_child,
+                    model.body_com,
+                    dof_ref,
+                    self.mj_q_start,
+                    self.mj_qd_start,
+                    world_mask,
+                ],
+                outputs=[self.mjw_data.qpos, self.mjw_data.qvel],
+                device=model.device,
+            )
+
+    def _reset_mujoco_cpu(
+        self,
+        state_in: State,
+        state_out: State,
+        world_mask: wp.array | None,
+    ) -> None:
+        """Reset the MuJoCo CPU backend."""
+        if world_mask is not None:
+            raise NotImplementedError(
+                "SolverMuJoCo.reset(world_mask=...) is not supported with "
+                "use_mujoco_cpu=True because mujoco.mj_resetData is not "
+                "per-world. Pass world_mask=None to reset all worlds."
+            )
+        model = self.model
+        self._mujoco.mj_resetData(self.mj_model, self.mj_data)
+        self._update_mjc_data(self.mj_data, model, state_in)
+        self._mujoco.mj_forward(self.mj_model, self.mj_data)
+        self._update_newton_state(model, state_out, self.mj_data, state_prev=state_in)
 
     def _enable_rne_postconstraint(self, state_out: State):
         """Request computation of RNE forces if required for state fields."""

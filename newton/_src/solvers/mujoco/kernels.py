@@ -726,6 +726,106 @@ def convert_warp_coords_to_mj_kernel(
 
 
 @wp.kernel
+def convert_warp_coords_to_mj_masked_kernel(
+    joint_q: wp.array[wp.float32],
+    joint_qd: wp.array[wp.float32],
+    joints_per_world: int,
+    joint_type: wp.array[wp.int32],
+    joint_q_start: wp.array[wp.int32],
+    joint_qd_start: wp.array[wp.int32],
+    joint_dof_dim: wp.array2d[wp.int32],
+    joint_child: wp.array[wp.int32],
+    body_com: wp.array[wp.vec3],
+    dof_ref: wp.array[wp.float32],
+    mj_q_start: wp.array[wp.int32],
+    mj_qd_start: wp.array[wp.int32],
+    world_mask: wp.array[bool],
+    # outputs
+    qpos: wp.array2d[wp.float32],
+    qvel: wp.array2d[wp.float32],
+):
+    """Write Newton joint coords into MuJoCo qpos/qvel for masked worlds only.
+
+    Identical to :func:`convert_warp_coords_to_mj_kernel` except that worlds
+    whose ``world_mask`` entry is ``False`` are skipped so that their
+    ``qpos``/``qvel`` values remain untouched (e.g. already cleared by
+    ``mujoco_warp.reset_data`` or preserved from a prior step).
+    """
+    worldid, jntid = wp.tid()
+
+    if not world_mask[worldid]:
+        return
+
+    # Skip loop joints — they have no MuJoCo qpos/qvel entries
+    q_i = mj_q_start[jntid]
+    if q_i < 0:
+        return
+
+    qd_i = mj_qd_start[jntid]
+    type = joint_type[jntid]
+    wq_i = joint_q_start[joints_per_world * worldid + jntid]
+    wqd_i = joint_qd_start[joints_per_world * worldid + jntid]
+
+    if type == JointType.FREE:
+        # convert position components
+        for i in range(3):
+            qpos[worldid, q_i + i] = joint_q[wq_i + i]
+
+        rot = wp.quat(
+            joint_q[wq_i + 3],
+            joint_q[wq_i + 4],
+            joint_q[wq_i + 5],
+            joint_q[wq_i + 6],
+        )
+        # change quaternion order from xyzw to wxyz
+        rot_wxyz = quat_xyzw_to_wxyz(rot)
+        qpos[worldid, q_i + 3] = rot_wxyz[0]
+        qpos[worldid, q_i + 4] = rot_wxyz[1]
+        qpos[worldid, q_i + 5] = rot_wxyz[2]
+        qpos[worldid, q_i + 6] = rot_wxyz[3]
+
+        # See convert_warp_coords_to_mj_kernel for the v_origin / w_body
+        # derivation (CoM-twist -> body-origin + body-frame angular velocity).
+        w_world = wp.vec3(joint_qd[wqd_i + 3], joint_qd[wqd_i + 4], joint_qd[wqd_i + 5])
+
+        child = joint_child[jntid]
+        com_local = body_com[child]
+        com_world = wp.quat_rotate(rot, com_local)
+
+        v_com = wp.vec3(joint_qd[wqd_i + 0], joint_qd[wqd_i + 1], joint_qd[wqd_i + 2])
+
+        v_origin = v_com - wp.cross(w_world, com_world)
+        qvel[worldid, qd_i + 0] = v_origin[0]
+        qvel[worldid, qd_i + 1] = v_origin[1]
+        qvel[worldid, qd_i + 2] = v_origin[2]
+
+        w_body = wp.quat_rotate_inv(rot, w_world)
+        qvel[worldid, qd_i + 3] = w_body[0]
+        qvel[worldid, qd_i + 4] = w_body[1]
+        qvel[worldid, qd_i + 5] = w_body[2]
+
+    elif type == JointType.BALL:
+        # change quaternion order from xyzw to wxyz
+        ball_q = wp.quat(joint_q[wq_i], joint_q[wq_i + 1], joint_q[wq_i + 2], joint_q[wq_i + 3])
+        ball_q_wxyz = quat_xyzw_to_wxyz(ball_q)
+        qpos[worldid, q_i + 0] = ball_q_wxyz[0]
+        qpos[worldid, q_i + 1] = ball_q_wxyz[1]
+        qpos[worldid, q_i + 2] = ball_q_wxyz[2]
+        qpos[worldid, q_i + 3] = ball_q_wxyz[3]
+        for i in range(3):
+            qvel[worldid, qd_i + i] = joint_qd[wqd_i + i]
+    else:
+        axis_count = joint_dof_dim[jntid, 0] + joint_dof_dim[jntid, 1]
+        for i in range(axis_count):
+            ref = float(0.0)
+            if dof_ref:
+                ref = dof_ref[wqd_i + i]
+            qpos[worldid, q_i + i] = joint_q[wq_i + i] + ref
+        for i in range(axis_count):
+            qvel[worldid, qd_i + i] = joint_qd[wqd_i + i]
+
+
+@wp.kernel
 def sync_qpos0_kernel(
     joints_per_world: int,
     bodies_per_world: int,

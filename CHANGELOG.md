@@ -12,6 +12,7 @@
 - Add `Mesh.is_watertight` property (cached) that reports whether every geometric edge is shared by exactly two triangles
 - Add `deterministic` flag to `CollisionPipeline` and `NarrowPhase` for GPU-thread-scheduling-independent contact ordering via radix sort and deterministic fingerprint tiebreaking in contact reduction
 - Add fast parity-based SDF construction path for watertight meshes in `SDF.create_from_mesh`, using `wp.mesh_query_point_sign_parity` instead of winding numbers; selected via the new `sign_method` argument (`"auto"` — the default — picks parity when `Mesh.is_watertight` is true, or `"parity"` / `"winding"` to force either strategy)
+- Add `SolverMuJoCo.reset(state_in, state_out, world_mask=None)` to clear per-world MuJoCo solver state (including `qacc_warmstart`) and overlay `state_in` joint coordinates, suppressing spurious velocity kicks after teleporting bodies on a settled scene; `world_mask` restricts the reset to a subset of worlds
 - Add `ViewerBase.log_arrows()` for arrow rendering (wide line + arrowhead) in the GL viewer with a dedicated geometry shader
 - Add `enable_multiccd` parameter to `SolverMuJoCo` for multi-CCD contact generation (up to 4 contact points per geom pair)
 - Add `ViewerViser.log_scalar()` for live scalar time-series plots via uPlot

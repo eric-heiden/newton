@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .featherstone import SolverFeatherstone
-from .flags import SolverNotifyFlags
+from .flags import SolverNotifyFlags, SolverStateFlags
 from .implicit_mpm import SolverImplicitMPM
 from .kamino import SolverKamino
 from .mujoco import SolverMuJoCo
@@ -20,6 +20,7 @@ __all__ = [
     "SolverMuJoCo",
     "SolverNotifyFlags",
     "SolverSemiImplicit",
+    "SolverStateFlags",
     "SolverStyle3D",
     "SolverVBD",
     "SolverXPBD",

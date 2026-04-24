@@ -414,7 +414,7 @@ from ._src.solvers import (
 )
 
 # solver flags
-from ._src.solvers.flags import SolverNotifyFlags
+from ._src.solvers.flags import SolverNotifyFlags, SolverStateFlags
 
 __all__ = [
     "SolverBase",
@@ -424,6 +424,7 @@ __all__ = [
     "SolverMuJoCo",
     "SolverNotifyFlags",
     "SolverSemiImplicit",
+    "SolverStateFlags",
     "SolverStyle3D",
     "SolverVBD",
     "SolverXPBD",

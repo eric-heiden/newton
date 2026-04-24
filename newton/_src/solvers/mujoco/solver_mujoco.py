@@ -24,13 +24,14 @@ from ...sim import (
     Model,
     ModelBuilder,
     State,
+    eval_ik,
 )
 from ...sim.contacts import GENERATION_SENTINEL as _GENERATION_SENTINEL
 from ...sim.graph_coloring import color_graph, plot_graph
 from ...utils import topological_sort
 from ...utils.benchmark import event_scope
 from ...utils.import_utils import string_to_warp
-from ..flags import SolverNotifyFlags
+from ..flags import SolverNotifyFlags, SolverStateFlags
 from ..solver import SolverBase
 from .kernels import (
     _snapshot_nacon_count,
@@ -3006,6 +3007,29 @@ class SolverMuJoCo(SolverBase):
             )
         self.update_data_interval = update_data_interval
         self._step = 0
+        self._reset_state_cache = model.state()
+        self._reset_state_scratch = model.state()
+        self._body_world_start_np = (
+            model.body_world_start.numpy()
+            if model.body_world_start is not None
+            else np.zeros(model.world_count + 2, dtype=np.int32)
+        )
+        self._joint_coord_world_start_np = (
+            model.joint_coord_world_start.numpy()
+            if model.joint_coord_world_start is not None
+            else np.zeros(model.world_count + 2, dtype=np.int32)
+        )
+        self._joint_dof_world_start_np = (
+            model.joint_dof_world_start.numpy()
+            if model.joint_dof_world_start is not None
+            else np.zeros(model.world_count + 2, dtype=np.int32)
+        )
+        self._articulation_world_start_np = (
+            model.articulation_world_start.numpy()
+            if model.articulation_world_start is not None
+            else np.zeros(model.world_count + 2, dtype=np.int32)
+        )
+        self._reset_state_scratch.assign(self._reset_state_cache)
 
         if self.mjw_model is not None:
             self.mjw_model.opt.run_collision_detection = use_mujoco_contacts
@@ -3039,44 +3063,44 @@ class SolverMuJoCo(SolverBase):
                     self._mujoco_warp_step()
 
             self._update_newton_state(self.model, state_out, self.mjw_data, state_prev=state_in)
+        self._cache_reset_state(state_out)
         self._step += 1
 
     @event_scope
-    def reset(self, state_in: State, state_out: State, world_mask: wp.array | None = None) -> None:
-        """Reset the solver's internal state, optionally per-world.
+    @override
+    def reset(
+        self,
+        state: State,
+        world_mask: wp.array[bool] | None = None,
+        flags: SolverStateFlags | int | None = None,
+    ) -> None:
+        """Reset the solver's internal state in place, optionally per-world.
 
         This clears per-world MuJoCo data that persists across :meth:`step`
         calls (``qacc_warmstart``, ``qacc``, ``qfrc_applied``, ``xfrc_applied``,
         ``ctrl``, ``act``, ``act_dot``, cached sensors, contacts, equality
         activations, mocap state, accumulated ``time``/``energy``) and then
-        overlays the joint coordinates and velocities supplied by ``state_in``.
-        ``state_out`` is populated with the post-reset Newton snapshot (joint
-        coords, body poses, and body velocities).
-
-        The primary motivation is to avoid spurious velocity kicks after bodies
-        are teleported on a settled scene — see
-        `Isaac Lab #5359 <https://github.com/isaac-sim/IsaacLab/issues/5359>`_,
-        where a converged ``qacc_warmstart`` combined with the new pose
-        produces integrator corrections on the order of ~3 cm/s that then
-        compound unboundedly.
+        re-applies the selected state attributes to the reset worlds.
 
         Args:
-            state_in: Newton state supplying the target joint coordinates and
-                velocities for the worlds being reset.
-            state_out: Newton state populated with the post-reset snapshot.
+            state: Newton state to update in place with the post-reset solver
+                snapshot.
             world_mask: Optional per-world boolean mask of shape
                 ``(world_count,)`` and dtype ``wp.bool``. Entries set to
                 ``True`` are reset; entries set to ``False`` retain their
                 prior MuJoCo data. If ``None`` every world is reset.
+            flags: Optional bit-mask composed from
+                :class:`~newton.solvers.SolverStateFlags`. Joint flags re-apply
+                ``joint_q`` / ``joint_qd`` directly, body flags first run
+                :func:`newton.eval_ik` to recover the corresponding joint
+                coordinates, and ``None`` resets all supported state data.
 
         Notes:
             * The MuJoCo CPU backend (``use_mujoco_cpu=True``) only supports
-              full resets. Passing a ``world_mask`` raises
+              full resets. Passing a partial ``world_mask`` raises
               :class:`NotImplementedError` because ``mujoco.mj_resetData`` is
               not per-world.
-            * After the reset, ``mujoco_warp.fwd_position`` is called so the
-              derived kinematics (body transforms, site poses, etc.) used by
-              ``state_out`` are consistent with the overlaid ``qpos``.
+            * A fully-``True`` ``world_mask`` is treated the same as ``None``.
         """
         model = self.model
         if world_mask is not None:
@@ -3088,17 +3112,118 @@ class SolverMuJoCo(SolverBase):
                 raise ValueError(
                     f"world_mask must have shape (world_count,) = ({model.world_count},), got {world_mask.shape}"
                 )
+            if np.all(world_mask.numpy()):
+                world_mask = None
+
+        flags_value = self._normalize_reset_flags(flags)
+        self._validate_reset_state(state, flags_value)
+        self._compose_reset_state(state, world_mask, flags_value)
 
         if self.use_mujoco_cpu:
-            self._reset_mujoco_cpu(state_in, state_out, world_mask)
+            self._reset_mujoco_cpu(state, world_mask)
         else:
-            self._reset_mujoco_warp(state_in, state_out, world_mask)
+            self._reset_mujoco_warp(state, world_mask)
+
+    @staticmethod
+    def _normalize_reset_flags(flags: SolverStateFlags | int | None) -> int:
+        """Validate and normalize reset flags to an integer bit-mask."""
+        if flags is None:
+            return int(SolverStateFlags.ALL)
+        if not isinstance(flags, (int, np.integer, SolverStateFlags)):
+            raise TypeError(f"flags must be an int bit-mask or SolverStateFlags, got {type(flags).__name__}")
+
+        flags_value = int(flags)
+        unknown_bits = flags_value & ~int(SolverStateFlags.ALL)
+        if unknown_bits:
+            raise ValueError(f"flags contains unsupported bits: 0x{unknown_bits:x}")
+        return flags_value
+
+    def _validate_reset_state(self, state: State, flags: int) -> None:
+        """Validate that the state contains the arrays required by ``flags``."""
+        missing = []
+        if flags & int(SolverStateFlags.JOINT_POS) and state.joint_q is None:
+            missing.append("joint_q")
+        if flags & int(SolverStateFlags.JOINT_VEL) and state.joint_qd is None:
+            missing.append("joint_qd")
+        if flags & int(SolverStateFlags.BODY_POS) and state.body_q is None:
+            missing.append("body_q")
+        if flags & int(SolverStateFlags.BODY_VEL) and state.body_qd is None:
+            missing.append("body_qd")
+        if missing:
+            names = ", ".join(missing)
+            raise ValueError(f"state is missing the arrays required by reset(): {names}")
+
+    def _compose_reset_state(
+        self,
+        state: State,
+        world_mask: wp.array[bool] | None,
+        flags: int,
+    ) -> None:
+        """Compose the authoritative state snapshot used to seed the reset."""
+        scratch = self._reset_state_scratch
+        scratch.assign(self._reset_state_cache)
+        world_mask_np = None if world_mask is None else world_mask.numpy().astype(bool, copy=False)
+
+        if flags & int(SolverStateFlags.JOINT_POS):
+            self._copy_world_slices(scratch.joint_q, state.joint_q, self._joint_coord_world_start_np, world_mask_np)
+        if flags & int(SolverStateFlags.JOINT_VEL):
+            self._copy_world_slices(scratch.joint_qd, state.joint_qd, self._joint_dof_world_start_np, world_mask_np)
+        if flags & int(SolverStateFlags.BODY_POS):
+            self._copy_world_slices(scratch.body_q, state.body_q, self._body_world_start_np, world_mask_np)
+        if flags & int(SolverStateFlags.BODY_VEL):
+            self._copy_world_slices(scratch.body_qd, state.body_qd, self._body_world_start_np, world_mask_np)
+
+        if flags & (int(SolverStateFlags.BODY_POS) | int(SolverStateFlags.BODY_VEL)):
+            eval_ik(
+                self.model,
+                scratch,
+                scratch.joint_q,
+                scratch.joint_qd,
+                mask=self._build_articulation_mask(world_mask_np),
+            )
+
+    def _cache_reset_state(self, state: State) -> None:
+        """Cache the solver's latest authoritative Newton state."""
+        self._reset_state_cache.assign(state)
+
+    @staticmethod
+    def _copy_world_slices(
+        dst: wp.array | None,
+        src: wp.array | None,
+        world_start: np.ndarray,
+        world_mask: np.ndarray | None,
+    ) -> None:
+        """Copy per-world slices from ``src`` into ``dst``."""
+        if dst is None or src is None:
+            return
+        if world_mask is None:
+            dst.assign(src)
+            return
+
+        dst_np = dst.numpy()
+        src_np = src.numpy()
+        for world in np.flatnonzero(world_mask):
+            start = int(world_start[world])
+            end = int(world_start[world + 1])
+            dst_np[start:end] = src_np[start:end]
+        dst.assign(dst_np)
+
+    def _build_articulation_mask(self, world_mask: np.ndarray | None) -> wp.array[bool] | None:
+        """Convert a world mask to an articulation mask for :func:`eval_ik`."""
+        if world_mask is None:
+            return None
+
+        articulation_mask = np.zeros(self.model.articulation_count, dtype=bool)
+        for world in np.flatnonzero(world_mask):
+            start = int(self._articulation_world_start_np[world])
+            end = int(self._articulation_world_start_np[world + 1])
+            articulation_mask[start:end] = True
+        return wp.array(articulation_mask, dtype=wp.bool, device=self.model.device)
 
     def _reset_mujoco_warp(
         self,
-        state_in: State,
-        state_out: State,
-        world_mask: wp.array | None,
+        state: State,
+        world_mask: wp.array[bool] | None,
     ) -> None:
         """Reset the MuJoCo Warp data, optionally restricted to masked worlds."""
         model = self.model
@@ -3108,29 +3233,23 @@ class SolverMuJoCo(SolverBase):
             # qacc_warmstart <- 0, ...).
             self._mujoco_warp.reset_data(self.mjw_model, self.mjw_data, reset=world_mask)
 
-            # Overlay the caller's joint coords/velocities on the reset worlds.
-            # reset_data already populated qpos with qpos0, so for an all-world
-            # reset we still want to respect the user's state_in — callers may
-            # have updated joint_q between steps.
-            self._apply_state_to_mjwarp_qpos_qvel(state_in, world_mask)
+            # Overlay the prepared joint coords/velocities on the reset worlds.
+            self._apply_state_to_mjwarp_qpos_qvel(self._reset_state_scratch, world_mask)
 
             # Force the next contact conversion to take the full path because
             # reset_data has zeroed nacon and contact buffers.
             self._invalidate_contact_fast_path()
 
-            # Refresh derived kinematics (body_xpos/xquat, site_xpos, ...) so
-            # _update_newton_state sees the new pose — without this the body
-            # transforms lag behind the new qpos.
-            self._mujoco_warp.fwd_position(self.mjw_model, self.mjw_data)
-
-        self._update_newton_state(model, state_out, self.mjw_data, state_prev=state_in)
+        self._update_newton_state(model, state, self.mjw_data, state_prev=self._reset_state_scratch)
+        self._clear_reset_outputs(state, world_mask)
+        self._cache_reset_state(state)
 
     def _apply_state_to_mjwarp_qpos_qvel(
         self,
-        state_in: State,
-        world_mask: wp.array | None,
+        state: State,
+        world_mask: wp.array[bool] | None,
     ) -> None:
-        """Write state_in.joint_q / joint_qd into mjw_data.qpos / qvel.
+        """Write state joint coords into mjw_data.qpos / qvel.
 
         If ``world_mask`` is ``None`` every world is overwritten, otherwise
         only worlds whose mask entry is ``True`` are touched.
@@ -3146,8 +3265,8 @@ class SolverMuJoCo(SolverBase):
                 convert_warp_coords_to_mj_kernel,
                 dim=(nworld, joints_per_world),
                 inputs=[
-                    state_in.joint_q,
-                    state_in.joint_qd,
+                    state.joint_q,
+                    state.joint_qd,
                     joints_per_world,
                     model.joint_type,
                     model.joint_q_start,
@@ -3167,8 +3286,8 @@ class SolverMuJoCo(SolverBase):
                 convert_warp_coords_to_mj_masked_kernel,
                 dim=(nworld, joints_per_world),
                 inputs=[
-                    state_in.joint_q,
-                    state_in.joint_qd,
+                    state.joint_q,
+                    state.joint_qd,
                     joints_per_world,
                     model.joint_type,
                     model.joint_q_start,
@@ -3187,9 +3306,8 @@ class SolverMuJoCo(SolverBase):
 
     def _reset_mujoco_cpu(
         self,
-        state_in: State,
-        state_out: State,
-        world_mask: wp.array | None,
+        state: State,
+        world_mask: wp.array[bool] | None,
     ) -> None:
         """Reset the MuJoCo CPU backend."""
         if world_mask is not None:
@@ -3200,9 +3318,38 @@ class SolverMuJoCo(SolverBase):
             )
         model = self.model
         self._mujoco.mj_resetData(self.mj_model, self.mj_data)
-        self._update_mjc_data(self.mj_data, model, state_in)
-        self._mujoco.mj_forward(self.mj_model, self.mj_data)
-        self._update_newton_state(model, state_out, self.mj_data, state_prev=state_in)
+        self._update_mjc_data(self.mj_data, model, self._reset_state_scratch)
+        self._update_newton_state(model, state, self.mj_data, state_prev=self._reset_state_scratch)
+        self._clear_reset_outputs(state, world_mask)
+        self._cache_reset_state(state)
+
+    def _clear_reset_outputs(self, state: State, world_mask: wp.array[bool] | None) -> None:
+        """Zero derived outputs invalidated by reset_data / mj_resetData."""
+        world_mask_np = None if world_mask is None else world_mask.numpy().astype(bool, copy=False)
+        self._zero_world_slices(state.body_qdd, self._body_world_start_np, world_mask_np)
+        self._zero_world_slices(state.body_parent_f, self._body_world_start_np, world_mask_np)
+        qfrc_actuator = getattr(getattr(state, "mujoco", None), "qfrc_actuator", None)
+        self._zero_world_slices(qfrc_actuator, self._joint_dof_world_start_np, world_mask_np)
+
+    @staticmethod
+    def _zero_world_slices(
+        array: wp.array | None,
+        world_start: np.ndarray,
+        world_mask: np.ndarray | None,
+    ) -> None:
+        """Zero selected per-world slices of an array."""
+        if array is None:
+            return
+        if world_mask is None:
+            array.zero_()
+            return
+
+        array_np = array.numpy()
+        for world in np.flatnonzero(world_mask):
+            start = int(world_start[world])
+            end = int(world_start[world + 1])
+            array_np[start:end] = 0
+        array.assign(array_np)
 
     def _enable_rne_postconstraint(self, state_out: State):
         """Request computation of RNE forces if required for state fields."""

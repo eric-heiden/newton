@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import warp as wp
 
 from ..geometry import ParticleFlags
 from ..sim import BodyFlags, Contacts, Control, Model, ModelBuilder, State
+from .flags import SolverStateFlags
 
 
 @wp.kernel
@@ -314,6 +317,28 @@ class SolverBase:
             dt: The time step (typically in seconds).
         """
         raise NotImplementedError()
+
+    def reset(
+        self,
+        state: State,
+        world_mask: wp.array[bool] | None = None,
+        flags: SolverStateFlags | int | None = None,
+    ) -> None:
+        """Reset the solver's internal state in place.
+
+        Concrete solvers may override this to clear backend-specific caches and
+        re-apply selected state attributes for a subset of worlds.
+
+        Args:
+            state: The state to reset in place.
+            world_mask: Optional mask selecting which worlds to reset. If
+                ``None``, all worlds are reset.
+            flags: Optional bit-mask composed from
+                :class:`~newton.solvers.SolverStateFlags` indicating which
+                state attributes should be re-applied. If ``None``, all state
+                attributes are treated as updated.
+        """
+        del state, world_mask, flags
 
     def notify_model_changed(self, flags: int) -> None:
         """Notify the solver that parts of the :class:`~newton.Model` were modified.

@@ -56,6 +56,37 @@ class SolverNotifyFlags(IntEnum):
     """Indicates all property updates."""
 
 
+class SolverStateFlags(IntEnum):
+    """
+    Flags indicating which parts of the state have been updated before a solver reset.
+
+    These flags are used with :meth:`solver.reset() <newton.solvers.SolverBase.reset>`
+    to specify which state attributes should be re-applied to the solver's internal data.
+    """
+
+    JOINT_POS = 1 << 0
+    """Indicates reduced joint position coordinates: ``joint_q``."""
+
+    JOINT_VEL = 1 << 1
+    """Indicates reduced joint velocity coordinates: ``joint_qd``."""
+
+    BODY_POS = 1 << 2
+    """Indicates maximal body poses: ``body_q``."""
+
+    BODY_VEL = 1 << 3
+    """Indicates maximal body velocities: ``body_qd``."""
+
+    PARTICLE_POS = 1 << 4
+    """Indicates particle positions: ``particle_q``."""
+
+    PARTICLE_VEL = 1 << 5
+    """Indicates particle velocities: ``particle_qd``."""
+
+    ALL = JOINT_POS | JOINT_VEL | BODY_POS | BODY_VEL | PARTICLE_POS | PARTICLE_VEL
+    """Indicates all resettable state attributes."""
+
+
 __all__ = [
     "SolverNotifyFlags",
+    "SolverStateFlags",
 ]

@@ -2168,32 +2168,33 @@ class TestMuJoCoSolverGeomProperties(TestMuJoCoSolverPropertiesBase):
                 )
 
                 # Test 2: Contact parameters (solref)
+                # Only verify when ke > 0, because when ke == 0 the MJCF-authored
+                # solref is preserved (not overwritten with Newton defaults).
                 actual_solref = geom_solref[world_idx, geom_idx]
-
-                # Compute expected solref based on Newton's conversion logic
                 ke = shape_ke[shape_idx]
                 kd = shape_kd[shape_idx]
 
-                if ke > 0.0 and kd > 0.0:
-                    timeconst = 2.0 / kd
-                    dampratio = np.sqrt(1.0 / (timeconst * timeconst * ke))
-                    expected_solref = (timeconst, dampratio)
-                else:
-                    expected_solref = (0.02, 1.0)
+                if ke > 0.0:
+                    if kd > 0.0:
+                        timeconst = 2.0 / kd
+                        dampratio = np.sqrt(1.0 / (timeconst * timeconst * ke))
+                    else:
+                        timeconst = 0.02
+                        dampratio = 1.0
 
-                self.assertAlmostEqual(
-                    float(actual_solref[0]),
-                    expected_solref[0],
-                    places=5,
-                    msg=f"Solref[0] mismatch for shape {shape_idx} in world {world_idx}, geom {geom_idx}",
-                )
+                    self.assertAlmostEqual(
+                        float(actual_solref[0]),
+                        timeconst,
+                        places=5,
+                        msg=f"Solref[0] mismatch for shape {shape_idx} in world {world_idx}, geom {geom_idx}",
+                    )
 
-                self.assertAlmostEqual(
-                    float(actual_solref[1]),
-                    expected_solref[1],
-                    places=5,
-                    msg=f"Solref[1] mismatch for shape {shape_idx} in world {world_idx}, geom {geom_idx}",
-                )
+                    self.assertAlmostEqual(
+                        float(actual_solref[1]),
+                        dampratio,
+                        places=5,
+                        msg=f"Solref[1] mismatch for shape {shape_idx} in world {world_idx}, geom {geom_idx}",
+                    )
 
                 # Test 3: Size
                 actual_size = geom_size[world_idx, geom_idx]
@@ -2464,6 +2465,43 @@ class TestMuJoCoSolverGeomProperties(TestMuJoCoSolverPropertiesBase):
 
         # Run another simulation step to ensure the updated properties work
         solver.step(self.state_in, self.state_out, self.control, self.contacts, 0.01)
+
+    def test_geom_solref_preserved_when_ke_zero(self):
+        """When shape_material_ke is set to 0, geom_solref must not be overwritten."""
+        solver = SolverMuJoCo(self.model, iterations=1, disable_contacts=True)
+
+        # Run one step to populate the MuJoCo model
+        solver.step(self.state_in, self.state_out, self.control, self.contacts, 0.01)
+        self.state_in, self.state_out = self.state_out, self.state_in
+
+        # Record the current geom_solref (populated from spec during init)
+        initial_solref = solver.mjw_model.geom_solref.numpy().copy()
+        mjc_geom_to_newton_shape = solver.mjc_geom_to_newton_shape.numpy()
+
+        # Set ke=0 for all shapes to opt-out of solref override
+        shape_count = self.model.shape_count
+        self.model.shape_material_ke.assign(np.zeros(shape_count))
+
+        # Trigger a shape-properties update
+        solver.notify_model_changed(SolverNotifyFlags.SHAPE_PROPERTIES)
+
+        # Verify geom_solref was NOT overwritten
+        updated_solref = solver.mjw_model.geom_solref.numpy()
+        for world_idx in range(self.model.world_count):
+            num_geoms = solver.mj_model.ngeom
+            for geom_idx in range(num_geoms):
+                shape_idx = mjc_geom_to_newton_shape[world_idx, geom_idx]
+                if shape_idx < 0:
+                    continue
+                np.testing.assert_array_almost_equal(
+                    updated_solref[world_idx, geom_idx],
+                    initial_solref[world_idx, geom_idx],
+                    decimal=6,
+                    err_msg=(
+                        f"geom_solref should be preserved when ke=0 "
+                        f"(world={world_idx}, geom={geom_idx})"
+                    ),
+                )
 
     def test_mesh_maxhullvert_attribute(self):
         """Test that Mesh objects can store maxhullvert attribute"""

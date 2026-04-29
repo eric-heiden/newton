@@ -2295,7 +2295,9 @@ def update_geom_properties_kernel(
     # update geom_solref (timeconst, dampratio) using stiffness and damping
     # we don't use the negative convention to support controlling the mixing of shapes' stiffnesses via solmix
     # use approximation of d(0) = d(width) = 1
-    geom_solref[world, geom_idx] = convert_solref(shape_ke[shape_idx], shape_kd[shape_idx], 1.0, 1.0)
+    # Only override when ke > 0 to preserve MJCF-authored solref when Newton defaults are unset
+    if shape_ke[shape_idx] > 0.0:
+        geom_solref[world, geom_idx] = convert_solref(shape_ke[shape_idx], shape_kd[shape_idx], 1.0, 1.0)
 
     # update geom_solimp from custom attribute
     if shape_geom_solimp:

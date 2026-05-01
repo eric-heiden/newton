@@ -1,0 +1,231 @@
+{
+  "schema_version": 1,
+  "run_id": "20260330T122713Z",
+  "generated_at": "2026-03-30T12:27:13+00:00",
+  "started_at": "2026-03-30T12:26:23+00:00",
+  "device": "cuda:0",
+  "host": "eheiden-claw2",
+  "steps": 3,
+  "warmup_steps": 1,
+  "scenarios": [
+    {
+      "name": "basic_shapes",
+      "capability": "rigid_contacts",
+      "description": "Rigid collision shapes resting on the ground.",
+      "solvers": [
+        "xpbd",
+        "vbd"
+      ],
+      "example_module": "newton.examples.basic.example_basic_shapes"
+    },
+    {
+      "name": "basic_joints",
+      "capability": "articulations",
+      "description": "Programmatic jointed rigid-body system with articulated motion.",
+      "solvers": [
+        "xpbd",
+        "vbd"
+      ],
+      "example_module": "newton.examples.basic.example_basic_joints"
+    },
+    {
+      "name": "cloth_hanging",
+      "capability": "cloth",
+      "description": "Hanging cloth benchmark across supported cloth solvers.",
+      "solvers": [
+        "semi_implicit",
+        "xpbd",
+        "vbd"
+      ],
+      "example_module": "newton.examples.cloth.example_cloth_hanging"
+    }
+  ],
+  "results": [
+    {
+      "scenario": "basic_shapes",
+      "capability": "rigid_contacts",
+      "description": "Rigid collision shapes resting on the ground.",
+      "example_module": "newton.examples.basic.example_basic_shapes",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "step_times_ms": [
+        2.152774,
+        2.150751,
+        2.153997
+      ],
+      "model": {
+        "body_count": 7,
+        "joint_count": 7,
+        "joint_dof_count": 42,
+        "shape_count": 8,
+        "particle_count": 0
+      },
+      "total_time_ms": 6.4575220458209515,
+      "mean_step_time_ms": 2.1525073486069837,
+      "median_step_time_ms": 2.152774017304182,
+      "min_step_time_ms": 2.1507509518414736,
+      "max_step_time_ms": 2.153997076675296,
+      "steps_per_second": 464.57448828091566
+    },
+    {
+      "scenario": "basic_shapes",
+      "capability": "rigid_contacts",
+      "description": "Rigid collision shapes resting on the ground.",
+      "example_module": "newton.examples.basic.example_basic_shapes",
+      "solver_id": "vbd",
+      "solver_name": "SolverVBD",
+      "step_times_ms": [
+        3.343571,
+        3.320015,
+        3.321207
+      ],
+      "model": {
+        "body_count": 7,
+        "joint_count": 7,
+        "joint_dof_count": 42,
+        "shape_count": 8,
+        "particle_count": 0
+      },
+      "total_time_ms": 9.984792908653617,
+      "mean_step_time_ms": 3.328264302884539,
+      "median_step_time_ms": 3.321206895634532,
+      "min_step_time_ms": 3.320015035569668,
+      "max_step_time_ms": 3.343570977449417,
+      "steps_per_second": 300.4569075638976
+    },
+    {
+      "scenario": "basic_joints",
+      "capability": "articulations",
+      "description": "Programmatic jointed rigid-body system with articulated motion.",
+      "example_module": "newton.examples.basic.example_basic_joints",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "step_times_ms": [
+        0.725805,
+        0.723415,
+        0.721322
+      ],
+      "model": {
+        "body_count": 6,
+        "joint_count": 6,
+        "joint_dof_count": 5,
+        "shape_count": 7,
+        "particle_count": 0
+      },
+      "total_time_ms": 2.170541789382696,
+      "mean_step_time_ms": 0.723513929794232,
+      "median_step_time_ms": 0.72341482155025,
+      "min_step_time_ms": 0.7213219068944454,
+      "max_step_time_ms": 0.7258050609380007,
+      "steps_per_second": 1382.1433960288794
+    },
+    {
+      "scenario": "basic_joints",
+      "capability": "articulations",
+      "description": "Programmatic jointed rigid-body system with articulated motion.",
+      "example_module": "newton.examples.basic.example_basic_joints",
+      "solver_id": "vbd",
+      "solver_name": "SolverVBD",
+      "step_times_ms": [
+        1.637906,
+        1.629649,
+        1.629847
+      ],
+      "model": {
+        "body_count": 6,
+        "joint_count": 6,
+        "joint_dof_count": 5,
+        "shape_count": 7,
+        "particle_count": 0
+      },
+      "total_time_ms": 4.897401900961995,
+      "mean_step_time_ms": 1.6324673003206651,
+      "median_step_time_ms": 1.629847101867199,
+      "min_step_time_ms": 1.6296489629894495,
+      "max_step_time_ms": 1.6379058361053467,
+      "steps_per_second": 612.5696972941328
+    },
+    {
+      "scenario": "cloth_hanging",
+      "capability": "cloth",
+      "description": "Hanging cloth benchmark across supported cloth solvers.",
+      "example_module": "newton.examples.cloth.example_cloth_hanging",
+      "solver_id": "semi_implicit",
+      "solver_name": "SolverSemiImplicit",
+      "step_times_ms": [
+        1.079905,
+        1.071032,
+        1.051262
+      ],
+      "model": {
+        "body_count": 0,
+        "joint_count": 0,
+        "joint_dof_count": 0,
+        "shape_count": 1,
+        "particle_count": 117
+      },
+      "total_time_ms": 3.2021990045905113,
+      "mean_step_time_ms": 1.0673996681968372,
+      "median_step_time_ms": 1.071031903848052,
+      "min_step_time_ms": 1.0512620210647583,
+      "max_step_time_ms": 1.079905079677701,
+      "steps_per_second": 936.8562027841964
+    },
+    {
+      "scenario": "cloth_hanging",
+      "capability": "cloth",
+      "description": "Hanging cloth benchmark across supported cloth solvers.",
+      "example_module": "newton.examples.cloth.example_cloth_hanging",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "step_times_ms": [
+        4.031062,
+        3.82906,
+        3.742202
+      ],
+      "model": {
+        "body_count": 0,
+        "joint_count": 0,
+        "joint_dof_count": 0,
+        "shape_count": 1,
+        "particle_count": 117
+      },
+      "total_time_ms": 11.602323967963457,
+      "mean_step_time_ms": 3.8674413226544857,
+      "median_step_time_ms": 3.8290598895400763,
+      "min_step_time_ms": 3.742201952263713,
+      "max_step_time_ms": 4.031062126159668,
+      "steps_per_second": 258.5688874301091
+    },
+    {
+      "scenario": "cloth_hanging",
+      "capability": "cloth",
+      "description": "Hanging cloth benchmark across supported cloth solvers.",
+      "example_module": "newton.examples.cloth.example_cloth_hanging",
+      "solver_id": "vbd",
+      "solver_name": "SolverVBD",
+      "step_times_ms": [
+        12.297928,
+        12.169263,
+        12.142606
+      ],
+      "model": {
+        "body_count": 0,
+        "joint_count": 0,
+        "joint_dof_count": 0,
+        "shape_count": 1,
+        "particle_count": 117
+      },
+      "total_time_ms": 36.6097972728312,
+      "mean_step_time_ms": 12.203265757610401,
+      "median_step_time_ms": 12.169263092800975,
+      "min_step_time_ms": 12.1426060795784,
+      "max_step_time_ms": 12.297928100451827,
+      "steps_per_second": 81.94527758902272
+    }
+  ],
+  "notes": [
+    "This matrix uses in-tree example scenarios to provide immediate solver-vs-capability coverage.",
+    "MuJoCo/MABD parity is not represented here yet because the documented generic solver benchmark harness is missing."
+  ]
+}

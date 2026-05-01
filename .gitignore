@@ -58,6 +58,7 @@ docs/api/_generated/
 asv/env
 asv/results
 asv/html
+.runtime/
 
 # Log files, settings
 MUJOCO_LOG.TXT

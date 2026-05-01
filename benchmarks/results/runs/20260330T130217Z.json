@@ -1,0 +1,749 @@
+{
+  "schema_version": 2,
+  "run_id": "20260330T130217Z",
+  "generated_at": "2026-03-30T13:02:17+00:00",
+  "started_at": "2026-03-30T12:59:34+00:00",
+  "device": "cuda:0",
+  "host": "eheiden-claw2",
+  "steps": 1,
+  "warmup_steps": 0,
+  "coverage_summary": {
+    "benchmarked": 18,
+    "harness_gap": 12,
+    "unsupported": 6
+  },
+  "scenarios": [
+    {
+      "name": "gravity_capsule",
+      "capability": "rigid_body_dynamics",
+      "description": "Single rigid capsule dropped onto a plane across core rigid-body solvers.",
+      "solvers": [
+        "xpbd",
+        "semi_implicit",
+        "featherstone",
+        "mujoco"
+      ],
+      "example_module": "newton._src.tools.solver_benchmark_matrix",
+      "coverage": [
+        {
+          "solver_id": "xpbd",
+          "solver_name": "SolverXPBD",
+          "status": "benchmarked",
+          "reason": "Direct builder-backed benchmark implemented."
+        },
+        {
+          "solver_id": "semi_implicit",
+          "solver_name": "SolverSemiImplicit",
+          "status": "benchmarked",
+          "reason": "Direct builder-backed benchmark implemented."
+        },
+        {
+          "solver_id": "featherstone",
+          "solver_name": "SolverFeatherstone",
+          "status": "benchmarked",
+          "reason": "Direct builder-backed benchmark implemented."
+        },
+        {
+          "solver_id": "mujoco",
+          "solver_name": "SolverMuJoCo",
+          "status": "benchmarked",
+          "reason": "Direct builder-backed benchmark implemented."
+        },
+        {
+          "solver_id": "vbd",
+          "solver_name": "SolverVBD",
+          "status": "harness_gap",
+          "reason": "The solver supports rigid bodies, but this parity slice is not wired into the matrix yet."
+        },
+        {
+          "solver_id": "style3d",
+          "solver_name": "SolverStyle3D",
+          "status": "unsupported",
+          "reason": "Style3D is a cloth solver and does not support rigid-body dynamics."
+        }
+      ]
+    },
+    {
+      "name": "pendulum",
+      "capability": "joint_chains",
+      "description": "Double-pendulum articulation parity across maximal-coordinate and generalized-coordinate solvers.",
+      "solvers": [
+        "xpbd",
+        "semi_implicit",
+        "featherstone",
+        "mujoco"
+      ],
+      "example_module": "newton._src.tools.solver_benchmark_matrix",
+      "coverage": [
+        {
+          "solver_id": "xpbd",
+          "solver_name": "SolverXPBD",
+          "status": "benchmarked",
+          "reason": "Direct builder-backed benchmark implemented."
+        },
+        {
+          "solver_id": "semi_implicit",
+          "solver_name": "SolverSemiImplicit",
+          "status": "benchmarked",
+          "reason": "Direct builder-backed benchmark implemented."
+        },
+        {
+          "solver_id": "featherstone",
+          "solver_name": "SolverFeatherstone",
+          "status": "benchmarked",
+          "reason": "Direct builder-backed benchmark implemented."
+        },
+        {
+          "solver_id": "mujoco",
+          "solver_name": "SolverMuJoCo",
+          "status": "benchmarked",
+          "reason": "Direct builder-backed benchmark implemented."
+        },
+        {
+          "solver_id": "vbd",
+          "solver_name": "SolverVBD",
+          "status": "harness_gap",
+          "reason": "VBD joint support exists, but this articulation parity slice is not wired into the matrix yet."
+        },
+        {
+          "solver_id": "style3d",
+          "solver_name": "SolverStyle3D",
+          "status": "unsupported",
+          "reason": "Style3D does not support articulated rigid-body joint chains."
+        }
+      ]
+    },
+    {
+      "name": "basic_shapes",
+      "capability": "rigid_contacts",
+      "description": "Rigid collision shapes resting on the ground.",
+      "solvers": [
+        "xpbd",
+        "vbd"
+      ],
+      "example_module": "newton.examples.basic.example_basic_shapes",
+      "coverage": [
+        {
+          "solver_id": "xpbd",
+          "solver_name": "SolverXPBD",
+          "status": "benchmarked",
+          "reason": "Example-backed benchmark implemented."
+        },
+        {
+          "solver_id": "vbd",
+          "solver_name": "SolverVBD",
+          "status": "benchmarked",
+          "reason": "Example-backed benchmark implemented."
+        },
+        {
+          "solver_id": "semi_implicit",
+          "solver_name": "SolverSemiImplicit",
+          "status": "harness_gap",
+          "reason": "The rigid-contact example only exposes XPBD/VBD today."
+        },
+        {
+          "solver_id": "featherstone",
+          "solver_name": "SolverFeatherstone",
+          "status": "harness_gap",
+          "reason": "The rigid-contact example only exposes XPBD/VBD today."
+        },
+        {
+          "solver_id": "mujoco",
+          "solver_name": "SolverMuJoCo",
+          "status": "harness_gap",
+          "reason": "The rigid-contact example only exposes XPBD/VBD today."
+        },
+        {
+          "solver_id": "style3d",
+          "solver_name": "SolverStyle3D",
+          "status": "unsupported",
+          "reason": "Style3D does not support rigid-body contact benchmarks."
+        }
+      ]
+    },
+    {
+      "name": "basic_joints",
+      "capability": "articulations",
+      "description": "Programmatic jointed rigid-body system with articulated motion.",
+      "solvers": [
+        "xpbd",
+        "vbd"
+      ],
+      "example_module": "newton.examples.basic.example_basic_joints",
+      "coverage": [
+        {
+          "solver_id": "xpbd",
+          "solver_name": "SolverXPBD",
+          "status": "benchmarked",
+          "reason": "Example-backed benchmark implemented."
+        },
+        {
+          "solver_id": "vbd",
+          "solver_name": "SolverVBD",
+          "status": "benchmarked",
+          "reason": "Example-backed benchmark implemented."
+        },
+        {
+          "solver_id": "semi_implicit",
+          "solver_name": "SolverSemiImplicit",
+          "status": "harness_gap",
+          "reason": "The example only exposes XPBD/VBD today."
+        },
+        {
+          "solver_id": "featherstone",
+          "solver_name": "SolverFeatherstone",
+          "status": "harness_gap",
+          "reason": "This maximal-coordinate example is not wired into the generic articulation benchmark path."
+        },
+        {
+          "solver_id": "mujoco",
+          "solver_name": "SolverMuJoCo",
+          "status": "harness_gap",
+          "reason": "This maximal-coordinate example is not wired into the generic articulation benchmark path."
+        },
+        {
+          "solver_id": "style3d",
+          "solver_name": "SolverStyle3D",
+          "status": "unsupported",
+          "reason": "Style3D does not support articulated rigid-body joints."
+        }
+      ]
+    },
+    {
+      "name": "basic_heightfield",
+      "capability": "terrain_contacts",
+      "description": "Heightfield terrain drop test across the currently wired terrain solvers.",
+      "solvers": [
+        "xpbd",
+        "mujoco"
+      ],
+      "example_module": "newton.examples.basic.example_basic_heightfield",
+      "coverage": [
+        {
+          "solver_id": "xpbd",
+          "solver_name": "SolverXPBD",
+          "status": "benchmarked",
+          "reason": "Example-backed benchmark implemented."
+        },
+        {
+          "solver_id": "mujoco",
+          "solver_name": "SolverMuJoCo",
+          "status": "benchmarked",
+          "reason": "Example-backed benchmark implemented."
+        },
+        {
+          "solver_id": "semi_implicit",
+          "solver_name": "SolverSemiImplicit",
+          "status": "harness_gap",
+          "reason": "The terrain example only exposes XPBD/MuJoCo today."
+        },
+        {
+          "solver_id": "featherstone",
+          "solver_name": "SolverFeatherstone",
+          "status": "harness_gap",
+          "reason": "The terrain example only exposes XPBD/MuJoCo today."
+        },
+        {
+          "solver_id": "vbd",
+          "solver_name": "SolverVBD",
+          "status": "harness_gap",
+          "reason": "The terrain example only exposes XPBD/MuJoCo today."
+        },
+        {
+          "solver_id": "style3d",
+          "solver_name": "SolverStyle3D",
+          "status": "unsupported",
+          "reason": "Style3D does not support terrain-backed rigid-body contacts."
+        }
+      ]
+    },
+    {
+      "name": "cloth_hanging",
+      "capability": "cloth",
+      "description": "Hanging cloth benchmark across supported cloth solvers.",
+      "solvers": [
+        "semi_implicit",
+        "style3d",
+        "xpbd",
+        "vbd"
+      ],
+      "example_module": "newton.examples.cloth.example_cloth_hanging",
+      "coverage": [
+        {
+          "solver_id": "semi_implicit",
+          "solver_name": "SolverSemiImplicit",
+          "status": "benchmarked",
+          "reason": "Example-backed benchmark implemented."
+        },
+        {
+          "solver_id": "style3d",
+          "solver_name": "SolverStyle3D",
+          "status": "benchmarked",
+          "reason": "Example-backed benchmark implemented."
+        },
+        {
+          "solver_id": "xpbd",
+          "solver_name": "SolverXPBD",
+          "status": "benchmarked",
+          "reason": "Example-backed benchmark implemented."
+        },
+        {
+          "solver_id": "vbd",
+          "solver_name": "SolverVBD",
+          "status": "benchmarked",
+          "reason": "Example-backed benchmark implemented."
+        },
+        {
+          "solver_id": "featherstone",
+          "solver_name": "SolverFeatherstone",
+          "status": "harness_gap",
+          "reason": "Newton uses Featherstone as a helper in mixed examples, not as a standalone cloth benchmark here."
+        },
+        {
+          "solver_id": "mujoco",
+          "solver_name": "SolverMuJoCo",
+          "status": "unsupported",
+          "reason": "MuJoCo does not support Newton cloth simulation."
+        }
+      ]
+    }
+  ],
+  "results": [
+    {
+      "scenario": "gravity_capsule",
+      "capability": "rigid_body_dynamics",
+      "description": "Single rigid capsule dropped onto a plane across core rigid-body solvers.",
+      "example_module": "newton._src.tools.solver_benchmark_matrix",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "step_times_ms": [
+        27794.363826
+      ],
+      "model": {
+        "body_count": 1,
+        "joint_count": 1,
+        "joint_dof_count": 6,
+        "shape_count": 2,
+        "particle_count": 0
+      },
+      "total_time_ms": 27794.36382604763,
+      "mean_step_time_ms": 27794.36382604763,
+      "median_step_time_ms": 27794.36382604763,
+      "min_step_time_ms": 27794.36382604763,
+      "max_step_time_ms": 27794.36382604763,
+      "steps_per_second": 0.035978517308708644
+    },
+    {
+      "scenario": "gravity_capsule",
+      "capability": "rigid_body_dynamics",
+      "description": "Single rigid capsule dropped onto a plane across core rigid-body solvers.",
+      "example_module": "newton._src.tools.solver_benchmark_matrix",
+      "solver_id": "semi_implicit",
+      "solver_name": "SolverSemiImplicit",
+      "step_times_ms": [
+        2208.444667
+      ],
+      "model": {
+        "body_count": 1,
+        "joint_count": 1,
+        "joint_dof_count": 6,
+        "shape_count": 2,
+        "particle_count": 0
+      },
+      "total_time_ms": 2208.4446670487523,
+      "mean_step_time_ms": 2208.4446670487523,
+      "median_step_time_ms": 2208.4446670487523,
+      "min_step_time_ms": 2208.4446670487523,
+      "max_step_time_ms": 2208.4446670487523,
+      "steps_per_second": 0.45280736027511465
+    },
+    {
+      "scenario": "gravity_capsule",
+      "capability": "rigid_body_dynamics",
+      "description": "Single rigid capsule dropped onto a plane across core rigid-body solvers.",
+      "example_module": "newton._src.tools.solver_benchmark_matrix",
+      "solver_id": "featherstone",
+      "solver_name": "SolverFeatherstone",
+      "step_times_ms": [
+        2.495057
+      ],
+      "model": {
+        "body_count": 1,
+        "joint_count": 1,
+        "joint_dof_count": 6,
+        "shape_count": 2,
+        "particle_count": 0
+      },
+      "total_time_ms": 2.495056949555874,
+      "mean_step_time_ms": 2.495056949555874,
+      "median_step_time_ms": 2.495056949555874,
+      "min_step_time_ms": 2.495056949555874,
+      "max_step_time_ms": 2.495056949555874,
+      "steps_per_second": 400.79245492893557
+    },
+    {
+      "scenario": "gravity_capsule",
+      "capability": "rigid_body_dynamics",
+      "description": "Single rigid capsule dropped onto a plane across core rigid-body solvers.",
+      "example_module": "newton._src.tools.solver_benchmark_matrix",
+      "solver_id": "mujoco",
+      "solver_name": "SolverMuJoCo",
+      "step_times_ms": [
+        11122.225383
+      ],
+      "model": {
+        "body_count": 1,
+        "joint_count": 1,
+        "joint_dof_count": 6,
+        "shape_count": 2,
+        "particle_count": 0
+      },
+      "total_time_ms": 11122.225383063778,
+      "mean_step_time_ms": 11122.225383063778,
+      "median_step_time_ms": 11122.225383063778,
+      "min_step_time_ms": 11122.225383063778,
+      "max_step_time_ms": 11122.225383063778,
+      "steps_per_second": 0.0899100643584095
+    },
+    {
+      "scenario": "pendulum",
+      "capability": "joint_chains",
+      "description": "Double-pendulum articulation parity across maximal-coordinate and generalized-coordinate solvers.",
+      "example_module": "newton._src.tools.solver_benchmark_matrix",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "step_times_ms": [
+        4510.037135
+      ],
+      "model": {
+        "body_count": 2,
+        "joint_count": 2,
+        "joint_dof_count": 2,
+        "shape_count": 2,
+        "particle_count": 0
+      },
+      "total_time_ms": 4510.0371348671615,
+      "mean_step_time_ms": 4510.0371348671615,
+      "median_step_time_ms": 4510.0371348671615,
+      "min_step_time_ms": 4510.0371348671615,
+      "max_step_time_ms": 4510.0371348671615,
+      "steps_per_second": 0.2217276643398312
+    },
+    {
+      "scenario": "pendulum",
+      "capability": "joint_chains",
+      "description": "Double-pendulum articulation parity across maximal-coordinate and generalized-coordinate solvers.",
+      "example_module": "newton._src.tools.solver_benchmark_matrix",
+      "solver_id": "semi_implicit",
+      "solver_name": "SolverSemiImplicit",
+      "step_times_ms": [
+        0.714824
+      ],
+      "model": {
+        "body_count": 2,
+        "joint_count": 2,
+        "joint_dof_count": 2,
+        "shape_count": 2,
+        "particle_count": 0
+      },
+      "total_time_ms": 0.7148240692913532,
+      "mean_step_time_ms": 0.7148240692913532,
+      "median_step_time_ms": 0.7148240692913532,
+      "min_step_time_ms": 0.7148240692913532,
+      "max_step_time_ms": 0.7148240692913532,
+      "steps_per_second": 1398.9456188728484
+    },
+    {
+      "scenario": "pendulum",
+      "capability": "joint_chains",
+      "description": "Double-pendulum articulation parity across maximal-coordinate and generalized-coordinate solvers.",
+      "example_module": "newton._src.tools.solver_benchmark_matrix",
+      "solver_id": "featherstone",
+      "solver_name": "SolverFeatherstone",
+      "step_times_ms": [
+        0.557896
+      ],
+      "model": {
+        "body_count": 2,
+        "joint_count": 2,
+        "joint_dof_count": 2,
+        "shape_count": 2,
+        "particle_count": 0
+      },
+      "total_time_ms": 0.5578959826380014,
+      "mean_step_time_ms": 0.5578959826380014,
+      "median_step_time_ms": 0.5578959826380014,
+      "min_step_time_ms": 0.5578959826380014,
+      "max_step_time_ms": 0.5578959826380014,
+      "steps_per_second": 1792.4488275959927
+    },
+    {
+      "scenario": "pendulum",
+      "capability": "joint_chains",
+      "description": "Double-pendulum articulation parity across maximal-coordinate and generalized-coordinate solvers.",
+      "example_module": "newton._src.tools.solver_benchmark_matrix",
+      "solver_id": "mujoco",
+      "solver_name": "SolverMuJoCo",
+      "step_times_ms": [
+        2800.866946
+      ],
+      "model": {
+        "body_count": 2,
+        "joint_count": 2,
+        "joint_dof_count": 2,
+        "shape_count": 2,
+        "particle_count": 0
+      },
+      "total_time_ms": 2800.8669461123645,
+      "mean_step_time_ms": 2800.8669461123645,
+      "median_step_time_ms": 2800.8669461123645,
+      "min_step_time_ms": 2800.8669461123645,
+      "max_step_time_ms": 2800.8669461123645,
+      "steps_per_second": 0.3570323115091245
+    },
+    {
+      "scenario": "basic_shapes",
+      "capability": "rigid_contacts",
+      "description": "Rigid collision shapes resting on the ground.",
+      "example_module": "newton.examples.basic.example_basic_shapes",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "step_times_ms": [
+        5.402349
+      ],
+      "model": {
+        "body_count": 7,
+        "joint_count": 7,
+        "joint_dof_count": 42,
+        "shape_count": 8,
+        "particle_count": 0
+      },
+      "total_time_ms": 5.402349168434739,
+      "mean_step_time_ms": 5.402349168434739,
+      "median_step_time_ms": 5.402349168434739,
+      "min_step_time_ms": 5.402349168434739,
+      "max_step_time_ms": 5.402349168434739,
+      "steps_per_second": 185.1046588848564
+    },
+    {
+      "scenario": "basic_shapes",
+      "capability": "rigid_contacts",
+      "description": "Rigid collision shapes resting on the ground.",
+      "example_module": "newton.examples.basic.example_basic_shapes",
+      "solver_id": "vbd",
+      "solver_name": "SolverVBD",
+      "step_times_ms": [
+        6.979475
+      ],
+      "model": {
+        "body_count": 7,
+        "joint_count": 7,
+        "joint_dof_count": 42,
+        "shape_count": 8,
+        "particle_count": 0
+      },
+      "total_time_ms": 6.97947503067553,
+      "mean_step_time_ms": 6.97947503067553,
+      "median_step_time_ms": 6.97947503067553,
+      "min_step_time_ms": 6.97947503067553,
+      "max_step_time_ms": 6.97947503067553,
+      "steps_per_second": 143.27725159913808
+    },
+    {
+      "scenario": "basic_joints",
+      "capability": "articulations",
+      "description": "Programmatic jointed rigid-body system with articulated motion.",
+      "example_module": "newton.examples.basic.example_basic_joints",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "step_times_ms": [
+        1.429272
+      ],
+      "model": {
+        "body_count": 6,
+        "joint_count": 6,
+        "joint_dof_count": 5,
+        "shape_count": 7,
+        "particle_count": 0
+      },
+      "total_time_ms": 1.4292721170932055,
+      "mean_step_time_ms": 1.4292721170932055,
+      "median_step_time_ms": 1.4292721170932055,
+      "min_step_time_ms": 1.4292721170932055,
+      "max_step_time_ms": 1.4292721170932055,
+      "steps_per_second": 699.656830942563
+    },
+    {
+      "scenario": "basic_joints",
+      "capability": "articulations",
+      "description": "Programmatic jointed rigid-body system with articulated motion.",
+      "example_module": "newton.examples.basic.example_basic_joints",
+      "solver_id": "vbd",
+      "solver_name": "SolverVBD",
+      "step_times_ms": [
+        2.558077
+      ],
+      "model": {
+        "body_count": 6,
+        "joint_count": 6,
+        "joint_dof_count": 5,
+        "shape_count": 7,
+        "particle_count": 0
+      },
+      "total_time_ms": 2.558076987043023,
+      "mean_step_time_ms": 2.558076987043023,
+      "median_step_time_ms": 2.558076987043023,
+      "min_step_time_ms": 2.558076987043023,
+      "max_step_time_ms": 2.558076987043023,
+      "steps_per_second": 390.9186490731608
+    },
+    {
+      "scenario": "basic_heightfield",
+      "capability": "terrain_contacts",
+      "description": "Heightfield terrain drop test across the currently wired terrain solvers.",
+      "example_module": "newton.examples.basic.example_basic_heightfield",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "step_times_ms": [
+        4.984078
+      ],
+      "model": {
+        "body_count": 5,
+        "joint_count": 5,
+        "joint_dof_count": 30,
+        "shape_count": 6,
+        "particle_count": 0
+      },
+      "total_time_ms": 4.984077997505665,
+      "mean_step_time_ms": 4.984077997505665,
+      "median_step_time_ms": 4.984077997505665,
+      "min_step_time_ms": 4.984077997505665,
+      "max_step_time_ms": 4.984077997505665,
+      "steps_per_second": 200.63891465993524
+    },
+    {
+      "scenario": "basic_heightfield",
+      "capability": "terrain_contacts",
+      "description": "Heightfield terrain drop test across the currently wired terrain solvers.",
+      "example_module": "newton.examples.basic.example_basic_heightfield",
+      "solver_id": "mujoco",
+      "solver_name": "SolverMuJoCo",
+      "step_times_ms": [
+        7.333163
+      ],
+      "model": {
+        "body_count": 5,
+        "joint_count": 5,
+        "joint_dof_count": 30,
+        "shape_count": 6,
+        "particle_count": 0
+      },
+      "total_time_ms": 7.333162939175963,
+      "mean_step_time_ms": 7.333162939175963,
+      "median_step_time_ms": 7.333162939175963,
+      "min_step_time_ms": 7.333162939175963,
+      "max_step_time_ms": 7.333162939175963,
+      "steps_per_second": 136.366804923657
+    },
+    {
+      "scenario": "cloth_hanging",
+      "capability": "cloth",
+      "description": "Hanging cloth benchmark across supported cloth solvers.",
+      "example_module": "newton.examples.cloth.example_cloth_hanging",
+      "solver_id": "semi_implicit",
+      "solver_name": "SolverSemiImplicit",
+      "step_times_ms": [
+        2.627506
+      ],
+      "model": {
+        "body_count": 0,
+        "joint_count": 0,
+        "joint_dof_count": 0,
+        "shape_count": 1,
+        "particle_count": 117
+      },
+      "total_time_ms": 2.6275059208273888,
+      "mean_step_time_ms": 2.6275059208273888,
+      "median_step_time_ms": 2.6275059208273888,
+      "min_step_time_ms": 2.6275059208273888,
+      "max_step_time_ms": 2.6275059208273888,
+      "steps_per_second": 380.5890567451528
+    },
+    {
+      "scenario": "cloth_hanging",
+      "capability": "cloth",
+      "description": "Hanging cloth benchmark across supported cloth solvers.",
+      "example_module": "newton.examples.cloth.example_cloth_hanging",
+      "solver_id": "style3d",
+      "solver_name": "SolverStyle3D",
+      "step_times_ms": [
+        9.29013
+      ],
+      "model": {
+        "body_count": 0,
+        "joint_count": 0,
+        "joint_dof_count": 0,
+        "shape_count": 1,
+        "particle_count": 117
+      },
+      "total_time_ms": 9.290129877626896,
+      "mean_step_time_ms": 9.290129877626896,
+      "median_step_time_ms": 9.290129877626896,
+      "min_step_time_ms": 9.290129877626896,
+      "max_step_time_ms": 9.290129877626896,
+      "steps_per_second": 107.64112161749924
+    },
+    {
+      "scenario": "cloth_hanging",
+      "capability": "cloth",
+      "description": "Hanging cloth benchmark across supported cloth solvers.",
+      "example_module": "newton.examples.cloth.example_cloth_hanging",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "step_times_ms": [
+        7.224943
+      ],
+      "model": {
+        "body_count": 0,
+        "joint_count": 0,
+        "joint_dof_count": 0,
+        "shape_count": 1,
+        "particle_count": 117
+      },
+      "total_time_ms": 7.224943023175001,
+      "mean_step_time_ms": 7.224943023175001,
+      "median_step_time_ms": 7.224943023175001,
+      "min_step_time_ms": 7.224943023175001,
+      "max_step_time_ms": 7.224943023175001,
+      "steps_per_second": 138.40939600386633
+    },
+    {
+      "scenario": "cloth_hanging",
+      "capability": "cloth",
+      "description": "Hanging cloth benchmark across supported cloth solvers.",
+      "example_module": "newton.examples.cloth.example_cloth_hanging",
+      "solver_id": "vbd",
+      "solver_name": "SolverVBD",
+      "step_times_ms": [
+        21.448507
+      ],
+      "model": {
+        "body_count": 0,
+        "joint_count": 0,
+        "joint_dof_count": 0,
+        "shape_count": 1,
+        "particle_count": 117
+      },
+      "total_time_ms": 21.448506973683834,
+      "mean_step_time_ms": 21.448506973683834,
+      "median_step_time_ms": 21.448506973683834,
+      "min_step_time_ms": 21.448506973683834,
+      "max_step_time_ms": 21.448506973683834,
+      "steps_per_second": 46.62329183224484
+    }
+  ],
+  "notes": [
+    "This matrix combines in-tree examples with direct builder-backed scenarios to provide honest solver-vs-capability coverage.",
+    "Coverage metadata distinguishes benchmarked paths from harness gaps and unsupported solver/scenario combinations."
+  ]
+}

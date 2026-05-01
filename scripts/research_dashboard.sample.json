@@ -1,0 +1,193 @@
+{
+  "message": "Reading list v1 loaded from ROB-70. Focus areas: differentiable collision queries, dense-contact response, and articulated solver scaling.",
+  "timeline": [
+    {
+      "id": "update-1",
+      "title": "Created Newton follow-up ticket for differentiable collision queries",
+      "summary": "DiffCollision, DCOL, and iDCOL all point to a bounded Newton spike around witness-point or distance-query gradients before any solver integration work.",
+      "date": "2026-03-30T09:41:05Z",
+      "entry_id": "diffcollision-2025"
+    },
+    {
+      "id": "update-2",
+      "title": "Created benchmark-first ticket for analytical contact response",
+      "summary": "ComFree-Sim argues for per-contact closed-form updates and near-linear scaling, but Newton should validate the idea on dense-contact scenes before architectural churn.",
+      "date": "2026-03-30T09:41:05Z",
+      "entry_id": "comfree-2026"
+    },
+    {
+      "id": "update-3",
+      "title": "Large-assembly solver direction narrowed to a reduced-space experiment",
+      "summary": "M-ABD looks relevant for solver architecture and benchmark design, but not as a drop-in rigid-body replacement without a design pass.",
+      "date": "2026-03-30T09:41:05Z",
+      "entry_id": "mabd-2026"
+    },
+    {
+      "id": "update-4",
+      "title": "Adaptive merging kept as an optimization candidate, not a default roadmap item",
+      "summary": "The idea is promising for resting stacks and quasi-rigid clusters, but it needs a clear distinction from ordinary sleeping and islanding before investment.",
+      "date": "2026-03-30T09:41:05Z",
+      "entry_id": "adaptive-merging-2020"
+    }
+  ],
+  "entries": [
+    {
+      "id": "diffcollision-2025",
+      "section": "Differentiable Contact Geometry",
+      "kind": "paper",
+      "title": "Robust Differentiable Collision Detection for General Objects",
+      "summary": "Extends differentiable witness-point computation beyond convex objects by combining distance-based randomized smoothing, adaptive sampling, and gradient transport for complex meshes and concave geometry.",
+      "date": "2026-02-28T00:00:00Z",
+      "source": {
+        "label": "arXiv 2511.06267",
+        "url": "https://arxiv.org/abs/2511.06267"
+      },
+      "implementation_notes": "Most relevant as a geometry-query layer rather than a whole Newton solver change. The paper suggests a path for gradients through contact geometry on mesh-backed assets, which is the main gap left by convex-only approaches.",
+      "next_steps": [
+        "Prototype a differentiable closest-point or witness-point path for a small Newton shape subset before touching solver internals.",
+        "Benchmark gradient stability on one convex case and one mesh-backed case to decide whether public API exposure is justified.",
+        "Use ROB-72 as the implementation spike for this direction."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "This is the strongest lead for Newton's differentiable-contact roadmap because it targets general objects instead of only convex decompositions.",
+          "created_at": "2026-03-30T09:41:05Z"
+        }
+      ],
+      "tags": ["differentiable-simulation", "collision-detection", "meshes", "contact-gradients"]
+    },
+    {
+      "id": "dcol-2022",
+      "section": "Differentiable Contact Geometry",
+      "kind": "paper",
+      "title": "Differentiable Collision Detection for a Set of Convex Primitives",
+      "summary": "DCOL formulates collision detection as a convex optimization over composable convex primitives and returns differentiable collision metrics plus contact points.",
+      "date": "2023-05-18T00:00:00Z",
+      "source": {
+        "label": "arXiv 2207.00669",
+        "url": "https://arxiv.org/abs/2207.00669"
+      },
+      "implementation_notes": "Useful as the lower-risk baseline for Newton because sphere, box, capsule, and convex approximations already fit this style better than arbitrary triangle meshes do.",
+      "next_steps": [
+        "Start any Newton differentiable-collision experiment with convex primitives and only then test mesh-backed escalation.",
+        "Check whether current Newton contact generation already exposes enough intermediate data to support a DCOL-like query API."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "This is likely the right first benchmark target even if the long-term goal is broader mesh support.",
+          "created_at": "2026-03-30T09:41:05Z"
+        }
+      ],
+      "tags": ["differentiable-simulation", "convex-primitives", "optimization", "contact-queries"]
+    },
+    {
+      "id": "idcol-2026",
+      "section": "Differentiable Contact Geometry",
+      "kind": "paper",
+      "title": "Collision Detection with Analytical Derivatives of Contact Kinematics",
+      "summary": "iDCOL regularizes contact geometry into strictly convex implicit surfaces and uses the Implicit Function Theorem to derive analytical derivatives of distance, location, and normal.",
+      "date": "2026-02-03T00:00:00Z",
+      "source": {
+        "label": "arXiv 2602.03250",
+        "url": "https://arxiv.org/abs/2602.03250"
+      },
+      "implementation_notes": "This is the most direct related work to DiffCollision for Newton because it makes the derivative story explicit and could inform whether implicit-surface proxies are more practical than smoothing over raw mesh geometry.",
+      "next_steps": [
+        "Compare implicit-surface proxies against mesh smoothing in the ROB-72 spike.",
+        "Decide whether Newton needs exact contact-kinematic derivatives or only stable gradients for optimization and learning loops."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "iDCOL sharpens the question from 'can we differentiate collision?' to 'which geometry representation keeps the derivatives useful and stable?'",
+          "created_at": "2026-03-30T09:41:05Z"
+        }
+      ],
+      "tags": ["differentiable-simulation", "implicit-surfaces", "contact-kinematics", "related-work"]
+    },
+    {
+      "id": "comfree-2026",
+      "section": "Contact And Friction Solvers",
+      "kind": "paper",
+      "title": "ComFree-Sim: A GPU-Parallelized Analytical Contact Physics Engine for Scalable Contact-Rich Robotics Simulation and Control",
+      "summary": "Presents a complementarity-free analytical contact update in the dual cone of Coulomb friction, with near-linear contact scaling and Warp-based implementation aimed at control loops.",
+      "date": "2026-03-14T00:00:00Z",
+      "source": {
+        "label": "arXiv 2603.12185",
+        "url": "https://arxiv.org/abs/2603.12185"
+      },
+      "implementation_notes": "Important for Newton because it is both Warp-based and benchmarked on dense contact. The practical lesson is not 'replace the engine wholesale' but 'benchmark whether a contact-local analytical update pays off on Newton's hot scenes.'",
+      "next_steps": [
+        "Use ROB-73 to build a benchmark-first evaluation against dense-contact Newton scenes.",
+        "Isolate tangential, torsional, and rolling-friction terms so the experiment can stay narrow.",
+        "Reject the direction quickly if the simplified prototype cannot beat current throughput or fidelity in the relevant regimes."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "This is the most actionable contact-resolution paper because it shares Warp as an implementation substrate and emphasizes dense-contact throughput instead of only theory.",
+          "created_at": "2026-03-30T09:41:05Z"
+        }
+      ],
+      "tags": ["contact-solver", "friction", "warp", "benchmarking", "robotics-control"]
+    },
+    {
+      "id": "mabd-2026",
+      "section": "Articulation And Assembly Solvers",
+      "kind": "paper",
+      "title": "M-ABD: Scalable, Efficient, and Robust Multi-Affine-Body Dynamics",
+      "summary": "Uses affine-body dynamics with reduced-space KKT solves and prefactorizable system structure to simulate very large articulated assemblies with diverse joint topologies.",
+      "date": "2026-03-13T00:00:00Z",
+      "source": {
+        "label": "arXiv 2603.08079",
+        "url": "https://arxiv.org/abs/2603.08079"
+      },
+      "implementation_notes": "Relevant to Newton as solver architecture inspiration, especially for chains, trees, loops, and large assemblies. It is not a direct rigid-body transplant, so the value is in reduced-space formulation ideas and benchmark design.",
+      "next_steps": [
+        "Use ROB-74 to map the paper's reduced-space and prefactorization ideas onto Newton's current articulation state layout.",
+        "Focus early design work on chain/tree/closed-loop benchmarks and explicit risk around world contacts."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "The paper is strong on architecture and scaling, but Newton needs a translation layer from ABD assumptions to its existing rigid-body abstractions.",
+          "created_at": "2026-03-30T09:41:05Z"
+        }
+      ],
+      "tags": ["articulations", "solver-architecture", "kkt", "large-assemblies", "reduced-space"]
+    },
+    {
+      "id": "adaptive-merging-2020",
+      "section": "Articulation And Assembly Solvers",
+      "kind": "paper",
+      "title": "Adaptive Merging for Rigid Body Simulation",
+      "summary": "Accelerates rigid-body simulation by merging bodies that share a common spatial velocity and unmerging them when contact evolution indicates that internal dynamics matter again.",
+      "date": "2020-07-01T00:00:00Z",
+      "source": {
+        "label": "Project page",
+        "url": "https://eulaliecoevoet.github.io/AdaptiveMerging/"
+      },
+      "implementation_notes": "This looks like an optimization candidate for resting or quasi-rigid contact islands, not a default Newton roadmap item. The first question is whether Newton's sleeping or island handling already captures most of the easy wins.",
+      "next_steps": [
+        "Use ROB-75 to compare adaptive merging against ordinary sleeping and islanding on long-lived contact clusters.",
+        "Reject the idea if bookkeeping complexity outweighs any measured runtime benefit on representative Newton scenes."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "Worth keeping as a scoped optimization study, but it is less urgent than differentiable queries or dense-contact benchmarking.",
+          "created_at": "2026-03-30T09:41:05Z"
+        }
+      ],
+      "tags": ["performance", "sleeping", "contact-islands", "resting-stacks", "related-work"]
+    }
+  ],
+  "chat": {
+    "mode": "stub",
+    "agent_name": "Research Scientist",
+    "placeholder": "Ask which reading-list item should become implementation work next.",
+    "status": "Reading list v1 loaded. Follow-on engineering tickets: ROB-72 through ROB-75."
+  }
+}

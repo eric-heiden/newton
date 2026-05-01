@@ -1,0 +1,107 @@
+{
+  "benchmark": {
+    "name": "grasp_lift_identification",
+    "schema_version": 1,
+    "git_commit": "0123456789abcdef",
+    "device": "cuda:0",
+    "warp_version": "1.0.0",
+    "step_dt": 0.002,
+    "substeps": 4,
+    "seed": 7
+  },
+  "scenario": {
+    "object_asset": "assets/objects/cylinder.usd",
+    "object_scale": 1.0,
+    "gripper_trajectory_source": "logs/gripper_pose.csv",
+    "observation_source": "logs/object_pose.csv",
+    "loss_weights": {
+      "trajectory": 1.0,
+      "slip_timing": 0.5,
+      "terminal_pose": 0.25,
+      "grasp_success": 2.0
+    }
+  },
+  "parameters": {
+    "nominal": {
+      "object_mass": 0.25,
+      "gripper_object_friction": 0.8,
+      "table_object_friction": 0.5,
+      "normal_compliance": 2e-05
+    },
+    "initial_guess": {
+      "object_mass": 0.2,
+      "gripper_object_friction": 0.6,
+      "table_object_friction": 0.4,
+      "normal_compliance": 3e-05
+    },
+    "identified": {
+      "object_mass": 0.24,
+      "gripper_object_friction": 0.77,
+      "table_object_friction": 0.48,
+      "normal_compliance": 2.2e-05
+    }
+  },
+  "replay": {
+    "initial_state": {
+      "object_pose": [0.0, 0.0, 0.03, 1.0, 0.0, 0.0, 0.0],
+      "object_twist": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "gripper_pose": [0.0, 0.0, 0.1, 1.0, 0.0, 0.0, 0.0],
+      "solver_warmstart": {
+        "contact_impulses": [0.0, 0.0]
+      }
+    },
+    "steps": [
+      {
+        "step": 0,
+        "time": 0.0,
+        "gripper_command": {
+          "pose": [0.0, 0.0, 0.1, 1.0, 0.0, 0.0, 0.0],
+          "jaw_width": 0.08
+        },
+        "object_pose": [0.0, 0.0, 0.03, 1.0, 0.0, 0.0, 0.0],
+        "object_twist": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "contact_count": 2,
+        "grasp_success": true,
+        "slip_detected": false,
+        "slip_margin": 0.01,
+        "loss_terms": {
+          "trajectory": 0.0,
+          "slip_timing": 0.0,
+          "terminal_pose": 0.0,
+          "grasp_success": 0.0
+        }
+      }
+    ],
+    "summary": {
+      "trajectory_rmse_m": 0.0004,
+      "trajectory_rmse_rad": 0.001,
+      "slip_event_step": 121,
+      "terminal_pose_error_m": 0.0007,
+      "terminal_pose_error_rad": 0.002,
+      "loss": 0.014
+    }
+  },
+  "gradient_validation": {
+    "checkpoints": [
+      {
+        "name": "post_lift",
+        "step": 80
+      },
+      {
+        "name": "perturbation_onset",
+        "step": 120
+      }
+    ],
+    "checks": [
+      {
+        "parameter": "object_mass",
+        "epsilon": 0.0025,
+        "analytic_grad": -0.42,
+        "fd_grad": -0.4,
+        "sign_match": true,
+        "relative_error": 0.05,
+        "passed": true
+      }
+    ]
+  }
+}

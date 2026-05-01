@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily refresh for Newton benchmark dashboard
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+Persistent=true
+Unit=newton-benchmark-dashboard-refresh.service
+
+[Install]
+WantedBy=timers.target

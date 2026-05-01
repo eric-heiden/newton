@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "run_id": "20260401T190000Z",
+  "generated_at": "2026-04-01T19:00:00+00:00",
+  "benchmark": {
+    "name": "visual_first_tiled_sensing",
+    "schema_version": 1,
+    "git_commit": "0123456789abcdef",
+    "device": "cpu",
+    "host": "runner",
+    "warp_version": "1.0.0",
+    "steps": 6,
+    "warmup_steps": 1,
+    "resolution": [
+      64,
+      64
+    ],
+    "render_order": "tiled",
+    "tile_shape": [
+      8,
+      8
+    ]
+  },
+  "scenario": {
+    "name": "multi_world_brick_stacking",
+    "world_count": 8,
+    "camera_count": 1,
+    "stack_brick_counts": [
+      2,
+      3,
+      4,
+      2,
+      3,
+      4,
+      2,
+      3
+    ],
+    "camera_fov_rad": 0.7330382858,
+    "brick_half_extents_m": [
+      0.016,
+      0.008,
+      0.0048
+    ]
+  },
+  "runtime": {
+    "alignment": "internal_sensor_runtime_boundary",
+    "input_fields": [
+      "world_id",
+      "body_q",
+      "camera_transform",
+      "camera_rays"
+    ],
+    "derived_observables": [
+      "moving_brick_pose",
+      "stack_top_height_m",
+      "depth_hit_pixel_count",
+      "color_nonzero_pixel_count",
+      "mean_depth_m"
+    ],
+    "output_fields": [
+      "color_image",
+      "depth_image"
+    ]
+  },
+  "summary": {
+    "total_render_time_ms": 72.1,
+    "mean_render_time_ms": 12.0,
+    "min_render_time_ms": 11.5,
+    "max_render_time_ms": 12.8,
+    "steps_per_second": 83.3,
+    "pixels_per_second": 2730496.0,
+    "preview_step": 5
+  },
+  "observability": {
+    "world_packets": [
+      {
+        "world_id": 0,
+        "step": 0,
+        "time_s": 0.0,
+        "camera_transform": [
+          0.18,
+          -0.18,
+          0.12,
+          0.504,
+          0.209,
+          0.312,
+          0.775
+        ],
+        "moving_brick_pose": [
+          -0.08,
+          -0.002,
+          0.0548,
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "stack_brick_count": 2,
+        "stack_top_height_m": 0.0208,
+        "depth_hit_pixel_count": 1540,
+        "color_nonzero_pixel_count": 4096,
+        "mean_depth_m": 0.182,
+        "min_depth_m": 0.141,
+        "max_depth_m": 0.257
+      }
+    ]
+  },
+  "artifacts": {
+    "color_preview": "previews/20260401T190000Z_color.npy",
+    "depth_preview": "previews/20260401T190000Z_depth.npy"
+  }
+}

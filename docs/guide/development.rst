@@ -736,6 +736,101 @@ benchmark code from the ``asv/benchmarks`` directory against the code state of t
 the benchmark definitions themselves are not checked out from different branches—only the code being
 benchmarked is.
 
+To publish the ASV HTML dashboard and serve it on a LAN-accessible host, Newton also includes helper scripts under
+``scripts/benchmarks/``:
+
+.. code-block:: console
+
+    ./scripts/benchmarks/refresh_dashboard.sh
+    ./scripts/benchmarks/serve_dashboard.sh
+
+The refresh script keeps a dedicated worktree at ``.runtime/benchmark-dashboard/main`` pinned to the latest
+``origin/main`` so the dashboard can be regenerated without modifying the active development checkout. The serve
+script starts a lightweight dashboard on ``0.0.0.0:7000`` that summarizes ``asv/results`` and links through to the
+native ASV HTML report in ``asv/html``, which makes the dashboard reachable from LAN and Tailscale clients when the
+machine firewall permits that port. The systemd service template also exports ``NEWTON_BENCHMARK_HOST=0.0.0.0`` and
+``NEWTON_BENCHMARK_PORT=7000`` explicitly so deployments inherit the same LAN-facing endpoint without extra local
+configuration. The same runtime also reads solver benchmark matrix evidence from
+``benchmarks/results/index.json`` by default via ``NEWTON_BENCHMARK_INDEX_PATH``, so same-day matrix runs can show up
+even before a fresh ASV HTML publish exists.
+
+Systemd unit templates for a long-running dashboard service and a daily refresh timer are provided in
+``scripts/systemd/``. A typical installation flow on a Linux host is:
+
+.. code-block:: console
+
+    sudo cp scripts/systemd/newton-benchmark-dashboard*.service /etc/systemd/system/
+    sudo cp scripts/systemd/newton-benchmark-dashboard-refresh.timer /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now newton-benchmark-dashboard-refresh.timer
+    sudo systemctl start newton-benchmark-dashboard-refresh.service
+    sudo systemctl enable --now newton-benchmark-dashboard.service
+
+Newton also includes a hosted research dashboard entrypoint that serves the structured reading-list artifact on
+``0.0.0.0:7070`` without requiring an extra per-run artifact CLI argument:
+
+.. code-block:: console
+
+    ./scripts/research/serve_dashboard.sh
+
+By default, the runtime reads ``scripts/research_dashboard.json``. The systemd unit template
+``scripts/systemd/newton-research-dashboard.service`` exports the same default path via
+``NEWTON_RESEARCH_ARTIFACT_PATH`` so the hosted service and manual runs use one stable artifact location. When the
+reading list changes, update ``scripts/research_dashboard.json`` and restart the service:
+
+.. code-block:: console
+
+    sudo cp scripts/systemd/newton-research-dashboard.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now newton-research-dashboard.service
+    sudo systemctl restart newton-research-dashboard.service
+
+The hosted service also exposes a small JSON API so the Research Scientist can capture new entries and recover old
+ones without editing the artifact by hand. Create a new entry with ``POST /api/research/entries`` and query existing
+entries with ``GET /api/research/entries``:
+
+.. code-block:: console
+
+    curl -X POST http://127.0.0.1:7070/api/research/entries \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "title": "Differentiable contact survey",
+        "section": "Differentiable Contact Geometry",
+        "kind": "paper",
+        "summary": "Collects contact-gradient references relevant to Newton.",
+        "implementation_notes": "Use it to scope a Newton query spike.",
+        "next_steps": ["Create a prototype issue."],
+        "tags": ["differentiable-simulation", "contact-queries"],
+        "author": "Research Scientist",
+        "note": "Relevant to the current dashboard work."
+      }'
+
+    curl "http://127.0.0.1:7070/api/research/entries?q=differentiable&section=Differentiable%20Contact%20Geometry"
+
+For repeatable local updates, use ``scripts/research/publish_entry.sh`` with a checked-in or scratch JSON payload file
+instead of hand-editing ``scripts/research_dashboard.json``:
+
+.. code-block:: console
+
+    cat >/tmp/research-entry.json <<'EOF'
+    {
+      "title": "Differentiable contact survey",
+      "section": "Differentiable Contact Geometry",
+      "kind": "paper",
+      "summary": "Collects contact-gradient references relevant to Newton.",
+      "implementation_notes": "Use it to scope a Newton query spike.",
+      "next_steps": ["Create a prototype issue."],
+      "tags": ["differentiable-simulation", "contact-queries"],
+      "author": "Research Scientist",
+      "note": "Relevant to the current dashboard work."
+    }
+    EOF
+    ./scripts/research/publish_entry.sh /tmp/research-entry.json
+
+Created entries persist into ``scripts/research_dashboard.json`` immediately and show up on the next dashboard refresh.
+Supported list filters are ``q``, ``section``, ``kind``, ``tag``, and ``limit``. ``GET /api/research/entries/<id>``
+returns one normalized entry when the caller already knows the entry identifier.
+
 Benchmarks can also be run against a range of commits using the ``commit1...commit2`` syntax.
 This is useful for comparing performance across several recent changes:
 

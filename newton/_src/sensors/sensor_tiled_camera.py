@@ -107,7 +107,42 @@ class SensorTiledCamera(metaclass=_SensorTiledCameraMeta):
         enable_particles: bool = True
         """.. deprecated:: Use ``render_config.enable_particles`` instead."""
 
-    def __init__(self, model: Model, *, config: Config | RenderConfig | None = None, load_textures: bool = True):
+    @dataclass(frozen=True)
+    class BatchPolicy:
+        """Recommended batching guardrails for multi-world tiled sensing launches.
+
+        The policy chunks camera batches when a single ``update()`` call would
+        exceed the preferred launch envelope for the requested output mix.
+        Limits are expressed in world-camera view pixels so they stay stable
+        across different world and camera fanout combinations.
+
+        The default values encode the initial tiled-sensing guidance from
+        [ROB-130](/ROB/issues/ROB-130):
+
+        - allow up to 64 concurrent ``256x256`` views for baseline output sets
+          (depth only, depth+normal, color only, or color+depth)
+        - reduce richer output mixes to 16 concurrent ``256x256`` views
+        - additionally cap rich output batches at roughly 96 MiB of output
+          buffers per launch
+        """
+
+        max_standard_view_pixels_per_batch: int = 64 * 256 * 256
+        """Maximum world-camera view pixels per batch for baseline outputs."""
+
+        max_rich_view_pixels_per_batch: int = 16 * 256 * 256
+        """Maximum world-camera view pixels per batch for rich output mixes."""
+
+        max_rich_output_bytes_per_batch: int = 96 * 1024 * 1024
+        """Maximum output-buffer footprint [bytes] for rich output mixes."""
+
+    def __init__(
+        self,
+        model: Model,
+        *,
+        config: Config | RenderConfig | None = None,
+        load_textures: bool = True,
+        batch_policy: BatchPolicy | None = None,
+    ):
         """Initialize the tiled camera sensor from a simulation model.
 
         Builds the internal :class:`RenderContext`, loads shape geometry (and
@@ -122,8 +157,12 @@ class SensorTiledCamera(metaclass=_SensorTiledCameraMeta):
                 accepted but deprecated.
             load_textures: Load texture data from the model. Set to ``False``
                 to skip texture loading when textures are not needed.
+            batch_policy: Optional launch guardrails for camera batching. Pass
+                :class:`BatchPolicy` to chunk large multi-world updates into
+                smaller camera groups within the recommended sensing envelope.
         """
         self.model = model
+        self.batch_policy = batch_policy
 
         render_config = config
 
@@ -208,17 +247,109 @@ class SensorTiledCamera(metaclass=_SensorTiledCameraMeta):
         if state is not None:
             self.sync_transforms(state)
 
-        self.__render_context.render(
-            camera_transforms,
+        camera_batch_size = self.__resolve_camera_batch_size(
             camera_rays,
             color_image,
             depth_image,
             shape_index_image,
             normal_image,
             albedo_image,
-            refit_bvh=refit_bvh,
-            clear_data=clear_data,
         )
+
+        camera_count = camera_rays.shape[0]
+        if camera_batch_size >= camera_count:
+            self.__render_context.render(
+                camera_transforms,
+                camera_rays,
+                color_image,
+                depth_image,
+                shape_index_image,
+                normal_image,
+                albedo_image,
+                refit_bvh=refit_bvh,
+                clear_data=clear_data,
+            )
+            return
+
+        for camera_begin in range(0, camera_count, camera_batch_size):
+            camera_end = min(camera_begin + camera_batch_size, camera_count)
+            self.__render_context.render(
+                camera_transforms[camera_begin:camera_end],
+                camera_rays[camera_begin:camera_end],
+                None if color_image is None else color_image[:, camera_begin:camera_end],
+                None if depth_image is None else depth_image[:, camera_begin:camera_end],
+                None if shape_index_image is None else shape_index_image[:, camera_begin:camera_end],
+                None if normal_image is None else normal_image[:, camera_begin:camera_end],
+                None if albedo_image is None else albedo_image[:, camera_begin:camera_end],
+                refit_bvh=refit_bvh and camera_begin == 0,
+                clear_data=clear_data,
+            )
+
+    def __resolve_camera_batch_size(
+        self,
+        camera_rays: wp.array(dtype=wp.vec3f, ndim=4),
+        color_image: wp.array(dtype=wp.uint32, ndim=4) | None,
+        depth_image: wp.array(dtype=wp.float32, ndim=4) | None,
+        shape_index_image: wp.array(dtype=wp.uint32, ndim=4) | None,
+        normal_image: wp.array(dtype=wp.vec3f, ndim=4) | None,
+        albedo_image: wp.array(dtype=wp.uint32, ndim=4) | None,
+    ) -> int:
+        """Return the camera batch size implied by :attr:`batch_policy`."""
+        if self.batch_policy is None:
+            return camera_rays.shape[0]
+
+        width = camera_rays.shape[2]
+        height = camera_rays.shape[1]
+        pixels_per_view = width * height
+
+        output_flags = {
+            "color": color_image is not None,
+            "depth": depth_image is not None,
+            "shape_index": shape_index_image is not None,
+            "normal": normal_image is not None,
+            "albedo": albedo_image is not None,
+        }
+        rich_outputs = output_flags["shape_index"] or output_flags["albedo"] or sum(output_flags.values()) >= 3
+
+        views_per_batch_limits: list[int] = []
+        if rich_outputs:
+            views_per_batch_limits.append(self.batch_policy.max_rich_view_pixels_per_batch // pixels_per_view)
+
+            output_bytes_per_pixel = (
+                4 * int(output_flags["color"])
+                + 4 * int(output_flags["depth"])
+                + 4 * int(output_flags["shape_index"])
+                + 12 * int(output_flags["normal"])
+                + 4 * int(output_flags["albedo"])
+            )
+            output_bytes_per_view = output_bytes_per_pixel * pixels_per_view
+            if output_bytes_per_view > 0:
+                views_per_batch_limits.append(
+                    self.batch_policy.max_rich_output_bytes_per_batch // output_bytes_per_view
+                )
+        else:
+            views_per_batch_limits.append(self.batch_policy.max_standard_view_pixels_per_batch // pixels_per_view)
+
+        max_views_per_batch = min(views_per_batch_limits)
+        if max_views_per_batch <= 0:
+            output_names = [name for name, enabled in output_flags.items() if enabled]
+            raise ValueError(
+                "Requested tiled sensing launch exceeds the configured batch policy for a single world fanout: "
+                f"world_count={self.model.world_count}, resolution={width}x{height}, outputs={output_names}. "
+                "Reduce resolution, request fewer output channels, or relax SensorTiledCamera.BatchPolicy."
+            )
+
+        camera_batch_size = max_views_per_batch // self.model.world_count
+        if camera_batch_size <= 0:
+            output_names = [name for name, enabled in output_flags.items() if enabled]
+            raise ValueError(
+                "Requested tiled sensing launch exceeds the configured batch policy before even one camera can fit: "
+                f"world_count={self.model.world_count}, resolution={width}x{height}, outputs={output_names}. "
+                "Reduce world_count or resolution, request fewer output channels, or relax "
+                "SensorTiledCamera.BatchPolicy."
+            )
+
+        return min(camera_rays.shape[0], camera_batch_size)
 
     def compute_pinhole_camera_rays(
         self, width: int, height: int, camera_fovs: float | list[float] | np.ndarray | wp.array(dtype=wp.float32)

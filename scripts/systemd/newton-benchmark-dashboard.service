@@ -1,0 +1,18 @@
+[Unit]
+Description=Newton benchmark dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/newton
+Environment=PYTHONUNBUFFERED=1
+Environment=NEWTON_BENCHMARK_HOST=0.0.0.0
+Environment=NEWTON_BENCHMARK_PORT=7000
+Environment=NEWTON_BENCHMARK_INDEX_PATH=%h/newton/benchmarks/results/index.json
+ExecStart=%h/newton/scripts/benchmarks/serve_dashboard.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

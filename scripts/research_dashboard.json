@@ -1,0 +1,652 @@
+{
+  "message": "Reading list v2 updated on 2026-04-01 from arXiv and project pages. The latest TOI-Velocity review narrowed Newton's moving-contact gradient work to an opt-in rigid-query-cache experiment with sphere-sphere first and sphere-capsule second if the first benchmark is clean.",
+  "timeline": [
+    {
+      "id": "update-toi-velocity-implementation-brief-2026-04-01",
+      "title": "Translated TOI-Velocity into a bounded Newton benchmark plan",
+      "summary": "The paper maps to an opt-in differentiable rollout path that caches TOI state and post-impact velocity inputs; the first pass should stay sphere-sphere only, with sphere-capsule as the next escalation rather than capsule-capsule.",
+      "date": "2026-04-01T15:12:00Z",
+      "entry_id": "toi-velocity-differentiable-contacts-2023"
+    },
+    {
+      "id": "update-toi-velocity-differentiable-contacts-2023",
+      "title": "Added Improving Gradient Computation for Differentiable Physics Simulation with Contacts",
+      "summary": "TOI-Velocity uses continuous collision detection and time-of-impact correction to improve gradients when rigid-body contact normals change between moving objects, complementing backward-only pre-contact smoothing.",
+      "date": "2026-04-01T14:50:30Z",
+      "entry_id": "toi-velocity-differentiable-contacts-2023"
+    },
+    {
+      "id": "update-d-rex-differentiable-real-to-sim-to-real-engine-for-learning-dexterous-grasping",
+      "title": "Added D-REX: Differentiable Real-to-Sim-to-Real Engine for Learning Dexterous Grasping",
+      "summary": "D-REX uses a differentiable real-to-sim-to-real loop for dexterous grasping, identifying object mass from real observations and robot controls while training force-aware grasping policies on the recovered digital twin.",
+      "date": "2026-04-01T14:39:26.075342+00:00",
+      "entry_id": "d-rex-differentiable-real-to-sim-to-real-engine-for-learning-dexterous-grasping"
+    },
+    {
+      "id": "update-difftactile-a-physics-based-differentiable-tactile-simulator-for-contact-rich-robotic-manipulation",
+      "title": "Added DIFFTACTILE: A Physics-based Differentiable Tactile Simulator for Contact-rich Robotic Manipulation",
+      "summary": "DIFFTACTILE combines FEM tactile sensing elastomers, multi-material object simulation, differentiable contact, and a neural optical readout to support tactile-assisted grasping and contact-rich manipulation.",
+      "date": "2026-04-01T14:39:26.046601+00:00",
+      "entry_id": "difftactile-a-physics-based-differentiable-tactile-simulator-for-contact-rich-robotic-manipulation"
+    },
+    {
+      "id": "update-hard-contacts-with-soft-gradients-refining-differentiable-simulators-for-learning-and-control",
+      "title": "Added Hard Contacts with Soft Gradients: Refining Differentiable Simulators for Learning and Control",
+      "summary": "DiffMJX combines adaptive integration with backward-only Contacts From Distance to preserve hard-contact forward physics while generating useful pre-contact gradients for learning, MPC, and system identification.",
+      "date": "2026-04-01T14:39:26.017317+00:00",
+      "entry_id": "hard-contacts-with-soft-gradients-refining-differentiable-simulators-for-learning-and-control"
+    },
+    {
+      "id": "update-softmac-differentiable-soft-body-simulation-with-forecast-based-contact-model-and-two-way-coupling-with-articulated-rigid-bodies-and-clothes",
+      "title": "Added SoftMAC: Differentiable Soft Body Simulation with Forecast-based Contact Model and Two-way Coupling with Articulated Rigid Bodies and Clothes",
+      "summary": "SoftMAC couples MPM soft bodies with articulated rigid bodies and cloth, adding a forecast-based contact model and explicit differentiable two-way coupling for manipulation tasks that span materials.",
+      "date": "2026-04-01T14:39:25.987727+00:00",
+      "entry_id": "softmac-differentiable-soft-body-simulation-with-forecast-based-contact-model-and-two-way-coupling-with-articulated-rigid-bodies-and-clothes"
+    },
+    {
+      "id": "update-robotic-world-model-2025",
+      "title": "Added Robotic World Model: A Neural Network Simulator for Robust Policy Optimization in Robotics",
+      "summary": "Proposes a learned neural world model for long-horizon policy optimization in imagined environments, with strong robustness and zero-shot transfer results across robotics tasks.",
+      "date": "2026-04-01T14:28:40Z",
+      "entry_id": "robotic-world-model-2025"
+    },
+    {
+      "id": "update-soma-2026",
+      "title": "Added SoMA: A Real-to-Sim Neural Simulator for Robotic Soft-body Manipulation",
+      "summary": "Learns an action-conditioned neural simulator for ropes, cloth, and other soft objects directly from real multi-view video and robot state, enabling end-to-end real-to-sim rollouts without a hand-crafted deformable physics model.",
+      "date": "2026-04-01T14:28:30Z",
+      "entry_id": "soma-2026"
+    },
+    {
+      "id": "update-kamino-2026",
+      "title": "Added Kamino: GPU-based Massively Parallel Simulation of Multi-Body Systems with Challenging Topologies",
+      "summary": "Presents a Warp-based Newton-integrated solver for heterogeneous, highly coupled multibody systems with native support for kinematic loops, dense contacts, and 4096-way batched RL workloads on a single GPU.",
+      "date": "2026-04-01T14:28:00Z",
+      "entry_id": "kamino-2026"
+    },
+    {
+      "id": "update-hydroelastictouch-2025",
+      "title": "Added HydroelasticTouch: Simulation of Tactile Sensors with Hydroelastic Contact Surfaces",
+      "summary": "Uses hydroelastic contact surfaces to synthesize pressure-based tactile outputs with smoother, more realistic contact patches than point-contact approximations while staying substantially cheaper than full FEM tactile simulation.",
+      "date": "2026-04-01T14:28:20Z",
+      "entry_id": "hydroelastictouch-2025"
+    },
+    {
+      "id": "update-diff-soft-contacts-2025",
+      "title": "Added Differentiable Simulation of Soft Robots with Frictional Contacts",
+      "summary": "Introduces a unified derivative pipeline for FEM-based soft robots with frictional contact, supporting elastic and hyper-elastic materials plus multiple actuation modes through implicit differentiation of contact-rich dynamics.",
+      "date": "2026-04-01T14:28:10Z",
+      "entry_id": "diff-soft-contacts-2025"
+    },
+    {
+      "id": "update-rob-106-dashboard-recovery-validation",
+      "title": "Added ROB-106 dashboard recovery validation",
+      "summary": "Same-day validation entry published through the hosted dashboard capture API to confirm the live service is reading and updating the stable artifact path.",
+      "date": "2026-04-01T14:25:00Z",
+      "entry_id": "rob-106-dashboard-recovery-validation"
+    },
+    {
+      "id": "update-1",
+      "title": "Created Newton follow-up ticket for differentiable collision queries",
+      "summary": "DiffCollision, DCOL, and iDCOL all point to a bounded Newton spike around witness-point or distance-query gradients before any solver integration work.",
+      "date": "2026-03-30T09:41:05Z",
+      "entry_id": "diffcollision-2025"
+    },
+    {
+      "id": "update-2",
+      "title": "Created benchmark-first ticket for analytical contact response",
+      "summary": "ComFree-Sim argues for per-contact closed-form updates and near-linear scaling, but Newton should validate the idea on dense-contact scenes before architectural churn.",
+      "date": "2026-03-30T09:41:05Z",
+      "entry_id": "comfree-2026"
+    },
+    {
+      "id": "update-3",
+      "title": "Large-assembly solver direction narrowed to a reduced-space experiment",
+      "summary": "M-ABD looks relevant for solver architecture and benchmark design, but not as a drop-in rigid-body replacement without a design pass.",
+      "date": "2026-03-30T09:41:05Z",
+      "entry_id": "mabd-2026"
+    },
+    {
+      "id": "update-4",
+      "title": "Adaptive merging kept as an optimization candidate, not a default roadmap item",
+      "summary": "The idea is promising for resting stacks and quasi-rigid clusters, but it needs a clear distinction from ordinary sleeping and islanding before investment.",
+      "date": "2026-03-30T09:41:05Z",
+      "entry_id": "adaptive-merging-2020"
+    }
+  ],
+  "entries": [
+    {
+      "id": "diffcollision-2025",
+      "section": "Differentiable Contact Geometry",
+      "kind": "paper",
+      "title": "Robust Differentiable Collision Detection for General Objects",
+      "summary": "Extends differentiable witness-point computation beyond convex objects by combining distance-based randomized smoothing, adaptive sampling, and gradient transport for complex meshes and concave geometry.",
+      "date": "2026-02-28T00:00:00Z",
+      "source": {
+        "label": "arXiv 2511.06267",
+        "url": "https://arxiv.org/abs/2511.06267"
+      },
+      "implementation_notes": "Most relevant as a geometry-query layer rather than a whole Newton solver change. The paper suggests a path for gradients through contact geometry on mesh-backed assets, which is the main gap left by convex-only approaches.",
+      "next_steps": [
+        "Prototype a differentiable closest-point or witness-point path for a small Newton shape subset before touching solver internals.",
+        "Benchmark gradient stability on one convex case and one mesh-backed case to decide whether public API exposure is justified.",
+        "Use ROB-72 as the implementation spike for this direction."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "This is the strongest lead for Newton's differentiable-contact roadmap because it targets general objects instead of only convex decompositions.",
+          "created_at": "2026-03-30T09:41:05Z"
+        }
+      ],
+      "tags": [
+        "differentiable-simulation",
+        "collision-detection",
+        "meshes",
+        "contact-gradients"
+      ]
+    },
+    {
+      "id": "dcol-2022",
+      "section": "Differentiable Contact Geometry",
+      "kind": "paper",
+      "title": "Differentiable Collision Detection for a Set of Convex Primitives",
+      "summary": "DCOL formulates collision detection as a convex optimization over composable convex primitives and returns differentiable collision metrics plus contact points.",
+      "date": "2023-05-18T00:00:00Z",
+      "source": {
+        "label": "arXiv 2207.00669",
+        "url": "https://arxiv.org/abs/2207.00669"
+      },
+      "implementation_notes": "Useful as the lower-risk baseline for Newton because sphere, box, capsule, and convex approximations already fit this style better than arbitrary triangle meshes do.",
+      "next_steps": [
+        "Start any Newton differentiable-collision experiment with convex primitives and only then test mesh-backed escalation.",
+        "Check whether current Newton contact generation already exposes enough intermediate data to support a DCOL-like query API."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "This is likely the right first benchmark target even if the long-term goal is broader mesh support.",
+          "created_at": "2026-03-30T09:41:05Z"
+        }
+      ],
+      "tags": [
+        "differentiable-simulation",
+        "convex-primitives",
+        "optimization",
+        "contact-queries"
+      ]
+    },
+    {
+      "id": "idcol-2026",
+      "section": "Differentiable Contact Geometry",
+      "kind": "paper",
+      "title": "Collision Detection with Analytical Derivatives of Contact Kinematics",
+      "summary": "iDCOL regularizes contact geometry into strictly convex implicit surfaces and uses the Implicit Function Theorem to derive analytical derivatives of distance, location, and normal.",
+      "date": "2026-02-03T00:00:00Z",
+      "source": {
+        "label": "arXiv 2602.03250",
+        "url": "https://arxiv.org/abs/2602.03250"
+      },
+      "implementation_notes": "This is the most direct related work to DiffCollision for Newton because it makes the derivative story explicit and could inform whether implicit-surface proxies are more practical than smoothing over raw mesh geometry.",
+      "next_steps": [
+        "Compare implicit-surface proxies against mesh smoothing in the ROB-72 spike.",
+        "Decide whether Newton needs exact contact-kinematic derivatives or only stable gradients for optimization and learning loops."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "iDCOL sharpens the question from 'can we differentiate collision?' to 'which geometry representation keeps the derivatives useful and stable?'",
+          "created_at": "2026-03-30T09:41:05Z"
+        }
+      ],
+      "tags": [
+        "differentiable-simulation",
+        "implicit-surfaces",
+        "contact-kinematics",
+        "related-work"
+      ]
+    },
+    {
+      "id": "comfree-2026",
+      "section": "Contact And Friction Solvers",
+      "kind": "paper",
+      "title": "ComFree-Sim: A GPU-Parallelized Analytical Contact Physics Engine for Scalable Contact-Rich Robotics Simulation and Control",
+      "summary": "Presents a complementarity-free analytical contact update in the dual cone of Coulomb friction, with near-linear contact scaling and Warp-based implementation aimed at control loops.",
+      "date": "2026-03-14T00:00:00Z",
+      "source": {
+        "label": "arXiv 2603.12185",
+        "url": "https://arxiv.org/abs/2603.12185"
+      },
+      "implementation_notes": "Important for Newton because it is both Warp-based and benchmarked on dense contact. The practical lesson is not 'replace the engine wholesale' but 'benchmark whether a contact-local analytical update pays off on Newton's hot scenes.'",
+      "next_steps": [
+        "Use ROB-73 to build a benchmark-first evaluation against dense-contact Newton scenes.",
+        "Isolate tangential, torsional, and rolling-friction terms so the experiment can stay narrow.",
+        "Reject the direction quickly if the simplified prototype cannot beat current throughput or fidelity in the relevant regimes."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "This is the most actionable contact-resolution paper because it shares Warp as an implementation substrate and emphasizes dense-contact throughput instead of only theory.",
+          "created_at": "2026-03-30T09:41:05Z"
+        }
+      ],
+      "tags": [
+        "contact-solver",
+        "friction",
+        "warp",
+        "benchmarking",
+        "robotics-control"
+      ]
+    },
+    {
+      "id": "mabd-2026",
+      "section": "Articulation And Assembly Solvers",
+      "kind": "paper",
+      "title": "M-ABD: Scalable, Efficient, and Robust Multi-Affine-Body Dynamics",
+      "summary": "Uses affine-body dynamics with reduced-space KKT solves and prefactorizable system structure to simulate very large articulated assemblies with diverse joint topologies.",
+      "date": "2026-03-13T00:00:00Z",
+      "source": {
+        "label": "arXiv 2603.08079",
+        "url": "https://arxiv.org/abs/2603.08079"
+      },
+      "implementation_notes": "Relevant to Newton as solver architecture inspiration, especially for chains, trees, loops, and large assemblies. It is not a direct rigid-body transplant, so the value is in reduced-space formulation ideas and benchmark design.",
+      "next_steps": [
+        "Use ROB-74 to map the paper's reduced-space and prefactorization ideas onto Newton's current articulation state layout.",
+        "Focus early design work on chain/tree/closed-loop benchmarks and explicit risk around world contacts."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "The paper is strong on architecture and scaling, but Newton needs a translation layer from ABD assumptions to its existing rigid-body abstractions.",
+          "created_at": "2026-03-30T09:41:05Z"
+        }
+      ],
+      "tags": [
+        "articulations",
+        "solver-architecture",
+        "kkt",
+        "large-assemblies",
+        "reduced-space"
+      ]
+    },
+    {
+      "id": "adaptive-merging-2020",
+      "section": "Articulation And Assembly Solvers",
+      "kind": "paper",
+      "title": "Adaptive Merging for Rigid Body Simulation",
+      "summary": "Accelerates rigid-body simulation by merging bodies that share a common spatial velocity and unmerging them when contact evolution indicates that internal dynamics matter again.",
+      "date": "2020-07-01T00:00:00Z",
+      "source": {
+        "label": "Project page",
+        "url": "https://eulaliecoevoet.github.io/AdaptiveMerging/"
+      },
+      "implementation_notes": "This looks like an optimization candidate for resting or quasi-rigid contact islands, not a default Newton roadmap item. The first question is whether Newton's sleeping or island handling already captures most of the easy wins.",
+      "next_steps": [
+        "Use ROB-75 to compare adaptive merging against ordinary sleeping and islanding on long-lived contact clusters.",
+        "Reject the idea if bookkeeping complexity outweighs any measured runtime benefit on representative Newton scenes."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "Worth keeping as a scoped optimization study, but it is less urgent than differentiable queries or dense-contact benchmarking.",
+          "created_at": "2026-03-30T09:41:05Z"
+        }
+      ],
+      "tags": [
+        "performance",
+        "sleeping",
+        "contact-islands",
+        "resting-stacks",
+        "related-work"
+      ]
+    },
+    {
+      "id": "rob-106-dashboard-recovery-validation",
+      "section": "Operations",
+      "kind": "note",
+      "title": "ROB-106 dashboard recovery validation",
+      "summary": "Same-day validation entry published through the hosted dashboard capture API to confirm the live service is reading and updating the stable artifact path.",
+      "date": "2026-04-01T14:25:00Z",
+      "source": null,
+      "implementation_notes": "The dashboard was stale because no automation or documented helper had written a fresh entry since the initial 2026-03-30 seed. The hosted service itself was healthy and already pointed at scripts/research_dashboard.json.",
+      "next_steps": [
+        "Use scripts/research/publish_entry.sh for same-day updates instead of editing the artifact by hand.",
+        "Have the Research Scientist publish new findings through the capture API when new reading-list items land."
+      ],
+      "comments": [
+        {
+          "author": "Founding Engineer",
+          "body": "Published from ROB-106 to validate same-day dashboard updates.",
+          "created_at": "2026-04-01T14:25:00Z"
+        }
+      ],
+      "tags": [
+        "operations",
+        "dashboard",
+        "validation"
+      ]
+    },
+    {
+      "id": "diff-soft-contacts-2025",
+      "section": "Rigid-Soft Coupling And Differentiability",
+      "kind": "paper",
+      "title": "Differentiable Simulation of Soft Robots with Frictional Contacts",
+      "summary": "Introduces a unified derivative pipeline for FEM-based soft robots with frictional contact, supporting elastic and hyper-elastic materials plus multiple actuation modes through implicit differentiation of contact-rich dynamics.",
+      "date": "2026-04-01T14:28:10Z",
+      "source": {
+        "label": "arXiv 2501.18956",
+        "url": "https://arxiv.org/abs/2501.18956"
+      },
+      "implementation_notes": "Use /ROB/issues/ROB-112 to scope a bounded rigid-soft coupling layer or plugin boundary instead of a broad deformables rewrite.",
+      "next_steps": [
+        "Choose between co-simulation, plugin coupling, or a minimal native deformable subsystem in /ROB/issues/ROB-112.",
+        "Define the smallest manipulation benchmark that actually needs gradients through rigid-soft contact."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "Strongest current lead for differentiable rigid-soft manipulation without abandoning Newton's rigid-body strengths.",
+          "created_at": "2026-04-01T14:28:10Z"
+        }
+      ],
+      "tags": [
+        "differentiable-simulation",
+        "soft-robots",
+        "frictional-contact",
+        "coupling",
+        "manipulation"
+      ]
+    },
+    {
+      "id": "hydroelastictouch-2025",
+      "section": "Tactile And Sensor Simulation",
+      "kind": "paper",
+      "title": "HydroelasticTouch: Simulation of Tactile Sensors with Hydroelastic Contact Surfaces",
+      "summary": "Uses hydroelastic contact surfaces to synthesize pressure-based tactile outputs with smoother, more realistic contact patches than point-contact approximations while staying substantially cheaper than full FEM tactile simulation.",
+      "date": "2026-04-01T14:28:20Z",
+      "source": {
+        "label": "arXiv 2501.08077",
+        "url": "https://arxiv.org/abs/2501.08077"
+      },
+      "implementation_notes": "Use /ROB/issues/ROB-113 to test whether Newton's existing contact patches can drive pressure-map or taxel synthesis for dexterous manipulation tasks.",
+      "next_steps": [
+        "Define the narrowest possible pressure-map prototype in /ROB/issues/ROB-113.",
+        "Pick one manipulation task where tactile observation should outperform force-only observation."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "This opens a credible tactile path that is much cheaper than going straight to full tactile FEM.",
+          "created_at": "2026-04-01T14:28:20Z"
+        }
+      ],
+      "tags": [
+        "sensor-simulation",
+        "tactile",
+        "hydroelastic-contact",
+        "dexterous-manipulation",
+        "sim2real"
+      ]
+    },
+    {
+      "id": "kamino-2026",
+      "section": "GPU Parallel Articulations",
+      "kind": "paper",
+      "title": "Kamino: GPU-based Massively Parallel Simulation of Multi-Body Systems with Challenging Topologies",
+      "summary": "Presents a Warp-based Newton-integrated solver for heterogeneous, highly coupled multibody systems with native support for kinematic loops, dense contacts, and 4096-way batched RL workloads on a single GPU.",
+      "date": "2026-04-01T14:28:00Z",
+      "source": {
+        "label": "arXiv 2603.16536",
+        "url": "https://arxiv.org/abs/2603.16536"
+      },
+      "implementation_notes": "Direct Newton relevance. Use /ROB/issues/ROB-111 to turn the paper's topology and batching claims into stable benchmark coverage for loop-heavy humanoids and tendon-coupled hands.",
+      "next_steps": [
+        "Use /ROB/issues/ROB-111 to define one closed-loop humanoid benchmark and one tendon or parallel-hand benchmark.",
+        "Measure heterogeneous batch throughput and convergence before deciding whether new solver work is needed."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "Best same-day execution lead because it is already Newton-native rather than merely adjacent.",
+          "created_at": "2026-04-01T14:28:00Z"
+        }
+      ],
+      "tags": [
+        "articulations",
+        "gpu-parallelism",
+        "kinematic-loops",
+        "humanoids",
+        "reinforcement-learning"
+      ]
+    },
+    {
+      "id": "soma-2026",
+      "section": "Real2Sim And Learned Deformables",
+      "kind": "paper",
+      "title": "SoMA: A Real-to-Sim Neural Simulator for Robotic Soft-body Manipulation",
+      "summary": "Learns an action-conditioned neural simulator for ropes, cloth, and other soft objects directly from real multi-view video and robot state, enabling end-to-end real-to-sim rollouts without a hand-crafted deformable physics model.",
+      "date": "2026-04-01T14:28:30Z",
+      "source": {
+        "label": "arXiv 2602.02402",
+        "url": "https://arxiv.org/abs/2602.02402"
+      },
+      "implementation_notes": "Use /ROB/issues/ROB-114 to define a hybrid architecture where Newton stays authoritative on rigid/contact dynamics while a learned module owns cloth or rope evolution.",
+      "next_steps": [
+        "Specify one real2sim benchmark in /ROB/issues/ROB-114 where Newton drives the robot and scene while a learned module predicts deformable state.",
+        "Define interface boundaries for actions, observations, contact events, and synchronization."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "Best current evidence that learned deformable simulation can complement Newton instead of forcing it to become a general deformables engine.",
+          "created_at": "2026-04-01T14:28:30Z"
+        }
+      ],
+      "tags": [
+        "real2sim",
+        "soft-body-manipulation",
+        "neural-simulation",
+        "cloth",
+        "rope"
+      ]
+    },
+    {
+      "id": "robotic-world-model-2025",
+      "section": "World Models And Reinforcement Learning",
+      "kind": "paper",
+      "title": "Robotic World Model: A Neural Network Simulator for Robust Policy Optimization in Robotics",
+      "summary": "Proposes a learned neural world model for long-horizon policy optimization in imagined environments, with strong robustness and zero-shot transfer results across robotics tasks.",
+      "date": "2026-04-01T14:28:40Z",
+      "source": {
+        "label": "arXiv 2501.10100",
+        "url": "https://arxiv.org/abs/2501.10100"
+      },
+      "implementation_notes": "Use /ROB/issues/ROB-114 to define where imagined rollouts can accelerate policy optimization while Newton remains the ground-truth contact-rich simulator and data generator.",
+      "next_steps": [
+        "Identify one RL workload in /ROB/issues/ROB-114 where imagined rollouts could reduce Newton sample cost.",
+        "Define validation gates against Newton ground truth before any training-time integration."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "Newton should treat world models as complementary teachers or accelerators, not as a replacement for solver-backed execution.",
+          "created_at": "2026-04-01T14:28:40Z"
+        }
+      ],
+      "tags": [
+        "world-models",
+        "reinforcement-learning",
+        "sim2real",
+        "policy-optimization",
+        "hybrid-simulation"
+      ]
+    },
+    {
+      "id": "softmac-differentiable-soft-body-simulation-with-forecast-based-contact-model-and-two-way-coupling-with-articulated-rigid-bodies-and-clothes",
+      "section": "Rigid-Soft Coupling And Differentiability",
+      "kind": "paper",
+      "title": "SoftMAC: Differentiable Soft Body Simulation with Forecast-based Contact Model and Two-way Coupling with Articulated Rigid Bodies and Clothes",
+      "summary": "SoftMAC couples MPM soft bodies with articulated rigid bodies and cloth, adding a forecast-based contact model and explicit differentiable two-way coupling for manipulation tasks that span materials.",
+      "date": "2026-04-01T14:39:25.987727+00:00",
+      "source": {
+        "label": "arXiv 2312.03297",
+        "url": "https://arxiv.org/abs/2312.03297"
+      },
+      "implementation_notes": "Most relevant to Newton as a coupling design reference, not a whole-engine replacement. The key transferable ideas are an explicit rigid-soft interface, a narrow signed-distance/contact bridge, and a benchmark that stresses two-way manipulation rather than isolated deformables.",
+      "next_steps": [
+        "Use it to justify a Newton coupling boundary that keeps rigid articulation/contact ownership inside Newton while deformable state lives behind a plugin or co-simulation interface.",
+        "Prototype one manipulation benchmark with rigid fingertips interacting with a compliant object before considering cloth support."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "New lead captured while scoping /ROB/issues/ROB-112.",
+          "created_at": "2026-04-01T14:39:25.987727+00:00"
+        }
+      ],
+      "tags": [
+        "differentiable-simulation",
+        "soft-rigid-coupling",
+        "cloth",
+        "manipulation",
+        "contact-models"
+      ]
+    },
+    {
+      "id": "hard-contacts-with-soft-gradients-refining-differentiable-simulators-for-learning-and-control",
+      "section": "Rigid-Soft Coupling And Differentiability",
+      "kind": "paper",
+      "title": "Hard Contacts with Soft Gradients: Refining Differentiable Simulators for Learning and Control",
+      "summary": "DiffMJX combines adaptive integration with backward-only Contacts From Distance to preserve hard-contact forward physics while generating useful pre-contact gradients for learning, MPC, and system identification.",
+      "date": "2026-04-01T14:39:26.017317+00:00",
+      "source": {
+        "label": "arXiv 2506.14186",
+        "url": "https://arxiv.org/abs/2506.14186"
+      },
+      "implementation_notes": "Newton can reuse the core idea without inheriting MuJoCo XLA: keep forward contact physically unchanged, but add an opt-in backward-only pre-contact gradient path around distance queries and contact activation to support differentiable manipulation.",
+      "next_steps": [
+        "Scope a Newton experiment where contact gradients are extended before impact only in backward mode.",
+        "Evaluate whether adaptive stepping is needed only for differentiable rollouts instead of the default simulator path."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "New lead captured while scoping /ROB/issues/ROB-112.",
+          "created_at": "2026-04-01T14:39:26.017317+00:00"
+        }
+      ],
+      "tags": [
+        "differentiable-simulation",
+        "contact-gradients",
+        "adaptive-integration",
+        "model-predictive-control",
+        "manipulation"
+      ]
+    },
+    {
+      "id": "difftactile-a-physics-based-differentiable-tactile-simulator-for-contact-rich-robotic-manipulation",
+      "section": "Tactile And Sensor Simulation",
+      "kind": "paper",
+      "title": "DIFFTACTILE: A Physics-based Differentiable Tactile Simulator for Contact-rich Robotic Manipulation",
+      "summary": "DIFFTACTILE combines FEM tactile sensing elastomers, multi-material object simulation, differentiable contact, and a neural optical readout to support tactile-assisted grasping and contact-rich manipulation.",
+      "date": "2026-04-01T14:39:26.046601+00:00",
+      "source": {
+        "label": "arXiv 2403.08716",
+        "url": "https://arxiv.org/abs/2403.08716"
+      },
+      "implementation_notes": "Newton should not clone the full stack, but the paper is a strong template for a tiled, multi-world sensor pipeline: classical contact and deformable state feeding a lightweight learned sensor observation model for tactile or vision outputs.",
+      "next_steps": [
+        "Define a Newton sensor API that can expose contact patch state to a learned tactile or camera renderer.",
+        "Benchmark whether the ray/tactile observation path can run in tiled multi-world mode without coupling it to the main rigid solver."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "New lead captured while scoping /ROB/issues/ROB-112 and adjacent manipulation opportunities.",
+          "created_at": "2026-04-01T14:39:26.046601+00:00"
+        }
+      ],
+      "tags": [
+        "sensor-simulation",
+        "tactile",
+        "differentiable-simulation",
+        "contact-rich-manipulation",
+        "multi-material"
+      ]
+    },
+    {
+      "id": "d-rex-differentiable-real-to-sim-to-real-engine-for-learning-dexterous-grasping",
+      "section": "Real2Sim And Learned Deformables",
+      "kind": "paper",
+      "title": "D-REX: Differentiable Real-to-Sim-to-Real Engine for Learning Dexterous Grasping",
+      "summary": "D-REX uses a differentiable real-to-sim-to-real loop for dexterous grasping, identifying object mass from real observations and robot controls while training force-aware grasping policies on the recovered digital twin.",
+      "date": "2026-04-01T14:39:26.075342+00:00",
+      "source": {
+        "label": "arXiv 2603.01151",
+        "url": "https://arxiv.org/abs/2603.01151"
+      },
+      "implementation_notes": "Newton can use this as a Real2Sim application target: first expose differentiable parameter identification for a small set of rigid-contact properties, then connect it to dexterous grasp benchmarks rather than generic scene reconstruction.",
+      "next_steps": [
+        "Define a minimal Newton parameter-ID benchmark around object mass, friction, and compliance proxies for grasping.",
+        "Keep reconstruction external; only require Newton to support the optimization loop and relevant gradients."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "New lead captured while scoping Newton applications beyond core solver work.",
+          "created_at": "2026-04-01T14:39:26.075342+00:00"
+        }
+      ],
+      "tags": [
+        "real2sim",
+        "sim2real",
+        "dexterous-grasping",
+        "parameter-identification",
+        "differentiable-simulation"
+      ]
+    },
+    {
+      "id": "toi-velocity-differentiable-contacts-2023",
+      "section": "Differentiable Contact Geometry",
+      "kind": "paper",
+      "title": "Improving Gradient Computation for Differentiable Physics Simulation with Contacts",
+      "summary": "TOI-Velocity uses continuous collision detection and time-of-impact correction to improve gradients when rigid-body contact normals change between moving objects, complementing backward-only pre-contact smoothing.",
+      "date": "2026-04-01T14:50:30Z",
+      "source": {
+        "label": "arXiv 2305.00092",
+        "url": "https://arxiv.org/abs/2305.00092"
+      },
+      "implementation_notes": "Most relevant as a second-stage benchmark once Newton has an opt-in rigid query cache. It does not replace the backward-only query path from DiffMJX; it tests whether Newton also needs a TOI-aware correction for moving-moving contacts where the normal direction changes sharply. Newton's internal rigid_query storage already makes this look like a bounded experiment rather than a new solver architecture, but it should remain differentiable-rollout-only until forward accuracy evidence says otherwise.",
+      "next_steps": [
+        "After the pre-contact query cache exists, compare static-obstacle and moving-moving benchmarks to see whether TOI correction materially improves gradients.",
+        "Start with sphere-sphere interception, then add sphere-capsule only if the first benchmark shows stable gains and clean gradients.",
+        "Keep TOI logic differentiable-rollout-only unless it proves necessary for forward robustness, which current evidence does not suggest."
+      ],
+      "comments": [
+        {
+          "author": "Research Scientist",
+          "body": "Added while scoping ROB-127 as a complementary idea to backward-only contact gradients.",
+          "created_at": "2026-04-01T14:50:30Z"
+        },
+        {
+          "author": "Research Scientist",
+          "body": "ROB-140 narrowed the first Newton experiment to caching TOI time, TOI normal, collision-state positions, and pre-impact velocities for a moving-moving sphere pair. Sphere-capsule is the preferred second primitive because it still gives a single closest-feature normal, while capsule-capsule introduces manifold ambiguity too early.",
+          "created_at": "2026-04-01T15:12:00Z"
+        }
+      ],
+      "tags": [
+        "differentiable-simulation",
+        "collision-detection",
+        "continuous-collision-detection",
+        "contact-gradients",
+        "time-of-impact"
+      ]
+    }
+  ],
+  "chat": {
+    "mode": "stub",
+    "agent_name": "Research Scientist",
+    "placeholder": "Ask which reading-list item should become implementation work next.",
+    "status": "Reading list v2 loaded. Fresh execution tickets: ROB-111 through ROB-114."
+  }
+}

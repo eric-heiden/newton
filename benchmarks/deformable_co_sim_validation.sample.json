@@ -1,0 +1,144 @@
+{
+  "benchmark": {
+    "name": "deformable_co_sim_validation",
+    "schema_version": 1,
+    "git_commit": "0123456789abcdef",
+    "device": "cuda:0",
+    "warp_version": "1.0.0",
+    "step_dt": 0.0016666667,
+    "substeps": 10,
+    "seed": 11
+  },
+  "scenario": {
+    "cloth_example_module": "newton.examples.cloth.example_cloth_franka",
+    "cable_family": "endpoint_placement",
+    "asset_ids": {
+      "cloth": "unisex_shirt.usd",
+      "cable": "generated_straight_cable",
+      "obstacle": "target_disk_v1"
+    },
+    "timing": {
+      "cloth_horizon_s": 1.25,
+      "cable_horizon_s": 0.9
+    }
+  },
+  "real2sim_cloth": {
+    "windows": [
+      {
+        "name": "calibration_replay",
+        "start_step": 120,
+        "end_step": 195
+      },
+      {
+        "name": "heldout_replay",
+        "start_step": 220,
+        "end_step": 295
+      }
+    ],
+    "metrics": {
+      "position_rmse_median_m": 0.014,
+      "position_rmse_p95_m": 0.031,
+      "contact_onset_frame_error": 1,
+      "contact_count_jsd": 0.08,
+      "wrench_normalized_abs_error": 0.11,
+      "penetration_p95_m": 0.003,
+      "penetration_max_m": 0.007
+    }
+  },
+  "imagined_rollout_cable": {
+    "action_space": {
+      "x_m": 0.18,
+      "y_m": -0.05,
+      "height_m": 0.12,
+      "release_time_s": 0.38
+    },
+    "metrics": {
+      "tip_error_m": 0.019,
+      "centerline_mean_error_m": 0.017,
+      "contact_onset_frame_error": 2,
+      "contact_count_jsd": 0.12,
+      "impulse_normalized_abs_error": 0.16,
+      "penetration_p95_m": 0.002,
+      "penetration_max_m": 0.004
+    },
+    "policy_revalidation": {
+      "learned_success_rate": 0.78,
+      "newton_replayed_success_rate": 0.74,
+      "baseline_success_rate": 0.68,
+      "relative_gain": 0.147,
+      "retained_gain_fraction": 0.91,
+      "passed": true
+    }
+  },
+  "observability": {
+    "world_packets": [
+      {
+        "world_id": 0,
+        "step": 120,
+        "time": 0.2,
+        "action": {
+          "target_pose": [
+            0.45,
+            -0.11,
+            0.22
+          ]
+        },
+        "observed_state": {
+          "tip_position": [
+            0.41,
+            -0.09,
+            0.18
+          ]
+        },
+        "predicted_state": {
+          "tip_position": [
+            0.42,
+            -0.1,
+            0.19
+          ]
+        },
+        "newton_state": {
+          "tip_position": [
+            0.43,
+            -0.1,
+            0.19
+          ]
+        },
+        "contact_summary": {
+          "count": 3,
+          "first_contact_step": 133,
+          "impulse_norm": 1.8
+        },
+        "loss_terms": {
+          "rollout_error": 0.013,
+          "contact_error": 0.021
+        }
+      }
+    ],
+    "latent_confidence": [
+      {
+        "step": 120,
+        "confidence": 0.84,
+        "residual_norm": 0.09
+      }
+    ],
+    "contact_residuals": [
+      {
+        "step": 120,
+        "normal_residual": 0.04,
+        "tangent_residual": 0.02
+      }
+    ],
+    "divergence_alarms": [
+      {
+        "name": "tip_error_limit",
+        "threshold": 0.03,
+        "first_failing_step": null
+      }
+    ],
+    "replay_contract": {
+      "initial_state_key": "state_0000",
+      "control_sequence_key": "controls_0000"
+    }
+  }
+}

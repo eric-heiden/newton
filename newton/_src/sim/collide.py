@@ -47,6 +47,14 @@ class ContactWriterData:
     out_margin0: wp.array(dtype=float)
     out_margin1: wp.array(dtype=float)
     out_tids: wp.array(dtype=int)
+    query_count: wp.array(dtype=int)
+    query_shape0: wp.array(dtype=int)
+    query_shape1: wp.array(dtype=int)
+    query_point0: wp.array(dtype=wp.vec3)
+    query_point1: wp.array(dtype=wp.vec3)
+    query_normal: wp.array(dtype=wp.vec3)
+    query_distance: wp.array(dtype=float)
+    query_active: wp.array(dtype=int)
     # Per-contact shape properties, empty arrays if not enabled.
     # Zero-values indicate that no per-contact shape properties are set for this contact
     out_stiffness: wp.array(dtype=float)
@@ -95,6 +103,18 @@ def write_contact(
     contact_gap = gap_a + gap_b
 
     index = output_index
+    query_index = -1
+
+    if writer_data.query_shape0.shape[0] > 0:
+        query_index = wp.atomic_add(writer_data.query_count, 0, 1)
+        if query_index < writer_data.contact_max:
+            writer_data.query_shape0[query_index] = contact_data.shape_a
+            writer_data.query_shape1[query_index] = contact_data.shape_b
+            writer_data.query_point0[query_index] = a_contact_world
+            writer_data.query_point1[query_index] = b_contact_world
+            writer_data.query_normal[query_index] = contact_normal_a_to_b
+            writer_data.query_distance[query_index] = d
+            writer_data.query_active[query_index] = 1 if d <= contact_gap else 0
 
     if index < 0:
         # compute index using atomic counter
@@ -791,6 +811,14 @@ class CollisionPipeline:
             writer_data.out_margin0 = contacts.rigid_contact_margin0
             writer_data.out_margin1 = contacts.rigid_contact_margin1
             writer_data.out_tids = contacts.rigid_contact_tids
+            writer_data.query_count = contacts.rigid_query_count
+            writer_data.query_shape0 = contacts.rigid_query_shape0
+            writer_data.query_shape1 = contacts.rigid_query_shape1
+            writer_data.query_point0 = contacts.rigid_query_point0
+            writer_data.query_point1 = contacts.rigid_query_point1
+            writer_data.query_normal = contacts.rigid_query_normal
+            writer_data.query_distance = contacts.rigid_query_distance
+            writer_data.query_active = contacts.rigid_query_active
 
             writer_data.out_stiffness = contacts.rigid_contact_stiffness
             writer_data.out_damping = contacts.rigid_contact_damping

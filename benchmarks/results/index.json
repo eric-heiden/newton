@@ -1,0 +1,816 @@
+{
+  "schema_version": 2,
+  "generated_at": "2026-04-01T14:40:05+00:00",
+  "run_count": 3,
+  "runs": [
+    {
+      "run_id": "20260401T144005Z",
+      "generated_at": "2026-04-01T14:40:05+00:00",
+      "device": "cpu",
+      "steps": 1,
+      "warmup_steps": 0,
+      "result_count": 5,
+      "coverage_summary": {
+        "benchmarked": 5,
+        "harness_gap": 10,
+        "unsupported": 5
+      }
+    },
+    {
+      "run_id": "20260330T130217Z",
+      "generated_at": "2026-03-30T13:02:17+00:00",
+      "device": "cuda:0",
+      "steps": 1,
+      "warmup_steps": 0,
+      "result_count": 18,
+      "coverage_summary": {
+        "benchmarked": 18,
+        "harness_gap": 12,
+        "unsupported": 6
+      }
+    },
+    {
+      "run_id": "20260330T122713Z",
+      "generated_at": "2026-03-30T12:27:13+00:00",
+      "device": "cuda:0",
+      "steps": 3,
+      "warmup_steps": 1,
+      "result_count": 7,
+      "coverage_summary": {}
+    }
+  ],
+  "latest_run": {
+    "schema_version": 2,
+    "run_id": "20260401T144005Z",
+    "generated_at": "2026-04-01T14:40:05+00:00",
+    "started_at": "2026-04-01T14:37:52+00:00",
+    "device": "cpu",
+    "host": "eheiden-claw2",
+    "steps": 1,
+    "warmup_steps": 0,
+    "coverage_summary": {
+      "benchmarked": 5,
+      "harness_gap": 10,
+      "unsupported": 5
+    },
+    "scenarios": [
+      {
+        "name": "fourbar_loop",
+        "capability": "closed_loop_linkage",
+        "description": "Closed-loop four-bar linkage workload using the Kamino benchmark harness.",
+        "solvers": [
+          "kamino"
+        ],
+        "example_module": "newton._src.solvers.kamino._src.utils.benchmark.problems",
+        "coverage": [
+          {
+            "solver_id": "kamino",
+            "solver_name": "SolverKamino",
+            "status": "benchmarked",
+            "reason": "Kamino benchmark problem wired into the solver dashboard matrix."
+          },
+          {
+            "solver_id": "xpbd",
+            "solver_name": "SolverXPBD",
+            "status": "harness_gap",
+            "reason": "The closed-loop linkage parity slice is not yet exposed through Newton's public XPBD benchmark examples."
+          },
+          {
+            "solver_id": "mujoco",
+            "solver_name": "SolverMuJoCo",
+            "status": "harness_gap",
+            "reason": "The closed-loop linkage parity slice is not yet exposed through Newton's public MuJoCo benchmark examples."
+          },
+          {
+            "solver_id": "style3d",
+            "solver_name": "SolverStyle3D",
+            "status": "unsupported",
+            "reason": "Style3D does not support rigid closed-loop articulation benchmarks."
+          }
+        ]
+      },
+      {
+        "name": "dr_legs_loop",
+        "capability": "loop_heavy_legged_robot",
+        "description": "DR Legs closed-chain workload using repo-backed Disney Research assets in the Kamino harness.",
+        "solvers": [
+          "kamino"
+        ],
+        "example_module": "newton._src.solvers.kamino._src.utils.benchmark.problems",
+        "coverage": [
+          {
+            "solver_id": "kamino",
+            "solver_name": "SolverKamino",
+            "status": "benchmarked",
+            "reason": "Repo-backed DR Legs benchmark wired into the Kamino matrix."
+          },
+          {
+            "solver_id": "xpbd",
+            "solver_name": "SolverXPBD",
+            "status": "harness_gap",
+            "reason": "Newton does not yet expose a public XPBD benchmark path for the DR Legs asset pack."
+          },
+          {
+            "solver_id": "mujoco",
+            "solver_name": "SolverMuJoCo",
+            "status": "harness_gap",
+            "reason": "Newton does not yet expose a public MuJoCo benchmark path for the DR Legs asset pack."
+          },
+          {
+            "solver_id": "style3d",
+            "solver_name": "SolverStyle3D",
+            "status": "unsupported",
+            "reason": "Style3D does not support articulated rigid-body robot benchmarks."
+          }
+        ]
+      },
+      {
+        "name": "humanoid_loop_heavy",
+        "capability": "loop_heavy_humanoid",
+        "description": "Loop-heavy humanoid workload using the public humanoid plotting example as a benchmark harness.",
+        "solvers": [
+          "mujoco"
+        ],
+        "example_module": "newton.examples.basic.example_basic_plotting",
+        "coverage": [
+          {
+            "solver_id": "mujoco",
+            "solver_name": "SolverMuJoCo",
+            "status": "benchmarked",
+            "reason": "Public humanoid example benchmarked through the dashboard matrix."
+          },
+          {
+            "solver_id": "kamino",
+            "solver_name": "SolverKamino",
+            "status": "harness_gap",
+            "reason": "A Kamino-native humanoid benchmark path is not yet productized in the shared benchmark harness."
+          },
+          {
+            "solver_id": "xpbd",
+            "solver_name": "SolverXPBD",
+            "status": "harness_gap",
+            "reason": "The public humanoid example does not expose an XPBD-backed benchmark path."
+          },
+          {
+            "solver_id": "style3d",
+            "solver_name": "SolverStyle3D",
+            "status": "unsupported",
+            "reason": "Style3D does not support articulated humanoid rigid-body benchmarks."
+          }
+        ]
+      },
+      {
+        "name": "allegro_hand",
+        "capability": "tendon_hand",
+        "description": "Public Allegro hand workload for tendon-style dexterous manipulation benchmarking.",
+        "solvers": [
+          "mujoco"
+        ],
+        "example_module": "newton.examples.robot.example_robot_allegro_hand",
+        "coverage": [
+          {
+            "solver_id": "mujoco",
+            "solver_name": "SolverMuJoCo",
+            "status": "benchmarked",
+            "reason": "Public Allegro hand benchmark wired into the dashboard matrix."
+          },
+          {
+            "solver_id": "kamino",
+            "solver_name": "SolverKamino",
+            "status": "harness_gap",
+            "reason": "A Kamino-native tendon-hand benchmark path is not yet benchmark-ready in the shared harness."
+          },
+          {
+            "solver_id": "xpbd",
+            "solver_name": "SolverXPBD",
+            "status": "harness_gap",
+            "reason": "Newton does not yet expose an XPBD-backed Allegro hand benchmark path."
+          },
+          {
+            "solver_id": "style3d",
+            "solver_name": "SolverStyle3D",
+            "status": "unsupported",
+            "reason": "Style3D does not support rigid-body hand articulation benchmarks."
+          }
+        ]
+      },
+      {
+        "name": "heterogeneous_worlds",
+        "capability": "heterogeneous_batching",
+        "description": "Heterogeneous-world batching workload that mixes structurally different Kamino worlds in one run.",
+        "solvers": [
+          "kamino"
+        ],
+        "example_module": "newton._src.solvers.kamino._src.utils.benchmark.problems",
+        "coverage": [
+          {
+            "solver_id": "kamino",
+            "solver_name": "SolverKamino",
+            "status": "benchmarked",
+            "reason": "Kamino heterogeneous-world batching benchmark wired into the dashboard matrix."
+          },
+          {
+            "solver_id": "xpbd",
+            "solver_name": "SolverXPBD",
+            "status": "harness_gap",
+            "reason": "Newton's public benchmark flow does not yet expose heterogeneous multi-world batching for XPBD."
+          },
+          {
+            "solver_id": "mujoco",
+            "solver_name": "SolverMuJoCo",
+            "status": "harness_gap",
+            "reason": "Newton's public benchmark flow does not yet expose heterogeneous multi-world batching for MuJoCo."
+          },
+          {
+            "solver_id": "style3d",
+            "solver_name": "SolverStyle3D",
+            "status": "unsupported",
+            "reason": "Style3D does not support heterogeneous rigid-world batching benchmarks."
+          }
+        ]
+      }
+    ],
+    "results": [
+      {
+        "scenario": "fourbar_loop",
+        "capability": "closed_loop_linkage",
+        "description": "Closed-loop four-bar linkage workload using the Kamino benchmark harness.",
+        "example_module": "newton._src.solvers.kamino._src.utils.benchmark.problems",
+        "solver_id": "kamino",
+        "solver_name": "SolverKamino",
+        "step_times_ms": [
+          325.262534
+        ],
+        "model": {
+          "body_count": 0,
+          "joint_count": 0,
+          "joint_dof_count": 0,
+          "shape_count": 0,
+          "particle_count": 0
+        },
+        "total_time_ms": 325.2625339664519,
+        "mean_step_time_ms": 325.2625339664519,
+        "median_step_time_ms": 325.2625339664519,
+        "min_step_time_ms": 325.2625339664519,
+        "max_step_time_ms": 325.2625339664519,
+        "steps_per_second": 3.074439554428183
+      },
+      {
+        "scenario": "dr_legs_loop",
+        "capability": "loop_heavy_legged_robot",
+        "description": "DR Legs closed-chain workload using repo-backed Disney Research assets in the Kamino harness.",
+        "example_module": "newton._src.solvers.kamino._src.utils.benchmark.problems",
+        "solver_id": "kamino",
+        "solver_name": "SolverKamino",
+        "step_times_ms": [
+          2821.762773
+        ],
+        "model": {
+          "body_count": 0,
+          "joint_count": 0,
+          "joint_dof_count": 0,
+          "shape_count": 0,
+          "particle_count": 0
+        },
+        "total_time_ms": 2821.762772742659,
+        "mean_step_time_ms": 2821.762772742659,
+        "median_step_time_ms": 2821.762772742659,
+        "min_step_time_ms": 2821.762772742659,
+        "max_step_time_ms": 2821.762772742659,
+        "steps_per_second": 0.3543884020512587
+      },
+      {
+        "scenario": "humanoid_loop_heavy",
+        "capability": "loop_heavy_humanoid",
+        "description": "Loop-heavy humanoid workload using the public humanoid plotting example as a benchmark harness.",
+        "example_module": "newton.examples.basic.example_basic_plotting",
+        "solver_id": "mujoco",
+        "solver_name": "SolverMuJoCo",
+        "step_times_ms": [
+          47928.264337
+        ],
+        "model": {
+          "body_count": 208,
+          "joint_count": 208,
+          "joint_dof_count": 432,
+          "shape_count": 657,
+          "particle_count": 0
+        },
+        "total_time_ms": 47928.264337126166,
+        "mean_step_time_ms": 47928.264337126166,
+        "median_step_time_ms": 47928.264337126166,
+        "min_step_time_ms": 47928.264337126166,
+        "max_step_time_ms": 47928.264337126166,
+        "steps_per_second": 0.02086451520476573
+      },
+      {
+        "scenario": "allegro_hand",
+        "capability": "tendon_hand",
+        "description": "Public Allegro hand workload for tendon-style dexterous manipulation benchmarking.",
+        "example_module": "newton.examples.robot.example_robot_allegro_hand",
+        "solver_id": "mujoco",
+        "solver_name": "SolverMuJoCo",
+        "step_times_ms": [
+          21966.225746
+        ],
+        "model": {
+          "body_count": 176,
+          "joint_count": 176,
+          "joint_dof_count": 176,
+          "shape_count": 305,
+          "particle_count": 0
+        },
+        "total_time_ms": 21966.22574608773,
+        "mean_step_time_ms": 21966.22574608773,
+        "median_step_time_ms": 21966.22574608773,
+        "min_step_time_ms": 21966.22574608773,
+        "max_step_time_ms": 21966.22574608773,
+        "steps_per_second": 0.045524434263728895
+      },
+      {
+        "scenario": "heterogeneous_worlds",
+        "capability": "heterogeneous_batching",
+        "description": "Heterogeneous-world batching workload that mixes structurally different Kamino worlds in one run.",
+        "example_module": "newton._src.solvers.kamino._src.utils.benchmark.problems",
+        "solver_id": "kamino",
+        "solver_name": "SolverKamino",
+        "step_times_ms": [
+          66.461344
+        ],
+        "model": {
+          "body_count": 0,
+          "joint_count": 0,
+          "joint_dof_count": 0,
+          "shape_count": 0,
+          "particle_count": 0
+        },
+        "total_time_ms": 66.46134424954653,
+        "mean_step_time_ms": 66.46134424954653,
+        "median_step_time_ms": 66.46134424954653,
+        "min_step_time_ms": 66.46134424954653,
+        "max_step_time_ms": 66.46134424954653,
+        "steps_per_second": 15.046340264278104
+      }
+    ],
+    "notes": [
+      "This matrix combines in-tree examples with direct builder-backed scenarios to provide honest solver-vs-capability coverage.",
+      "Coverage metadata distinguishes benchmarked paths from harness gaps and unsupported solver/scenario combinations."
+    ]
+  },
+  "latest_matrix": [
+    {
+      "scenario": "fourbar_loop",
+      "capability": "closed_loop_linkage",
+      "solver_name": "SolverKamino",
+      "solver_id": "kamino",
+      "rank": 1,
+      "steps_per_second": 3.074439554428183,
+      "median_step_time_ms": 325.2625339664519,
+      "total_time_ms": 325.2625339664519,
+      "relative_to_best": 1.0
+    },
+    {
+      "scenario": "dr_legs_loop",
+      "capability": "loop_heavy_legged_robot",
+      "solver_name": "SolverKamino",
+      "solver_id": "kamino",
+      "rank": 1,
+      "steps_per_second": 0.3543884020512587,
+      "median_step_time_ms": 2821.762772742659,
+      "total_time_ms": 2821.762772742659,
+      "relative_to_best": 1.0
+    },
+    {
+      "scenario": "humanoid_loop_heavy",
+      "capability": "loop_heavy_humanoid",
+      "solver_name": "SolverMuJoCo",
+      "solver_id": "mujoco",
+      "rank": 1,
+      "steps_per_second": 0.02086451520476573,
+      "median_step_time_ms": 47928.264337126166,
+      "total_time_ms": 47928.264337126166,
+      "relative_to_best": 1.0
+    },
+    {
+      "scenario": "allegro_hand",
+      "capability": "tendon_hand",
+      "solver_name": "SolverMuJoCo",
+      "solver_id": "mujoco",
+      "rank": 1,
+      "steps_per_second": 0.045524434263728895,
+      "median_step_time_ms": 21966.22574608773,
+      "total_time_ms": 21966.22574608773,
+      "relative_to_best": 1.0
+    },
+    {
+      "scenario": "heterogeneous_worlds",
+      "capability": "heterogeneous_batching",
+      "solver_name": "SolverKamino",
+      "solver_id": "kamino",
+      "rank": 1,
+      "steps_per_second": 15.046340264278104,
+      "median_step_time_ms": 66.46134424954653,
+      "total_time_ms": 66.46134424954653,
+      "relative_to_best": 1.0
+    }
+  ],
+  "latest_coverage": [
+    {
+      "scenario": "fourbar_loop",
+      "capability": "closed_loop_linkage",
+      "solver_id": "kamino",
+      "solver_name": "SolverKamino",
+      "status": "benchmarked",
+      "reason": "Kamino benchmark problem wired into the solver dashboard matrix."
+    },
+    {
+      "scenario": "fourbar_loop",
+      "capability": "closed_loop_linkage",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "status": "harness_gap",
+      "reason": "The closed-loop linkage parity slice is not yet exposed through Newton's public XPBD benchmark examples."
+    },
+    {
+      "scenario": "fourbar_loop",
+      "capability": "closed_loop_linkage",
+      "solver_id": "mujoco",
+      "solver_name": "SolverMuJoCo",
+      "status": "harness_gap",
+      "reason": "The closed-loop linkage parity slice is not yet exposed through Newton's public MuJoCo benchmark examples."
+    },
+    {
+      "scenario": "fourbar_loop",
+      "capability": "closed_loop_linkage",
+      "solver_id": "style3d",
+      "solver_name": "SolverStyle3D",
+      "status": "unsupported",
+      "reason": "Style3D does not support rigid closed-loop articulation benchmarks."
+    },
+    {
+      "scenario": "dr_legs_loop",
+      "capability": "loop_heavy_legged_robot",
+      "solver_id": "kamino",
+      "solver_name": "SolverKamino",
+      "status": "benchmarked",
+      "reason": "Repo-backed DR Legs benchmark wired into the Kamino matrix."
+    },
+    {
+      "scenario": "dr_legs_loop",
+      "capability": "loop_heavy_legged_robot",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "status": "harness_gap",
+      "reason": "Newton does not yet expose a public XPBD benchmark path for the DR Legs asset pack."
+    },
+    {
+      "scenario": "dr_legs_loop",
+      "capability": "loop_heavy_legged_robot",
+      "solver_id": "mujoco",
+      "solver_name": "SolverMuJoCo",
+      "status": "harness_gap",
+      "reason": "Newton does not yet expose a public MuJoCo benchmark path for the DR Legs asset pack."
+    },
+    {
+      "scenario": "dr_legs_loop",
+      "capability": "loop_heavy_legged_robot",
+      "solver_id": "style3d",
+      "solver_name": "SolverStyle3D",
+      "status": "unsupported",
+      "reason": "Style3D does not support articulated rigid-body robot benchmarks."
+    },
+    {
+      "scenario": "humanoid_loop_heavy",
+      "capability": "loop_heavy_humanoid",
+      "solver_id": "mujoco",
+      "solver_name": "SolverMuJoCo",
+      "status": "benchmarked",
+      "reason": "Public humanoid example benchmarked through the dashboard matrix."
+    },
+    {
+      "scenario": "humanoid_loop_heavy",
+      "capability": "loop_heavy_humanoid",
+      "solver_id": "kamino",
+      "solver_name": "SolverKamino",
+      "status": "harness_gap",
+      "reason": "A Kamino-native humanoid benchmark path is not yet productized in the shared benchmark harness."
+    },
+    {
+      "scenario": "humanoid_loop_heavy",
+      "capability": "loop_heavy_humanoid",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "status": "harness_gap",
+      "reason": "The public humanoid example does not expose an XPBD-backed benchmark path."
+    },
+    {
+      "scenario": "humanoid_loop_heavy",
+      "capability": "loop_heavy_humanoid",
+      "solver_id": "style3d",
+      "solver_name": "SolverStyle3D",
+      "status": "unsupported",
+      "reason": "Style3D does not support articulated humanoid rigid-body benchmarks."
+    },
+    {
+      "scenario": "allegro_hand",
+      "capability": "tendon_hand",
+      "solver_id": "mujoco",
+      "solver_name": "SolverMuJoCo",
+      "status": "benchmarked",
+      "reason": "Public Allegro hand benchmark wired into the dashboard matrix."
+    },
+    {
+      "scenario": "allegro_hand",
+      "capability": "tendon_hand",
+      "solver_id": "kamino",
+      "solver_name": "SolverKamino",
+      "status": "harness_gap",
+      "reason": "A Kamino-native tendon-hand benchmark path is not yet benchmark-ready in the shared harness."
+    },
+    {
+      "scenario": "allegro_hand",
+      "capability": "tendon_hand",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "status": "harness_gap",
+      "reason": "Newton does not yet expose an XPBD-backed Allegro hand benchmark path."
+    },
+    {
+      "scenario": "allegro_hand",
+      "capability": "tendon_hand",
+      "solver_id": "style3d",
+      "solver_name": "SolverStyle3D",
+      "status": "unsupported",
+      "reason": "Style3D does not support rigid-body hand articulation benchmarks."
+    },
+    {
+      "scenario": "heterogeneous_worlds",
+      "capability": "heterogeneous_batching",
+      "solver_id": "kamino",
+      "solver_name": "SolverKamino",
+      "status": "benchmarked",
+      "reason": "Kamino heterogeneous-world batching benchmark wired into the dashboard matrix."
+    },
+    {
+      "scenario": "heterogeneous_worlds",
+      "capability": "heterogeneous_batching",
+      "solver_id": "xpbd",
+      "solver_name": "SolverXPBD",
+      "status": "harness_gap",
+      "reason": "Newton's public benchmark flow does not yet expose heterogeneous multi-world batching for XPBD."
+    },
+    {
+      "scenario": "heterogeneous_worlds",
+      "capability": "heterogeneous_batching",
+      "solver_id": "mujoco",
+      "solver_name": "SolverMuJoCo",
+      "status": "harness_gap",
+      "reason": "Newton's public benchmark flow does not yet expose heterogeneous multi-world batching for MuJoCo."
+    },
+    {
+      "scenario": "heterogeneous_worlds",
+      "capability": "heterogeneous_batching",
+      "solver_id": "style3d",
+      "solver_name": "SolverStyle3D",
+      "status": "unsupported",
+      "reason": "Style3D does not support heterogeneous rigid-world batching benchmarks."
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "fourbar_loop",
+      "capability": "closed_loop_linkage",
+      "description": "Closed-loop four-bar linkage workload using the Kamino benchmark harness.",
+      "coverage": [
+        {
+          "solver_id": "kamino",
+          "solver_name": "SolverKamino",
+          "status": "benchmarked",
+          "reason": "Kamino benchmark problem wired into the solver dashboard matrix."
+        },
+        {
+          "solver_id": "xpbd",
+          "solver_name": "SolverXPBD",
+          "status": "harness_gap",
+          "reason": "The closed-loop linkage parity slice is not yet exposed through Newton's public XPBD benchmark examples."
+        },
+        {
+          "solver_id": "mujoco",
+          "solver_name": "SolverMuJoCo",
+          "status": "harness_gap",
+          "reason": "The closed-loop linkage parity slice is not yet exposed through Newton's public MuJoCo benchmark examples."
+        },
+        {
+          "solver_id": "style3d",
+          "solver_name": "SolverStyle3D",
+          "status": "unsupported",
+          "reason": "Style3D does not support rigid closed-loop articulation benchmarks."
+        }
+      ],
+      "throughput_plot": [
+        {
+          "solver_name": "SolverKamino",
+          "solver_id": "kamino",
+          "steps_per_second": 3.074439554428183
+        }
+      ],
+      "step_time_plot": [
+        {
+          "solver_name": "SolverKamino",
+          "solver_id": "kamino",
+          "values_ms": [
+            325.262534
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dr_legs_loop",
+      "capability": "loop_heavy_legged_robot",
+      "description": "DR Legs closed-chain workload using repo-backed Disney Research assets in the Kamino harness.",
+      "coverage": [
+        {
+          "solver_id": "kamino",
+          "solver_name": "SolverKamino",
+          "status": "benchmarked",
+          "reason": "Repo-backed DR Legs benchmark wired into the Kamino matrix."
+        },
+        {
+          "solver_id": "xpbd",
+          "solver_name": "SolverXPBD",
+          "status": "harness_gap",
+          "reason": "Newton does not yet expose a public XPBD benchmark path for the DR Legs asset pack."
+        },
+        {
+          "solver_id": "mujoco",
+          "solver_name": "SolverMuJoCo",
+          "status": "harness_gap",
+          "reason": "Newton does not yet expose a public MuJoCo benchmark path for the DR Legs asset pack."
+        },
+        {
+          "solver_id": "style3d",
+          "solver_name": "SolverStyle3D",
+          "status": "unsupported",
+          "reason": "Style3D does not support articulated rigid-body robot benchmarks."
+        }
+      ],
+      "throughput_plot": [
+        {
+          "solver_name": "SolverKamino",
+          "solver_id": "kamino",
+          "steps_per_second": 0.3543884020512587
+        }
+      ],
+      "step_time_plot": [
+        {
+          "solver_name": "SolverKamino",
+          "solver_id": "kamino",
+          "values_ms": [
+            2821.762773
+          ]
+        }
+      ]
+    },
+    {
+      "name": "humanoid_loop_heavy",
+      "capability": "loop_heavy_humanoid",
+      "description": "Loop-heavy humanoid workload using the public humanoid plotting example as a benchmark harness.",
+      "coverage": [
+        {
+          "solver_id": "mujoco",
+          "solver_name": "SolverMuJoCo",
+          "status": "benchmarked",
+          "reason": "Public humanoid example benchmarked through the dashboard matrix."
+        },
+        {
+          "solver_id": "kamino",
+          "solver_name": "SolverKamino",
+          "status": "harness_gap",
+          "reason": "A Kamino-native humanoid benchmark path is not yet productized in the shared benchmark harness."
+        },
+        {
+          "solver_id": "xpbd",
+          "solver_name": "SolverXPBD",
+          "status": "harness_gap",
+          "reason": "The public humanoid example does not expose an XPBD-backed benchmark path."
+        },
+        {
+          "solver_id": "style3d",
+          "solver_name": "SolverStyle3D",
+          "status": "unsupported",
+          "reason": "Style3D does not support articulated humanoid rigid-body benchmarks."
+        }
+      ],
+      "throughput_plot": [
+        {
+          "solver_name": "SolverMuJoCo",
+          "solver_id": "mujoco",
+          "steps_per_second": 0.02086451520476573
+        }
+      ],
+      "step_time_plot": [
+        {
+          "solver_name": "SolverMuJoCo",
+          "solver_id": "mujoco",
+          "values_ms": [
+            47928.264337
+          ]
+        }
+      ]
+    },
+    {
+      "name": "allegro_hand",
+      "capability": "tendon_hand",
+      "description": "Public Allegro hand workload for tendon-style dexterous manipulation benchmarking.",
+      "coverage": [
+        {
+          "solver_id": "mujoco",
+          "solver_name": "SolverMuJoCo",
+          "status": "benchmarked",
+          "reason": "Public Allegro hand benchmark wired into the dashboard matrix."
+        },
+        {
+          "solver_id": "kamino",
+          "solver_name": "SolverKamino",
+          "status": "harness_gap",
+          "reason": "A Kamino-native tendon-hand benchmark path is not yet benchmark-ready in the shared harness."
+        },
+        {
+          "solver_id": "xpbd",
+          "solver_name": "SolverXPBD",
+          "status": "harness_gap",
+          "reason": "Newton does not yet expose an XPBD-backed Allegro hand benchmark path."
+        },
+        {
+          "solver_id": "style3d",
+          "solver_name": "SolverStyle3D",
+          "status": "unsupported",
+          "reason": "Style3D does not support rigid-body hand articulation benchmarks."
+        }
+      ],
+      "throughput_plot": [
+        {
+          "solver_name": "SolverMuJoCo",
+          "solver_id": "mujoco",
+          "steps_per_second": 0.045524434263728895
+        }
+      ],
+      "step_time_plot": [
+        {
+          "solver_name": "SolverMuJoCo",
+          "solver_id": "mujoco",
+          "values_ms": [
+            21966.225746
+          ]
+        }
+      ]
+    },
+    {
+      "name": "heterogeneous_worlds",
+      "capability": "heterogeneous_batching",
+      "description": "Heterogeneous-world batching workload that mixes structurally different Kamino worlds in one run.",
+      "coverage": [
+        {
+          "solver_id": "kamino",
+          "solver_name": "SolverKamino",
+          "status": "benchmarked",
+          "reason": "Kamino heterogeneous-world batching benchmark wired into the dashboard matrix."
+        },
+        {
+          "solver_id": "xpbd",
+          "solver_name": "SolverXPBD",
+          "status": "harness_gap",
+          "reason": "Newton's public benchmark flow does not yet expose heterogeneous multi-world batching for XPBD."
+        },
+        {
+          "solver_id": "mujoco",
+          "solver_name": "SolverMuJoCo",
+          "status": "harness_gap",
+          "reason": "Newton's public benchmark flow does not yet expose heterogeneous multi-world batching for MuJoCo."
+        },
+        {
+          "solver_id": "style3d",
+          "solver_name": "SolverStyle3D",
+          "status": "unsupported",
+          "reason": "Style3D does not support heterogeneous rigid-world batching benchmarks."
+        }
+      ],
+      "throughput_plot": [
+        {
+          "solver_name": "SolverKamino",
+          "solver_id": "kamino",
+          "steps_per_second": 15.046340264278104
+        }
+      ],
+      "step_time_plot": [
+        {
+          "solver_name": "SolverKamino",
+          "solver_id": "kamino",
+          "values_ms": [
+            66.461344
+          ]
+        }
+      ]
+    }
+  ]
+}

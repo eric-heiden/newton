@@ -3,10 +3,14 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any, Literal
 
 import warp as wp
 
+import newton.examples
 import newton.utils
+from newton.examples.basic.example_basic_plotting import Example as HumanoidBenchmarkExample
+from newton.examples.cloth.example_cloth_hanging import Example as ClothHangingExample
 
 from ...core.builder import ModelBuilderKamino
 from ...models import basics
@@ -61,13 +65,26 @@ class CameraConfig:
     yaw: float
 
 
-ProblemConfig = tuple[ModelBuilderKamino | Callable, ControlConfig | None, CameraConfig | None]
+@dataclass(frozen=True)
+class NewtonExampleConfig:
+    example_type: type
+    kwargs: dict[str, Any]
+    args_factory: Callable[[], Any] | None = None
+
+
+@dataclass(frozen=True)
+class BenchmarkProblemDefinition:
+    runtime: Literal["kamino", "newton_example"]
+    factory: Callable[[], ModelBuilderKamino | NewtonExampleConfig]
+
+
+ProblemConfig = tuple[BenchmarkProblemDefinition, ControlConfig | None, CameraConfig | None]
 """
 Defines the configurations for a single benchmark problem.
 
 This contains:
-- A model builder that constructs the simulation worlds for the benchmark problem, or a callable
-  taking no arguments returning such a builder (for deferred loading of the problem assets).
+- A runtime definition that constructs either a Kamino-native builder or a
+  Newton-native benchmark example for the benchmark problem.
 - Optional control configurations for perturbing the benchmark problem.
 - Optional camera configurations for visualizing the benchmark problem.
 """
@@ -109,7 +126,7 @@ def make_benchmark_problem_fourbar(
         pitch=-5.0,
         yaw=70.0,
     )
-    return builder_fn, control, camera
+    return BenchmarkProblemDefinition(runtime="kamino", factory=builder_fn), control, camera
 
 
 def make_benchmark_problem_dr_legs(
@@ -154,7 +171,57 @@ def make_benchmark_problem_dr_legs(
         pitch=-10.0,
         yaw=225.0,
     )
-    return builder_fn, control, camera
+    return BenchmarkProblemDefinition(runtime="kamino", factory=builder_fn), control, camera
+
+
+def make_benchmark_problem_humanoid(
+    num_worlds: int = 1,
+    gravity: bool = True,
+    ground: bool = True,
+) -> ProblemConfig:
+    def example_factory() -> NewtonExampleConfig:
+        def make_args():
+            parser = HumanoidBenchmarkExample.create_parser()
+            args = newton.examples.default_args(parser)
+            args.world_count = num_worlds
+            return args
+
+        return NewtonExampleConfig(
+            example_type=HumanoidBenchmarkExample,
+            kwargs={},
+            args_factory=make_args,
+        )
+
+    control = ControlConfig(decimation=10, scale=0.75)
+    camera = CameraConfig(
+        position=(2.0, 1.7, 1.3),
+        pitch=-15.0,
+        yaw=220.0,
+    )
+    return BenchmarkProblemDefinition(runtime="newton_example", factory=example_factory), control, camera
+
+
+def make_benchmark_problem_cloth_hanging(
+    num_worlds: int = 1,
+    gravity: bool = True,
+    ground: bool = True,
+) -> ProblemConfig:
+    if num_worlds != 1:
+        raise ValueError("The cloth benchmark currently supports exactly one world.")
+
+    def example_factory() -> NewtonExampleConfig:
+        return NewtonExampleConfig(
+            example_type=ClothHangingExample,
+            kwargs={
+                "solver_type": "vbd",
+                "width": 24,
+                "height": 16,
+            },
+        )
+
+    control = None
+    camera = None
+    return BenchmarkProblemDefinition(runtime="newton_example", factory=example_factory), control, camera
 
 
 ###
@@ -164,6 +231,8 @@ def make_benchmark_problem_dr_legs(
 BenchmarkProblemNameToConfigFn: dict[str, Callable[..., ProblemConfig]] = {
     "fourbar": make_benchmark_problem_fourbar,
     "dr_legs": make_benchmark_problem_dr_legs,
+    "humanoid": make_benchmark_problem_humanoid,
+    "cloth_hanging": make_benchmark_problem_cloth_hanging,
 }
 """
 Defines a mapping from benchmark problem names to their

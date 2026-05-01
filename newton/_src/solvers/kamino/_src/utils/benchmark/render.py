@@ -421,9 +421,14 @@ def render_solver_configs_table(
         if "sparse" in groups:
             cfg_row.extend([str(cfg.sparse_jacobian), str(cfg.sparse_dynamics)])
         if "linear" in groups:
+            linear_solver_name = (
+                cfg.dynamics.linear_solver_type
+                if isinstance(cfg.dynamics.linear_solver_type, str)
+                else LinearSolverTypeToName[cfg.dynamics.linear_solver_type]
+            )
             cfg_row.extend(
                 [
-                    str(LinearSolverTypeToName[cfg.dynamics.linear_solver_type]),
+                    str(linear_solver_name),
                     str(cfg.dynamics.linear_solver_kwargs),
                 ]
             )

@@ -14,6 +14,8 @@ from newton.viewer import ViewerNull
 
 ISAACGYM_ENVS_REPO_URL = "https://github.com/isaac-sim/IsaacGymEnvs.git"
 ISAACGYM_NUT_BOLT_FOLDER = "assets/factory/mesh/factory_nut_bolt"
+DENSE_PYRAMID_NUM_PYRAMIDS = 6
+DENSE_PYRAMID_SIZE = 28
 
 try:
     from newton.examples import download_external_git_folder as _download_external_git_folder
@@ -41,6 +43,42 @@ def _import_example_class(module_names: list[str]):
         return module.Example
 
     raise SkipNotImplemented
+
+
+def _build_pyramid_example(
+    num_frames: int,
+    *,
+    num_pyramids: int | None = None,
+    pyramid_size: int | None = None,
+    test_mode: bool | None = None,
+):
+    """Build the pyramid contact example with optional argument overrides."""
+    example_cls = _import_example_class(
+        [
+            "newton.examples.contacts.example_pyramid",
+        ]
+    )
+
+    if hasattr(newton.examples, "default_args") and hasattr(example_cls, "create_parser"):
+        args = newton.examples.default_args(example_cls.create_parser())
+        if num_pyramids is not None:
+            args.num_pyramids = num_pyramids
+        if pyramid_size is not None:
+            args.pyramid_size = pyramid_size
+        if test_mode is not None:
+            args.test = test_mode
+        return example_cls(ViewerNull(num_frames=num_frames), args)
+
+    kwargs = {
+        "viewer": ViewerNull(num_frames=num_frames),
+        "solver": "xpbd",
+        "test_mode": False if test_mode is None else test_mode,
+    }
+    if num_pyramids is not None:
+        kwargs["num_pyramids"] = num_pyramids
+    if pyramid_size is not None:
+        kwargs["pyramid_size"] = pyramid_size
+    return example_cls(**kwargs)
 
 
 class FastExampleContactSdfDefaults:
@@ -122,27 +160,39 @@ class FastExampleContactPyramidDefaults:
     number = 1
 
     def setup(self):
-        example_cls = _import_example_class(
-            [
-                "newton.examples.contacts.example_pyramid",
-            ]
-        )
         self.num_frames = 20
-        if hasattr(newton.examples, "default_args") and hasattr(example_cls, "create_parser"):
-            args = newton.examples.default_args(example_cls.create_parser())
-            self.example = example_cls(ViewerNull(num_frames=self.num_frames), args)
-        else:
-            self.example = example_cls(
-                viewer=ViewerNull(num_frames=self.num_frames),
-                solver="xpbd",
-                test_mode=False,
-            )
+        self.example = _build_pyramid_example(self.num_frames)
 
     @skip_benchmark_if(wp.get_cuda_device_count() == 0)
     def time_simulate(self):
         for _ in range(self.num_frames):
             self.example.step()
         wp.synchronize_device()
+
+
+class FastExampleContactPyramidDense:
+    """Benchmark a denser pyramid stack for contact-heavy solver experiments."""
+
+    repeat = 2
+    number = 1
+
+    def setup(self):
+        self.num_frames = 10
+        self.example = _build_pyramid_example(
+            self.num_frames,
+            num_pyramids=DENSE_PYRAMID_NUM_PYRAMIDS,
+            pyramid_size=DENSE_PYRAMID_SIZE,
+            test_mode=True,
+        )
+
+    @skip_benchmark_if(wp.get_cuda_device_count() == 0)
+    def time_simulate(self):
+        for _ in range(self.num_frames):
+            self.example.step()
+        wp.synchronize_device()
+
+    def track_contact_count(self):
+        return int(self.example.contacts.rigid_contact_count.numpy()[0])
 
 
 if __name__ == "__main__":
@@ -154,6 +204,7 @@ if __name__ == "__main__":
         "FastExampleContactSdfDefaults": FastExampleContactSdfDefaults,
         "FastExampleContactHydroWorkingDefaults": FastExampleContactHydroWorkingDefaults,
         "FastExampleContactPyramidDefaults": FastExampleContactPyramidDefaults,
+        "FastExampleContactPyramidDense": FastExampleContactPyramidDense,
     }
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)

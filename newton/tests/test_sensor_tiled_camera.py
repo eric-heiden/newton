@@ -13,6 +13,20 @@ from newton.sensors import SensorTiledCamera
 
 
 class TestSensorTiledCamera(unittest.TestCase):
+    def __build_multiworld_box_scene(self, world_count: int):
+        blueprint = newton.ModelBuilder()
+        body = blueprint.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), label="box")
+        blueprint.add_shape_box(body, hx=0.25, hy=0.25, hz=0.25)
+
+        builder = newton.ModelBuilder()
+        for world_id in range(world_count):
+            builder.add_world(
+                blueprint,
+                xform=wp.transform(wp.vec3(float(world_id) * 2.0, 0.0, 0.0), wp.quat_identity()),
+            )
+
+        return builder.finalize()
+
     def __build_scene(self):
         from pxr import Usd, UsdGeom
 
@@ -163,6 +177,145 @@ class TestSensorTiledCamera(unittest.TestCase):
         tiled_camera_sensor.update(model.state(), camera_transforms, camera_rays, color_image=None, depth_image=None)
         self.assertFalse(np.any(color_image.numpy() != 0), "Color image should NOT contain rendered data")
         self.assertFalse(np.any(depth_image.numpy() != 0), "Depth image should NOT contain rendered data")
+
+    def test_batch_policy_splits_rich_outputs_by_camera(self):
+        model = self.__build_multiworld_box_scene(world_count=4)
+        sensor = SensorTiledCamera(model=model, batch_policy=SensorTiledCamera.BatchPolicy())
+
+        width = 256
+        height = 256
+        camera_count = 8
+
+        camera_transforms = wp.array(
+            [
+                [wp.transformf(wp.vec3f(2.0, 0.0, 1.0), wp.quatf(0.0, 0.0, 0.0, 1.0)) for _ in range(model.world_count)]
+                for _ in range(camera_count)
+            ],
+            dtype=wp.transformf,
+        )
+        camera_rays = sensor.utils.compute_pinhole_camera_rays(width, height, [math.radians(45.0)] * camera_count)
+
+        color_image = sensor.utils.create_color_image_output(width, height, camera_count)
+        depth_image = sensor.utils.create_depth_image_output(width, height, camera_count)
+        normal_image = sensor.utils.create_normal_image_output(width, height, camera_count)
+
+        calls = []
+
+        def fake_render(
+            chunk_camera_transforms,
+            chunk_camera_rays,
+            chunk_color_image=None,
+            chunk_depth_image=None,
+            chunk_shape_index_image=None,
+            chunk_normal_image=None,
+            chunk_albedo_image=None,
+            *,
+            refit_bvh=True,
+            clear_data=None,
+        ):
+            calls.append(
+                {
+                    "camera_count": chunk_camera_rays.shape[0],
+                    "color_shape": None if chunk_color_image is None else chunk_color_image.shape,
+                    "normal_shape": None if chunk_normal_image is None else chunk_normal_image.shape,
+                    "refit_bvh": refit_bvh,
+                }
+            )
+
+        sensor._SensorTiledCamera__render_context.render = fake_render
+        sensor.update(
+            None,
+            camera_transforms,
+            camera_rays,
+            color_image=color_image,
+            depth_image=depth_image,
+            normal_image=normal_image,
+        )
+
+        self.assertEqual([call["camera_count"] for call in calls], [4, 4])
+        self.assertEqual(calls[0]["color_shape"], (model.world_count, 4, height, width))
+        self.assertEqual(calls[0]["normal_shape"], (model.world_count, 4, height, width))
+        self.assertTrue(calls[0]["refit_bvh"])
+        self.assertFalse(calls[1]["refit_bvh"])
+
+    def test_batch_policy_keeps_depth_normal_within_single_launch(self):
+        model = self.__build_multiworld_box_scene(world_count=4)
+        sensor = SensorTiledCamera(model=model, batch_policy=SensorTiledCamera.BatchPolicy())
+
+        width = 256
+        height = 256
+        camera_count = 16
+
+        camera_transforms = wp.array(
+            [
+                [wp.transformf(wp.vec3f(2.0, 0.0, 1.0), wp.quatf(0.0, 0.0, 0.0, 1.0)) for _ in range(model.world_count)]
+                for _ in range(camera_count)
+            ],
+            dtype=wp.transformf,
+        )
+        camera_rays = sensor.utils.compute_pinhole_camera_rays(width, height, [math.radians(45.0)] * camera_count)
+
+        depth_image = sensor.utils.create_depth_image_output(width, height, camera_count)
+        normal_image = sensor.utils.create_normal_image_output(width, height, camera_count)
+
+        calls = []
+
+        def fake_render(
+            chunk_camera_transforms,
+            chunk_camera_rays,
+            chunk_color_image=None,
+            chunk_depth_image=None,
+            chunk_shape_index_image=None,
+            chunk_normal_image=None,
+            chunk_albedo_image=None,
+            *,
+            refit_bvh=True,
+            clear_data=None,
+        ):
+            calls.append(chunk_camera_rays.shape[0])
+
+        sensor._SensorTiledCamera__render_context.render = fake_render
+        sensor.update(
+            None,
+            camera_transforms,
+            camera_rays,
+            depth_image=depth_image,
+            normal_image=normal_image,
+        )
+
+        self.assertEqual(calls, [camera_count])
+
+    def test_batch_policy_rejects_unbatchable_single_camera_launch(self):
+        model = self.__build_multiworld_box_scene(world_count=16)
+        sensor = SensorTiledCamera(model=model, batch_policy=SensorTiledCamera.BatchPolicy())
+
+        width = 512
+        height = 512
+        camera_count = 1
+
+        camera_transforms = wp.array(
+            [[wp.transformf(wp.vec3f(2.0, 0.0, 1.0), wp.quatf(0.0, 0.0, 0.0, 1.0)) for _ in range(model.world_count)]],
+            dtype=wp.transformf,
+        )
+        camera_rays = sensor.utils.compute_pinhole_camera_rays(width, height, math.radians(45.0))
+
+        color_image = sensor.utils.create_color_image_output(width, height, camera_count)
+        depth_image = sensor.utils.create_depth_image_output(width, height, camera_count)
+        shape_index_image = sensor.utils.create_shape_index_image_output(width, height, camera_count)
+        normal_image = sensor.utils.create_normal_image_output(width, height, camera_count)
+        albedo_image = sensor.utils.create_albedo_image_output(width, height, camera_count)
+
+        with self.assertRaisesRegex(ValueError, "batch policy"):
+            sensor.update(
+                None,
+                camera_transforms,
+                camera_rays,
+                color_image=color_image,
+                depth_image=depth_image,
+                shape_index_image=shape_index_image,
+                normal_image=normal_image,
+                albedo_image=albedo_image,
+            )
 
 
 if __name__ == "__main__":

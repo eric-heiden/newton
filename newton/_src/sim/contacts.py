@@ -19,7 +19,7 @@ class Contacts:
         This class is a temporary solution and its interface may change in the future.
     """
 
-    EXTENDED_ATTRIBUTES: frozenset[str] = frozenset(("force",))
+    EXTENDED_ATTRIBUTES: frozenset[str] = frozenset(("force", "rigid_query"))
     """
     Names of optional extended contact attributes that are not allocated by default.
 
@@ -124,6 +124,31 @@ class Contacts:
             # to be filled by the solver (currently unused)
             self.rigid_contact_force = wp.zeros(rigid_contact_max, dtype=wp.vec3)
             """Contact force [N], shape (rigid_contact_max,), dtype :class:`vec3`."""
+            self.rigid_query_count = wp.zeros(1, dtype=wp.int32)
+            """Number of cached rigid query entries [count], shape (1,), dtype int."""
+            self.rigid_query_shape0: wp.array | None = None
+            """Shape-0 index for each cached rigid query [count], shape (rigid_contact_max,), dtype int."""
+            self.rigid_query_shape1: wp.array | None = None
+            """Shape-1 index for each cached rigid query [count], shape (rigid_contact_max,), dtype int."""
+            self.rigid_query_point0: wp.array | None = None
+            """World-space witness point on shape 0 [m], shape (rigid_contact_max,), dtype :class:`vec3`."""
+            self.rigid_query_point1: wp.array | None = None
+            """World-space witness point on shape 1 [m], shape (rigid_contact_max,), dtype :class:`vec3`."""
+            self.rigid_query_normal: wp.array | None = None
+            """World-space normal from shape 0 toward shape 1 [unitless], shape (rigid_contact_max,), dtype :class:`vec3`."""
+            self.rigid_query_distance: wp.array | None = None
+            """Signed separation distance after margin/radius offsets [m], shape (rigid_contact_max,), dtype float."""
+            self.rigid_query_active: wp.array | None = None
+            """Activation flag for each cached rigid query [bool as int], shape (rigid_contact_max,), dtype int."""
+
+            if requested_attributes and "rigid_query" in requested_attributes:
+                self.rigid_query_shape0 = wp.full(rigid_contact_max, -1, dtype=wp.int32)
+                self.rigid_query_shape1 = wp.full(rigid_contact_max, -1, dtype=wp.int32)
+                self.rigid_query_point0 = wp.zeros(rigid_contact_max, dtype=wp.vec3)
+                self.rigid_query_point1 = wp.zeros(rigid_contact_max, dtype=wp.vec3)
+                self.rigid_query_normal = wp.zeros(rigid_contact_max, dtype=wp.vec3)
+                self.rigid_query_distance = wp.zeros(rigid_contact_max, dtype=wp.float32)
+                self.rigid_query_active = wp.zeros(rigid_contact_max, dtype=wp.int32)
 
             # contact stiffness/damping/friction (only allocated if per_contact_shape_properties is enabled)
             if self.per_contact_shape_properties:
@@ -184,6 +209,7 @@ class Contacts:
         """
         # Clear all counters with a single kernel launch (consolidated counter array)
         self._counter_array.zero_()
+        self.rigid_query_count.zero_()
 
         if self.clear_buffers:
             # Conservative path: clear all buffers (7-10 kernel launches)
@@ -195,6 +221,14 @@ class Contacts:
 
             if self.force is not None:
                 self.force.zero_()
+            if self.rigid_query_shape0 is not None:
+                self.rigid_query_shape0.fill_(-1)
+                self.rigid_query_shape1.fill_(-1)
+                self.rigid_query_point0.zero_()
+                self.rigid_query_point1.zero_()
+                self.rigid_query_normal.zero_()
+                self.rigid_query_distance.zero_()
+                self.rigid_query_active.zero_()
 
             if self.per_contact_shape_properties:
                 self.rigid_contact_stiffness.zero_()

@@ -5,7 +5,9 @@
 ### Added
 
 - Add 3D texture-based SDF, replacing NanoVDB volumes in the mesh-mesh collision pipeline for improved performance and CPU compatibility.
+- Add opt-in `rigid_query` contact attributes that retain witness points, signed distance, normal, and activation state for rigid narrow-phase queries
 - Add `--benchmark [SECONDS]` flag to examples for headless FPS measurement with warmup
+- Add a local benchmark dashboard server that summarizes `asv/results` on port 7000 and links through to the native ASV HTML report
 - Interactive example browser in the GL viewer with tree-view navigation and switch/reset support
 - Add `TetMesh` class and USD loading API for tetrahedral mesh geometry
 - Support kinematic bodies in VBD solver
@@ -24,6 +26,10 @@
 - Add `enable_ambient_lighting` and `enable_particles` options to `SensorTiledCamera.Config`
 - Add per-shape display colors via `ModelBuilder.shape_color`, `Model.shape_color`, and `color=` on `ModelBuilder.add_shape_*`; mesh shapes fall back to `Mesh.color` when available and viewers honor runtime `Model.shape_color` updates
 - Add `ModelBuilder.inertia_tolerance` to configure the eigenvalue positivity and triangle inequality threshold used during inertia correction in `finalize()`
+- Add a local research dashboard server on port 7070 for structured research artifacts, detail views, and a chat-ready integration stub
+- Add rigid-body, pendulum, terrain, and Style3D cloth coverage to the solver benchmark matrix and label benchmarked, harness-gap, and unsupported solver/scenario pairs
+- Add research dashboard capture and retrieval APIs so new entries can be created and queried through the hosted `:7070` service
+- Add optional `SensorTiledCamera.BatchPolicy` guardrails to chunk large multi-world camera updates by output mix and view budget
 
 ### Changed
 
@@ -61,6 +67,7 @@
 
 ### Fixed
 
+- Fix the hosted research dashboard to auto-load a stable default artifact at `scripts/research_dashboard.json` instead of requiring an ad hoc artifact CLI argument
 - Restore keyboard camera movement while hovering gizmos so keyboard controls remain active when the pointer is over gizmos
 - Resolve USD asset references recursively in `resolve_usd_from_url` so nested stages are fully downloaded
 - Unify CPU and GPU inertia validation to produce identical results for zero-mass bodies with `bound_mass`, singular inertia, non-symmetric tensors, and triangle-inequality boundary cases

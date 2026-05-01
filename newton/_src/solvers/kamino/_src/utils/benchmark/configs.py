@@ -3,7 +3,7 @@
 
 import ast
 
-from ...linalg.linear import LinearSolverNameToType, LinearSolverTypeToName
+from ...linalg.linear import LinearSolverTypeToName
 from ...solver_kamino_impl import SolverKaminoImpl
 
 ###
@@ -41,7 +41,7 @@ def make_solver_config_default() -> tuple[str, SolverKaminoImpl.Config]:
     config.sparse_dynamics = False
     # ------------------------------------------------------------------------------
     # Linear system solver
-    config.dynamics.linear_solver_type = LinearSolverNameToType["LLTB"]
+    config.dynamics.linear_solver_type = "LLTB"
     config.dynamics.linear_solver_kwargs = {}
     # ------------------------------------------------------------------------------
     # PADMM
@@ -79,7 +79,7 @@ def make_solver_config_dense_jacobian_llt_accurate() -> tuple[str, SolverKaminoI
     config.sparse_jacobian = False
     # ------------------------------------------------------------------------------
     # Linear system solver
-    config.dynamics.linear_solver_type = LinearSolverNameToType["LLTB"]
+    config.dynamics.linear_solver_type = "LLTB"
     config.dynamics.linear_solver_kwargs = {}
     # ------------------------------------------------------------------------------
     # PADMM
@@ -117,7 +117,7 @@ def make_solver_config_dense_jacobian_llt_fast() -> tuple[str, SolverKaminoImpl.
     config.sparse_jacobian = False
     # ------------------------------------------------------------------------------
     # Linear system solver
-    config.dynamics.linear_solver_type = LinearSolverNameToType["LLTB"]
+    config.dynamics.linear_solver_type = "LLTB"
     config.dynamics.linear_solver_kwargs = {}
     # ------------------------------------------------------------------------------
     # PADMM
@@ -155,7 +155,7 @@ def make_solver_config_sparse_jacobian_llt_accurate() -> tuple[str, SolverKamino
     config.sparse_jacobian = True
     # ------------------------------------------------------------------------------
     # Linear system solver
-    config.dynamics.linear_solver_type = LinearSolverNameToType["LLTB"]
+    config.dynamics.linear_solver_type = "LLTB"
     config.dynamics.linear_solver_kwargs = {}
     # ------------------------------------------------------------------------------
     # PADMM
@@ -193,7 +193,7 @@ def make_solver_config_sparse_jacobian_llt_fast() -> tuple[str, SolverKaminoImpl
     config.sparse_jacobian = True
     # ------------------------------------------------------------------------------
     # Linear system solver
-    config.dynamics.linear_solver_type = LinearSolverNameToType["LLTB"]
+    config.dynamics.linear_solver_type = "LLTB"
     config.dynamics.linear_solver_kwargs = {}
     # ------------------------------------------------------------------------------
     # PADMM
@@ -231,7 +231,7 @@ def make_solver_config_sparse_delassus_cr_accurate() -> tuple[str, SolverKaminoI
     config.sparse_jacobian = True
     # ------------------------------------------------------------------------------
     # Linear system solver
-    config.dynamics.linear_solver_type = LinearSolverNameToType["CR"]
+    config.dynamics.linear_solver_type = "CR"
     config.dynamics.linear_solver_kwargs = {"maxiter": 30}
     # ------------------------------------------------------------------------------
     # PADMM
@@ -269,7 +269,7 @@ def make_solver_config_sparse_delassus_cr_fast() -> tuple[str, SolverKaminoImpl.
     config.constraints.alpha = 0.1
     # ------------------------------------------------------------------------------
     # Linear system solver
-    config.dynamics.linear_solver_type = LinearSolverNameToType["CR"]
+    config.dynamics.linear_solver_type = "CR"
     config.dynamics.linear_solver_kwargs = {"maxiter": 9}
     # ------------------------------------------------------------------------------
     # PADMM
@@ -337,7 +337,11 @@ def save_solver_configs_to_hdf5(configs: dict[str, SolverKaminoImpl.Config], dat
         datafile[f"{scope}/constraints/gamma"] = config.constraints.gamma
         datafile[f"{scope}/constraints/delta"] = config.constraints.delta
         # ------------------------------------------------------------------------------
-        solver_name = LinearSolverTypeToName[config.dynamics.linear_solver_type]
+        solver_name = (
+            config.dynamics.linear_solver_type
+            if isinstance(config.dynamics.linear_solver_type, str)
+            else LinearSolverTypeToName[config.dynamics.linear_solver_type]
+        )
         datafile[f"{scope}/dynamics/preconditioning"] = config.dynamics.preconditioning
         datafile[f"{scope}/dynamics/linear_solver/type"] = str(solver_name)
         datafile[f"{scope}/dynamics/linear_solver/args"] = f"{config.dynamics.linear_solver_kwargs}"
@@ -378,9 +382,9 @@ def load_solver_configs_to_hdf5(datafile) -> dict[str, SolverKaminoImpl.Config]:
         config.constraints.delta = float(datafile[f"Solver/{config_name}/constraints/delta"][()])
         # ------------------------------------------------------------------------------
         config.dynamics.preconditioning = bool(datafile[f"Solver/{config_name}/dynamics/preconditioning"][()])
-        config.dynamics.linear_solver_type = LinearSolverNameToType[
-            datafile[f"Solver/{config_name}/dynamics/linear_solver/type"][()].decode("utf-8")
-        ]
+        config.dynamics.linear_solver_type = datafile[f"Solver/{config_name}/dynamics/linear_solver/type"][()].decode(
+            "utf-8"
+        )
         config.dynamics.linear_solver_kwargs = ast.literal_eval(
             datafile[f"Solver/{config_name}/dynamics/linear_solver/args"][()].decode("utf-8")
         )

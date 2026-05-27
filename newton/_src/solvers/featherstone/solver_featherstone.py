@@ -7,6 +7,9 @@ import warp as wp
 from ...core.types import override
 from ...sim import BodyFlags, Contacts, Control, JointType, Model, State
 from ..flags import SolverNotifyFlags
+from ..semi_implicit import kernels_contact as _si_kernels_contact
+from ..semi_implicit import kernels_muscle as _si_kernels_muscle
+from ..semi_implicit import kernels_particle as _si_kernels_particle
 from ..semi_implicit.kernels_contact import (
     eval_body_contact,
     eval_particle_body_contact_forces,
@@ -22,6 +25,7 @@ from ..semi_implicit.kernels_particle import (
     eval_triangle_forces,
 )
 from ..solver import SolverBase
+from . import kernels as _featherstone_kernel_module
 from .kernels import (
     accumulate_free_distance_joint_f_to_body_force,
     compute_body_parent_f,
@@ -134,6 +138,8 @@ class SolverFeatherstone(SolverBase):
         friction_smoothing: float = 1.0,
         use_tile_gemm: bool = False,
         fuse_cholesky: bool = True,
+        deterministic: bool | str | None = None,
+        deterministic_max_records: int | None = None,
     ):
         """
         Args:
@@ -143,8 +149,28 @@ class SolverFeatherstone(SolverBase):
             friction_smoothing: The delta value for the Huber norm (see :func:`warp.norm_huber() <warp._src.lang.norm_huber>`) used for the friction velocity normalization. Defaults to 1.0.
             use_tile_gemm: Whether to use operators from Warp's Tile API to solve for joint accelerations. Defaults to False.
             fuse_cholesky: Whether to fuse the Cholesky decomposition into the inertia matrix evaluation kernel when using the Tile API. Only used if `use_tile_gemm` is true. Defaults to True.
+            deterministic: Opt-in determinism for this solver's atomic-emitting
+                kernel modules (its own and the borrowed SemiImplicit contact /
+                muscle / particle modules). Accepts ``True``/``False``,
+                ``"not_guaranteed"``, ``"run_to_run"``, ``"gpu_to_gpu"``, or
+                ``None`` (default) to defer to ``wp.config.deterministic`` at
+                compile time.
+            deterministic_max_records: Per-target, per-thread upper bound for
+                deterministic scatter records. ``None`` leaves the module option
+                untouched.
         """
         super().__init__(model)
+        self.deterministic = deterministic
+        self._apply_deterministic_options(
+            deterministic,
+            [
+                _featherstone_kernel_module,
+                _si_kernels_contact,
+                _si_kernels_muscle,
+                _si_kernels_particle,
+            ],
+            deterministic_max_records=deterministic_max_records,
+        )
 
         self.angular_damping = angular_damping
         self.update_mass_matrix_interval = update_mass_matrix_interval

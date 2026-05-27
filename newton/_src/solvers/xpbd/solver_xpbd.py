@@ -7,6 +7,7 @@ from ...core.types import override
 from ...sim import Contacts, Control, Model, State
 from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
+from . import kernels as _xpbd_kernel_module
 from .kernels import (
     accumulate_weighted_contact_impulse,
     apply_body_delta_velocities,
@@ -108,8 +109,17 @@ class SolverXPBD(SolverBase):
         rigid_contact_con_weighting: bool = True,
         angular_damping: float = 0.0,
         enable_restitution: bool = False,
+        deterministic: bool | str | None = None,
+        deterministic_max_records: int | None = None,
     ):
         super().__init__(model=model)
+        self.deterministic = deterministic
+        self._apply_deterministic_options(
+            deterministic,
+            [_xpbd_kernel_module],
+            deterministic_max_records=deterministic_max_records,
+        )
+
         self.iterations = iterations
 
         self.soft_body_relaxation = soft_body_relaxation

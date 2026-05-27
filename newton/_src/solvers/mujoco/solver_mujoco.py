@@ -80,6 +80,9 @@ from .kernels import (
 HINGE_CONNECT_AXIS_OFFSET = 0.1
 """Distance [m] along the hinge axis for the second CONNECT constraint point of a revolute loop joint."""
 
+MUJOCO_WARP_SOLVER_DETERMINISTIC_MAX_RECORDS = 16
+"""Per-thread scatter record bound for MuJoCo Warp solver kernels in deterministic mode."""
+
 if TYPE_CHECKING:
     from mujoco import MjData, MjModel
     from mujoco_warp import Data as MjWarpData
@@ -3023,6 +3026,8 @@ class SolverMuJoCo(SolverBase):
         use_mujoco_contacts: bool = True,
         include_sites: bool = True,
         skip_visual_only_geoms: bool = True,
+        deterministic: bool | str | None = None,
+        deterministic_max_records: int = MUJOCO_WARP_SOLVER_DETERMINISTIC_MAX_RECORDS,
     ):
         """
         Solver options (e.g., ``impratio``) follow this resolution priority:
@@ -3062,11 +3067,22 @@ class SolverMuJoCo(SolverBase):
             use_mujoco_contacts: If True, use the MuJoCo contact solver. If False, use the Newton contact solver (newton contacts must be passed in through the step function in that case).
             include_sites: If ``True`` (default), Newton shapes marked with ``ShapeFlags.SITE`` are exported as MuJoCo sites. Sites are non-colliding reference points used for sensor attachment, debugging, or as frames of reference. If ``False``, sites are skipped during export. Defaults to ``True``.
             skip_visual_only_geoms: If ``True`` (default), geometries used only for visualization (i.e. not involved in collision) are excluded from the exported MuJoCo spec. This avoids mismatches with models that use explicit ``<contact>`` definitions for collision geometry.
+            deterministic: Deterministic mode for MuJoCo Warp solver kernels. If ``None``, inherits ``wp.config.deterministic``.
+            deterministic_max_records: Per-target, per-thread upper bound for deterministic scatter records. Defaults to ``16`` because MuJoCo-Warp solver kernels emit atomics from runtime-dependent loops.
         """
         super().__init__(model)
 
         # Import and cache MuJoCo modules (only happens once per class)
         mujoco, _ = self.import_mujoco()
+        self.deterministic = deterministic
+        if not use_mujoco_cpu:
+            from mujoco_warp._src import solver as mujoco_warp_solver  # noqa: PLC0415
+
+            self._apply_deterministic_options(
+                deterministic,
+                [mujoco_warp_solver],
+                deterministic_max_records=deterministic_max_records,
+            )
 
         # Deferred from module scope: wp.static() in this kernel imports mujoco_warp.
         if SolverMuJoCo._convert_mjw_contacts_to_newton_kernel is None:

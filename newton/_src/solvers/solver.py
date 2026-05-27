@@ -185,6 +185,35 @@ class SolverBase:
 
     def __init__(self, model: Model):
         self.model = model
+        self.deterministic: bool | str | None = None
+
+    @staticmethod
+    def _apply_deterministic_options(
+        mode: bool | str | None,
+        modules,
+        deterministic_max_records: int | None = None,
+    ) -> None:
+        """Apply deterministic Warp module options to each module.
+
+        Args:
+            mode: Deterministic mode. Accepts ``True``/``False``,
+                ``"not_guaranteed"``, ``"run_to_run"``, ``"gpu_to_gpu"``,
+                or ``None`` to leave the module's deterministic mode untouched.
+            modules: Iterable of Python module objects whose ``@wp.kernel``
+                definitions should be tagged.
+            deterministic_max_records: Per-target, per-thread upper bound for
+                deterministic scatter records. ``None`` leaves the module option
+                untouched; ``0`` uses Warp's inferred bound.
+        """
+        options: dict[str, bool | str | int] = {}
+        if mode is not None:
+            options["deterministic"] = mode
+        if deterministic_max_records is not None:
+            options["deterministic_max_records"] = deterministic_max_records
+        if not options:
+            return
+        for module in modules:
+            wp.set_module_options(options, module=module)
 
     @property
     def device(self) -> wp.Device:

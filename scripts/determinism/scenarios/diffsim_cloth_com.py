@@ -76,13 +76,20 @@ class DiffsimClothComScenario(Scenario):
             targets.append((x, 2.0, 0.0))
 
         self.model = scene.finalize(requires_grad=True)
-        self.solver = newton.solvers.SolverSemiImplicit(self.model)
+        self.solver = newton.solvers.SolverSemiImplicit(
+            self.model,
+            deterministic=self.args.solver_deterministic,
+        )
         self.solver.enable_tri_contact = False
         state_count = self.horizon_steps * self.horizon_substeps
         self.states = [self.model.state() for _ in range(state_count + 1)]
         self.control = self.model.control()
         self.contacts = None
-        self.particles_per_world = self.DIM_X * self.DIM_Y
+        # ``add_cloth_grid`` builds an inclusive vertex grid of size
+        # ``(dim_x + 1) * (dim_y + 1)`` (see ``ModelBuilder.add_cloth_grid``),
+        # not ``dim_x * dim_y``. Using the latter under-counts particles and
+        # mis-routes their atomic contributions to the wrong world.
+        self.particles_per_world = (self.DIM_X + 1) * (self.DIM_Y + 1)
 
         self.targets = wp.array(targets, dtype=wp.vec3)
         self.com = wp.zeros(self.args.world_count, dtype=wp.vec3, requires_grad=True)

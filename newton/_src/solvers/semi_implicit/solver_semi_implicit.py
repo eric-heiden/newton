@@ -6,6 +6,10 @@ import warp as wp
 from ...core.types import override
 from ...sim import Contacts, Control, Model, State
 from ..solver import SolverBase
+from . import kernels_body as _si_kernels_body
+from . import kernels_contact as _si_kernels_contact
+from . import kernels_muscle as _si_kernels_muscle
+from . import kernels_particle as _si_kernels_particle
 from .kernels_body import (
     eval_body_joint_forces,
 )
@@ -23,6 +27,13 @@ from .kernels_particle import (
     eval_spring_forces,
     eval_tetrahedra_forces,
     eval_triangle_forces,
+)
+
+_SI_KERNEL_MODULES = (
+    _si_kernels_body,
+    _si_kernels_contact,
+    _si_kernels_muscle,
+    _si_kernels_particle,
 )
 
 
@@ -74,6 +85,8 @@ class SolverSemiImplicit(SolverBase):
         joint_attach_ke: float = 1.0e4,
         joint_attach_kd: float = 1.0e2,
         enable_tri_contact: bool = True,
+        deterministic: bool | str | None = None,
+        deterministic_max_records: int | None = None,
     ):
         """
         Args:
@@ -83,8 +96,21 @@ class SolverSemiImplicit(SolverBase):
             joint_attach_ke: Joint attachment spring stiffness. Defaults to 1.0e4.
             joint_attach_kd: Joint attachment spring damping. Defaults to 1.0e2.
             enable_tri_contact: Enable triangle contact. Defaults to True.
+            deterministic: Opt-in determinism for this solver's atomic-emitting
+                kernel modules. Accepts ``True``/``False``, ``"not_guaranteed"``,
+                ``"run_to_run"``, ``"gpu_to_gpu"``, or ``None`` (default) to
+                defer to ``wp.config.deterministic`` at compile time.
+            deterministic_max_records: Per-target, per-thread upper bound for
+                deterministic scatter records. ``None`` leaves the module option
+                untouched.
         """
         super().__init__(model=model)
+        self.deterministic = deterministic
+        self._apply_deterministic_options(
+            deterministic,
+            _SI_KERNEL_MODULES,
+            deterministic_max_records=deterministic_max_records,
+        )
         self.angular_damping = angular_damping
         self.friction_smoothing = friction_smoothing
         self.joint_attach_ke = joint_attach_ke

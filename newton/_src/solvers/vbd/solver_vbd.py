@@ -20,7 +20,10 @@ from ...sim import (
 )
 from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
+from ..xpbd import kernels as _xpbd_kernel_module
 from ..xpbd.kernels import apply_joint_forces
+from . import particle_vbd_kernels as _vbd_particle_kernel_module
+from . import rigid_vbd_kernels as _vbd_rigid_kernel_module
 from .particle_vbd_kernels import (
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
@@ -236,6 +239,8 @@ class SolverVBD(SolverBase):
         rigid_joint_linear_kd: float = 0.0,  # Rayleigh damping for non-cable linear joint constraints
         rigid_joint_angular_kd: float = 0.0,  # Rayleigh damping for non-cable angular joint constraints
         rigid_enable_dahl_friction: bool | None = None,  # Deprecated: auto-detected from model attributes
+        deterministic: bool | str | None = None,
+        deterministic_max_records: int | None = None,
     ):
         """
         Args:
@@ -345,6 +350,15 @@ class SolverVBD(SolverBase):
                 Negative values are clamped to 0.
             rigid_enable_dahl_friction: Deprecated and ignored. Dahl friction is auto-detected
                 from ``model.vbd.dahl_eps_max`` / ``model.vbd.dahl_tau``.
+            deterministic: Opt-in determinism for this solver's atomic-emitting
+                kernel modules (the particle and rigid AVBD kernels plus the
+                borrowed XPBD joint-force kernel). Accepts ``True``/``False``,
+                ``"not_guaranteed"``, ``"run_to_run"``, ``"gpu_to_gpu"``, or
+                ``None`` (default) to defer to ``wp.config.deterministic`` at
+                compile time.
+            deterministic_max_records: Per-target, per-thread upper bound for
+                deterministic scatter records. ``None`` leaves the module option
+                untouched.
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -377,6 +391,17 @@ class SolverVBD(SolverBase):
         rigid_avbd_angular_beta = rigid_avbd_angular_beta if rigid_avbd_angular_beta is not None else rigid_avbd_beta
 
         super().__init__(model)
+
+        self.deterministic = deterministic
+        self._apply_deterministic_options(
+            deterministic,
+            [
+                _vbd_particle_kernel_module,
+                _vbd_rigid_kernel_module,
+                _xpbd_kernel_module,
+            ],
+            deterministic_max_records=deterministic_max_records,
+        )
 
         # Common parameters
         self.iterations = iterations

@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import os
 import pickle
 import subprocess
 import sys
@@ -52,7 +51,7 @@ import newton.solvers as newton_solvers
 # ---------------------------------------------------------------------------
 
 
-SolverFactory = Callable[[newton.Model], "newton.solvers.SolverBase"]
+SolverFactory = Callable[..., "newton.solvers.SolverBase"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -69,7 +68,11 @@ class SolverSpec:
     """Free-form note shown in ``--list`` output."""
 
 
-def _mj_factory(model: newton.Model) -> Any:
+def _mj_factory(
+    model: newton.Model,
+    deterministic: str | None = None,
+    deterministic_max_records: int = 16,
+) -> Any:
     # Sensible defaults; scenarios can construct their own solver if they
     # need scenario-specific tuning. Contact count is sized for stacks of
     # small boxes; bumped as needed per scenario.
@@ -77,54 +80,88 @@ def _mj_factory(model: newton.Model) -> Any:
     if model.joint_dof_count <= 60:
         kwargs["jacobian"] = "dense"
 
-    max_records = os.environ.get("NEWTON_DET_MJW_MAX_RECORDS")
-    old_max_records = wp.config.deterministic_max_records
-    try:
-        if max_records:
-            # MJWarp solver kernels contain dynamic per-thread atomics. Give
-            # those modules a larger deterministic bound while keeping Newton
-            # collision kernels on their generated bounds.
-            wp.config.deterministic_max_records = int(max_records)
-        solver = newton_solvers.SolverMuJoCo(
-            model,
-            iterations=100,
-            ls_iterations=50,
-            njmax=200,
-            nconmax=300,
-            use_mujoco_contacts=False,
-            **kwargs,
-        )
-    finally:
-        wp.config.deterministic_max_records = old_max_records
+    solver = newton_solvers.SolverMuJoCo(
+        model,
+        iterations=100,
+        ls_iterations=50,
+        njmax=200,
+        nconmax=300,
+        use_mujoco_contacts=False,
+        deterministic=deterministic,
+        deterministic_max_records=deterministic_max_records,
+        **kwargs,
+    )
     if getattr(solver, "mjw_model", None) is not None:
         solver.mjw_model.opt.graph_conditional = False
     return solver
 
 
-def _vbd_factory(model: newton.Model) -> Any:
+def _vbd_factory(
+    model: newton.Model,
+    deterministic: str | None = None,
+    deterministic_max_records: int | None = None,
+) -> Any:
     return newton_solvers.SolverVBD(
         model,
         iterations=10,
         particle_enable_self_contact=False,
         particle_enable_tile_solve=False,
+        deterministic=deterministic,
+        deterministic_max_records=deterministic_max_records,
+    )
+
+
+def _xpbd_factory(
+    model: newton.Model,
+    deterministic: str | None = None,
+    deterministic_max_records: int | None = None,
+) -> Any:
+    return newton_solvers.SolverXPBD(
+        model,
+        deterministic=deterministic,
+        deterministic_max_records=deterministic_max_records,
+    )
+
+
+def _featherstone_factory(
+    model: newton.Model,
+    deterministic: str | None = None,
+    deterministic_max_records: int | None = None,
+) -> Any:
+    return newton_solvers.SolverFeatherstone(
+        model,
+        deterministic=deterministic,
+        deterministic_max_records=deterministic_max_records,
+    )
+
+
+def _semi_implicit_factory(
+    model: newton.Model,
+    deterministic: str | None = None,
+    deterministic_max_records: int | None = None,
+) -> Any:
+    return newton_solvers.SolverSemiImplicit(
+        model,
+        deterministic=deterministic,
+        deterministic_max_records=deterministic_max_records,
     )
 
 
 SOLVER_SPECS: dict[str, SolverSpec] = {
     "xpbd": SolverSpec(
         name="xpbd",
-        factory=newton_solvers.SolverXPBD,
+        factory=_xpbd_factory,
         notes="Position-based dynamics; fast rigid contacts.",
     ),
     "featherstone": SolverSpec(
         name="featherstone",
-        factory=newton_solvers.SolverFeatherstone,
+        factory=_featherstone_factory,
         needs_articulated=True,
         notes="Featherstone articulated-body algorithm; requires joints.",
     ),
     "semi_implicit": SolverSpec(
         name="semi_implicit",
-        factory=newton_solvers.SolverSemiImplicit,
+        factory=_semi_implicit_factory,
         notes="Explicit symplectic integrator; simple dynamics only.",
     ),
     "vbd": SolverSpec(
@@ -163,6 +200,8 @@ class ScenarioArgs:
     substeps: int
     collision_pipeline_deterministic: bool = False
     collision_pipeline_warp_deterministic: str | None = None
+    solver_deterministic: str | None = None
+    solver_deterministic_max_records: int | None = None
 
 
 @dataclasses.dataclass
@@ -265,7 +304,10 @@ class Scenario(ABC):
             builder.color(include_bending=self.use_vbd_bending_coloring())
 
         self.model = builder.finalize()
-        self.solver = self.args.solver.factory(self.model)
+        solver_kwargs = {"deterministic": self.args.solver_deterministic}
+        if self.args.solver_deterministic_max_records is not None:
+            solver_kwargs["deterministic_max_records"] = self.args.solver_deterministic_max_records
+        self.solver = self.args.solver.factory(self.model, **solver_kwargs)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

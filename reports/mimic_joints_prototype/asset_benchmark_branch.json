@@ -2,12 +2,49 @@
   "assets": {
     "leap_hand_right_mjcf": {
       "eval_fk_timing": {
-        "max_us": 481.76818527281284,
-        "mean_us": 408.47955582042533,
-        "median_us": 382.90107622742653,
-        "min_us": 360.7694059610367
+        "max_us": 383.3593335002661,
+        "mean_us": 370.27862854301924,
+        "median_us": 365.71649834513664,
+        "min_us": 361.76005378365517
       },
       "kind": "mjcf",
+      "solver_step_timing": {
+        "featherstone": {
+          "max_us": 4398.698732256889,
+          "mean_us": 4364.9959688385325,
+          "median_us": 4348.787106573582,
+          "min_us": 4347.502067685127,
+          "status": "ok"
+        },
+        "mujoco": {
+          "max_us": 4672.0074489712715,
+          "mean_us": 4325.423389673233,
+          "median_us": 4305.524006485939,
+          "min_us": 3998.7387135624886,
+          "status": "ok"
+        },
+        "semi_implicit": {
+          "max_us": 197.8447660803795,
+          "mean_us": 184.61470802625018,
+          "median_us": 182.11156129837036,
+          "min_us": 173.88779670000076,
+          "status": "ok"
+        },
+        "vbd": {
+          "max_us": 4653.400182723999,
+          "mean_us": 4436.986769239108,
+          "median_us": 4371.8066066503525,
+          "min_us": 4285.753518342972,
+          "status": "ok"
+        },
+        "xpbd": {
+          "max_us": 712.183490395546,
+          "mean_us": 609.2692414919536,
+          "median_us": 563.0530416965485,
+          "min_us": 552.5711923837662,
+          "status": "ok"
+        }
+      },
       "source": "/home/horde/.cache/newton/mujoco_menagerie_leap_hand_d94a1630_feadf76d/leap_hand/right_hand.xml",
       "stats": {
         "body_count": 17,
@@ -18,16 +55,51 @@
         "mimic_constraint_count": 0,
         "mimic_joint_count": 0,
         "shape_count": 67
-      }
+      },
+      "video": "reports/mimic_joints_prototype/videos/leap_hand_right_mjcf.mp4"
     },
     "robotiq_2f85_v4_mjcf": {
       "eval_fk_timing": {
-        "max_us": 361.7407288402319,
-        "mean_us": 350.951108460625,
-        "median_us": 345.70619463920593,
-        "min_us": 345.4064019024372
+        "max_us": 367.8619861602783,
+        "mean_us": 342.1228223790725,
+        "median_us": 341.21787175536156,
+        "min_us": 317.28860922157764
       },
       "kind": "mjcf",
+      "solver_step_timing": {
+        "featherstone": {
+          "max_us": 872.4203333258629,
+          "mean_us": 829.0625487764676,
+          "median_us": 807.9886436462402,
+          "min_us": 806.7786693572998,
+          "status": "ok"
+        },
+        "mujoco": {
+          "error": "ValueError: Error: mass and inertia of moving bodies must be larger than mjMINVAL\nElement name 'Dual_wrist_camera_worldbody_base_left_driver', id 2",
+          "status": "error"
+        },
+        "semi_implicit": {
+          "max_us": 220.13913840055466,
+          "mean_us": 189.5845557252566,
+          "median_us": 181.45442008972168,
+          "min_us": 167.16010868549347,
+          "status": "ok"
+        },
+        "vbd": {
+          "max_us": 4189.165122807026,
+          "mean_us": 3947.372610370318,
+          "median_us": 3847.702406346798,
+          "min_us": 3805.2503019571304,
+          "status": "ok"
+        },
+        "xpbd": {
+          "max_us": 774.1333916783333,
+          "mean_us": 702.2850836316745,
+          "median_us": 704.638659954071,
+          "min_us": 628.083199262619,
+          "status": "ok"
+        }
+      },
       "source": "/home/horde/.cache/newton/mujoco_menagerie_robotiq_2f85_v4_f233abbd_feadf76d/robotiq_2f85_v4/2f85.xml",
       "stats": {
         "body_count": 11,
@@ -38,16 +110,54 @@
         "mimic_constraint_count": 0,
         "mimic_joint_count": 0,
         "shape_count": 4
-      }
+      },
+      "video": "reports/mimic_joints_prototype/videos/robotiq_2f85_v4_mjcf.mp4"
     },
     "robotiq_2f85_v4_usd": {
       "eval_fk_timing": {
-        "max_us": 348.050007596612,
-        "mean_us": 343.9212683588266,
-        "median_us": 347.44665026664734,
-        "min_us": 336.2671472132206
+        "max_us": 322.8669986128807,
+        "mean_us": 316.44629004100955,
+        "median_us": 320.20043581724167,
+        "min_us": 306.2714356929064
       },
       "kind": "usd",
+      "solver_step_timing": {
+        "featherstone": {
+          "max_us": 817.556120455265,
+          "mean_us": 815.3032511472703,
+          "median_us": 815.0966838002205,
+          "min_us": 813.2569491863251,
+          "status": "ok"
+        },
+        "mujoco": {
+          "max_us": 38269.83254402876,
+          "mean_us": 15423.025066653885,
+          "median_us": 4076.3229131698613,
+          "min_us": 3922.9197427630424,
+          "status": "ok"
+        },
+        "semi_implicit": {
+          "max_us": 170.1684668660164,
+          "mean_us": 159.37965363264084,
+          "median_us": 156.36645257472992,
+          "min_us": 151.6040414571762,
+          "status": "ok"
+        },
+        "vbd": {
+          "max_us": 4482.218809425831,
+          "mean_us": 4383.274540305138,
+          "median_us": 4468.214511871338,
+          "min_us": 4199.390299618244,
+          "status": "ok"
+        },
+        "xpbd": {
+          "max_us": 515.9413442015648,
+          "mean_us": 503.61206134160363,
+          "median_us": 508.72694700956345,
+          "min_us": 486.16789281368256,
+          "status": "ok"
+        }
+      },
       "source": "/home/horde/apps/newton-assets/robotiq_2f85_v4/usd_structured/Dual_wrist_camera.usda",
       "stats": {
         "body_count": 11,
@@ -58,16 +168,51 @@
         "mimic_constraint_count": 0,
         "mimic_joint_count": 0,
         "shape_count": 28
-      }
+      },
+      "video": "reports/mimic_joints_prototype/videos/robotiq_2f85_v4_usd.mp4"
     },
     "shadow_hand_right_mjcf": {
       "eval_fk_timing": {
-        "max_us": 426.3646434992552,
-        "mean_us": 401.16710588335985,
-        "median_us": 410.4199353605509,
-        "min_us": 366.71673879027367
+        "max_us": 336.77564933896065,
+        "mean_us": 332.9009283334016,
+        "median_us": 331.557122990489,
+        "min_us": 330.3700126707554
       },
       "kind": "mjcf",
+      "solver_step_timing": {
+        "featherstone": {
+          "max_us": 13536.912761628628,
+          "mean_us": 13429.37555164099,
+          "median_us": 13409.830629825592,
+          "min_us": 13341.383263468742,
+          "status": "ok"
+        },
+        "mujoco": {
+          "error": "ValueError: Error: mass and inertia of moving bodies must be larger than mjMINVAL\nElement name 'right_shadow_hand_worldbody_rh_forearm_rh_wrist_rh_palm_rh_ffknuckle_rh_ffproximal_rh_ffmiddle_rh_ffdistal', id 7",
+          "status": "error"
+        },
+        "semi_implicit": {
+          "max_us": 196.18310034275055,
+          "mean_us": 176.61545425653458,
+          "median_us": 175.26857554912567,
+          "min_us": 158.3946868777275,
+          "status": "ok"
+        },
+        "vbd": {
+          "max_us": 4185.820929706097,
+          "mean_us": 4107.8103085358935,
+          "median_us": 4085.230454802513,
+          "min_us": 4052.379541099072,
+          "status": "ok"
+        },
+        "xpbd": {
+          "max_us": 502.9451102018356,
+          "mean_us": 496.8162005146345,
+          "median_us": 502.74394452571863,
+          "min_us": 484.75954681634903,
+          "status": "ok"
+        }
+      },
       "source": "/home/horde/.cache/newton/mujoco_menagerie_shadow_hand_46b0dcac_feadf76d/shadow_hand/right_hand.xml",
       "stats": {
         "body_count": 25,
@@ -78,16 +223,48 @@
         "mimic_constraint_count": 0,
         "mimic_joint_count": 0,
         "shape_count": 33
-      }
+      },
+      "video": "reports/mimic_joints_prototype/videos/shadow_hand_right_mjcf.mp4"
     },
     "synthetic_robotiq_urdf": {
       "eval_fk_timing": {
-        "max_us": 366.21661856770515,
-        "mean_us": 352.2181883454322,
-        "median_us": 355.26277497410774,
-        "min_us": 335.17517149448395
+        "max_us": 313.5315142571926,
+        "mean_us": 305.03137968480587,
+        "median_us": 302.56379395723343,
+        "min_us": 298.99883083999157
       },
       "kind": "urdf",
+      "solver_step_timing": {
+        "featherstone": {
+          "max_us": 572.9397758841515,
+          "mean_us": 529.9967403213183,
+          "median_us": 515.1199176907539,
+          "min_us": 501.9305273890496,
+          "status": "ok"
+        },
+        "mujoco": {
+          "error": "ValueError: Error: mass and inertia of moving bodies must be larger than mjMINVAL\nElement name 'robotiq_mimic_synthetic_driver', id 2",
+          "status": "error"
+        },
+        "semi_implicit": {
+          "max_us": 194.86304372549057,
+          "mean_us": 169.08142715692523,
+          "median_us": 157.20948576927185,
+          "min_us": 155.17175197601318,
+          "status": "ok"
+        },
+        "vbd": {
+          "error": "NotImplementedError: SolverVBD rigid joints: JointType.MIMIC is not implemented yet (only CABLE, BALL, FIXED, REVOLUTE, PRISMATIC, and D6 are supported).",
+          "status": "error"
+        },
+        "xpbd": {
+          "max_us": 536.0152572393417,
+          "mean_us": 513.372818628947,
+          "median_us": 510.3960633277893,
+          "min_us": 493.7071353197098,
+          "status": "ok"
+        }
+      },
       "source": "inline synthetic URDF",
       "stats": {
         "body_count": 7,
@@ -102,12 +279,46 @@
     },
     "unitree_g1_with_hands_urdf": {
       "eval_fk_timing": {
-        "max_us": 427.68092826008797,
-        "mean_us": 420.82718573510647,
-        "median_us": 419.19671930372715,
-        "min_us": 415.6039096415043
+        "max_us": 386.7705352604389,
+        "mean_us": 384.44221330185735,
+        "median_us": 385.540584102273,
+        "min_us": 381.01552054286003
       },
       "kind": "urdf",
+      "solver_step_timing": {
+        "featherstone": {
+          "max_us": 107153.18247675896,
+          "mean_us": 107075.28634617726,
+          "median_us": 107134.023681283,
+          "min_us": 106938.65288048983,
+          "status": "ok"
+        },
+        "mujoco": {
+          "error": "ValueError: Error: mass and inertia of moving bodies must be larger than mjMINVAL\nElement name 'g1_29dof_with_hand_rev_1_0_waist_yaw_link', id 15",
+          "status": "error"
+        },
+        "semi_implicit": {
+          "max_us": 199.105404317379,
+          "mean_us": 174.89350090424222,
+          "median_us": 168.0433750152588,
+          "min_us": 157.5317233800888,
+          "status": "ok"
+        },
+        "vbd": {
+          "max_us": 3967.448510229588,
+          "mean_us": 3947.8223770856857,
+          "median_us": 3948.930837213993,
+          "min_us": 3927.087783813477,
+          "status": "ok"
+        },
+        "xpbd": {
+          "max_us": 504.42442297935486,
+          "mean_us": 498.55957428614306,
+          "median_us": 503.27740609645844,
+          "min_us": 487.97689378261566,
+          "status": "ok"
+        }
+      },
       "source": "/home/horde/apps/newton-assets/unitree_g1/urdf/g1_29dof_with_hand_rev_1_0.urdf",
       "stats": {
         "body_count": 53,
@@ -118,11 +329,15 @@
         "mimic_constraint_count": 0,
         "mimic_joint_count": 0,
         "shape_count": 101
-      }
+      },
+      "video": "reports/mimic_joints_prototype/videos/unitree_g1_with_hands_urdf.mp4"
     }
   },
   "device": "cuda:0",
   "newton_file": "/home/horde/apps/newton-dashboard/worktrees/pr--164/newton/__init__.py",
   "repeats": 3,
-  "samples": 20
+  "samples": 20,
+  "solver_dt": 0.004166666666666667,
+  "solver_repeats": 3,
+  "solver_samples": 5
 }

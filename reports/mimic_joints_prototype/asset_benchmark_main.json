@@ -2,12 +2,49 @@
   "assets": {
     "leap_hand_right_mjcf": {
       "eval_fk_timing": {
-        "max_us": 326.8130589276552,
-        "mean_us": 320.173567160964,
-        "median_us": 318.613788112998,
-        "min_us": 315.0938544422388
+        "max_us": 330.65141178667545,
+        "mean_us": 324.6030615021785,
+        "median_us": 323.05167987942696,
+        "min_us": 320.1060928404331
       },
       "kind": "mjcf",
+      "solver_step_timing": {
+        "featherstone": {
+          "max_us": 4340.218752622604,
+          "mean_us": 4333.441828687985,
+          "median_us": 4330.067150294781,
+          "min_us": 4330.039583146572,
+          "status": "ok"
+        },
+        "mujoco": {
+          "max_us": 4155.991040170193,
+          "mean_us": 3952.9501150051756,
+          "median_us": 3935.8073845505714,
+          "min_us": 3767.0519202947617,
+          "status": "ok"
+        },
+        "semi_implicit": {
+          "max_us": 176.30290240049362,
+          "mean_us": 170.07111261288327,
+          "median_us": 173.4413206577301,
+          "min_us": 160.46911478042603,
+          "status": "ok"
+        },
+        "vbd": {
+          "max_us": 4009.240865707397,
+          "mean_us": 3954.7519137461977,
+          "median_us": 3945.4761892557144,
+          "min_us": 3909.538686275482,
+          "status": "ok"
+        },
+        "xpbd": {
+          "max_us": 573.6108869314194,
+          "mean_us": 520.1265215873718,
+          "median_us": 510.0660026073455,
+          "min_us": 476.7026752233505,
+          "status": "ok"
+        }
+      },
       "source": "/home/horde/.cache/newton/mujoco_menagerie_leap_hand_d94a1630_feadf76d/leap_hand/right_hand.xml",
       "stats": {
         "body_count": 17,
@@ -22,12 +59,46 @@
     },
     "robotiq_2f85_v4_mjcf": {
       "eval_fk_timing": {
-        "max_us": 489.239813759923,
-        "mean_us": 482.96754248440266,
-        "median_us": 481.99757002294064,
-        "min_us": 477.66524367034435
+        "max_us": 497.5069779902697,
+        "mean_us": 490.0946902732054,
+        "median_us": 492.49958246946335,
+        "min_us": 480.2775103598833
       },
       "kind": "mjcf",
+      "solver_step_timing": {
+        "featherstone": {
+          "max_us": 835.6096222996712,
+          "mean_us": 822.8542283177376,
+          "median_us": 820.942223072052,
+          "min_us": 812.0108395814896,
+          "status": "ok"
+        },
+        "mujoco": {
+          "error": "ValueError: Error: mass and inertia of moving bodies must be larger than mjMINVAL\nElement name 'Dual_wrist_camera_worldbody_base_left_driver', id 2",
+          "status": "error"
+        },
+        "semi_implicit": {
+          "max_us": 171.88526690006256,
+          "mean_us": 160.8256871501605,
+          "median_us": 157.1059226989746,
+          "min_us": 153.48587185144424,
+          "status": "ok"
+        },
+        "vbd": {
+          "max_us": 5524.324253201485,
+          "mean_us": 5279.952846467495,
+          "median_us": 5230.231396853924,
+          "min_us": 5085.302889347076,
+          "status": "ok"
+        },
+        "xpbd": {
+          "max_us": 529.4837057590485,
+          "mean_us": 502.8126761317253,
+          "median_us": 496.6365173459053,
+          "min_us": 482.31780529022217,
+          "status": "ok"
+        }
+      },
       "source": "/home/horde/.cache/newton/mujoco_menagerie_robotiq_2f85_v4_f233abbd_feadf76d/robotiq_2f85_v4/2f85.xml",
       "stats": {
         "body_count": 11,
@@ -42,12 +113,49 @@
     },
     "robotiq_2f85_v4_usd": {
       "eval_fk_timing": {
-        "max_us": 809.2817850410938,
-        "mean_us": 698.6132822930812,
-        "median_us": 740.3999101370573,
-        "min_us": 546.1581517010927
+        "max_us": 492.7617032080889,
+        "mean_us": 460.4910345127185,
+        "median_us": 455.16807585954666,
+        "min_us": 433.54332447052
       },
       "kind": "usd",
+      "solver_step_timing": {
+        "featherstone": {
+          "max_us": 806.6816255450249,
+          "mean_us": 804.3981467684109,
+          "median_us": 803.7937805056572,
+          "min_us": 802.7190342545509,
+          "status": "ok"
+        },
+        "mujoco": {
+          "max_us": 38845.95204144716,
+          "mean_us": 29931.066868205864,
+          "median_us": 38721.917383372784,
+          "min_us": 12225.33117979765,
+          "status": "ok"
+        },
+        "semi_implicit": {
+          "max_us": 155.42730689048767,
+          "mean_us": 150.18625805775324,
+          "median_us": 149.7635617852211,
+          "min_us": 145.36790549755096,
+          "status": "ok"
+        },
+        "vbd": {
+          "max_us": 4895.425774157047,
+          "mean_us": 4883.434188862642,
+          "median_us": 4884.311929345131,
+          "min_us": 4870.564863085747,
+          "status": "ok"
+        },
+        "xpbd": {
+          "max_us": 470.3730344772339,
+          "mean_us": 461.0273366173108,
+          "median_us": 457.5498402118683,
+          "min_us": 455.15913516283035,
+          "status": "ok"
+        }
+      },
       "source": "/home/horde/apps/newton-assets/robotiq_2f85_v4/usd_structured/Dual_wrist_camera.usda",
       "stats": {
         "body_count": 11,
@@ -62,12 +170,46 @@
     },
     "shadow_hand_right_mjcf": {
       "eval_fk_timing": {
-        "max_us": 339.31187354028225,
-        "mean_us": 331.03918346265954,
-        "median_us": 332.40076154470444,
-        "min_us": 321.40491530299187
+        "max_us": 353.2704897224903,
+        "mean_us": 339.66454987724626,
+        "median_us": 333.55276100337505,
+        "min_us": 332.1703989058733
       },
       "kind": "mjcf",
+      "solver_step_timing": {
+        "featherstone": {
+          "max_us": 13385.949283838272,
+          "mean_us": 13363.497890532017,
+          "median_us": 13359.202444553375,
+          "min_us": 13345.341943204403,
+          "status": "ok"
+        },
+        "mujoco": {
+          "error": "ValueError: Error: mass and inertia of moving bodies must be larger than mjMINVAL\nElement name 'right_shadow_hand_worldbody_rh_forearm_rh_wrist_rh_palm_rh_ffknuckle_rh_ffproximal_rh_ffmiddle_rh_ffdistal', id 7",
+          "status": "error"
+        },
+        "semi_implicit": {
+          "max_us": 175.37754029035568,
+          "mean_us": 167.2131319840749,
+          "median_us": 166.6652038693428,
+          "min_us": 159.59665179252625,
+          "status": "ok"
+        },
+        "vbd": {
+          "max_us": 4089.1237556934357,
+          "mean_us": 4009.535908699035,
+          "median_us": 3980.2759885787964,
+          "min_us": 3959.207981824875,
+          "status": "ok"
+        },
+        "xpbd": {
+          "max_us": 554.6100437641144,
+          "mean_us": 546.3318278392156,
+          "median_us": 543.753057718277,
+          "min_us": 540.6323820352554,
+          "status": "ok"
+        }
+      },
       "source": "/home/horde/.cache/newton/mujoco_menagerie_shadow_hand_46b0dcac_feadf76d/shadow_hand/right_hand.xml",
       "stats": {
         "body_count": 25,
@@ -82,12 +224,46 @@
     },
     "synthetic_robotiq_urdf": {
       "eval_fk_timing": {
-        "max_us": 592.1884439885616,
-        "mean_us": 544.4129463285209,
-        "median_us": 555.0038069486618,
-        "min_us": 486.0465880483389
+        "max_us": 533.1249441951513,
+        "mean_us": 509.9357881893715,
+        "median_us": 499.8266696929932,
+        "min_us": 496.85575067996984
       },
       "kind": "urdf",
+      "solver_step_timing": {
+        "featherstone": {
+          "max_us": 538.8127639889717,
+          "mean_us": 523.9428952336311,
+          "median_us": 523.175299167633,
+          "min_us": 509.8406225442886,
+          "status": "ok"
+        },
+        "mujoco": {
+          "error": "ValueError: Error: mass and inertia of moving bodies must be larger than mjMINVAL\nElement name 'robotiq_mimic_synthetic_driver', id 2",
+          "status": "error"
+        },
+        "semi_implicit": {
+          "max_us": 208.07664841413498,
+          "mean_us": 179.85602219899496,
+          "median_us": 167.40374267101288,
+          "min_us": 164.087675511837,
+          "status": "ok"
+        },
+        "vbd": {
+          "max_us": 3708.8554352521896,
+          "mean_us": 3683.3905304471655,
+          "median_us": 3675.936721265316,
+          "min_us": 3665.37943482399,
+          "status": "ok"
+        },
+        "xpbd": {
+          "max_us": 532.8718572854996,
+          "mean_us": 508.19541017214453,
+          "median_us": 498.4447732567787,
+          "min_us": 493.26959997415537,
+          "status": "ok"
+        }
+      },
       "source": "inline synthetic URDF",
       "stats": {
         "body_count": 7,
@@ -102,12 +278,46 @@
     },
     "unitree_g1_with_hands_urdf": {
       "eval_fk_timing": {
-        "max_us": 415.89438915252686,
-        "mean_us": 400.1481148103873,
-        "median_us": 400.13822726905346,
-        "min_us": 384.41172800958157
+        "max_us": 311.0152203589678,
+        "mean_us": 307.9588680217663,
+        "median_us": 308.85953456163406,
+        "min_us": 304.0018491446972
       },
       "kind": "urdf",
+      "solver_step_timing": {
+        "featherstone": {
+          "max_us": 106647.98710495234,
+          "mean_us": 106552.24745472273,
+          "median_us": 106570.41780650616,
+          "min_us": 106438.33745270967,
+          "status": "ok"
+        },
+        "mujoco": {
+          "error": "ValueError: Error: mass and inertia of moving bodies must be larger than mjMINVAL\nElement name 'g1_29dof_with_hand_rev_1_0_waist_yaw_link', id 15",
+          "status": "error"
+        },
+        "semi_implicit": {
+          "max_us": 125.18856674432756,
+          "mean_us": 121.88504139582317,
+          "median_us": 122.36628681421278,
+          "min_us": 118.10027062892914,
+          "status": "ok"
+        },
+        "vbd": {
+          "max_us": 3770.141303539276,
+          "mean_us": 3742.815926671028,
+          "median_us": 3759.293630719185,
+          "min_us": 3699.0128457546234,
+          "status": "ok"
+        },
+        "xpbd": {
+          "max_us": 395.3920677304268,
+          "mean_us": 387.9806647698084,
+          "median_us": 387.13011890649796,
+          "min_us": 381.4198076725006,
+          "status": "ok"
+        }
+      },
       "source": "/home/horde/apps/newton-assets/unitree_g1/urdf/g1_29dof_with_hand_rev_1_0.urdf",
       "stats": {
         "body_count": 53,
@@ -124,5 +334,8 @@
   "device": "cuda:0",
   "newton_file": "/tmp/newton-main-benchmark/newton/__init__.py",
   "repeats": 3,
-  "samples": 20
+  "samples": 20,
+  "solver_dt": 0.004166666666666667,
+  "solver_repeats": 3,
+  "solver_samples": 5
 }

@@ -947,7 +947,7 @@ def apply_joint_forces(
     type = joint_type[tid]
     if not joint_enabled[tid]:
         return
-    if type == JointType.FIXED or type == JointType.CABLE:
+    if type == JointType.FIXED or type == JointType.CABLE or type == JointType.MIMIC:
         return
 
     # rigid body indices of the child and parent

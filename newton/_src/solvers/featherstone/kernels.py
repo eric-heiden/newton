@@ -140,12 +140,18 @@ def transform_spatial_inertia(t: wp.transform, I: wp.spatial_matrix):
 @wp.func
 def jcalc_transform(
     type: int,
+    joint_index: int,
     joint_axis: wp.array[wp.vec3],
     axis_start: int,
     lin_axis_count: int,
     ang_axis_count: int,
     joint_q: wp.array[float],
     q_start: int,
+    joint_q_start: wp.array[int],
+    joint_mimic_leader: wp.array[int],
+    joint_mimic_coef: wp.array2d[float],
+    joint_mimic_type: wp.array[int],
+    joint_mimic_axis: wp.array[wp.vec3],
 ):
     if type == JointType.PRISMATIC:
         q = joint_q[q_start]
@@ -171,6 +177,24 @@ def jcalc_transform(
     if type == JointType.FIXED:
         X_jc = wp.transform_identity()
         return X_jc
+
+    if type == JointType.MIMIC:
+        leader = joint_mimic_leader[joint_index]
+        if leader >= 0:
+            mimic_offset = joint_mimic_coef[joint_index, 0]
+            mimic_mult = joint_mimic_coef[joint_index, 1]
+            mimic_type = joint_mimic_type[joint_index]
+            mimic_axis = joint_mimic_axis[joint_index]
+            leader_q_start = joint_q_start[leader]
+            q_eff = mimic_offset + mimic_mult * joint_q[leader_q_start]
+
+            if mimic_type == JointType.PRISMATIC:
+                X_jc = wp.transform(mimic_axis * q_eff, wp.quat_identity())
+                return X_jc
+
+            if mimic_type == JointType.REVOLUTE:
+                X_jc = wp.transform(wp.vec3(), wp.quat_from_axis_angle(mimic_axis, q_eff))
+                return X_jc
 
     if type == JointType.FREE or type == JointType.DISTANCE:
         px = joint_q[q_start + 0]
@@ -240,12 +264,18 @@ def jcalc_transform(
 @wp.func
 def jcalc_motion(
     type: int,
+    joint_index: int,
     joint_axis: wp.array[wp.vec3],
     lin_axis_count: int,
     ang_axis_count: int,
     X_sc: wp.transform,
     joint_qd: wp.array[float],
     qd_start: int,
+    joint_qd_start: wp.array[int],
+    joint_mimic_leader: wp.array[int],
+    joint_mimic_coef: wp.array2d[float],
+    joint_mimic_type: wp.array[int],
+    joint_mimic_axis: wp.array[wp.vec3],
     # outputs
     joint_S_s: wp.array[wp.spatial_vector],
 ):
@@ -310,6 +340,25 @@ def jcalc_motion(
         return S_0 * joint_qd[qd_start + 0] + S_1 * joint_qd[qd_start + 1] + S_2 * joint_qd[qd_start + 2]
 
     if type == JointType.FIXED:
+        return wp.spatial_vector()
+
+    if type == JointType.MIMIC:
+        leader = joint_mimic_leader[joint_index]
+        if leader >= 0:
+            mimic_mult = joint_mimic_coef[joint_index, 1]
+            mimic_type = joint_mimic_type[joint_index]
+            mimic_axis = joint_mimic_axis[joint_index]
+            leader_qd_start = joint_qd_start[leader]
+            qd_eff = mimic_mult * joint_qd[leader_qd_start]
+
+            if mimic_type == JointType.PRISMATIC:
+                S_s = transform_twist(X_sc, wp.spatial_vector(mimic_axis, wp.vec3()))
+                return S_s * qd_eff
+
+            if mimic_type == JointType.REVOLUTE:
+                S_s = transform_twist(X_sc, wp.spatial_vector(wp.vec3(), mimic_axis))
+                return S_s * qd_eff
+
         return wp.spatial_vector()
 
     if type == JointType.FREE or type == JointType.DISTANCE:
@@ -598,6 +647,10 @@ def compute_link_transform(
     body_X_com: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
+    joint_mimic_leader: wp.array[int],
+    joint_mimic_coef: wp.array2d[float],
+    joint_mimic_type: wp.array[int],
+    joint_mimic_axis: wp.array[wp.vec3],
     # outputs
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
@@ -622,7 +675,21 @@ def compute_link_transform(
     coord_start = joint_q_start[i]
 
     # compute transform across joint
-    X_j = jcalc_transform(type, joint_axis, qd_start, lin_axis_count, ang_axis_count, joint_q, coord_start)
+    X_j = jcalc_transform(
+        type,
+        i,
+        joint_axis,
+        qd_start,
+        lin_axis_count,
+        ang_axis_count,
+        joint_q,
+        coord_start,
+        joint_q_start,
+        joint_mimic_leader,
+        joint_mimic_coef,
+        joint_mimic_type,
+        joint_mimic_axis,
+    )
 
     # transform from world to joint anchor frame at child body
     X_wcj = X_wpj * X_j
@@ -652,6 +719,10 @@ def eval_rigid_fk(
     body_X_com: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
+    joint_mimic_leader: wp.array[int],
+    joint_mimic_coef: wp.array2d[float],
+    joint_mimic_type: wp.array[int],
+    joint_mimic_axis: wp.array[wp.vec3],
     # outputs
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
@@ -676,6 +747,10 @@ def eval_rigid_fk(
             body_X_com,
             joint_axis,
             joint_dof_dim,
+            joint_mimic_leader,
+            joint_mimic_coef,
+            joint_mimic_type,
+            joint_mimic_axis,
             body_q,
             body_q_com,
         )
@@ -724,6 +799,10 @@ def compute_link_velocity(
     joint_qd: wp.array[float],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
+    joint_mimic_leader: wp.array[int],
+    joint_mimic_coef: wp.array2d[float],
+    joint_mimic_type: wp.array[int],
+    joint_mimic_axis: wp.array[wp.vec3],
     body_I_m: wp.array[wp.spatial_matrix],
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
@@ -756,12 +835,18 @@ def compute_link_velocity(
     ang_axis_count = joint_dof_dim[i, 1]
     v_j_s = jcalc_motion(
         type,
+        i,
         joint_axis,
         lin_axis_count,
         ang_axis_count,
         X_wpj,
         joint_qd,
         qd_start,
+        joint_qd_start,
+        joint_mimic_leader,
+        joint_mimic_coef,
+        joint_mimic_type,
+        joint_mimic_axis,
         joint_S_s,
     )
 
@@ -1039,6 +1124,10 @@ def eval_rigid_id(
     joint_qd: wp.array[float],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
+    joint_mimic_leader: wp.array[int],
+    joint_mimic_coef: wp.array2d[float],
+    joint_mimic_type: wp.array[int],
+    joint_mimic_axis: wp.array[wp.vec3],
     body_I_m: wp.array[wp.spatial_matrix],
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
@@ -1069,6 +1158,10 @@ def eval_rigid_id(
             joint_qd,
             joint_axis,
             joint_dof_dim,
+            joint_mimic_leader,
+            joint_mimic_coef,
+            joint_mimic_type,
+            joint_mimic_axis,
             body_I_m,
             body_q,
             body_q_com,
@@ -1743,6 +1836,10 @@ def eval_single_articulation_fk_with_velocity_conversion(
     joint_X_c: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
+    joint_mimic_leader: wp.array[int],
+    joint_mimic_coef: wp.array2d[float],
+    joint_mimic_type: wp.array[int],
+    joint_mimic_axis: wp.array[wp.vec3],
     body_com: wp.array[wp.vec3],
     # outputs
     body_q: wp.array[wp.transform],
@@ -1859,6 +1956,29 @@ def eval_single_articulation_fk_with_velocity_conversion(
             X_j = wp.transform(pos, rot)
             v_j = wp.spatial_vector(vel_v, vel_w)
 
+        if type == JointType.MIMIC:
+            leader = joint_mimic_leader[i]
+            if leader >= 0:
+                mimic_offset = joint_mimic_coef[i, 0]
+                mimic_mult = joint_mimic_coef[i, 1]
+                mimic_type = joint_mimic_type[i]
+                mimic_axis = joint_mimic_axis[i]
+
+                leader_q_start = joint_q_start[leader]
+                leader_qd_start = joint_qd_start[leader]
+
+                if mimic_type == JointType.PRISMATIC:
+                    q_eff = mimic_offset + mimic_mult * joint_q[leader_q_start]
+                    qd_eff = mimic_mult * joint_qd[leader_qd_start]
+                    X_j = wp.transform(mimic_axis * q_eff, wp.quat_identity())
+                    v_j = wp.spatial_vector(mimic_axis * qd_eff, wp.vec3())
+
+                if mimic_type == JointType.REVOLUTE:
+                    q_eff = mimic_offset + mimic_mult * joint_q[leader_q_start]
+                    qd_eff = mimic_mult * joint_qd[leader_qd_start]
+                    X_j = wp.transform(wp.vec3(), wp.quat_from_axis_angle(mimic_axis, q_eff))
+                    v_j = wp.spatial_vector(wp.vec3(), mimic_axis * qd_eff)
+
         # transform from world to parent joint anchor frame
         X_wpj = X_pj
         if parent >= 0:
@@ -1912,6 +2032,10 @@ def eval_articulation_fk_with_velocity_conversion(
     joint_X_c: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
+    joint_mimic_leader: wp.array[int],
+    joint_mimic_coef: wp.array2d[float],
+    joint_mimic_type: wp.array[int],
+    joint_mimic_axis: wp.array[wp.vec3],
     body_com: wp.array[wp.vec3],
     # outputs
     body_q: wp.array[wp.transform],
@@ -1953,6 +2077,10 @@ def eval_articulation_fk_with_velocity_conversion(
         joint_X_c,
         joint_axis,
         joint_dof_dim,
+        joint_mimic_leader,
+        joint_mimic_coef,
+        joint_mimic_type,
+        joint_mimic_axis,
         body_com,
         # outputs
         body_q,
@@ -1976,6 +2104,10 @@ def eval_articulation_fk_with_velocity_conversion_from_joint(
     joint_X_c: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
+    joint_mimic_leader: wp.array[int],
+    joint_mimic_coef: wp.array2d[float],
+    joint_mimic_type: wp.array[int],
+    joint_mimic_axis: wp.array[wp.vec3],
     body_com: wp.array[wp.vec3],
     # outputs
     body_q: wp.array[wp.transform],
@@ -2000,6 +2132,10 @@ def eval_articulation_fk_with_velocity_conversion_from_joint(
         joint_X_c,
         joint_axis,
         joint_dof_dim,
+        joint_mimic_leader,
+        joint_mimic_coef,
+        joint_mimic_type,
+        joint_mimic_axis,
         body_com,
         # outputs
         body_q,
@@ -2060,6 +2196,10 @@ def eval_fk_with_velocity_conversion(
             model.joint_X_c,
             model.joint_axis,
             model.joint_dof_dim,
+            model.joint_mimic_leader,
+            model.joint_mimic_coef,
+            model.joint_mimic_type,
+            model.joint_mimic_axis,
             model.body_com,
         ],
         outputs=[
@@ -2098,6 +2238,10 @@ def eval_fk_with_velocity_conversion_from_joint_starts(
             model.joint_X_c,
             model.joint_axis,
             model.joint_dof_dim,
+            model.joint_mimic_leader,
+            model.joint_mimic_coef,
+            model.joint_mimic_type,
+            model.joint_mimic_axis,
             model.body_com,
         ],
         outputs=[

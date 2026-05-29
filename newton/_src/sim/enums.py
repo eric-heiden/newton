@@ -55,6 +55,9 @@ class JointType(IntEnum):
     CABLE = 7
     """Cable joint: two DOF slots for linear stretch and angular bend/twist."""
 
+    MIMIC = 8
+    """Mimic joint: 0 own DOFs, derives its transform from a leader joint's coordinates scaled by coefficients."""
+
     def dof_count(self, num_axes: int) -> tuple[int, int]:
         """
         Returns the number of degrees of freedom (DoF) in velocity and the number of coordinates
@@ -85,6 +88,9 @@ class JointType(IntEnum):
         elif self == JointType.FIXED:
             dof_count = 0
             coord_count = 0
+        elif self == JointType.MIMIC:
+            dof_count = 0
+            coord_count = 0
         return dof_count, coord_count
 
     def constraint_count(self, num_axes: int) -> int:
@@ -108,6 +114,8 @@ class JointType(IntEnum):
         elif self == JointType.FREE or self == JointType.DISTANCE:
             cts_count = 0
         elif self == JointType.FIXED:
+            cts_count = 6
+        elif self == JointType.MIMIC:
             cts_count = 6
         return cts_count
 

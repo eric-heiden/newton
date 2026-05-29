@@ -203,6 +203,8 @@ def eval_single_articulation_fk(
     joint_X_c: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
+    joint_mimic_leader: wp.array[int],
+    joint_mimic_coef: wp.array2d[float],
     body_com: wp.array[wp.vec3],
     body_flags: wp.array[wp.int32],
     body_flag_filter: int,
@@ -328,6 +330,29 @@ def eval_single_articulation_fk(
             X_j = wp.transform(pos, rot)
             v_j = wp.spatial_vector(vel_v, vel_w)
 
+        if type == JointType.MIMIC:
+            leader = joint_mimic_leader[i]
+            mimic_offset = joint_mimic_coef[i, 0]
+            mimic_mult = joint_mimic_coef[i, 1]
+
+            leader_type = joint_type[leader]
+            leader_q_start = joint_q_start[leader]
+            leader_qd_start = joint_qd_start[leader]
+
+            if leader_type == JointType.PRISMATIC:
+                leader_axis = joint_axis[leader_qd_start]
+                q_eff = mimic_offset + mimic_mult * joint_q[leader_q_start]
+                qd_eff = mimic_mult * joint_qd[leader_qd_start]
+                X_j = wp.transform(leader_axis * q_eff, wp.quat_identity())
+                v_j = wp.spatial_vector(leader_axis * qd_eff, wp.vec3())
+
+            if leader_type == JointType.REVOLUTE:
+                leader_axis = joint_axis[leader_qd_start]
+                q_eff = mimic_offset + mimic_mult * joint_q[leader_q_start]
+                qd_eff = mimic_mult * joint_qd[leader_qd_start]
+                X_j = wp.transform(wp.vec3(), wp.quat_from_axis_angle(leader_axis, q_eff))
+                v_j = wp.spatial_vector(wp.vec3(), leader_axis * qd_eff)
+
         # transform from world to parent joint anchor frame
         X_wpj = X_pj
         if parent >= 0:
@@ -397,6 +422,8 @@ def eval_articulation_fk(
     joint_X_c: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
+    joint_mimic_leader: wp.array[int],
+    joint_mimic_coef: wp.array2d[float],
     body_com: wp.array[wp.vec3],
     body_flags: wp.array[wp.int32],
     body_flag_filter: int,
@@ -441,6 +468,8 @@ def eval_articulation_fk(
         joint_X_c,
         joint_axis,
         joint_dof_dim,
+        joint_mimic_leader,
+        joint_mimic_coef,
         body_com,
         body_flags,
         body_flag_filter,
@@ -513,6 +542,8 @@ def eval_fk(
             model.joint_X_c,
             model.joint_axis,
             model.joint_dof_dim,
+            model.joint_mimic_leader,
+            model.joint_mimic_coef,
             model.body_com,
             model.body_flags,
             body_flag_filter,

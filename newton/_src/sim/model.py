@@ -513,6 +513,12 @@ class Model:
         """Joint labels, shape [joint_count], str."""
         self.joint_world: wp.array[wp.int32] | None = None
         """World index for each joint, shape [joint_count], int. -1 for global."""
+        self.joint_mimic_leader: wp.array[wp.int32] | None = None
+        """Leader joint index for MIMIC joints (-1 for non-mimic), shape [joint_count], int."""
+        self.joint_mimic_coef: wp.array2d[wp.float32] | None = None
+        """Mimic coefficients [offset, multiplier] per joint, shape [joint_count, 2], float.
+
+        For MIMIC joints: ``q_follower = coef[0] + coef[1] * q_leader``."""
         self.joint_world_start: wp.array[wp.int32] | None = None
         """Start index of the first joint per world, shape [world_count + 2], int.
 

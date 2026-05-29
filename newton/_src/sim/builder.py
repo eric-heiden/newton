@@ -1133,6 +1133,10 @@ class ModelBuilder:
         """Per-joint linear/angular DoF dimensions accumulated for :attr:`Model.joint_dof_dim`."""
         self.joint_world: list[int] = []
         """World indices accumulated for :attr:`Model.joint_world`."""
+        self.joint_mimic_leader: list[int] = []
+        """Leader joint index for MIMIC joints (-1 for non-mimic)."""
+        self.joint_mimic_coef: list[tuple[float, float]] = []
+        """Mimic coefficients (offset, multiplier) per joint."""
         self.joint_articulation: list[int] = []
         """Articulation indices accumulated for :attr:`Model.joint_articulation`."""
 
@@ -3162,6 +3166,10 @@ class ModelBuilder:
         if builder.joint_count > 0:
             s = [self.current_world] * builder.joint_count
             self.joint_world.extend(s)
+            self.joint_mimic_leader.extend(
+                [l + start_joint_idx if l >= 0 else -1 for l in builder.joint_mimic_leader]
+            )
+            self.joint_mimic_coef.extend(builder.joint_mimic_coef)
             # Offset articulation indices for joints (-1 stays -1)
             self.joint_articulation.extend(
                 [a + start_articulation_idx if a >= 0 else -1 for a in builder.joint_articulation]
@@ -3812,6 +3820,8 @@ class ModelBuilder:
         self.joint_enabled.append(enabled)
         self.joint_collision_filter_parent.append(collision_filter_parent)
         self.joint_world.append(self.current_world)
+        self.joint_mimic_leader.append(-1)
+        self.joint_mimic_coef.append((0.0, 1.0))
         self.joint_articulation.append(-1)
 
         def add_axis_dim(dim: ModelBuilder.JointDofConfig):
@@ -3895,6 +3905,63 @@ class ModelBuilder:
             )
 
         return joint_index
+
+    def add_joint_mimic(
+        self,
+        parent: int,
+        child: int,
+        leader_joint: int,
+        coef0: float = 0.0,
+        coef1: float = 1.0,
+        parent_xform: Transform | None = None,
+        child_xform: Transform | None = None,
+        label: str | None = None,
+        collision_filter_parent: bool | None = None,
+        enabled: bool = True,
+        custom_attributes: dict[str, Any] | None = None,
+    ) -> int:
+        """Add a mimic joint that derives its transform from a leader joint.
+
+        A mimic joint has 0 own DOFs. During forward kinematics, its transform
+        is computed as if the leader joint's coordinate were
+        ``coef0 + coef1 * q_leader``, using the leader joint's type and axis.
+
+        Args:
+            parent: Parent body index (-1 for world).
+            child: Child body index.
+            leader_joint: Index of the leader joint whose coordinates drive this joint.
+            coef0: Offset added after scaling the leader coordinate.
+            coef1: Multiplier applied to the leader joint coordinate.
+            parent_xform: Transform from parent body to joint parent anchor frame.
+            child_xform: Transform from child body to joint child anchor frame.
+            label: Optional joint label.
+            collision_filter_parent: Whether to filter collisions between parent/child shapes.
+            enabled: Whether the joint is enabled.
+            custom_attributes: Custom attributes dict.
+
+        Returns:
+            Index of the added mimic joint.
+        """
+        joint_count = self.joint_count
+        if leader_joint < 0 or leader_joint >= joint_count:
+            raise ValueError(f"Invalid leader joint index {leader_joint}; expected 0..{joint_count - 1}")
+
+        joint_idx = self.add_joint(
+            joint_type=JointType.MIMIC,
+            parent=parent,
+            child=child,
+            linear_axes=[],
+            angular_axes=[],
+            label=label,
+            parent_xform=parent_xform,
+            child_xform=child_xform,
+            collision_filter_parent=collision_filter_parent,
+            enabled=enabled,
+            custom_attributes=custom_attributes,
+        )
+        self.joint_mimic_leader[joint_idx] = leader_joint
+        self.joint_mimic_coef[joint_idx] = (coef0, coef1)
+        return joint_idx
 
     def add_joint_revolute(
         self,
@@ -5387,6 +5454,17 @@ class ModelBuilder:
                 if verbose:
                     print(f"Warning: Mimic constraint references removed joint {old_joint1}, disabling constraint")
                 self.constraint_mimic_enabled[i] = False
+
+        # Remap joint_mimic_leader indices for MIMIC joint type
+        for i in range(len(self.joint_mimic_leader)):
+            old_leader = self.joint_mimic_leader[i]
+            if old_leader >= 0:
+                if old_leader in joint_remap:
+                    self.joint_mimic_leader[i] = joint_remap[old_leader]
+                else:
+                    if verbose:
+                        print(f"Warning: MIMIC joint {i} references removed leader joint {old_leader}")
+                    self.joint_mimic_leader[i] = -1
 
         # Rebuild parent/child lookups
         self.joint_parents.clear()
@@ -10580,6 +10658,8 @@ class ModelBuilder:
             m.joint_qd = wp.array(self.joint_qd, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_label = self.joint_label
             m.joint_world = wp.array(self.joint_world, dtype=wp.int32)
+            m.joint_mimic_leader = wp.array(self.joint_mimic_leader, dtype=wp.int32)
+            m.joint_mimic_coef = wp.array(self.joint_mimic_coef, dtype=wp.float32)
             # compute joint ancestors
             child_to_joint = {}
             for i, child in enumerate(self.joint_child):

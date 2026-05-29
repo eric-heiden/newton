@@ -205,6 +205,8 @@ def eval_single_articulation_fk(
     joint_dof_dim: wp.array2d[int],
     joint_mimic_leader: wp.array[int],
     joint_mimic_coef: wp.array2d[float],
+    joint_mimic_type: wp.array[int],
+    joint_mimic_axis: wp.array[wp.vec3],
     body_com: wp.array[wp.vec3],
     body_flags: wp.array[wp.int32],
     body_flag_filter: int,
@@ -334,24 +336,23 @@ def eval_single_articulation_fk(
             leader = joint_mimic_leader[i]
             mimic_offset = joint_mimic_coef[i, 0]
             mimic_mult = joint_mimic_coef[i, 1]
+            mimic_type = joint_mimic_type[i]
+            mimic_axis = joint_mimic_axis[i]
 
-            leader_type = joint_type[leader]
             leader_q_start = joint_q_start[leader]
             leader_qd_start = joint_qd_start[leader]
 
-            if leader_type == JointType.PRISMATIC:
-                leader_axis = joint_axis[leader_qd_start]
+            if mimic_type == JointType.PRISMATIC:
                 q_eff = mimic_offset + mimic_mult * joint_q[leader_q_start]
                 qd_eff = mimic_mult * joint_qd[leader_qd_start]
-                X_j = wp.transform(leader_axis * q_eff, wp.quat_identity())
-                v_j = wp.spatial_vector(leader_axis * qd_eff, wp.vec3())
+                X_j = wp.transform(mimic_axis * q_eff, wp.quat_identity())
+                v_j = wp.spatial_vector(mimic_axis * qd_eff, wp.vec3())
 
-            if leader_type == JointType.REVOLUTE:
-                leader_axis = joint_axis[leader_qd_start]
+            if mimic_type == JointType.REVOLUTE:
                 q_eff = mimic_offset + mimic_mult * joint_q[leader_q_start]
                 qd_eff = mimic_mult * joint_qd[leader_qd_start]
-                X_j = wp.transform(wp.vec3(), wp.quat_from_axis_angle(leader_axis, q_eff))
-                v_j = wp.spatial_vector(wp.vec3(), leader_axis * qd_eff)
+                X_j = wp.transform(wp.vec3(), wp.quat_from_axis_angle(mimic_axis, q_eff))
+                v_j = wp.spatial_vector(wp.vec3(), mimic_axis * qd_eff)
 
         # transform from world to parent joint anchor frame
         X_wpj = X_pj
@@ -424,6 +425,8 @@ def eval_articulation_fk(
     joint_dof_dim: wp.array2d[int],
     joint_mimic_leader: wp.array[int],
     joint_mimic_coef: wp.array2d[float],
+    joint_mimic_type: wp.array[int],
+    joint_mimic_axis: wp.array[wp.vec3],
     body_com: wp.array[wp.vec3],
     body_flags: wp.array[wp.int32],
     body_flag_filter: int,
@@ -470,6 +473,8 @@ def eval_articulation_fk(
         joint_dof_dim,
         joint_mimic_leader,
         joint_mimic_coef,
+        joint_mimic_type,
+        joint_mimic_axis,
         body_com,
         body_flags,
         body_flag_filter,
@@ -544,6 +549,8 @@ def eval_fk(
             model.joint_dof_dim,
             model.joint_mimic_leader,
             model.joint_mimic_coef,
+            model.joint_mimic_type,
+            model.joint_mimic_axis,
             model.body_com,
             model.body_flags,
             body_flag_filter,

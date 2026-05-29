@@ -519,6 +519,10 @@ class Model:
         """Mimic coefficients [offset, multiplier] per joint, shape [joint_count, 2], float.
 
         For MIMIC joints: ``q_follower = coef[0] + coef[1] * q_leader``."""
+        self.joint_mimic_type: wp.array[wp.int32] | None = None
+        """Scalar follower joint type used by MIMIC joints, shape [joint_count], int."""
+        self.joint_mimic_axis: wp.array[wp.vec3] | None = None
+        """Follower joint axis used by MIMIC joints, shape [joint_count], vec3."""
         self.joint_world_start: wp.array[wp.int32] | None = None
         """Start index of the first joint per world, shape [world_count + 2], int.
 

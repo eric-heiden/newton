@@ -1789,6 +1789,25 @@ class TestMimicConstraints(unittest.TestCase):
         self.assertAlmostEqual(coef0, 0.0, places=5)
         self.assertAlmostEqual(coef1, 1.0, places=5)
 
+    def test_mimic_tags_can_import_as_mimic_joints(self):
+        """Prototype mode maps URDF mimic tags to zero-DOF MIMIC joints."""
+        builder = newton.ModelBuilder()
+        builder.add_urdf(MIMIC_URDF, mimic_constraints_as_joints=True)
+        model = builder.finalize()
+
+        leader_idx = model.joint_label.index("mimic_test/leader_joint")
+        follower_idx = model.joint_label.index("mimic_test/follower_joint")
+
+        self.assertEqual(model.constraint_mimic_count, 0)
+        self.assertEqual(model.joint_type.numpy()[follower_idx], newton.JointType.MIMIC)
+        self.assertEqual(model.joint_mimic_leader.numpy()[follower_idx], leader_idx)
+        np.testing.assert_allclose(model.joint_mimic_coef.numpy()[follower_idx], [0.5, 2.0], atol=1e-6)
+
+        leader_dofs = model.joint_qd_start.numpy()[leader_idx + 1] - model.joint_qd_start.numpy()[leader_idx]
+        follower_dofs = model.joint_qd_start.numpy()[follower_idx + 1] - model.joint_qd_start.numpy()[follower_idx]
+        self.assertEqual(leader_dofs, 1)
+        self.assertEqual(follower_dofs, 0)
+
     def test_mimic_joint_skipped_child_does_not_mismatch(self):
         """Regression test: skipped joints must not be included in name->index mapping."""
 

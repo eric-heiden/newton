@@ -65,9 +65,7 @@ class TestMimicJointFK(unittest.TestCase):
     def test_mimic_joint_fk_identity(self):
         """Mimic with coef0=0, coef1=1 copies leader angle exactly."""
         angle = 0.7
-        model, state, leader_joint = self._build_leader_follower_chain(
-            leader_angle=angle, coef0=0.0, coef1=1.0
-        )
+        model, state, _leader_joint = self._build_leader_follower_chain(leader_angle=angle, coef0=0.0, coef1=1.0)
 
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
 
@@ -87,9 +85,7 @@ class TestMimicJointFK(unittest.TestCase):
     def test_mimic_joint_fk_scaled(self):
         """Mimic with coef1=0.5 applies half the leader angle."""
         angle = 1.0
-        model, state, _ = self._build_leader_follower_chain(
-            leader_angle=angle, coef0=0.0, coef1=0.5
-        )
+        model, state, _ = self._build_leader_follower_chain(leader_angle=angle, coef0=0.0, coef1=0.5)
 
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
 
@@ -104,9 +100,7 @@ class TestMimicJointFK(unittest.TestCase):
         """Mimic with coef0=0.2 adds offset to the derived angle."""
         angle = 0.4
         offset = 0.2
-        model, state, _ = self._build_leader_follower_chain(
-            leader_angle=angle, coef0=offset, coef1=1.0
-        )
+        model, state, _ = self._build_leader_follower_chain(leader_angle=angle, coef0=offset, coef1=1.0)
 
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
 
@@ -175,8 +169,49 @@ class TestMimicJointFK(unittest.TestCase):
         for idx in range(4):
             cumulative_angle = (idx + 1) * angle
             expected_quat = np.array([0, 0, math.sin(cumulative_angle / 2), math.cos(cumulative_angle / 2)])
-            np.testing.assert_allclose(body_q[idx][3:], expected_quat, atol=1e-5,
-                                       err_msg=f"Body {idx} orientation mismatch")
+            np.testing.assert_allclose(
+                body_q[idx][3:], expected_quat, atol=1e-5, err_msg=f"Body {idx} orientation mismatch"
+            )
+
+    def test_mimic_joint_uses_follower_axis(self):
+        """A mimic joint derives q from the leader but rotates about its own axis."""
+        builder = newton.ModelBuilder()
+
+        b0 = builder.add_link(mass=1.0)
+        b1 = builder.add_link(mass=1.0)
+
+        leader = builder.add_joint_revolute(parent=-1, child=b0, axis=(0, 0, 1), label="leader_z")
+        follower = builder.add_joint_mimic(
+            parent=b0,
+            child=b1,
+            leader_joint=leader,
+            axis=(1, 0, 0),
+            mimic_type=newton.JointType.REVOLUTE,
+            label="follower_x",
+        )
+        builder.add_articulation([leader, follower])
+
+        model = builder.finalize()
+        state = model.state()
+
+        angle = 0.4
+        jq = state.joint_q.numpy()
+        jq[model.joint_q_start.numpy()[leader]] = angle
+        state.joint_q.assign(jq)
+
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+
+        qz = np.array([0.0, 0.0, math.sin(angle / 2.0), math.cos(angle / 2.0)])
+        qx = np.array([math.sin(angle / 2.0), 0.0, 0.0, math.cos(angle / 2.0)])
+        expected = np.array(
+            [
+                qz[3] * qx[0] + qz[0] * qx[3] + qz[1] * qx[2] - qz[2] * qx[1],
+                qz[3] * qx[1] - qz[0] * qx[2] + qz[1] * qx[3] + qz[2] * qx[0],
+                qz[3] * qx[2] + qz[0] * qx[1] - qz[1] * qx[0] + qz[2] * qx[3],
+                qz[3] * qx[3] - qz[0] * qx[0] - qz[1] * qx[1] - qz[2] * qx[2],
+            ]
+        )
+        np.testing.assert_allclose(state.body_q.numpy()[1][3:], expected, atol=1e-5)
 
 
 if __name__ == "__main__":

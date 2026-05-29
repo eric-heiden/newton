@@ -1137,6 +1137,10 @@ class ModelBuilder:
         """Leader joint index for MIMIC joints (-1 for non-mimic)."""
         self.joint_mimic_coef: list[tuple[float, float]] = []
         """Mimic coefficients (offset, multiplier) per joint."""
+        self.joint_mimic_type: list[JointType] = []
+        """Scalar follower joint type for MIMIC joints."""
+        self.joint_mimic_axis: list[wp.vec3] = []
+        """Follower joint axis for MIMIC joints."""
         self.joint_articulation: list[int] = []
         """Articulation indices accumulated for :attr:`Model.joint_articulation`."""
 
@@ -2284,6 +2288,7 @@ class ModelBuilder:
         mesh_maxhullvert: int | None = None,
         force_position_velocity_actuation: bool = False,
         override_root_xform: bool = False,
+        mimic_constraints_as_joints: bool = False,
     ):
         """
         Parses a URDF file and adds the bodies and joints to the given ModelBuilder.
@@ -2381,6 +2386,9 @@ class ModelBuilder:
                 :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
                 damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
                 (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
+            mimic_constraints_as_joints: Prototype path that imports URDF ``<mimic>`` tags as zero-DOF
+                :attr:`~newton.JointType.MIMIC` follower joints when possible. Tags that cannot be represented this
+                way fall back to the existing mimic-constraint path.
         """
         from ..utils.import_urdf import parse_urdf  # noqa: PLC0415
 
@@ -2404,6 +2412,7 @@ class ModelBuilder:
             mesh_maxhullvert=mesh_maxhullvert,
             force_position_velocity_actuation=force_position_velocity_actuation,
             override_root_xform=override_root_xform,
+            mimic_constraints_as_joints=mimic_constraints_as_joints,
         )
 
     def add_usd(
@@ -3166,10 +3175,10 @@ class ModelBuilder:
         if builder.joint_count > 0:
             s = [self.current_world] * builder.joint_count
             self.joint_world.extend(s)
-            self.joint_mimic_leader.extend(
-                [l + start_joint_idx if l >= 0 else -1 for l in builder.joint_mimic_leader]
-            )
+            self.joint_mimic_leader.extend([l + start_joint_idx if l >= 0 else -1 for l in builder.joint_mimic_leader])
             self.joint_mimic_coef.extend(builder.joint_mimic_coef)
+            self.joint_mimic_type.extend(builder.joint_mimic_type)
+            self.joint_mimic_axis.extend(builder.joint_mimic_axis)
             # Offset articulation indices for joints (-1 stays -1)
             self.joint_articulation.extend(
                 [a + start_articulation_idx if a >= 0 else -1 for a in builder.joint_articulation]
@@ -3822,6 +3831,8 @@ class ModelBuilder:
         self.joint_world.append(self.current_world)
         self.joint_mimic_leader.append(-1)
         self.joint_mimic_coef.append((0.0, 1.0))
+        self.joint_mimic_type.append(JointType.FIXED)
+        self.joint_mimic_axis.append(wp.vec3(0.0, 0.0, 0.0))
         self.joint_articulation.append(-1)
 
         def add_axis_dim(dim: ModelBuilder.JointDofConfig):
@@ -3913,6 +3924,8 @@ class ModelBuilder:
         leader_joint: int,
         coef0: float = 0.0,
         coef1: float = 1.0,
+        axis: AxisType | Vec3 | JointDofConfig | None = None,
+        mimic_type: JointType | None = None,
         parent_xform: Transform | None = None,
         child_xform: Transform | None = None,
         label: str | None = None,
@@ -3920,11 +3933,11 @@ class ModelBuilder:
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
     ) -> int:
-        """Add a mimic joint that derives its transform from a leader joint.
+        """Add a mimic joint that derives its coordinate from a leader joint.
 
         A mimic joint has 0 own DOFs. During forward kinematics, its transform
-        is computed as if the leader joint's coordinate were
-        ``coef0 + coef1 * q_leader``, using the leader joint's type and axis.
+        is computed as if this follower joint's coordinate were
+        ``coef0 + coef1 * q_leader``.
 
         Args:
             parent: Parent body index (-1 for world).
@@ -3932,6 +3945,9 @@ class ModelBuilder:
             leader_joint: Index of the leader joint whose coordinates drive this joint.
             coef0: Offset added after scaling the leader coordinate.
             coef1: Multiplier applied to the leader joint coordinate.
+            axis: Follower joint axis. Defaults to the leader axis for scalar leaders.
+            mimic_type: Scalar follower joint type, either ``PRISMATIC`` or ``REVOLUTE``.
+                Defaults to the leader type for scalar leaders.
             parent_xform: Transform from parent body to joint parent anchor frame.
             child_xform: Transform from child body to joint child anchor frame.
             label: Optional joint label.
@@ -3945,6 +3961,21 @@ class ModelBuilder:
         joint_count = self.joint_count
         if leader_joint < 0 or leader_joint >= joint_count:
             raise ValueError(f"Invalid leader joint index {leader_joint}; expected 0..{joint_count - 1}")
+
+        leader_type = self.joint_type[leader_joint]
+        if mimic_type is None:
+            mimic_type = leader_type
+        if mimic_type not in (JointType.PRISMATIC, JointType.REVOLUTE):
+            raise ValueError(f"MIMIC joints currently support PRISMATIC or REVOLUTE follower types, got {mimic_type}")
+
+        if axis is None:
+            if leader_type not in (JointType.PRISMATIC, JointType.REVOLUTE):
+                raise ValueError("axis is required when the leader joint is not scalar")
+            axis_vec = self.joint_axis[self.joint_qd_start[leader_joint]]
+        elif isinstance(axis, ModelBuilder.JointDofConfig):
+            axis_vec = axis.axis
+        else:
+            axis_vec = axis_to_vec3(axis)
 
         joint_idx = self.add_joint(
             joint_type=JointType.MIMIC,
@@ -3961,6 +3992,8 @@ class ModelBuilder:
         )
         self.joint_mimic_leader[joint_idx] = leader_joint
         self.joint_mimic_coef[joint_idx] = (coef0, coef1)
+        self.joint_mimic_type[joint_idx] = mimic_type
+        self.joint_mimic_axis[joint_idx] = axis_vec
         return joint_idx
 
     def add_joint_revolute(
@@ -10660,6 +10693,8 @@ class ModelBuilder:
             m.joint_world = wp.array(self.joint_world, dtype=wp.int32)
             m.joint_mimic_leader = wp.array(self.joint_mimic_leader, dtype=wp.int32)
             m.joint_mimic_coef = wp.array(self.joint_mimic_coef, dtype=wp.float32)
+            m.joint_mimic_type = wp.array(self.joint_mimic_type, dtype=wp.int32)
+            m.joint_mimic_axis = wp.array(self.joint_mimic_axis, dtype=wp.vec3)
             # compute joint ancestors
             child_to_joint = {}
             for i, child in enumerate(self.joint_child):

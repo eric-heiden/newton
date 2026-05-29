@@ -1,0 +1,43 @@
+{
+  "case": "robotiq_style_mimic_kinematics",
+  "device": "cuda:0",
+  "driver_q": 0.45,
+  "legacy_mimic_constraints": {
+    "eval_fk_with_prepropagated_q_timing": {
+      "max_us": 56.98204040527344,
+      "mean_us": 56.90203979611397,
+      "median_us": 56.90203979611397,
+      "min_us": 56.8220391869545
+    },
+    "host_propagate_q_plus_eval_fk_timing": {
+      "max_us": 233.88979025185108,
+      "mean_us": 207.50639960169792,
+      "median_us": 207.50639960169792,
+      "min_us": 181.12300895154476
+    },
+    "stats": {
+      "body_count": 6,
+      "joint_count": 6,
+      "joint_dof_count": 6,
+      "mimic_constraint_count": 5,
+      "mimic_joint_count": 0
+    }
+  },
+  "mimic_as_joints": {
+    "eval_fk_timing": {
+      "max_us": 68.19367408752441,
+      "mean_us": 64.34784736484289,
+      "median_us": 64.34784736484289,
+      "min_us": 60.50202064216137
+    },
+    "stats": {
+      "body_count": 6,
+      "joint_count": 6,
+      "joint_dof_count": 1,
+      "mimic_constraint_count": 0,
+      "mimic_joint_count": 5
+    }
+  },
+  "repeats": 2,
+  "samples": 20
+}

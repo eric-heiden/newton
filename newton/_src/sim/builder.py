@@ -2288,7 +2288,7 @@ class ModelBuilder:
         mesh_maxhullvert: int | None = None,
         force_position_velocity_actuation: bool = False,
         override_root_xform: bool = False,
-        mimic_constraints_as_joints: bool = False,
+        mimic_constraints_as_joints: bool = True,
     ):
         """
         Parses a URDF file and adds the bodies and joints to the given ModelBuilder.
@@ -2386,9 +2386,9 @@ class ModelBuilder:
                 :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
                 damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
                 (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
-            mimic_constraints_as_joints: Prototype path that imports URDF ``<mimic>`` tags as zero-DOF
-                :attr:`~newton.JointType.MIMIC` follower joints when possible. Tags that cannot be represented this
-                way fall back to the existing mimic-constraint path.
+            mimic_constraints_as_joints: Deprecated compatibility flag retained for callers that already pass it.
+                URDF ``<mimic>`` tags are imported as zero-DOF :attr:`~newton.JointType.MIMIC`
+                follower joints regardless of this flag.
         """
         from ..utils.import_urdf import parse_urdf  # noqa: PLC0415
 
@@ -4739,12 +4739,16 @@ class ModelBuilder:
         label: str | None = None,
         custom_attributes: dict[str, Any] | None = None,
     ) -> int:
-        """Adds a mimic constraint to the model.
+        """Adds a legacy mimic constraint to the model.
 
         A mimic constraint enforces that ``joint0 = coef0 + coef1 * joint1``,
         following URDF mimic joint semantics. Both scalar (prismatic, revolute) and
         multi-DOF joints are supported. For multi-DOF joints, the mimic behavior is
         applied equally to all degrees of freedom.
+
+        URDF and USD importers store representable mimic relationships as
+        zero-DOF :attr:`~newton.JointType.MIMIC` joints instead of using this
+        legacy constraint array.
 
         Args:
             joint0: Index of the follower joint (the one being constrained)

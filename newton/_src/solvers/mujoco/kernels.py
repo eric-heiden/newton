@@ -663,6 +663,8 @@ def convert_warp_coords_to_mj_kernel(
     joint_X_p: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     dof_ref: wp.array[wp.float32],
+    joint_mimic_leader: wp.array[wp.int32],
+    joint_mimic_coef: wp.array2d[wp.float32],
     mj_q_start: wp.array[wp.int32],
     mj_qd_start: wp.array[wp.int32],
     # outputs
@@ -737,6 +739,15 @@ def convert_warp_coords_to_mj_kernel(
         for i in range(3):
             # convert velocity components
             qvel[worldid, qd_i + i] = joint_qd[wqd_i + i]
+    elif jtype == JointType.MIMIC:
+        leader = joint_mimic_leader[joint_id]
+        if leader >= 0:
+            leader_q = joint_q_start[leader]
+            leader_qd = joint_qd_start[leader]
+            coef0 = joint_mimic_coef[joint_id, 0]
+            coef1 = joint_mimic_coef[joint_id, 1]
+            qpos[worldid, q_i] = coef0 + coef1 * joint_q[leader_q]
+            qvel[worldid, qd_i] = coef1 * joint_qd[leader_qd]
     else:
         axis_count = joint_dof_dim[joint_id, 0] + joint_dof_dim[joint_id, 1]
         for i in range(axis_count):
@@ -761,6 +772,9 @@ def sync_qpos0_kernel(
     body_q: wp.array[wp.transform],
     dof_ref: wp.array[wp.float32],
     dof_springref: wp.array[wp.float32],
+    joint_q: wp.array[wp.float32],
+    joint_mimic_leader: wp.array[wp.int32],
+    joint_mimic_coef: wp.array2d[wp.float32],
     mj_q_start: wp.array[wp.int32],
     # outputs
     qpos0: wp.array2d[wp.float32],
@@ -809,6 +823,14 @@ def sync_qpos0_kernel(
         qpos_spring[worldid, q_i + 1] = 0.0
         qpos_spring[worldid, q_i + 2] = 0.0
         qpos_spring[worldid, q_i + 3] = 0.0
+    elif type == JointType.MIMIC:
+        joint_id = joints_per_world * worldid + jntid
+        leader = joint_mimic_leader[joint_id]
+        if leader >= 0:
+            leader_q = joint_q_start[leader]
+            q = joint_mimic_coef[joint_id, 0] + joint_mimic_coef[joint_id, 1] * joint_q[leader_q]
+            qpos0[worldid, q_i] = q
+            qpos_spring[worldid, q_i] = q
     else:
         axis_count = joint_dof_dim[jntid, 0] + joint_dof_dim[jntid, 1]
         for i in range(axis_count):
@@ -1474,7 +1496,13 @@ def eval_single_articulation_fk(
     joint_X_c: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
+    joint_mimic_leader: wp.array[int],
+    joint_mimic_coef: wp.array2d[float],
+    joint_mimic_type: wp.array[int],
+    joint_mimic_axis: wp.array[wp.vec3],
     body_com: wp.array[wp.vec3],
+    body_flags: wp.array[wp.int32],
+    body_flag_filter: int,
     # outputs
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
@@ -1518,6 +1546,22 @@ def eval_single_articulation_fk(
 
             X_j = wp.transform(wp.vec3(), wp.quat_from_axis_angle(axis, q))
             v_j = wp.spatial_vector(wp.vec3(), axis * qd)
+
+        if type == JointType.MIMIC:
+            axis = joint_mimic_axis[i]
+            mimic_type = joint_mimic_type[i]
+            leader = joint_mimic_leader[i]
+            q = float(0.0)
+            qd = float(0.0)
+            if leader >= 0:
+                q = joint_mimic_coef[i, 0] + joint_mimic_coef[i, 1] * joint_q[joint_q_start[leader]]
+                qd = joint_mimic_coef[i, 1] * joint_qd[joint_qd_start[leader]]
+            if mimic_type == JointType.PRISMATIC:
+                X_j = wp.transform(axis * q, wp.quat_identity())
+                v_j = wp.spatial_vector(axis * qd, wp.vec3())
+            elif mimic_type == JointType.REVOLUTE:
+                X_j = wp.transform(wp.vec3(), wp.quat_from_axis_angle(axis, q))
+                v_j = wp.spatial_vector(wp.vec3(), axis * qd)
 
         if type == JointType.BALL:
             r = wp.quat(joint_q[q_start + 0], joint_q[q_start + 1], joint_q[q_start + 2], joint_q[q_start + 3])
@@ -1596,8 +1640,9 @@ def eval_single_articulation_fk(
             w_parent + angular_joint_world,
         )  # spatial vector with (linear, angular) ordering
 
-        body_q[child] = X_wc
-        body_qd[child] = origin_twist_to_com_twist(v_wc_origin, X_wc, body_com[child])
+        if (body_flags[child] & body_flag_filter) != 0:
+            body_q[child] = X_wc
+            body_qd[child] = origin_twist_to_com_twist(v_wc_origin, X_wc, body_com[child])
 
 
 @wp.kernel
@@ -1615,7 +1660,13 @@ def eval_articulation_fk(
     joint_X_c: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
+    joint_mimic_leader: wp.array[int],
+    joint_mimic_coef: wp.array2d[float],
+    joint_mimic_type: wp.array[int],
+    joint_mimic_axis: wp.array[wp.vec3],
     body_com: wp.array[wp.vec3],
+    body_flags: wp.array[wp.int32],
+    body_flag_filter: int,
     # outputs
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
@@ -1640,7 +1691,13 @@ def eval_articulation_fk(
         joint_X_c,
         joint_axis,
         joint_dof_dim,
+        joint_mimic_leader,
+        joint_mimic_coef,
+        joint_mimic_type,
+        joint_mimic_axis,
         body_com,
+        body_flags,
+        body_flag_filter,
         # outputs
         body_q,
         body_qd,
@@ -2690,6 +2747,32 @@ def update_mimic_eq_data_and_active_kernel(
 
     eq_data_out[world, mjc_eq] = data
     eq_active_out[world, mjc_eq] = constraint_mimic_enabled[newton_mimic]
+
+
+@wp.kernel
+def update_mimic_joint_eq_data_and_active_kernel(
+    mjc_eq_to_newton_mimic_joint: wp.array2d[wp.int32],
+    joint_mimic_coef: wp.array2d[wp.float32],
+    joint_enabled: wp.array[wp.bool],
+    # outputs
+    eq_data_out: wp.array2d[vec11],
+    eq_active_out: wp.array2d[wp.bool],
+):
+    """Update MuJoCo equality data from zero-DOF Newton MIMIC joint properties."""
+    world, mjc_eq = wp.tid()
+    newton_joint = mjc_eq_to_newton_mimic_joint[world, mjc_eq]
+    if newton_joint < 0:
+        return
+
+    data = eq_data_out[world, mjc_eq]
+    data[0] = joint_mimic_coef[newton_joint, 0]
+    data[1] = joint_mimic_coef[newton_joint, 1]
+    data[2] = 0.0
+    data[3] = 0.0
+    data[4] = 0.0
+
+    eq_data_out[world, mjc_eq] = data
+    eq_active_out[world, mjc_eq] = joint_enabled[newton_joint]
 
 
 @wp.func

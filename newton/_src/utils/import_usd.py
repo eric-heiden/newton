@@ -32,7 +32,7 @@ from ..core import quat_between_axes
 from ..core.types import Axis, Transform
 from ..geometry import GeoType, Mesh, ShapeFlags, compute_inertia_shape, compute_inertia_sphere
 from ..sim.builder import ModelBuilder
-from ..sim.enums import JointTargetMode
+from ..sim.enums import JointTargetMode, JointType
 from ..sim.model import Model
 from ..usd import utils as usd
 from ..usd.schema_resolver import PrimType, SchemaResolver, SchemaResolverManager
@@ -412,6 +412,136 @@ def parse_usd(
 
     def _has_api_schema(prim: Usd.Prim, schema_name: str) -> bool:
         return bool(prim and prim.IsValid() and usd.has_applied_api_schema(prim, schema_name))
+
+    def _absolute_joint_target_path(joint_prim: Usd.Prim, target) -> str:
+        if not target.IsAbsolutePath():
+            target = joint_prim.GetPath().GetParentPath().AppendPath(target)
+        return str(target)
+
+    def _get_mimic_joint_spec(joint_prim: Usd.Prim, joint_path: str) -> tuple[str, float, float] | None:
+        if _has_api_schema(joint_prim, "MjcEqualityJointAPI"):
+            return None
+
+        if usd.has_applied_api_schema(joint_prim, "NewtonMimicAPI"):
+            mimic_enabled = usd.get_attribute(joint_prim, "newton:mimicEnabled", default=True)
+            if not mimic_enabled:
+                return None
+            mimic_rel = joint_prim.GetRelationship("newton:mimicJoint")
+            if not mimic_rel or not mimic_rel.HasAuthoredTargets():
+                if verbose:
+                    print(f"NewtonMimicAPI on {joint_path} has no newton:mimicJoint target; skipping")
+                return None
+            targets = mimic_rel.GetTargets()
+            if not targets:
+                if verbose:
+                    print(f"NewtonMimicAPI on {joint_path}: newton:mimicJoint has no targets; skipping")
+                return None
+            leader_path = _absolute_joint_target_path(joint_prim, targets[0])
+            coef0 = usd.get_attribute(joint_prim, "newton:mimicCoef0", default=0.0)
+            coef1 = usd.get_attribute(joint_prim, "newton:mimicCoef1", default=1.0)
+            return leader_path, float(coef0), float(coef1)
+
+        schemas_listop = joint_prim.GetMetadata("apiSchemas")
+        if not schemas_listop:
+            return None
+
+        all_schemas = (
+            list(schemas_listop.prependedItems)
+            + list(schemas_listop.appendedItems)
+            + list(schemas_listop.explicitItems)
+        )
+        for schema in all_schemas:
+            schema_str = str(schema)
+            if not schema_str.startswith("PhysxMimicJointAPI"):
+                continue
+            parts = schema_str.split(":")
+            if len(parts) < 2:
+                continue
+            axis_instance = parts[1]
+            ref_joint_rel = joint_prim.GetRelationship(f"physxMimicJoint:{axis_instance}:referenceJoint")
+            if not ref_joint_rel:
+                continue
+            targets = ref_joint_rel.GetTargets()
+            if not targets:
+                continue
+            leader_path = _absolute_joint_target_path(joint_prim, targets[0])
+            gearing_attr = joint_prim.GetAttribute(f"physxMimicJoint:{axis_instance}:gearing")
+            gearing = float(gearing_attr.Get()) if gearing_attr and gearing_attr.HasValue() else 1.0
+            offset_attr = joint_prim.GetAttribute(f"physxMimicJoint:{axis_instance}:offset")
+            offset = float(offset_attr.Get()) if offset_attr and offset_attr.HasValue() else 0.0
+            return leader_path, -offset, -gearing
+
+        return None
+
+    pending_mimic_joints: dict[str, tuple[str, float, float]] = {}
+
+    def _convert_scalar_joint_to_mimic(joint_idx: int, leader_idx: int, coef0: float, coef1: float) -> bool:
+        old_type = builder.joint_type[joint_idx]
+        if old_type not in (JointType.PRISMATIC, JointType.REVOLUTE):
+            warnings.warn(
+                f"Mimic follower joint {builder.joint_label[joint_idx]!r} has unsupported type "
+                f"{JointType(old_type).name}; importing it as an independent joint.",
+                stacklevel=2,
+            )
+            return False
+
+        q_start = builder.joint_q_start[joint_idx]
+        qd_start = builder.joint_qd_start[joint_idx]
+        lin_axis_count, ang_axis_count = builder.joint_dof_dim[joint_idx]
+        if lin_axis_count + ang_axis_count != 1:
+            warnings.warn(
+                f"Mimic follower joint {builder.joint_label[joint_idx]!r} is not scalar; "
+                "importing it as an independent joint.",
+                stacklevel=2,
+            )
+            return False
+
+        axis = builder.joint_axis[qd_start]
+        del builder.joint_q[q_start : q_start + 1]
+        for attr in (
+            "joint_qd",
+            "joint_f",
+            "joint_act",
+            "joint_axis",
+            "joint_target_pos",
+            "joint_target_vel",
+            "joint_target_mode",
+            "joint_target_ke",
+            "joint_target_kd",
+            "joint_limit_ke",
+            "joint_limit_kd",
+            "joint_armature",
+            "joint_effort_limit",
+            "joint_velocity_limit",
+            "joint_friction",
+            "joint_limit_lower",
+            "joint_limit_upper",
+        ):
+            values = getattr(builder, attr)
+            del values[qd_start : qd_start + 1]
+
+        for idx in range(joint_idx + 1, len(builder.joint_q_start)):
+            builder.joint_q_start[idx] -= 1
+            builder.joint_qd_start[idx] -= 1
+
+        builder.joint_coord_count -= 1
+        builder.joint_dof_count -= 1
+        builder.joint_type[joint_idx] = JointType.MIMIC
+        builder.joint_dof_dim[joint_idx] = (0, 0)
+        builder.joint_mimic_leader[joint_idx] = leader_idx
+        builder.joint_mimic_coef[joint_idx] = (coef0, coef1)
+        builder.joint_mimic_type[joint_idx] = old_type
+        builder.joint_mimic_axis[joint_idx] = axis
+        return True
+
+    def _resolve_pending_mimic_joints() -> None:
+        for joint_path, (leader_path, coef0, coef1) in list(pending_mimic_joints.items()):
+            joint_idx = path_joint_map.get(joint_path)
+            leader_idx = path_joint_map.get(leader_path)
+            if joint_idx is None or leader_idx is None:
+                continue
+            if _convert_scalar_joint_to_mimic(joint_idx, leader_idx, coef0, coef1):
+                del pending_mimic_joints[joint_path]
 
     def _get_rigid_body_ancestor_path(prim: Usd.Prim) -> str | None:
         current = prim
@@ -1018,9 +1148,41 @@ def parse_usd(
                     joint_prim, PrimType.JOINT, "linear_velocity", default=None, verbose=verbose
                 )
 
-            if key == UsdPhysics.ObjectType.PrismaticJoint:
+            mimic_spec = _get_mimic_joint_spec(joint_prim, joint_path)
+            pending_mimic_spec = None
+            if mimic_spec is not None:
+                leader_path, coef0, coef1 = mimic_spec
+                leader_idx = path_joint_map.get(leader_path)
+                if leader_idx is not None:
+                    mimic_type = JointType.PRISMATIC if key == UsdPhysics.ObjectType.PrismaticJoint else JointType.REVOLUTE
+                    mimic_params = {
+                        "parent": joint_params["parent"],
+                        "child": joint_params["child"],
+                        "parent_xform": joint_params["parent_xform"],
+                        "child_xform": joint_params["child_xform"],
+                        "label": joint_params["label"],
+                        "enabled": joint_params["enabled"],
+                        "custom_attributes": joint_params["custom_attributes"],
+                    }
+                    joint_index = builder.add_joint_mimic(
+                        leader_joint=leader_idx,
+                        coef0=coef0,
+                        coef1=coef1,
+                        axis=joint_params["axis"],
+                        mimic_type=mimic_type,
+                        **mimic_params,
+                    )
+                    if verbose:
+                        print(
+                            f"Added MIMIC joint '{joint_path}' following "
+                            f"'{builder.joint_label[leader_idx]}' (coef0={coef0}, coef1={coef1})"
+                        )
+                else:
+                    pending_mimic_spec = mimic_spec
+
+            if joint_index is None and key == UsdPhysics.ObjectType.PrismaticJoint:
                 joint_index = builder.add_joint_prismatic(**joint_params)
-            else:
+            elif joint_index is None:
                 if joint_desc.drive.enabled:
                     joint_params["target_pos"] *= DegreesToRadian
                     joint_params["target_vel"] *= DegreesToRadian
@@ -1035,6 +1197,8 @@ def parse_usd(
                     joint_params["velocity_limit"] *= DegreesToRadian
 
                 joint_index = builder.add_joint_revolute(**joint_params)
+            if pending_mimic_spec is not None:
+                pending_mimic_joints[joint_path] = pending_mimic_spec
         elif key == UsdPhysics.ObjectType.SphericalJoint:
             joint_index = builder.add_joint_ball(**joint_params)
         elif key == UsdPhysics.ObjectType.D6Joint:
@@ -1245,7 +1409,9 @@ def parse_usd(
         path_joint_map[joint_path] = joint_index
 
         # Apply saved initial joint state after joint creation
-        if key in (UsdPhysics.ObjectType.RevoluteJoint, UsdPhysics.ObjectType.PrismaticJoint):
+        if key in (UsdPhysics.ObjectType.RevoluteJoint, UsdPhysics.ObjectType.PrismaticJoint) and builder.joint_type[
+            joint_index
+        ] != JointType.MIMIC:
             if initial_position is not None:
                 q_start = builder.joint_q_start[joint_index]
                 if key == UsdPhysics.ObjectType.RevoluteJoint:
@@ -2282,6 +2448,8 @@ def parse_usd(
                     if joint is not None:
                         processed_joints.add(joint_path)
 
+            _resolve_pending_mimic_joints()
+
             # Create the articulation from all collected joints
             if articulation_joint_indices:
                 builder._finalize_imported_articulation(
@@ -2413,6 +2581,14 @@ def parse_usd(
         warn_str += "If you want to proceed with these orphan joints, make sure to call ModelBuilder.finalize(skip_validation_joints=True) "
         warn_str += "to avoid raising a ValueError. Note that not all solvers will support such a configuration."
         warnings.warn(warn_str, stacklevel=2)
+
+    _resolve_pending_mimic_joints()
+    for joint_path, (leader_path, _, _) in pending_mimic_joints.items():
+        warnings.warn(
+            f"Mimic joint '{joint_path}' references '{leader_path}', but the leader joint was not imported; "
+            "leaving the follower as an independent joint.",
+            stacklevel=2,
+        )
 
     def _build_mass_info_from_authored_properties(
         prim: Usd.Prim,
@@ -3362,128 +3538,6 @@ def parse_usd(
             )
             if old_label is not None and old_label in new_label_to_idx:
                 path_joint_map[path] = new_label_to_idx[old_label]
-
-    # Mimic constraints from PhysxMimicJointAPI (run after collapse so joint indices are final).
-    # PhysxMimicJointAPI is an instance-applied schema (e.g. PhysxMimicJointAPI:rotZ)
-    # that couples a follower joint to a leader (reference) joint with a gearing ratio.
-    # PhysX convention: jointPos + gearing * refJointPos + offset = 0
-    # Newton/URDF convention: joint0 = coef0 + coef1 * joint1
-    # Therefore: coef1 = -gearing, coef0 = -offset
-    for joint_path, joint_idx in path_joint_map.items():
-        joint_prim = stage.GetPrimAtPath(joint_path)
-        if not joint_prim or not joint_prim.IsValid():
-            continue
-
-        # Skip if NewtonMimicAPI is present — it takes precedence over PhysxMimicJointAPI.
-        if usd.has_applied_api_schema(joint_prim, "NewtonMimicAPI"):
-            continue
-        # Skip if MjcEqualityJointAPI is present — it creates equality constraints, not mimic.
-        if _has_api_schema(joint_prim, "MjcEqualityJointAPI"):
-            continue
-
-        schemas_listop = joint_prim.GetMetadata("apiSchemas")
-        if not schemas_listop:
-            continue
-
-        all_schemas = (
-            list(schemas_listop.prependedItems)
-            + list(schemas_listop.appendedItems)
-            + list(schemas_listop.explicitItems)
-        )
-
-        for schema in all_schemas:
-            schema_str = str(schema)
-            if not schema_str.startswith("PhysxMimicJointAPI"):
-                continue
-
-            # Extract the axis instance name (e.g. "rotZ" from "PhysxMimicJointAPI:rotZ")
-            parts = schema_str.split(":")
-            if len(parts) < 2:
-                continue
-            axis_instance = parts[1]
-
-            ref_joint_rel = joint_prim.GetRelationship(f"physxMimicJoint:{axis_instance}:referenceJoint")
-            if not ref_joint_rel:
-                continue
-            targets = ref_joint_rel.GetTargets()
-            if not targets:
-                continue
-            leader_path = targets[0]
-            if not leader_path.IsAbsolutePath():
-                leader_path = joint_prim.GetPath().GetParentPath().AppendPath(leader_path)
-            leader_path = str(leader_path)
-
-            leader_idx = path_joint_map.get(leader_path)
-            if leader_idx is None:
-                warnings.warn(
-                    f"PhysxMimicJointAPI on '{joint_path}' references '{leader_path}' "
-                    f"but leader joint was not found, skipping mimic constraint",
-                    stacklevel=2,
-                )
-                continue
-
-            gearing_attr = joint_prim.GetAttribute(f"physxMimicJoint:{axis_instance}:gearing")
-            gearing = float(gearing_attr.Get()) if gearing_attr and gearing_attr.HasValue() else 1.0
-
-            offset_attr = joint_prim.GetAttribute(f"physxMimicJoint:{axis_instance}:offset")
-            offset = float(offset_attr.Get()) if offset_attr and offset_attr.HasValue() else 0.0
-
-            builder.add_constraint_mimic(
-                joint0=joint_idx,
-                joint1=leader_idx,
-                coef0=-offset,
-                coef1=-gearing,
-                enabled=True,
-                label=joint_path,
-            )
-
-            if verbose:
-                print(
-                    f"Added PhysxMimicJointAPI constraint: '{joint_path}' follows '{leader_path}' "
-                    f"(gearing={gearing}, offset={offset}, axis={axis_instance})"
-                )
-
-    # Mimic constraints from NewtonMimicAPI (run after collapse so joint indices are final).
-    for joint_path, joint_idx in path_joint_map.items():
-        joint_prim = stage.GetPrimAtPath(joint_path)
-        if not joint_prim.IsValid() or not joint_prim.HasAPI("NewtonMimicAPI"):
-            continue
-        if _has_api_schema(joint_prim, "MjcEqualityJointAPI"):
-            continue
-        mimic_enabled = usd.get_attribute(joint_prim, "newton:mimicEnabled", default=True)
-        if not mimic_enabled:
-            continue
-        mimic_rel = joint_prim.GetRelationship("newton:mimicJoint")
-        if not mimic_rel or not mimic_rel.HasAuthoredTargets():
-            if verbose:
-                print(f"NewtonMimicAPI on {joint_path} has no newton:mimicJoint target; skipping")
-            continue
-        targets = mimic_rel.GetTargets()
-        if not targets:
-            if verbose:
-                print(f"NewtonMimicAPI on {joint_path}: newton:mimicJoint has no targets; skipping")
-            continue
-        leader_path = targets[0]
-        if not leader_path.IsAbsolutePath():
-            leader_path = joint_prim.GetPath().GetParentPath().AppendPath(leader_path)
-        leader_path_str = str(leader_path)
-        if leader_path_str not in path_joint_map:
-            warnings.warn(
-                f"NewtonMimicAPI on {joint_path}: leader {leader_path_str} not in path_joint_map; skipping mimic constraint.",
-                stacklevel=2,
-            )
-            continue
-        coef0 = usd.get_attribute(joint_prim, "newton:mimicCoef0", default=0.0)
-        coef1 = usd.get_attribute(joint_prim, "newton:mimicCoef1", default=1.0)
-        leader_idx = path_joint_map[leader_path_str]
-        builder.add_constraint_mimic(
-            joint0=joint_idx,
-            joint1=leader_idx,
-            coef0=coef0,
-            coef1=coef1,
-            enabled=True,
-            label=joint_path,
-        )
 
     # Parse Newton actuator prims from the USD stage.
     from ..actuators.delay import Delay  # noqa: PLC0415

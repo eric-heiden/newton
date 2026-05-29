@@ -7522,8 +7522,75 @@ def Xform "R" (prepend apiSchemas = ["PhysicsArticulationRootAPI"])
         self.assertEqual(len(builder2.custom_attributes["mujoco:joint_dof_label"].values), 0)
 
 
+class TestMuJoCoSolverMimicJoints(unittest.TestCase):
+    """Tests for zero-DOF MIMIC joint support in SolverMuJoCo."""
+
+    def _make_mimic_joint_model(self, coef0=0.0, coef1=1.0):
+        builder = newton.ModelBuilder()
+        b1 = builder.add_link(mass=1.0, com=wp.vec3(0.0, 0.0, 0.0), inertia=wp.mat33(np.eye(3)))
+        b2 = builder.add_link(mass=1.0, com=wp.vec3(0.0, 0.0, 0.0), inertia=wp.mat33(np.eye(3)))
+        j1 = builder.add_joint_revolute(-1, b1, axis=(0, 0, 1), label="leader")
+        j2 = builder.add_joint_mimic(
+            -1,
+            b2,
+            leader_joint=j1,
+            coef0=coef0,
+            coef1=coef1,
+            axis=(0, 0, 1),
+            mimic_type=newton.JointType.REVOLUTE,
+            label="follower",
+        )
+        builder.add_shape_box(body=b1, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_shape_box(body=b2, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_articulation([j1, j2])
+        return builder.finalize()
+
+    def test_mimic_joint_conversion_without_model_constraint_storage(self):
+        model = self._make_mimic_joint_model(coef0=0.5, coef1=2.0)
+        self.assertEqual(model.constraint_mimic_count, 0)
+
+        solver = SolverMuJoCo(model, iterations=1, disable_contacts=True)
+
+        self.assertEqual(solver.mj_model.neq, 1)
+        self.assertEqual(solver.mj_model.eq_type[0], SolverMuJoCo._mujoco.mjtEq.mjEQ_JOINT)
+        eq_data = solver.mjw_model.eq_data.numpy()
+        np.testing.assert_allclose(eq_data[0, 0, :5], [0.5, 2.0, 0.0, 0.0, 0.0], rtol=1e-5)
+
+        self.assertIsNotNone(solver.mjc_eq_to_newton_mimic_joint)
+        mimic_joint_map = solver.mjc_eq_to_newton_mimic_joint.numpy()
+        follower_idx = model.joint_label.index("follower")
+        self.assertEqual(mimic_joint_map[0, 0], follower_idx)
+
+    def test_mimic_joint_state_transfer_derives_follower_from_leader(self):
+        model = self._make_mimic_joint_model(coef0=0.5, coef1=2.0)
+        solver = SolverMuJoCo(model, iterations=1, disable_contacts=True)
+
+        state = model.state()
+        q = state.joint_q.numpy()
+        qd = state.joint_qd.numpy()
+        leader_idx = model.joint_label.index("leader")
+        leader_q = model.joint_q_start.numpy()[leader_idx]
+        leader_qd = model.joint_qd_start.numpy()[leader_idx]
+        q[leader_q] = 0.25
+        qd[leader_qd] = 1.5
+        state.joint_q.assign(q)
+        state.joint_qd.assign(qd)
+
+        solver._update_mjc_data(solver.mjw_data, model, state)
+        qpos = solver.mjw_data.qpos.numpy()
+        qvel = solver.mjw_data.qvel.numpy()
+
+        follower_idx = model.joint_label.index("follower")
+        follower_mj_q = solver.mj_q_start.numpy()[follower_idx]
+        follower_mj_qd = solver.mj_qd_start.numpy()[follower_idx]
+        self.assertGreaterEqual(follower_mj_q, 0)
+        self.assertGreaterEqual(follower_mj_qd, 0)
+        np.testing.assert_allclose(qpos[0, follower_mj_q], 1.0, rtol=1e-5)
+        np.testing.assert_allclose(qvel[0, follower_mj_qd], 3.0, rtol=1e-5)
+
+
 class TestMuJoCoSolverMimicConstraints(unittest.TestCase):
-    """Tests for mimic constraint support in SolverMuJoCo."""
+    """Legacy tests for explicit mimic constraint support in SolverMuJoCo."""
 
     def _make_two_revolute_model(self, coef0=0.0, coef1=1.0, enabled=True):
         """Create a model with two revolute joints and a mimic constraint.

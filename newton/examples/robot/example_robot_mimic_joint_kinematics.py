@@ -29,7 +29,7 @@ def _add_link(builder: newton.ModelBuilder, label: str) -> int:
     return builder.add_link(mass=0.01, label=label)
 
 
-def build_robotiq_style_kinematic_model(*, mimic_as_joints: bool) -> newton.Model:
+def build_robotiq_style_kinematic_model() -> newton.Model:
     """Build a small Robotiq-2F85-like two-finger kinematic tree.
 
     The real menagerie Robotiq asset also has tendon and equality-constraint
@@ -83,23 +83,13 @@ def build_robotiq_style_kinematic_model(*, mimic_as_joints: bool) -> newton.Mode
             "parent_xform": parent_xform_by_joint[joint_name],
             "label": f"{joint_name}_joint",
         }
-        if mimic_as_joints:
-            joints[joint_name] = builder.add_joint_mimic(
-                leader_joint=joints[leader_name],
-                coef0=offset,
-                coef1=multiplier,
-                mimic_type=newton.JointType.REVOLUTE,
-                **joint_args,
-            )
-        else:
-            joints[joint_name] = builder.add_joint_revolute(**joint_args)
-            builder.add_constraint_mimic(
-                joint0=joints[joint_name],
-                joint1=joints[leader_name],
-                coef0=offset,
-                coef1=multiplier,
-                label=f"mimic_{joint_name}",
-            )
+        joints[joint_name] = builder.add_joint_mimic(
+            leader_joint=joints[leader_name],
+            coef0=offset,
+            coef1=multiplier,
+            mimic_type=newton.JointType.REVOLUTE,
+            **joint_args,
+        )
 
     builder.add_articulation(list(joints.values()), label="robotiq_style_mimic_kinematics")
     return builder.finalize()
@@ -112,15 +102,6 @@ def _set_joint_q(model: newton.Model, state: newton.State, values_by_label: dict
         joint_idx = model.joint_label.index(label)
         q[q_start[joint_idx]] = value
     state.joint_q.assign(q)
-
-
-def apply_legacy_mimic_coordinates(model: newton.Model, state: newton.State, driver_q: float) -> None:
-    """Propagate mimic constraints into independent follower q values on the host."""
-
-    values = {"right_driver_joint": driver_q}
-    for joint_name, _leader_name, offset, multiplier in MIMIC_SPECS:
-        values[f"{joint_name}_joint"] = offset + multiplier * driver_q
-    _set_joint_q(model, state, values)
 
 
 def apply_mimic_joint_coordinate(model: newton.Model, state: newton.State, driver_q: float) -> None:
@@ -159,33 +140,16 @@ def run_benchmark(*, samples: int, repeats: int, driver_q: float, device: str | 
     if device is not None:
         wp.set_device(device)
 
-    mimic_model = build_robotiq_style_kinematic_model(mimic_as_joints=True)
-    legacy_model = build_robotiq_style_kinematic_model(mimic_as_joints=False)
+    mimic_model = build_robotiq_style_kinematic_model()
 
     mimic_state = mimic_model.state()
-    legacy_state = legacy_model.state()
     apply_mimic_joint_coordinate(mimic_model, mimic_state, driver_q)
-    apply_legacy_mimic_coordinates(legacy_model, legacy_state, driver_q)
 
     newton.eval_fk(mimic_model, mimic_state.joint_q, mimic_state.joint_qd, mimic_state)
-    newton.eval_fk(legacy_model, legacy_state.joint_q, legacy_state.joint_qd, legacy_state)
     wp.synchronize()
 
     mimic_fk = _time_call(
         lambda: newton.eval_fk(mimic_model, mimic_state.joint_q, mimic_state.joint_qd, mimic_state),
-        samples=samples,
-        repeats=repeats,
-    )
-    legacy_fk = _time_call(
-        lambda: newton.eval_fk(legacy_model, legacy_state.joint_q, legacy_state.joint_qd, legacy_state),
-        samples=samples,
-        repeats=repeats,
-    )
-    legacy_propagate_fk = _time_call(
-        lambda: (
-            apply_legacy_mimic_coordinates(legacy_model, legacy_state, driver_q),
-            newton.eval_fk(legacy_model, legacy_state.joint_q, legacy_state.joint_qd, legacy_state),
-        ),
         samples=samples,
         repeats=repeats,
     )
@@ -196,14 +160,9 @@ def run_benchmark(*, samples: int, repeats: int, driver_q: float, device: str | 
         "repeats": repeats,
         "driver_q": driver_q,
         "device": str(wp.get_device()),
-        "mimic_as_joints": {
+        "mimic_joints": {
             "stats": _model_stats(mimic_model),
             "eval_fk_timing": mimic_fk,
-        },
-        "legacy_mimic_constraints": {
-            "stats": _model_stats(legacy_model),
-            "eval_fk_with_prepropagated_q_timing": legacy_fk,
-            "host_propagate_q_plus_eval_fk_timing": legacy_propagate_fk,
         },
     }
 
@@ -212,7 +171,7 @@ def write_gif(path: Path, *, frames: int = 36) -> None:
     import matplotlib.animation as animation  # noqa: PLC0415
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
-    model = build_robotiq_style_kinematic_model(mimic_as_joints=True)
+    model = build_robotiq_style_kinematic_model()
     state = model.state()
 
     fig, ax = plt.subplots(figsize=(4.8, 4.8))

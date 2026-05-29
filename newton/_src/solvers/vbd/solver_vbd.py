@@ -121,7 +121,7 @@ class SolverVBD(SolverBase):
         - :attr:`~newton.Control.joint_f` (feedforward forces) is supported.
         - Not supported: :attr:`~newton.Model.joint_armature`, :attr:`~newton.Model.joint_friction`,
           :attr:`~newton.Model.joint_effort_limit`, :attr:`~newton.Model.joint_velocity_limit`,
-          :attr:`~newton.Model.joint_target_mode`, equality constraints, mimic constraints.
+          :attr:`~newton.Model.joint_target_mode`, equality constraints, dependent-coordinate MIMIC joints.
 
         See :ref:`Joint feature support` for the full comparison across solvers.
 

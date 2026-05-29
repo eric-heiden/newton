@@ -1,17 +1,70 @@
-# Mimic Joints Prototype Report
+# Mimic Joints Clear-Cut Report
 
-This is the first report-ready pass for the API prototype that treats mimic relationships as zero-DOF joints. It is intentionally scoped to kinematics and importer behavior; full solver integration still needs separate design work.
+This branch now treats representable mimic relationships as joints, not as a parallel
+model-level mimic-constraint store. URDF and USD mimic metadata imports into
+zero-DOF `JointType.MIMIC` followers, FK derives follower transforms inline from the
+leader coordinate, and the MuJoCo bridge lowers those MIMIC joints internally when
+MuJoCo needs an equality row.
 
-## Prototype
+## Implementation
 
-- Added `JointType.MIMIC` as a zero-DOF follower joint.
-- Added per-joint metadata for `joint_mimic_leader`, `[offset, multiplier]`, follower scalar type, and follower axis.
-- Updated `eval_fk()` and batched IK FK evaluation so mimic followers are evaluated inline in the same articulation FK kernel.
-- Added `ModelBuilder.add_joint_mimic()` and a URDF prototype switch, `mimic_constraints_as_joints=True`, that maps representable URDF `<mimic>` tags to mimic joints instead of the existing separate mimic-constraint arrays.
+- `JointType.MIMIC` stores a zero-DOF follower joint in the normal joint tree.
+- Per-joint metadata records `joint_mimic_leader`, `[offset, multiplier]`, follower
+  scalar type, and follower axis.
+- URDF `<mimic>` tags import as MIMIC joints by default. The old
+  `mimic_constraints_as_joints` argument is retained only for call-site
+  compatibility; passing `False` no longer restores separate constraint storage.
+- USD `NewtonMimicAPI` and `PhysxMimicJointAPI` import as MIMIC joints, including
+  pending follower conversion when the referenced leader is parsed later.
+- `eval_fk()` and batched IK FK evaluation consume MIMIC joints directly.
+- `SolverMuJoCo` exports a synthetic scalar MuJoCo follower joint plus an
+  `mjEQ_JOINT` row for each Newton MIMIC joint. That equality row is solver-private
+  lowering, not a Newton model mimic-constraint representation.
 
-## Robotiq-Style Kinematics Example
+The legacy `ModelBuilder.add_constraint_mimic()` API remains present for older
+callers and existing tests, but importers and the report path no longer recommend it.
 
-The executable example is:
+## Branch vs Main Benchmarks
+
+Command used from each checkout:
+
+```bash
+uv run --with numpy --with warp-lang --with usd-core --with mujoco \
+  --with matplotlib --with pillow --with trimesh --with scipy \
+  reports/mimic_joints_prototype/benchmark_mimic_assets.py \
+  --samples 20 --repeats 3 \
+  --json-out reports/mimic_joints_prototype/asset_benchmark_branch.json
+```
+
+The main checkout used the same script from this branch and wrote
+`asset_benchmark_main.json`. Timings are per-sample FK means on `cuda:0`.
+
+| Asset | Branch coords / DOFs | Main coords / DOFs | Branch mimic joints / constraints | Main mimic joints / constraints | Branch FK mean | Main FK mean |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Synthetic Robotiq URDF | 1 / 1 | 6 / 6 | 5 / 0 | 0 / 5 | 352.2 us | 544.4 us |
+| Robotiq 2F85 USD | 6 / 6 | 14 / 12 | 0 / 0 | 0 / 1 | 343.9 us | 698.6 us |
+| Robotiq 2F85 MJCF | 6 / 6 | 14 / 12 | 0 / 0 | 0 / 1 | 351.0 us | 483.0 us |
+| LEAP hand MJCF | 16 / 16 | 16 / 16 | 0 / 0 | 0 / 0 | 408.5 us | 320.2 us |
+| Shadow hand MJCF | 24 / 24 | 24 / 24 | 0 / 0 | 0 / 0 | 401.2 us | 331.0 us |
+| Unitree G1 with hands URDF | 43 / 43 | 43 / 43 | 0 / 0 | 0 / 0 | 420.8 us | 400.1 us |
+
+The mimic-heavy Robotiq cases are the relevant comparison. The branch removes the
+extra follower coordinates and separate mimic-constraint storage from the synthetic
+URDF case, and the real Robotiq USD/MJCF imports no longer carry the main-branch
+mimic-constraint row. Assets without mimic relationships are included as control
+cases; they show no coordinate-count change and only ordinary run-to-run timing
+noise.
+
+## Real-Asset Captures
+
+Generated captures from the branch benchmark:
+
+- [Synthetic Robotiq URDF](videos/synthetic_robotiq_urdf.gif)
+- [Robotiq 2F85 USD](videos/robotiq_2f85_v4_usd.gif)
+- [LEAP hand MJCF](videos/leap_hand_right_mjcf.gif)
+- [Shadow hand MJCF](videos/shadow_hand_right_mjcf.gif)
+
+The minimal kinematic example remains available at:
 
 ```bash
 uv run --with numpy --with warp-lang --with matplotlib --with pillow \
@@ -21,40 +74,26 @@ uv run --with numpy --with warp-lang --with matplotlib --with pillow \
   --gif-out reports/mimic_joints_prototype/mimic_joint_kinematics.gif
 ```
 
-The model is a minimal Robotiq-2F85-style two-finger kinematic tree: one driver joint and five follower joints. It isolates the mimic relationship from the real menagerie asset's tendon, contact, and closed-loop equality details.
-
 ![Mimic joint kinematics](mimic_joint_kinematics.gif)
 
-## Initial Measurements
+## Solver Notes
 
-Generated on `cuda:0` with 20 samples and 2 repeats:
+FK and IK now have the cleanest behavior: the follower is a zero-DOF joint, its
+transform is derived inline from the leader, and no separate mimic-coordinate
+propagation step exists.
 
-| Representation | DOFs | Mimic joints | Mimic constraints | FK timing mean | Extra propagation timing |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Mimic as joints | 1 | 5 | 0 | 64.35 us | none |
-| Separate mimic constraints | 6 | 0 | 5 | 56.90 us with pre-propagated q | 207.51 us for host q propagation plus FK |
+MuJoCo support is implemented by solver-private lowering. Newton still stores the
+relationship as a MIMIC joint; MuJoCo receives the synthetic coordinate and
+`mjEQ_JOINT` row it needs for stepping.
 
-Interpretation: the single-kernel mimic-joint path does not yet win raw FK launch time in this tiny model, but it eliminates five independent coordinates and removes the separate "propagate mimic coordinates before FK" step needed when the current mimic-constraint representation is used for kinematics-only evaluation.
-
-## Solver Adaptation Notes
-
-For FK and IK target evaluation, mimic-as-joint is practical: the follower has no independent coordinate, and its transform can be derived inline from the leader coordinate in the FK kernel. That matches the way URDF and USD attach mimic metadata to joints.
-
-For maximal-coordinate solvers such as XPBD and Kamino, mimic-as-joint is only a kinematic representation unless the solver is taught how follower constraint impulses map back to the leader coordinate. Closed-loop mechanisms, including the full Robotiq menagerie model, still need equality/connect constraints for loop closure and contact-consistent dynamics.
-
-For generalized-coordinate solvers such as Featherstone, mimic followers reduce coordinates, but articulated inertia and forces from follower bodies must be accumulated through the leader's generalized coordinate. Treating the follower as a fixed zero-DOF joint without that mapping would move geometry correctly in FK but would not provide complete dynamics.
-
-For MuJoCo, the existing separate mimic/equality representation maps naturally to `mjEQ_JOINT`. A mimic-joint front-end would need to lower back to MuJoCo equality constraints for dynamic stepping unless the MuJoCo bridge adds dependent-coordinate handling explicitly.
+XPBD, Featherstone, Semi-Implicit, and VBD should implement dependent-coordinate
+force handling for MIMIC joints when they grow dynamic mimic support. They should
+not preserve or reintroduce a separate importer-facing mimic-constraint path for
+URDF/USD mimic metadata.
 
 ## Verdict
 
-Use mimic-as-joint as the user-facing/importer representation for kinematics and IK, but keep the separate mimic-constraint concept as a solver lowering target for dynamics until XPBD/Kamino/Featherstone/MuJoCo all have explicit dependent-coordinate force and constraint handling.
-
-The practical architecture is a hybrid: schemas and importers attach mimic metadata to joints, FK/IK consume that directly, and each solver either consumes the dependent joint natively or lowers it to the existing constraint/equality mechanism.
-
-## Remaining Work
-
-- Run larger timings on the real menagerie Robotiq assets and include CPU/GPU variance.
-- Publish this report under `reports.eric-heiden.com` by porting the markdown/data/GIF into the `academic-website` `gh-pages` layout used by the determinism report.
-- Add MP4/WebM video exports if the publishing environment has `ffmpeg`; this pass includes an animated GIF because the local environment only exposed the Pillow writer.
-- Decide whether MJCF `equality/joint` couplings should have their own mimic-joint prototype path or remain solver equality constraints.
+The clear cut is the right direction: mimics are joints. Importers should attach
+mimic metadata to joints, FK/IK should consume that directly, and solvers should
+either consume `JointType.MIMIC` natively or lower it internally without exposing a
+second model-level mimic representation.

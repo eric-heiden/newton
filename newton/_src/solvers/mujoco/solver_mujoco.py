@@ -81,6 +81,7 @@ from .kernels import (
     update_jnt_solref_from_invweight0_kernel,
     update_joint_transforms_kernel,
     update_mimic_eq_data_and_active_kernel,
+    update_mimic_joint_eq_data_and_active_kernel,
     update_mocap_transforms_kernel,
     update_model_properties_kernel,
     update_pair_properties_kernel,
@@ -303,7 +304,8 @@ class SolverMuJoCo(SolverBase):
           :attr:`~newton.Model.joint_effort_limit`, :attr:`~newton.Model.joint_limit_ke`/:attr:`~newton.Model.joint_limit_kd`,
           :attr:`~newton.Model.joint_target_ke`/:attr:`~newton.Model.joint_target_kd`,
           :attr:`~newton.Model.joint_target_mode`, and :attr:`~newton.Control.joint_f` are supported.
-        - Equality constraints (CONNECT, WELD, JOINT) and mimic constraints (REVOLUTE and PRISMATIC only) are supported.
+        - Equality constraints (CONNECT, WELD, JOINT) and zero-DOF MIMIC joints with REVOLUTE or PRISMATIC follower
+          semantics are supported.
         - :attr:`~newton.Model.joint_velocity_limit` and :attr:`~newton.Model.joint_enabled`
           are not supported.
 
@@ -3177,6 +3179,13 @@ class SolverMuJoCo(SolverBase):
         A value of -1 indicates that the MuJoCo equality constraint is not associated with a Newton mimic constraint.
 
         Shape [nworld, neq], dtype int32."""
+        self.mjc_eq_to_newton_mimic_joint: wp.array2d[wp.int32] | None = None
+        """Mapping from MuJoCo [world, eq] to Newton MIMIC joint index.
+
+        These entries are solver-internal scalar MuJoCo joints constrained by
+        ``mjEQ_JOINT`` and have no corresponding Newton DOF.
+
+        Shape [nworld, neq], dtype int32."""
         self.mjc_tendon_to_newton_tendon: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, tendon] to Newton tendon index.
 
@@ -3813,6 +3822,8 @@ class SolverMuJoCo(SolverBase):
                 model.joint_X_p,
                 model.body_com,
                 dof_ref,
+                model.joint_mimic_leader,
+                model.joint_mimic_coef,
                 self.mj_q_start,
                 self.mj_qd_start,
             ],
@@ -3903,7 +3914,13 @@ class SolverMuJoCo(SolverBase):
                 model.joint_X_c,
                 model.joint_axis,
                 model.joint_dof_dim,
+                model.joint_mimic_leader,
+                model.joint_mimic_coef,
+                model.joint_mimic_type,
+                model.joint_mimic_axis,
                 model.body_com,
+                model.body_flags,
+                BodyFlags.ALL,
             ],
             outputs=[
                 state.body_q,
@@ -4392,9 +4409,14 @@ class SolverMuJoCo(SolverBase):
         joint_limit_lower = model.joint_limit_lower.numpy()
         joint_limit_upper = model.joint_limit_upper.numpy()
         joint_type = model.joint_type.numpy()
+        joint_enabled = model.joint_enabled.numpy()
         joint_axis = model.joint_axis.numpy()
         joint_dof_dim = model.joint_dof_dim.numpy()
         joint_qd_start = model.joint_qd_start.numpy()
+        joint_mimic_leader = model.joint_mimic_leader.numpy()
+        joint_mimic_coef = model.joint_mimic_coef.numpy()
+        joint_mimic_type = model.joint_mimic_type.numpy()
+        joint_mimic_axis = model.joint_mimic_axis.numpy()
         joint_armature = model.joint_armature.numpy()
         joint_effort_limit = model.joint_effort_limit.numpy()
         # Per-DOF actuator arrays
@@ -5103,6 +5125,30 @@ class SolverMuJoCo(SolverBase):
                             mjc_actuator_ctrl_source_list.append(0)  # JOINT_TARGET
                             mjc_actuator_to_newton_idx_list.append(-(template_dof + 2))  # negative = velocity
                             actuator_count += 1
+            elif j_type == JointType.MIMIC:
+                mimic_type = joint_mimic_type[j]
+                if mimic_type not in (JointType.PRISMATIC, JointType.REVOLUTE):
+                    raise NotImplementedError(
+                        f"MIMIC joint {j} has unsupported follower type {JointType(mimic_type).name}"
+                    )
+
+                axis = wp.quat_rotate(joint_rot, wp.vec3(*joint_mimic_axis[j]))
+                mj_joint_type = (
+                    mujoco.mjtJoint.mjJNT_SLIDE
+                    if mimic_type == JointType.PRISMATIC
+                    else mujoco.mjtJoint.mjJNT_HINGE
+                )
+                body.add_joint(
+                    name=name,
+                    type=mj_joint_type,
+                    axis=axis,
+                    pos=joint_pos,
+                    limited=False,
+                )
+                mjc_joint_names.append(name)
+                num_dofs += 1
+                num_qpos += 1
+                num_mjc_joints += 1
             elif j_type in supported_joint_types:
                 lin_axis_count, ang_axis_count = joint_dof_dim[j]
                 multi_axis_joint = lin_axis_count + ang_axis_count > 1
@@ -5476,7 +5522,45 @@ class SolverMuJoCo(SolverBase):
                 )
                 continue
 
-        # add mimic constraints as mjEQ_JOINT equality constraints
+        # add zero-DOF MIMIC joints as internal mjEQ_JOINT equality constraints
+        mjc_eq_to_newton_mimic_joint_dict = {}
+        for j in selected_joints:
+            if joint_type[j] != JointType.MIMIC:
+                continue
+
+            leader = int(joint_mimic_leader[j])
+            follower_name = joint_mapping.get(j)
+            leader_name = joint_mapping.get(leader)
+            if follower_name is None or leader_name is None:
+                warnings.warn(
+                    f"Skipping MIMIC joint {j}: follower or leader joint {leader} "
+                    f"not found in MuJoCo joint mapping.",
+                    stacklevel=2,
+                )
+                continue
+
+            leader_type = joint_type[leader]
+            if leader_type not in (JointType.REVOLUTE, JointType.PRISMATIC):
+                warnings.warn(
+                    f"Skipping MIMIC joint {j}: leader joint {leader} has unsupported type "
+                    f"{JointType(leader_type).name} for mjEQ_JOINT.",
+                    stacklevel=2,
+                )
+                continue
+
+            eq = spec.add_equality()
+            eq.type = mujoco.mjtEq.mjEQ_JOINT
+            eq.active = bool(joint_enabled[j])
+            eq.name1 = follower_name
+            eq.name2 = leader_name
+            eq.data[0] = float(joint_mimic_coef[j, 0])
+            eq.data[1] = float(joint_mimic_coef[j, 1])
+            eq.data[2] = 0.0
+            eq.data[3] = 0.0
+            eq.data[4] = 0.0
+            mjc_eq_to_newton_mimic_joint_dict[eq.id] = j
+
+        # add legacy mimic constraints as mjEQ_JOINT equality constraints
         mjc_eq_to_newton_mimic_dict = {}
         for i in selected_mimic_constraints:
             j0 = mimic_joint0[i]  # follower
@@ -5859,6 +5943,14 @@ class SolverMuJoCo(SolverBase):
                 for w in range(nworld):
                     mjc_eq_to_newton_mimic_np[w, mjc_eq] = w * mimic_per_world + template_mimic
             self.mjc_eq_to_newton_mimic = wp.array(mjc_eq_to_newton_mimic_np, dtype=wp.int32)
+
+            # Create mjc_eq_to_newton_mimic_joint: MuJoCo[world, eq] -> Newton MIMIC joint
+            mjc_eq_to_newton_mimic_joint_np = np.full((nworld, neq), -1, dtype=np.int32)
+            for mjc_eq, newton_jnt in mjc_eq_to_newton_mimic_joint_dict.items():
+                template_jnt = newton_jnt % joints_per_world if joints_per_world > 0 else newton_jnt
+                for w in range(nworld):
+                    mjc_eq_to_newton_mimic_joint_np[w, mjc_eq] = w * joints_per_world + template_jnt
+            self.mjc_eq_to_newton_mimic_joint = wp.array(mjc_eq_to_newton_mimic_joint_np, dtype=wp.int32)
 
             # Create mjc_tendon_to_newton_tendon: MuJoCo[world, tendon] -> Newton tendon
             # selected_tendons[idx] is the Newton template tendon index
@@ -6367,6 +6459,9 @@ class SolverMuJoCo(SolverBase):
                 self.model.body_q,
                 dof_ref,
                 dof_springref,
+                self.model.joint_q,
+                self.model.joint_mimic_leader,
+                self.model.joint_mimic_coef,
                 self.mj_q_start,
             ],
             outputs=[
@@ -6507,7 +6602,13 @@ class SolverMuJoCo(SolverBase):
                 model.joint_X_c,
                 model.joint_axis,
                 model.joint_dof_dim,
+                model.joint_mimic_leader,
+                model.joint_mimic_coef,
+                model.joint_mimic_type,
+                model.joint_mimic_axis,
                 model.body_com,
+                model.body_flags,
+                BodyFlags.ALL,
             ],
             outputs=[
                 ref_body_q,
@@ -7181,40 +7282,60 @@ class SolverMuJoCo(SolverBase):
         )
 
     def _update_mimic_eq_properties(self):
-        """Update mimic constraint properties in the MuJoCo model.
+        """Update mimic-joint equality properties in the MuJoCo model.
 
         Updates:
 
-        - eq_data from Newton's constraint_mimic_coef0, constraint_mimic_coef1
-        - eq_active from Newton's constraint_mimic_enabled
+        - eq_data from Newton's MIMIC joint metadata and legacy mimic-constraint coefficients
+        - eq_active from Newton's joint/constraint enabled flags
 
-        Maps mimic constraints to MuJoCo mjEQ_JOINT equality constraints
-        using the polycoef representation: q1 = coef0 + coef1 * q2.
+        Maps zero-DOF Newton MIMIC joints to internal MuJoCo mjEQ_JOINT
+        equality constraints using the polycoef representation:
+        q1 = coef0 + coef1 * q2.
         """
-        if self.model.constraint_mimic_count == 0 or self.mjc_eq_to_newton_mimic is None:
+        has_legacy_mimic = self.model.constraint_mimic_count > 0 and self.mjc_eq_to_newton_mimic is not None
+        has_mimic_joints = self.mjc_eq_to_newton_mimic_joint is not None
+        if not has_legacy_mimic and not has_mimic_joints:
             return
 
         neq = self.mj_model.neq
         if neq == 0:
             return
 
-        world_count = self.mjc_eq_to_newton_mimic.shape[0]
+        if has_legacy_mimic:
+            world_count = self.mjc_eq_to_newton_mimic.shape[0]
+            wp.launch(
+                update_mimic_eq_data_and_active_kernel,
+                dim=(world_count, neq),
+                inputs=[
+                    self.mjc_eq_to_newton_mimic,
+                    self.model.constraint_mimic_coef0,
+                    self.model.constraint_mimic_coef1,
+                    self.model.constraint_mimic_enabled,
+                ],
+                outputs=[
+                    self.mjw_model.eq_data,
+                    self.mjw_data.eq_active,
+                ],
+                device=self.model.device,
+            )
 
-        wp.launch(
-            update_mimic_eq_data_and_active_kernel,
-            dim=(world_count, neq),
-            inputs=[
-                self.mjc_eq_to_newton_mimic,
-                self.model.constraint_mimic_coef0,
-                self.model.constraint_mimic_coef1,
-                self.model.constraint_mimic_enabled,
-            ],
-            outputs=[
-                self.mjw_model.eq_data,
-                self.mjw_data.eq_active,
-            ],
-            device=self.model.device,
-        )
+        if has_mimic_joints:
+            world_count = self.mjc_eq_to_newton_mimic_joint.shape[0]
+            wp.launch(
+                update_mimic_joint_eq_data_and_active_kernel,
+                dim=(world_count, neq),
+                inputs=[
+                    self.mjc_eq_to_newton_mimic_joint,
+                    self.model.joint_mimic_coef,
+                    self.model.joint_enabled,
+                ],
+                outputs=[
+                    self.mjw_model.eq_data,
+                    self.mjw_data.eq_active,
+                ],
+                device=self.model.device,
+            )
 
     def _update_tendon_properties(self):
         """Update fixed tendon properties in the MuJoCo model.

@@ -1730,37 +1730,27 @@ MIMIC_URDF = """
 """
 
 
-class TestMimicConstraints(unittest.TestCase):
+class TestMimicJoints(unittest.TestCase):
     """Tests for URDF mimic joint parsing."""
 
-    def test_mimic_constraint_basic(self):
-        """Test that mimic constraints are created from URDF mimic tags."""
+    def test_mimic_joint_basic(self):
+        """Test that URDF mimic tags are imported as zero-DOF MIMIC joints."""
         builder = newton.ModelBuilder()
         builder.add_urdf(MIMIC_URDF)
         model = builder.finalize()
 
-        # Should have 1 mimic constraint
-        self.assertEqual(model.constraint_mimic_count, 1)
-
-        # Check the constraint values
-        joint0 = model.constraint_mimic_joint0.numpy()[0]
-        joint1 = model.constraint_mimic_joint1.numpy()[0]
-        coef0 = model.constraint_mimic_coef0.numpy()[0]
-        coef1 = model.constraint_mimic_coef1.numpy()[0]
-        enabled = model.constraint_mimic_enabled.numpy()[0]
-
-        # Find joint indices by name
         leader_idx = model.joint_label.index("mimic_test/leader_joint")
         follower_idx = model.joint_label.index("mimic_test/follower_joint")
 
-        self.assertEqual(joint0, follower_idx)  # follower joint (joint0)
-        self.assertEqual(joint1, leader_idx)  # leader joint (joint1)
-        self.assertAlmostEqual(coef0, 0.5, places=5)
-        self.assertAlmostEqual(coef1, 2.0, places=5)
-        self.assertTrue(enabled)
+        self.assertEqual(model.constraint_mimic_count, 0)
+        self.assertEqual(model.joint_type.numpy()[follower_idx], newton.JointType.MIMIC)
+        self.assertEqual(model.joint_mimic_leader.numpy()[follower_idx], leader_idx)
+        np.testing.assert_allclose(model.joint_mimic_coef.numpy()[follower_idx], [0.5, 2.0], atol=1e-6)
+        self.assertEqual(model.joint_mimic_type.numpy()[follower_idx], newton.JointType.REVOLUTE)
+        np.testing.assert_allclose(model.joint_mimic_axis.numpy()[follower_idx], [0.0, 0.0, 1.0], atol=1e-6)
 
-    def test_mimic_constraint_default_values(self):
-        """Test mimic constraints with default coef1 and coef0."""
+    def test_mimic_joint_default_values(self):
+        """Test mimic joints with default coef1 and coef0."""
         urdf = """
         <robot name="mimic_defaults">
             <link name="base"/>
@@ -1781,32 +1771,35 @@ class TestMimicConstraints(unittest.TestCase):
         builder.add_urdf(urdf)
         model = builder.finalize()
 
-        self.assertEqual(model.constraint_mimic_count, 1)
-        coef0 = model.constraint_mimic_coef0.numpy()[0]
-        coef1 = model.constraint_mimic_coef1.numpy()[0]
+        follower_idx = model.joint_label.index("mimic_defaults/j2")
+        coef0, coef1 = model.joint_mimic_coef.numpy()[follower_idx]
 
         # Default values from URDF spec
+        self.assertEqual(model.constraint_mimic_count, 0)
+        self.assertEqual(model.joint_type.numpy()[follower_idx], newton.JointType.MIMIC)
         self.assertAlmostEqual(coef0, 0.0, places=5)
         self.assertAlmostEqual(coef1, 1.0, places=5)
 
-    def test_mimic_tags_can_import_as_mimic_joints(self):
-        """Prototype mode maps URDF mimic tags to zero-DOF MIMIC joints."""
-        builder = newton.ModelBuilder()
-        builder.add_urdf(MIMIC_URDF, mimic_constraints_as_joints=True)
-        model = builder.finalize()
+    def test_mimic_compatibility_flag_does_not_restore_constraint_storage(self):
+        """The deprecated compatibility flag no longer creates separate mimic constraints."""
+        for mimic_constraints_as_joints in (True, False):
+            with self.subTest(mimic_constraints_as_joints=mimic_constraints_as_joints):
+                builder = newton.ModelBuilder()
+                builder.add_urdf(MIMIC_URDF, mimic_constraints_as_joints=mimic_constraints_as_joints)
+                model = builder.finalize()
 
-        leader_idx = model.joint_label.index("mimic_test/leader_joint")
-        follower_idx = model.joint_label.index("mimic_test/follower_joint")
+                leader_idx = model.joint_label.index("mimic_test/leader_joint")
+                follower_idx = model.joint_label.index("mimic_test/follower_joint")
 
-        self.assertEqual(model.constraint_mimic_count, 0)
-        self.assertEqual(model.joint_type.numpy()[follower_idx], newton.JointType.MIMIC)
-        self.assertEqual(model.joint_mimic_leader.numpy()[follower_idx], leader_idx)
-        np.testing.assert_allclose(model.joint_mimic_coef.numpy()[follower_idx], [0.5, 2.0], atol=1e-6)
+                self.assertEqual(model.constraint_mimic_count, 0)
+                self.assertEqual(model.joint_type.numpy()[follower_idx], newton.JointType.MIMIC)
+                self.assertEqual(model.joint_mimic_leader.numpy()[follower_idx], leader_idx)
+                np.testing.assert_allclose(model.joint_mimic_coef.numpy()[follower_idx], [0.5, 2.0], atol=1e-6)
 
-        leader_dofs = model.joint_qd_start.numpy()[leader_idx + 1] - model.joint_qd_start.numpy()[leader_idx]
-        follower_dofs = model.joint_qd_start.numpy()[follower_idx + 1] - model.joint_qd_start.numpy()[follower_idx]
-        self.assertEqual(leader_dofs, 1)
-        self.assertEqual(follower_dofs, 0)
+                leader_dofs = model.joint_qd_start.numpy()[leader_idx + 1] - model.joint_qd_start.numpy()[leader_idx]
+                follower_dofs = model.joint_qd_start.numpy()[follower_idx + 1] - model.joint_qd_start.numpy()[follower_idx]
+                self.assertEqual(leader_dofs, 1)
+                self.assertEqual(follower_dofs, 0)
 
     def test_mimic_joint_skipped_child_does_not_mismatch(self):
         """Regression test: skipped joints must not be included in name->index mapping."""
@@ -1841,10 +1834,10 @@ class TestMimicConstraints(unittest.TestCase):
         """
 
         builder = _SkippingLinkBuilder()
-        with self.assertWarnsRegex(UserWarning, "was not created, skipping mimic constraint"):
+        with self.assertWarnsRegex(UserWarning, "was not created, skipping mimic joint"):
             builder.add_urdf(urdf, joint_ordering=None)
 
-        # No mimic constraint should be created because the follower joint was skipped.
+        # No mimic representation should be created because the follower joint was skipped.
         self.assertEqual(len(builder.constraint_mimic_joint0), 0)
 
 

@@ -1,0 +1,128 @@
+{
+  "assets": {
+    "leap_hand_right_mjcf": {
+      "eval_fk_timing": {
+        "max_us": 326.8130589276552,
+        "mean_us": 320.173567160964,
+        "median_us": 318.613788112998,
+        "min_us": 315.0938544422388
+      },
+      "kind": "mjcf",
+      "source": "/home/horde/.cache/newton/mujoco_menagerie_leap_hand_d94a1630_feadf76d/leap_hand/right_hand.xml",
+      "stats": {
+        "body_count": 17,
+        "equality_constraint_count": 0,
+        "joint_coord_count": 16,
+        "joint_count": 17,
+        "joint_dof_count": 16,
+        "mimic_constraint_count": 0,
+        "mimic_joint_count": 0,
+        "shape_count": 67
+      }
+    },
+    "robotiq_2f85_v4_mjcf": {
+      "eval_fk_timing": {
+        "max_us": 489.239813759923,
+        "mean_us": 482.96754248440266,
+        "median_us": 481.99757002294064,
+        "min_us": 477.66524367034435
+      },
+      "kind": "mjcf",
+      "source": "/home/horde/.cache/newton/mujoco_menagerie_robotiq_2f85_v4_f233abbd_feadf76d/robotiq_2f85_v4/2f85.xml",
+      "stats": {
+        "body_count": 11,
+        "equality_constraint_count": 3,
+        "joint_coord_count": 14,
+        "joint_count": 13,
+        "joint_dof_count": 12,
+        "mimic_constraint_count": 1,
+        "mimic_joint_count": 0,
+        "shape_count": 4
+      }
+    },
+    "robotiq_2f85_v4_usd": {
+      "eval_fk_timing": {
+        "max_us": 809.2817850410938,
+        "mean_us": 698.6132822930812,
+        "median_us": 740.3999101370573,
+        "min_us": 546.1581517010927
+      },
+      "kind": "usd",
+      "source": "/home/horde/apps/newton-assets/robotiq_2f85_v4/usd_structured/Dual_wrist_camera.usda",
+      "stats": {
+        "body_count": 11,
+        "equality_constraint_count": 3,
+        "joint_coord_count": 14,
+        "joint_count": 13,
+        "joint_dof_count": 12,
+        "mimic_constraint_count": 1,
+        "mimic_joint_count": 0,
+        "shape_count": 28
+      }
+    },
+    "shadow_hand_right_mjcf": {
+      "eval_fk_timing": {
+        "max_us": 339.31187354028225,
+        "mean_us": 331.03918346265954,
+        "median_us": 332.40076154470444,
+        "min_us": 321.40491530299187
+      },
+      "kind": "mjcf",
+      "source": "/home/horde/.cache/newton/mujoco_menagerie_shadow_hand_46b0dcac_feadf76d/shadow_hand/right_hand.xml",
+      "stats": {
+        "body_count": 25,
+        "equality_constraint_count": 0,
+        "joint_coord_count": 24,
+        "joint_count": 25,
+        "joint_dof_count": 24,
+        "mimic_constraint_count": 0,
+        "mimic_joint_count": 0,
+        "shape_count": 33
+      }
+    },
+    "synthetic_robotiq_urdf": {
+      "eval_fk_timing": {
+        "max_us": 592.1884439885616,
+        "mean_us": 544.4129463285209,
+        "median_us": 555.0038069486618,
+        "min_us": 486.0465880483389
+      },
+      "kind": "urdf",
+      "source": "inline synthetic URDF",
+      "stats": {
+        "body_count": 7,
+        "equality_constraint_count": 0,
+        "joint_coord_count": 6,
+        "joint_count": 7,
+        "joint_dof_count": 6,
+        "mimic_constraint_count": 5,
+        "mimic_joint_count": 0,
+        "shape_count": 0
+      }
+    },
+    "unitree_g1_with_hands_urdf": {
+      "eval_fk_timing": {
+        "max_us": 415.89438915252686,
+        "mean_us": 400.1481148103873,
+        "median_us": 400.13822726905346,
+        "min_us": 384.41172800958157
+      },
+      "kind": "urdf",
+      "source": "/home/horde/apps/newton-assets/unitree_g1/urdf/g1_29dof_with_hand_rev_1_0.urdf",
+      "stats": {
+        "body_count": 53,
+        "equality_constraint_count": 0,
+        "joint_coord_count": 43,
+        "joint_count": 53,
+        "joint_dof_count": 43,
+        "mimic_constraint_count": 0,
+        "mimic_joint_count": 0,
+        "shape_count": 101
+      }
+    }
+  },
+  "device": "cuda:0",
+  "newton_file": "/tmp/newton-main-benchmark/newton/__init__.py",
+  "repeats": 3,
+  "samples": 20
+}

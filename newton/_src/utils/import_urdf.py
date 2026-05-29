@@ -74,7 +74,7 @@ def parse_urdf(
     mesh_maxhullvert: int | None = None,
     force_position_velocity_actuation: bool = False,
     override_root_xform: bool = False,
-    mimic_constraints_as_joints: bool = False,
+    mimic_constraints_as_joints: bool = True,
 ):
     """
     Parses a URDF file and adds the bodies and joints to the given ModelBuilder.
@@ -173,9 +173,10 @@ def parse_urdf(
             :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
             damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
             (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
-        mimic_constraints_as_joints: Prototype path that imports URDF ``<mimic>`` tags as zero-DOF
-            :attr:`~newton.JointType.MIMIC` follower joints when the scalar leader has already been created.
-            Tags that cannot be represented this way fall back to the existing mimic-constraint path.
+        mimic_constraints_as_joints: Deprecated compatibility flag retained for callers that already pass it.
+            URDF ``<mimic>`` tags are imported as zero-DOF :attr:`~newton.JointType.MIMIC`
+            follower joints when the scalar leader has already been created, regardless of this flag.
+            Tags that cannot be represented this way are imported as independent joints with a warning.
     """
     # Early validation of base joint parameters
     builder._validate_base_joint_params(floating, base_joint, parent_body)
@@ -748,11 +749,15 @@ def parse_urdf(
     # add joints, in the desired order starting from root body
     # Track only joints that are actually created (some may be skipped if their child body wasn't inserted).
     joint_name_to_idx: dict[str, int] = {}
-    mimic_joint_names: set[str] = set()
     for joint in sorted_joints:
         parent = link_index[joint["parent"]]
         child = link_index[joint["child"]]
         if child == -1:
+            if "mimic_joint" in joint:
+                warnings.warn(
+                    f"Mimic joint '{joint['name']}' was not created, skipping mimic joint",
+                    stacklevel=2,
+                )
             # we skipped the insertion of the child body
             continue
 
@@ -781,8 +786,7 @@ def parse_urdf(
         created_joint_idx: int
         mimic_leader_name = joint.get("mimic_joint")
         if (
-            mimic_constraints_as_joints
-            and mimic_leader_name in joint_name_to_idx
+            mimic_leader_name in joint_name_to_idx
             and (joint["type"] == "revolute" or joint["type"] == "continuous" or joint["type"] == "prismatic")
         ):
             mimic_type = JointType.PRISMATIC if joint["type"] == "prismatic" else JointType.REVOLUTE
@@ -794,8 +798,13 @@ def parse_urdf(
                 mimic_type=mimic_type,
                 **joint_params,
             )
-            mimic_joint_names.add(joint["name"])
         elif joint["type"] == "revolute" or joint["type"] == "continuous":
+            if "mimic_joint" in joint:
+                warnings.warn(
+                    f"Mimic joint '{joint['name']}' references unknown or not-yet-created joint "
+                    f"'{mimic_leader_name}', importing it as an independent joint",
+                    stacklevel=2,
+                )
             created_joint_idx = builder.add_joint_revolute(
                 axis=joint["axis"],
                 target_kd=joint_damping,
@@ -807,6 +816,12 @@ def parse_urdf(
                 **joint_params,
             )
         elif joint["type"] == "prismatic":
+            if "mimic_joint" in joint:
+                warnings.warn(
+                    f"Mimic joint '{joint['name']}' references unknown or not-yet-created joint "
+                    f"'{mimic_leader_name}', importing it as an independent joint",
+                    stacklevel=2,
+                )
             created_joint_idx = builder.add_joint_prismatic(
                 axis=joint["axis"],
                 target_kd=joint_damping,
@@ -861,37 +876,6 @@ def parse_urdf(
 
         joint_indices.append(created_joint_idx)
         joint_name_to_idx[joint["name"]] = created_joint_idx
-
-    # Create mimic constraints
-    for joint in sorted_joints:
-        if "mimic_joint" in joint:
-            if joint["name"] in mimic_joint_names:
-                continue
-            mimic_target_name = joint["mimic_joint"]
-            if mimic_target_name not in joint_name_to_idx:
-                warnings.warn(
-                    f"Mimic joint '{joint['name']}' references unknown joint '{mimic_target_name}', skipping mimic constraint",
-                    stacklevel=2,
-                )
-                continue
-
-            follower_idx = joint_name_to_idx.get(joint["name"])
-            leader_idx = joint_name_to_idx.get(mimic_target_name)
-
-            if follower_idx is None:
-                warnings.warn(
-                    f"Mimic joint '{joint['name']}' was not created, skipping mimic constraint",
-                    stacklevel=2,
-                )
-                continue
-
-            builder.add_constraint_mimic(
-                joint0=follower_idx,
-                joint1=leader_idx,
-                coef0=joint.get("mimic_coef0", 0.0),
-                coef1=joint.get("mimic_coef1", 1.0),
-                label=make_label(f"mimic_{joint['name']}"),
-            )
 
     # Create articulation from all collected joints
     articulation_custom_attrs = parse_custom_attributes(

@@ -48,7 +48,7 @@ class SolverSemiImplicit(SolverBase):
         - :attr:`~newton.Model.joint_armature`, :attr:`~newton.Model.joint_friction`,
           :attr:`~newton.Model.joint_effort_limit`, :attr:`~newton.Model.joint_velocity_limit`,
           and :attr:`~newton.Model.joint_target_mode` are not supported.
-        - Equality and mimic constraints are not supported.
+        - Equality constraints and dependent-coordinate MIMIC joints are not supported.
 
         See :ref:`Joint feature support` for the full comparison across solvers.
 

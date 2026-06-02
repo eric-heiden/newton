@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+import unittest
+
+import numpy as np
+
+from newton.examples.cutting.cutting_common import (
+    CutMaterial,
+    KnifeProfile,
+    compute_particle_cut_update,
+    summarize_force_profile,
+)
+
+
+class TestCuttingCommon(unittest.TestCase):
+    def test_knife_cut_weights_are_localized_to_process_zone(self):
+        knife = KnifeProfile(
+            start_x=-0.1,
+            speed=1.0,
+            center_y=0.0,
+            center_z=0.0,
+            half_width_y=0.4,
+            half_width_z=0.2,
+            process_width=0.05,
+        )
+        points = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.049, 0.0, 0.0],
+                [0.08, 0.0, 0.0],
+                [0.0, 0.5, 0.0],
+                [0.0, 0.0, 0.3],
+            ],
+            dtype=np.float32,
+        )
+
+        weights = knife.cut_weights(points, time=0.1)
+
+        self.assertAlmostEqual(weights[0], 1.0, places=5)
+        self.assertGreater(weights[1], 0.0)
+        self.assertEqual(weights[2], 0.0)
+        self.assertEqual(weights[3], 0.0)
+        self.assertEqual(weights[4], 0.0)
+
+    def test_particle_damage_monotonic_and_force_scales_with_toughness(self):
+        points = np.array(
+            [
+                [0.0, -0.05, 0.0],
+                [0.01, 0.05, 0.0],
+                [0.25, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        damage = np.array([0.0, 0.5, 0.2], dtype=np.float32)
+        knife = KnifeProfile(start_x=0.0, speed=0.0, half_width_y=0.2, half_width_z=0.2, process_width=0.05)
+        soft = CutMaterial(fracture_energy=25.0, yield_stress=2.0e3, max_damage_rate=10.0)
+        tough = CutMaterial(fracture_energy=100.0, yield_stress=2.0e3, max_damage_rate=10.0)
+
+        soft_update = compute_particle_cut_update(points, damage, knife, soft, dt=0.02, particle_volume=1.0e-6)
+        tough_update = compute_particle_cut_update(points, damage, knife, tough, dt=0.02, particle_volume=1.0e-6)
+
+        self.assertTrue(np.all(soft_update.damage >= damage))
+        self.assertEqual(soft_update.active_count, 2)
+        self.assertEqual(soft_update.damage[2], damage[2])
+        self.assertGreater(soft_update.force, 0.0)
+        self.assertGreater(tough_update.force, soft_update.force)
+
+    def test_force_profile_summary(self):
+        summary = summarize_force_profile(
+            times=np.array([0.0, 0.1, 0.2, 0.3]),
+            forces=np.array([0.0, 2.0, 4.0, 0.0]),
+            damage=np.array([0.0, 0.2, 0.5, 0.75]),
+        )
+
+        self.assertAlmostEqual(summary["peak_force_n"], 4.0)
+        self.assertAlmostEqual(summary["mean_force_n"], 1.5)
+        self.assertAlmostEqual(summary["force_impulse_ns"], 0.6)
+        self.assertAlmostEqual(summary["final_mean_damage"], 0.75)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

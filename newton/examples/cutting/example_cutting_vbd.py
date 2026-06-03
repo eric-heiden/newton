@@ -3,6 +3,8 @@
 
 """Mesh-based VBD cutting track for a soft cuboid and moving knife."""
 
+import argparse
+
 import numpy as np
 import warp as wp
 
@@ -12,6 +14,7 @@ from newton.examples.cutting.cutting_common import (
     CutMaterial,
     ForceHistory,
     KnifeProfile,
+    SplitCuboidRenderMesh,
     add_cutting_artifact_args,
     estimate_particle_volume_from_grid,
     launch_cut_tet_degradation,
@@ -103,6 +106,17 @@ class Example:
         self.particle_volume = estimate_particle_volume_from_grid(tuple(self.block_size), self.model.particle_count)
         self.damage_threshold = args.tet_damage_threshold
         self.residual_stiffness = args.residual_stiffness
+        self.render_split_mesh = (
+            SplitCuboidRenderMesh(
+                self.block_pos,
+                self.block_pos + self.block_size,
+                self.knife,
+                max_gap=args.render_gap,
+                segments=args.render_mesh_segments,
+            )
+            if args.render_split_mesh
+            else None
+        )
 
         self.viewer.set_model(self.model)
         if hasattr(self.viewer, "set_camera"):
@@ -163,7 +177,15 @@ class Example:
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
-        self.viewer.log_state(self.state_0)
+        if self.render_split_mesh is not None:
+            self.render_split_mesh.log(
+                self.viewer,
+                self.model.device,
+                self.sim_time,
+                surface_color=(0.95, 0.58, 0.18),
+            )
+        else:
+            self.viewer.log_state(self.state_0)
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.log_points(
             name="/cutting/vbd_damage_particles",
@@ -210,6 +232,9 @@ class Example:
         parser.add_argument("--density", type=float, default=950.0)
         parser.add_argument("--gravity", type=float, nargs=3, default=[0.0, 0.0, -9.81])
         parser.add_argument("--particle-radius", type=float, default=0.018)
+        parser.add_argument("--render-split-mesh", action=argparse.BooleanOptionalAction, default=True)
+        parser.add_argument("--render-gap", type=float, default=0.14)
+        parser.add_argument("--render-mesh-segments", type=int, default=56)
 
         parser.add_argument("--knife-start-x", type=float, default=-0.55)
         parser.add_argument("--knife-speed", type=float, default=0.75)

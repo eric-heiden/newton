@@ -3,6 +3,7 @@
 
 """MPM baseline for cutting a soft cuboid with a moving knife."""
 
+import argparse
 import warnings
 
 import numpy as np
@@ -14,6 +15,7 @@ from newton.examples.cutting.cutting_common import (
     CutMaterial,
     ForceHistory,
     KnifeProfile,
+    SplitCuboidRenderMesh,
     add_cutting_artifact_args,
     estimate_particle_volume_from_grid,
     launch_mpm_knife_cut,
@@ -92,6 +94,17 @@ class Example:
         )
         self.cut_accum = wp.zeros(3, dtype=wp.float32, device=self.model.device)
         self.particle_volume = estimate_particle_volume_from_grid(tuple(self.block_size), self.model.particle_count)
+        self.render_split_mesh = (
+            SplitCuboidRenderMesh(
+                self.block_lo,
+                self.block_hi,
+                self.knife,
+                max_gap=args.render_gap,
+                segments=args.render_mesh_segments,
+            )
+            if args.render_split_mesh
+            else None
+        )
 
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
@@ -168,7 +181,10 @@ class Example:
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
-        self.viewer.log_state(self.state_0)
+        if self.render_split_mesh is not None:
+            self.render_split_mesh.log(self.viewer, self.model.device, self.sim_time)
+        else:
+            self.viewer.log_state(self.state_0)
         self.viewer.log_points(
             name="/model/particles",
             points=self.state_0.particle_q,
@@ -206,6 +222,9 @@ class Example:
         parser.add_argument("--gravity", type=float, nargs=3, default=[0.0, 0.0, -9.81])
         parser.add_argument("--density", type=float, default=950.0)
         parser.add_argument("--particles-per-cell", type=int, default=2)
+        parser.add_argument("--render-split-mesh", action=argparse.BooleanOptionalAction, default=True)
+        parser.add_argument("--render-gap", type=float, default=0.14)
+        parser.add_argument("--render-mesh-segments", type=int, default=56)
 
         parser.add_argument("--knife-start-x", type=float, default=-0.55)
         parser.add_argument("--knife-speed", type=float, default=0.75)

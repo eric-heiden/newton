@@ -102,6 +102,149 @@ class ParticleCutUpdate:
     mean_damage: float
 
 
+class SplitCuboidRenderMesh:
+    """Render-only cuboid remesh with duplicated seam vertices and cut walls.
+
+    This is deliberately a visualization layer. It keeps a fixed topology so it
+    can be updated every frame, while the vertices around the knife path are
+    duplicated and separated to show a visible slit behind the blade.
+    """
+
+    def __init__(
+        self,
+        block_lo: tuple[float, float, float] | np.ndarray,
+        block_hi: tuple[float, float, float] | np.ndarray,
+        knife: KnifeProfile,
+        max_gap: float = 0.12,
+        segments: int = 48,
+        front_width: float | None = None,
+    ):
+        self.block_lo = np.asarray(block_lo, dtype=np.float32)
+        self.block_hi = np.asarray(block_hi, dtype=np.float32)
+        self.knife = knife
+        self.max_gap = float(max_gap)
+        self.segments = int(max(2, segments))
+        self.front_width = float(front_width if front_width is not None else max(2.0 * knife.process_width, 1.0e-4))
+        self.x_values = np.linspace(self.block_lo[0], self.block_hi[0], self.segments + 1, dtype=np.float32)
+
+        surface_points, wall_points = self.build_points(time=0.0)
+        self.surface_points_np = surface_points
+        self.wall_points_np = wall_points
+        self.surface_indices_np = self._quad_indices(len(surface_points) // 4)
+        self.wall_indices_np = self._quad_indices(len(wall_points) // 4)
+
+        self.surface_points_wp: wp.array | None = None
+        self.wall_points_wp: wp.array | None = None
+        self.surface_indices_wp: wp.array | None = None
+        self.wall_indices_wp: wp.array | None = None
+
+    @staticmethod
+    def _quad_indices(quad_count: int) -> np.ndarray:
+        indices = np.empty(quad_count * 6, dtype=np.int32)
+        for q in range(quad_count):
+            v = q * 4
+            indices[q * 6 : q * 6 + 6] = [v, v + 1, v + 2, v, v + 2, v + 3]
+        return indices
+
+    @staticmethod
+    def _smoothstep(value: float) -> float:
+        x = min(1.0, max(0.0, value))
+        return x * x * (3.0 - 2.0 * x)
+
+    @staticmethod
+    def _append_quad(vertices: list[list[float]], a, b, c, d):
+        vertices.extend([list(a), list(b), list(c), list(d)])
+
+    def gap_at(self, x: float, time: float) -> float:
+        knife_x = self.knife.x_at(time)
+        return self.max_gap * self._smoothstep((knife_x - float(x)) / self.front_width)
+
+    def build_points(self, time: float) -> tuple[np.ndarray, np.ndarray]:
+        lo = self.block_lo
+        hi = self.block_hi
+        z0 = float(lo[2])
+        z1 = float(hi[2])
+        surface: list[list[float]] = []
+        walls: list[list[float]] = []
+        gaps = np.array([self.gap_at(float(x), time) for x in self.x_values], dtype=np.float32)
+
+        for side in (-1.0, 1.0):
+            y_outer = float(lo[1] if side < 0.0 else hi[1])
+            for i in range(self.segments):
+                x0 = float(self.x_values[i])
+                x1 = float(self.x_values[i + 1])
+                y_cut0 = self.knife.center_y + side * 0.5 * float(gaps[i])
+                y_cut1 = self.knife.center_y + side * 0.5 * float(gaps[i + 1])
+
+                self._append_quad(surface, (x0, y_outer, z1), (x1, y_outer, z1), (x1, y_cut1, z1), (x0, y_cut0, z1))
+                self._append_quad(surface, (x0, y_cut0, z0), (x1, y_cut1, z0), (x1, y_outer, z0), (x0, y_outer, z0))
+                self._append_quad(surface, (x0, y_outer, z0), (x1, y_outer, z0), (x1, y_outer, z1), (x0, y_outer, z1))
+                self._append_quad(walls, (x0, y_cut0, z0), (x1, y_cut1, z0), (x1, y_cut1, z1), (x0, y_cut0, z1))
+
+                if i == 0:
+                    self._append_quad(
+                        surface,
+                        (x0, y_outer, z0),
+                        (x0, y_cut0, z0),
+                        (x0, y_cut0, z1),
+                        (x0, y_outer, z1),
+                    )
+                if i == self.segments - 1:
+                    self._append_quad(
+                        surface,
+                        (x1, y_cut1, z0),
+                        (x1, y_outer, z0),
+                        (x1, y_outer, z1),
+                        (x1, y_cut1, z1),
+                    )
+
+        return np.asarray(surface, dtype=np.float32), np.asarray(walls, dtype=np.float32)
+
+    def _ensure_device_arrays(self, device):
+        if self.surface_points_wp is not None:
+            return
+        self.surface_points_wp = wp.array(self.surface_points_np, dtype=wp.vec3, device=device)
+        self.wall_points_wp = wp.array(self.wall_points_np, dtype=wp.vec3, device=device)
+        self.surface_indices_wp = wp.array(self.surface_indices_np, dtype=wp.int32, device=device)
+        self.wall_indices_wp = wp.array(self.wall_indices_np, dtype=wp.int32, device=device)
+
+    def log(
+        self,
+        viewer,
+        device,
+        time: float,
+        prefix: str = "/cutting/render_split",
+        surface_color: tuple[float, float, float] = (0.18, 0.62, 0.95),
+        wall_color: tuple[float, float, float] = (0.95, 0.32, 0.42),
+    ):
+        self._ensure_device_arrays(device)
+        self.surface_points_np, self.wall_points_np = self.build_points(time)
+        assert self.surface_points_wp is not None
+        assert self.wall_points_wp is not None
+        assert self.surface_indices_wp is not None
+        assert self.wall_indices_wp is not None
+        self.surface_points_wp.assign(self.surface_points_np)
+        self.wall_points_wp.assign(self.wall_points_np)
+        viewer.log_mesh(
+            f"{prefix}/surface",
+            self.surface_points_wp,
+            self.surface_indices_wp,
+            hidden=False,
+            backface_culling=False,
+            color=surface_color,
+            roughness=0.68,
+        )
+        viewer.log_mesh(
+            f"{prefix}/cut_walls",
+            self.wall_points_wp,
+            self.wall_indices_wp,
+            hidden=self.knife.x_at(time) < self.block_lo[0],
+            backface_culling=False,
+            color=wall_color,
+            roughness=0.82,
+        )
+
+
 @dataclass
 class RuntimeStats:
     solver: str

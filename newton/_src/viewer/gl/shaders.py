@@ -49,6 +49,9 @@ layout (location = 7) in vec3 aObjectColor;
 // material properties
 layout (location = 8) in vec4 aMaterial;
 
+// per-shape opacity
+layout (location = 9) in float aOpacity;
+
 uniform mat4 view;
 uniform mat4 projection;
 uniform mat4 light_space_matrix;
@@ -60,6 +63,7 @@ out vec2 TexCoord;
 out vec3 ObjectColor;
 out vec4 FragPosLightSpace;
 out vec4 Material;
+out float Opacity;
 
 void main()
 {
@@ -83,6 +87,7 @@ void main()
     ObjectColor = aObjectColor;
     FragPosLightSpace = light_space_matrix * worldPos;
     Material = aMaterial;
+    Opacity = aOpacity;
 }
 """
 
@@ -97,6 +102,7 @@ in vec2 TexCoord;
 in vec3 ObjectColor; // used as albedo
 in vec4 FragPosLightSpace;
 in vec4 Material;
+in float Opacity;
 
 uniform vec3 view_pos;
 uniform vec3 light_color;
@@ -382,7 +388,7 @@ void main()
     // gamma correction (sRGB)
     color = pow(color, vec3(1.0 / 2.2));
 
-    FragColor = vec4(color, 1.0);
+    FragColor = vec4(color, clamp(Opacity, 0.0, 1.0));
 }
 """
 

@@ -586,6 +586,7 @@ class ViewerViser(ViewerBase):
         color: tuple[float, float, float] | None = None,
         roughness: float | None = None,
         metallic: float | None = None,
+        opacity: float | None = None,
     ):
         """
         Log a mesh to viser for visualization.
@@ -605,6 +606,7 @@ class ViewerViser(ViewerBase):
                 smooth, ``1`` is fully rough.
             metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
                 is metal.
+            opacity: Surface opacity in ``[0, 1]``. Unused by this backend.
         """
         assert isinstance(points, wp.array)
         assert isinstance(indices, wp.array)

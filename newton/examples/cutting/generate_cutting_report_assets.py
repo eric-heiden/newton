@@ -21,6 +21,7 @@ from newton.examples.cutting.cutting_common import (
     RuntimeStats,
     SplitCuboidRenderMesh,
     TetMeshCutSurfaceRenderer,
+    capture_viewer_frame,
     collect_hardware_details,
     encode_mp4,
     export_remesh_artifacts,
@@ -60,13 +61,16 @@ class _NullViewer:
         return None
 
 
-def _parse_example_args(example_cls, argv: list[str]):
+def _parse_example_args(example_cls, argv: list[str], viewer_name: str = "null", headless: bool = False):
     old_argv = sys.argv
     try:
-        sys.argv = ["generate_cutting_report_assets", "--viewer", "null", "--quiet", *argv]
+        sys.argv = ["generate_cutting_report_assets", "--viewer", viewer_name, "--quiet"]
+        if headless:
+            sys.argv.append("--headless")
+        sys.argv.extend(argv)
         parser = example_cls.create_parser()
-        _viewer, args = newton.examples.init(parser)
-        return args
+        viewer, args = newton.examples.init(parser)
+        return viewer, args
     finally:
         sys.argv = old_argv
 
@@ -414,39 +418,49 @@ def _run_case(
     wall_color: tuple[float, float, float],
     frame_count: int,
     video_fps: float,
+    viewer=None,
 ):
-    args = _parse_example_args(example_cls, [*argv, "--num-frames", str(frame_count)])
-    example = example_cls(_NullViewer(), args)
-
-    snapshots: list[dict[str, object]] = []
-    remesh_history: list[dict[str, float]] = []
-    step_times: list[float] = []
-    for _frame in range(frame_count):
-        start = time.perf_counter()
-        example.step()
-        step_times.append(time.perf_counter() - start)
-        snapshot, stats = _snapshot(example)
-        snapshots.append(snapshot)
-        if stats:
-            remesh_history.append({"time_s": float(example.sim_time), **stats})
-
-    bounds = _bounds_from_snapshots(snapshots)
-    frames: list[np.ndarray] = []
-    render_times: list[float] = []
-    for i, snapshot in enumerate(snapshots):
-        start = time.perf_counter()
-        frames.append(
-            _render_frame(
-                snapshot,
-                example.force_history,
-                i,
-                bounds,
-                title,
-                surface_color=surface_color,
-                wall_color=wall_color,
-            )
+    owns_viewer = viewer is None
+    if owns_viewer:
+        viewer, args = _parse_example_args(
+            example_cls,
+            [*argv, "--num-frames", str(frame_count)],
+            viewer_name="gl",
+            headless=True,
         )
-        render_times.append(time.perf_counter() - start)
+    else:
+        parsed_viewer, args = _parse_example_args(
+            example_cls,
+            [*argv, "--num-frames", str(frame_count)],
+            viewer_name="null",
+            headless=False,
+        )
+        parsed_viewer.close()
+        if hasattr(viewer, "clear_model"):
+            viewer.clear_model()
+
+    example = example_cls(viewer, args)
+    if hasattr(viewer, "hide_loading_splash"):
+        viewer.hide_loading_splash()
+
+    frames: list[np.ndarray] = []
+    step_times: list[float] = []
+    render_times: list[float] = []
+    try:
+        for _frame in range(frame_count):
+            step_start = time.perf_counter()
+            example.step()
+            step_times.append(time.perf_counter() - step_start)
+
+            render_start = time.perf_counter()
+            example.render()
+            frame = capture_viewer_frame(viewer, render_ui=False)
+            render_times.append(time.perf_counter() - render_start)
+            if frame is not None:
+                frames.append(frame)
+    finally:
+        if owns_viewer:
+            viewer.close()
 
     output_dir.mkdir(parents=True, exist_ok=True)
     encode_mp4(frames, output_dir / f"{solver_name}_cutting.mp4", fps=video_fps)
@@ -460,12 +474,13 @@ def _run_case(
     stats = _make_runtime_stats(
         solver_name,
         frame_count,
-        float(snapshots[-1]["time"]) if snapshots else 0.0,
+        float(example.sim_time),
         step_times,
         render_times,
         example.force_history,
     )
     (output_dir / f"{solver_name}_runtime_stats.json").write_text(stats.to_json() + "\n", encoding="utf-8")
+    remesh_history = getattr(example, "remesh_history", [])
     remesh_path = export_remesh_artifacts(output_dir, solver_name, remesh_history)
     print(
         f"{name}: {frame_count} frames, {example.model.particle_count} particles, "
@@ -555,22 +570,32 @@ def main():
         ),
     }
 
-    for case_name in ["mpm", "vbd", "xfem_cuboid", "xfem_vegetable", "xfem_paper", "xfem_bread"]:
-        if case_name not in cases:
-            continue
-        example_cls, argv, output_dir, solver_name, title, surface_color, wall_color = configs[case_name]
-        _run_case(
-            case_name,
-            example_cls,
-            argv,
-            output_dir,
-            solver_name,
-            title,
-            surface_color,
-            wall_color,
-            args.frames,
-            args.video_fps,
-        )
+    case_order = ["mpm", "vbd", "xfem_cuboid", "xfem_vegetable", "xfem_paper", "xfem_bread"]
+    selected_cases = [case_name for case_name in case_order if case_name in cases]
+    if not selected_cases:
+        return
+
+    import newton.viewer  # noqa: PLC0415
+
+    shared_viewer = newton.viewer.ViewerGL(headless=True)
+    try:
+        for case_name in selected_cases:
+            example_cls, argv, output_dir, solver_name, title, surface_color, wall_color = configs[case_name]
+            _run_case(
+                case_name,
+                example_cls,
+                argv,
+                output_dir,
+                solver_name,
+                title,
+                surface_color,
+                wall_color,
+                args.frames,
+                args.video_fps,
+                viewer=shared_viewer,
+            )
+    finally:
+        shared_viewer.close()
 
 
 if __name__ == "__main__":

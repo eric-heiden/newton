@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+import inspect
 
 import numpy as np
 import warp as wp
@@ -12,9 +13,13 @@ from newton.examples.cutting.cutting_common import (
     KnifeProfile,
     SplitCuboidRenderMesh,
     compute_particle_cut_update,
+    encode_mp4,
     summarize_force_profile,
 )
 from newton.examples.cutting.example_cutting_xfem import build_half_cylinder_tet_mesh
+from newton.examples.cutting import generate_cutting_report_assets
+from newton._src.viewer.gl.opengl import RendererGL
+from newton.viewer import ViewerNull
 
 
 class TestCuttingCommon(unittest.TestCase):
@@ -113,6 +118,50 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertGreater(update.damage[0], 0.0)
         self.assertEqual(update.damage[1], 0.0)
         self.assertEqual(update.active_count, 1)
+
+    def test_viewer_log_mesh_accepts_opacity_keyword(self):
+        points = wp.array(
+            np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ],
+                dtype=np.float32,
+            ),
+            dtype=wp.vec3,
+        )
+        indices = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32)
+        viewer = ViewerNull(num_frames=1)
+
+        viewer.log_mesh("transparent_triangle", points, indices, opacity=0.35)
+
+    def test_report_generator_uses_viewergl_frame_capture(self):
+        source = inspect.getsource(generate_cutting_report_assets._run_case)
+
+        self.assertIn("capture_viewer_frame", source)
+        self.assertNotIn("_render_frame(", source)
+
+    def test_report_generator_reuses_viewergl_across_cases(self):
+        source = inspect.getsource(generate_cutting_report_assets.main)
+
+        self.assertIn("shared_viewer", source)
+        self.assertIn("shared_viewer.close()", source)
+
+    def test_viewergl_sets_pyglet_headless_before_shader_import(self):
+        source = inspect.getsource(RendererGL.__init__)
+
+        self.assertIn('pyglet.options["headless"] = bool(headless)', source)
+        self.assertLess(
+            source.index('pyglet.options["headless"] = bool(headless)'),
+            source.index("from pyglet.graphics.shader import Shader"),
+        )
+
+    def test_mp4_encoder_preserves_viewergl_frame_size(self):
+        source = inspect.getsource(encode_mp4)
+
+        self.assertIn("macro_block_size=1)", source)
+        self.assertNotIn("macro_block_size=16", source)
 
     def test_particle_damage_monotonic_and_force_scales_with_toughness(self):
         points = np.array(

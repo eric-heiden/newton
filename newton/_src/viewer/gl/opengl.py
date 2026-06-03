@@ -52,6 +52,12 @@ def check_gl_error():
         print(f"Called from: {''.join(stack[-2:-1])}")
 
 
+def _as_numpy_points(points) -> np.ndarray:
+    if isinstance(points, wp.array):
+        return points.numpy().reshape(-1, 3)
+    return np.asarray(points, dtype=np.float32).reshape(-1, 3)
+
+
 def _upload_texture_from_file(gl, texture_image: np.ndarray) -> int:
     image = normalize_texture(
         texture_image,
@@ -225,12 +231,17 @@ class MeshGL:
         gl.glVertexAttrib4f(5, 0.0, 0.0, 1.0, 0.0)
         #   column 3  (0,0,0,1)
         gl.glVertexAttrib4f(6, 0.0, 0.0, 0.0, 1.0)
+        gl.glVertexAttrib3f(7, 0.7, 0.5, 0.3)
+        gl.glVertexAttrib4f(8, 0.5, 0.0, 0.0, 0.0)
+        gl.glVertexAttrib1f(9, 1.0)
 
         gl.glBindVertexArray(0)
 
         # Per-mesh albedo and material (applied in render()).
         self.color = (0.7, 0.5, 0.3)
         self.material = (0.5, 0.0, 0.0, 0.0)
+        self.opacity = 1.0
+        self._sort_center: np.ndarray | None = None
 
         # Create CUDA-GL interop buffer for efficient updates
         if ENABLE_CUDA_INTEROP and self.device.is_cuda:
@@ -255,7 +266,7 @@ class MeshGL:
             # Ignore any errors if the GL context has already been torn down
             pass
 
-    def update(self, points, indices, normals, uvs, texture=None):
+    def update(self, points, indices, normals, uvs, texture=None, opacity=None):
         """Update vertex positions in the VBO.
 
         Args:
@@ -268,6 +279,9 @@ class MeshGL:
             raise RuntimeError("Number of points does not match")
 
         self._points = points
+        if opacity is not None:
+            self.opacity = float(np.clip(opacity, 0.0, 1.0))
+        self._sort_center = None
 
         # only update indices the first time (no topology changes)
         if self.indices is None:
@@ -306,7 +320,24 @@ class MeshGL:
             gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
             gl.glBufferData(gl.GL_ARRAY_BUFFER, host_vertices.nbytes, host_vertices.ctypes.data, gl.GL_STATIC_DRAW)
 
+        if self.opacity < 0.999 and len(points):
+            try:
+                self._sort_center = np.mean(_as_numpy_points(points), axis=0).astype(np.float32)
+            except Exception:
+                self._sort_center = None
+
         self.update_texture(texture)
+
+    def has_transparency(self) -> bool:
+        return not self.hidden and self.opacity < 0.999
+
+    def sort_depth(self, camera_pos, camera_front) -> float:
+        if self._sort_center is None:
+            return 0.0
+        center = np.asarray(self._sort_center, dtype=np.float32)
+        pos = np.asarray(camera_pos, dtype=np.float32)
+        front = np.asarray(camera_front, dtype=np.float32)
+        return float(np.dot(center - pos, front))
 
     def recompute_normals(self):
         if self._points is None or self.indices is None:
@@ -365,6 +396,7 @@ class MeshGL:
             # Set per-mesh albedo and material (global state, not per-VAO).
             gl.glVertexAttrib3f(7, *self.color)
             gl.glVertexAttrib4f(8, *self.material)
+            gl.glVertexAttrib1f(9, self.opacity)
 
             gl.glBindVertexArray(self.vao)
             gl.glDrawElements(gl.GL_TRIANGLES, self.num_indices, gl.GL_UNSIGNED_INT, None)
@@ -1014,6 +1046,9 @@ class RendererGL:
 
         try:
             import pyglet
+
+            if headless is not None:
+                pyglet.options["headless"] = bool(headless)
 
             # disable error checking for performance
             pyglet.options["debug_gl"] = False
@@ -1842,7 +1877,9 @@ class RendererGL:
         )
 
         with self._shape_shader:
-            self._draw_objects(objects)
+            opaque_objects, transparent_objects = self._split_by_transparency(objects)
+            self._draw_objects(opaque_objects)
+            self._draw_transparent_objects(transparent_objects)
 
         gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
 
@@ -1934,6 +1971,40 @@ class RendererGL:
         for o in objects.values():
             if hasattr(o, "render"):
                 o.render()
+
+        check_gl_error()
+
+    def _split_by_transparency(self, objects):
+        opaque_objects = {}
+        transparent_objects = {}
+        for name, obj in objects.items():
+            if hasattr(obj, "has_transparency") and obj.has_transparency():
+                transparent_objects[name] = obj
+            else:
+                opaque_objects[name] = obj
+        return opaque_objects, transparent_objects
+
+    def _transparent_sort_key(self, item) -> float:
+        obj = item[1]
+        if hasattr(obj, "sort_depth"):
+            return obj.sort_depth(self.camera.pos, self.camera.get_front())
+        return 0.0
+
+    def _draw_transparent_objects(self, objects):
+        if not objects:
+            return
+
+        gl = RendererGL.gl
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glDepthMask(gl.GL_FALSE)
+        try:
+            for _, obj in sorted(objects.items(), key=self._transparent_sort_key, reverse=True):
+                if hasattr(obj, "render"):
+                    obj.render()
+        finally:
+            gl.glDepthMask(gl.GL_TRUE)
+            gl.glDisable(gl.GL_BLEND)
 
         check_gl_error()
 

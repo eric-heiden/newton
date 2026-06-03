@@ -756,6 +756,7 @@ class ViewerGL(ViewerBase):
         color: tuple[float, float, float] | None = None,
         roughness: float | None = None,
         metallic: float | None = None,
+        opacity: float | None = None,
     ):
         """
         Log a mesh for rendering.
@@ -775,6 +776,7 @@ class ViewerGL(ViewerBase):
                 smooth, ``1`` is fully rough.
             metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
                 is metal.
+            opacity: Surface opacity in ``[0, 1]``.
         """
         assert isinstance(points, wp.array)
         assert isinstance(indices, wp.array)
@@ -786,7 +788,7 @@ class ViewerGL(ViewerBase):
                 len(points), len(indices), self.device, hidden=hidden, backface_culling=backface_culling
             )
 
-        self.objects[name].update(points, indices, normals, uvs, texture)
+        self.objects[name].update(points, indices, normals, uvs, texture, opacity=opacity)
         self.objects[name].hidden = hidden
         self.objects[name].backface_culling = backface_culling
 
@@ -800,6 +802,9 @@ class ViewerGL(ViewerBase):
             if metallic is not None:
                 m = float(metallic)
             self.objects[name].material = (r, m, c, t)
+
+        if opacity is not None:
+            self.objects[name].opacity = float(np.clip(opacity, 0.0, 1.0))
 
     @override
     def log_instances(

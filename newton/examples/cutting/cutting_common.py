@@ -283,6 +283,7 @@ def log_knife_mesh(
         backface_culling=False,
         color=blade_color,
         roughness=0.36,
+        opacity=1.0,
     )
     if edge.shape[0] > 1:
         starts = edge[:-1]
@@ -815,6 +816,8 @@ class SplitCuboidRenderMesh:
         prefix: str = "/cutting/render_split",
         surface_color: tuple[float, float, float] = (0.18, 0.62, 0.95),
         wall_color: tuple[float, float, float] = (0.95, 0.32, 0.42),
+        surface_opacity: float = 0.72,
+        wall_opacity: float = 1.0,
         rest_particle_points: np.ndarray | None = None,
         particle_points: np.ndarray | None = None,
     ):
@@ -838,6 +841,7 @@ class SplitCuboidRenderMesh:
             backface_culling=False,
             color=surface_color,
             roughness=0.68,
+            opacity=surface_opacity,
         )
         viewer.log_mesh(
             f"{prefix}/cut_walls",
@@ -847,6 +851,7 @@ class SplitCuboidRenderMesh:
             backface_culling=False,
             color=wall_color,
             roughness=0.82,
+            opacity=wall_opacity,
         )
 
 
@@ -1064,6 +1069,8 @@ class AdaptiveCutSurfaceRemesher:
         prefix: str = "/cutting/adaptive_remesh",
         surface_color: tuple[float, float, float] = (0.18, 0.62, 0.95),
         wall_color: tuple[float, float, float] = (0.95, 0.32, 0.42),
+        surface_opacity: float = 0.72,
+        wall_opacity: float = 1.0,
         rest_particle_points: np.ndarray | wp.array | None = None,
         particle_points: np.ndarray | wp.array | None = None,
     ) -> AdaptiveRemeshStats:
@@ -1085,6 +1092,7 @@ class AdaptiveCutSurfaceRemesher:
             backface_culling=False,
             color=surface_color,
             roughness=0.68,
+            opacity=surface_opacity,
         )
         viewer.log_mesh(
             f"{prefix}/cut_walls",
@@ -1094,6 +1102,7 @@ class AdaptiveCutSurfaceRemesher:
             backface_culling=False,
             color=wall_color,
             roughness=0.82,
+            opacity=wall_opacity,
         )
         return stats
 
@@ -1278,6 +1287,8 @@ class TetMeshCutSurfaceRenderer:
         prefix: str = "/cutting/tet_cut_surface",
         surface_color: tuple[float, float, float] = (0.18, 0.62, 0.95),
         wall_color: tuple[float, float, float] = (0.95, 0.32, 0.42),
+        surface_opacity: float = 0.72,
+        wall_opacity: float = 1.0,
         front_x: float | None = None,
         center_z: float | None = None,
     ) -> TetCutWallRenderStats:
@@ -1295,6 +1306,7 @@ class TetMeshCutSurfaceRenderer:
             backface_culling=False,
             color=surface_color,
             roughness=0.72,
+            opacity=surface_opacity,
         )
         viewer.log_mesh(
             f"{prefix}/cut_walls",
@@ -1304,6 +1316,7 @@ class TetMeshCutSurfaceRenderer:
             backface_culling=False,
             color=wall_color,
             roughness=0.86,
+            opacity=wall_opacity,
         )
         return stats
 
@@ -1889,7 +1902,7 @@ def encode_mp4(frames: list[np.ndarray], path: str | Path, fps: float = 30.0) ->
     try:
         import imageio.v3 as iio  # noqa: PLC0415
 
-        iio.imwrite(path, np.asarray(frames), fps=fps, codec="libx264", macro_block_size=16)
+        iio.imwrite(path, np.asarray(frames), fps=fps, codec="libx264", macro_block_size=1)
         return path
     except Exception:
         pass
@@ -1936,10 +1949,10 @@ def save_first_frame(frames: list[np.ndarray], path: str | Path) -> Path | None:
     return path
 
 
-def capture_viewer_frame(viewer) -> np.ndarray | None:
+def capture_viewer_frame(viewer, render_ui: bool = True) -> np.ndarray | None:
     if not hasattr(viewer, "get_frame"):
         return None
-    image = viewer.get_frame(render_ui=True)
+    image = viewer.get_frame(render_ui=render_ui)
     if image is None:
         return None
     frame = image.numpy()

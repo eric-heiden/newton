@@ -24,12 +24,36 @@ from .kernels import (
 __all__ = ["SolverXFEMCut"]
 
 
+MAX_XFEM_KNIFE_EDGE_POINTS = 32
+
+
 def _vec3_tuple(value: Sequence[float] | wp.vec3) -> tuple[float, float, float]:
     if isinstance(value, wp.vec3):
         return (float(value[0]), float(value[1]), float(value[2]))
     if len(value) != 3:
         raise ValueError("expected a 3-vector")
     return (float(value[0]), float(value[1]), float(value[2]))
+
+
+def _resample_polyline(points: np.ndarray, sample_count: int) -> np.ndarray:
+    if points.shape[0] <= sample_count:
+        return points.astype(np.float32, copy=True)
+
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    total_length = float(np.sum(segment_lengths))
+    if total_length <= 1.0e-12:
+        return np.repeat(points[:1], sample_count, axis=0).astype(np.float32, copy=False)
+
+    cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+    targets = np.linspace(0.0, total_length, sample_count)
+    samples = np.empty((sample_count, 3), dtype=np.float32)
+    for i, target in enumerate(targets):
+        segment = min(int(np.searchsorted(cumulative, target, side="right")) - 1, points.shape[0] - 2)
+        segment = max(segment, 0)
+        denom = max(float(segment_lengths[segment]), 1.0e-12)
+        alpha = float((target - cumulative[segment]) / denom)
+        samples[i] = (1.0 - alpha) * points[segment] + alpha * points[segment + 1]
+    return samples
 
 
 class SolverXFEMCut(SolverBase):
@@ -106,6 +130,8 @@ class SolverXFEMCut(SolverBase):
         self.tet_cut_weight = wp.zeros(model.tet_count, dtype=float, device=model.device)
         self.base_tet_materials = wp.clone(model.tet_materials) if model.tet_count and model.tet_materials else None
         self.force_accum = wp.zeros(6, dtype=float, device=model.device)
+        self.knife_edge_points = wp.zeros(MAX_XFEM_KNIFE_EDGE_POINTS, dtype=wp.vec3, device=model.device)
+        self.knife_edge_point_count = 2
 
         self.particle_area = self._estimate_particle_area()
         self.set_knife_state(front_x=-1.0, center_y=0.0, center_z=0.0)
@@ -131,6 +157,7 @@ class SolverXFEMCut(SolverBase):
         process_width: float = 0.06,
         knife_velocity: Sequence[float] | wp.vec3 = (0.0, 0.0, 0.0),
         knife_tangent: Sequence[float] | wp.vec3 = (0.0, 0.0, 1.0),
+        edge_points: Sequence[Sequence[float]] | np.ndarray | None = None,
     ) -> None:
         """Set the current blade state used by the next :meth:`step` call."""
 
@@ -150,6 +177,25 @@ class SolverXFEMCut(SolverBase):
         self.knife_velocity = _vec3_tuple(knife_velocity)
         self.knife_tangent = (float(tangent[0]), float(tangent[1]), float(tangent[2]))
 
+        if edge_points is None:
+            edge_np = np.array(
+                [
+                    [self.knife_front_x, self.knife_center_y, self.knife_center_z - self.knife_half_width_z],
+                    [self.knife_front_x, self.knife_center_y, self.knife_center_z + self.knife_half_width_z],
+                ],
+                dtype=np.float32,
+            )
+        else:
+            edge_np = np.asarray(edge_points, dtype=np.float32)
+            if edge_np.ndim != 2 or edge_np.shape[1] != 3 or edge_np.shape[0] < 2:
+                raise ValueError("edge_points must have shape (N, 3) with N >= 2")
+            edge_np = _resample_polyline(edge_np, MAX_XFEM_KNIFE_EDGE_POINTS)
+
+        self.knife_edge_point_count = int(edge_np.shape[0])
+        edge_buffer = np.zeros((MAX_XFEM_KNIFE_EDGE_POINTS, 3), dtype=np.float32)
+        edge_buffer[: self.knife_edge_point_count] = edge_np
+        self.knife_edge_points.assign(edge_buffer)
+
     def _classify_and_degrade(self, particle_q: wp.array) -> None:
         model = self.model
         if model.tet_count == 0 or model.tet_indices is None:
@@ -166,9 +212,12 @@ class SolverXFEMCut(SolverBase):
                 self.tet_cut_state,
                 self.tet_damage,
                 self.tet_cut_weight,
+                self.knife_edge_points,
+                self.knife_edge_point_count,
                 self.knife_front_x,
                 self.knife_center_y,
                 self.knife_center_z,
+                self.knife_half_width_y,
                 self.knife_half_width_z,
                 self.knife_process_width,
                 self.damage_threshold,
@@ -225,6 +274,8 @@ class SolverXFEMCut(SolverBase):
                     self.particle_enrichment_qd,
                     self.particle_colors,
                     self.force_accum,
+                    self.knife_edge_points,
+                    self.knife_edge_point_count,
                     self.knife_front_x,
                     self.knife_center_y,
                     self.knife_center_z,

@@ -19,6 +19,7 @@ from newton.examples.cutting.cutting_common import (
     SplitCuboidRenderMesh,
     TetMeshCutSurfaceRenderer,
     add_cutting_artifact_args,
+    log_knife_mesh,
     run_cutting_example,
 )
 
@@ -523,6 +524,7 @@ class Example:
                 process_width=cfg.process_width,
                 knife_velocity=knife_velocity,
                 knife_tangent=(0.0, 0.0, 1.0),
+                edge_points=self.knife_profile.edge_points(substep_time, front_x=front_x, center_z=center_z),
             )
 
             self.state_0.clear_forces()
@@ -611,15 +613,9 @@ class Example:
             half_width_y=cfg.knife_half_width_y,
             half_width_z=cfg.knife_half_width_z,
             process_width=cfg.process_width,
+            edge_control_points=self.knife_profile.edge_control_points,
         )
-        starts, ends, colors = blade.blade_segments(0.0)
-        self.viewer.log_lines(
-            f"/cutting/xfem_{cfg.name}/knife",
-            wp.array(starts, dtype=wp.vec3, device=self.model.device),
-            wp.array(ends, dtype=wp.vec3, device=self.model.device),
-            wp.array(colors, dtype=wp.vec3, device=self.model.device),
-            width=0.018,
-        )
+        log_knife_mesh(self.viewer, self.model.device, blade, 0.0, prefix=f"/cutting/xfem_{cfg.name}/knife")
         self.viewer.end_frame()
 
     def test_final(self):

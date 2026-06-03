@@ -21,6 +21,7 @@ from newton.examples.cutting.cutting_common import (
     add_cutting_artifact_args,
     estimate_particle_volume_from_grid,
     launch_mpm_knife_cut,
+    log_knife_mesh,
     run_cutting_example,
 )
 from newton.solvers import SolverImplicitMPM
@@ -225,14 +226,7 @@ class Example:
             )
         else:
             self.viewer.log_points(name="/model/particles", points=None, hidden=True)
-        starts, ends, colors = self.knife.blade_segments(self.sim_time)
-        self.viewer.log_lines(
-            "/cutting/knife",
-            wp.array(starts, dtype=wp.vec3, device=self.model.device),
-            wp.array(ends, dtype=wp.vec3, device=self.model.device),
-            wp.array(colors, dtype=wp.vec3, device=self.model.device),
-            width=0.018,
-        )
+        log_knife_mesh(self.viewer, self.model.device, self.knife, self.sim_time, prefix="/cutting/knife")
         self.viewer.end_frame()
 
     def test_final(self):

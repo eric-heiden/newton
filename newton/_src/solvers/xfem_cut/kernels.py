@@ -28,6 +28,37 @@ def _signed_side(value: float):
     return side
 
 
+@wp.func
+def _knife_edge_process_weight(
+    q: wp.vec3,
+    edge_points: wp.array(dtype=wp.vec3),
+    edge_point_count: int,
+    center_y: float,
+    half_width_y: float,
+    process_width: float,
+):
+    best_d2 = float(1.0e12)
+    for i in range(edge_point_count - 1):
+        a = edge_points[i]
+        b = edge_points[i + 1]
+        abx = b[0] - a[0]
+        abz = b[2] - a[2]
+        denom = abx * abx + abz * abz
+        t = float(0.0)
+        if denom > 1.0e-12:
+            t = ((q[0] - a[0]) * abx + (q[2] - a[2]) * abz) / denom
+            t = wp.min(1.0, wp.max(0.0, t))
+        cx = a[0] + t * abx
+        cz = a[2] + t * abz
+        dx = q[0] - cx
+        dz = q[2] - cz
+        best_d2 = wp.min(best_d2, dx * dx + dz * dz)
+
+    y_out = wp.max(0.0, wp.abs(q[1] - center_y) - half_width_y)
+    distance = wp.sqrt(best_d2 + y_out * y_out)
+    return wp.max(0.0, 1.0 - distance / wp.max(process_width, 1.0e-6))
+
+
 @wp.kernel
 def apply_xfem_knife_kernel(
     particle_q: wp.array(dtype=wp.vec3),
@@ -41,6 +72,8 @@ def apply_xfem_knife_kernel(
     particle_enrichment_qd: wp.array(dtype=wp.vec3),
     particle_colors: wp.array(dtype=wp.vec3),
     force_accum: wp.array(dtype=float),
+    knife_edge_points: wp.array(dtype=wp.vec3),
+    knife_edge_point_count: int,
     front_x: float,
     center_y: float,
     center_z: float,
@@ -68,14 +101,19 @@ def apply_xfem_knife_kernel(
     q = particle_q[tid]
     v = particle_qd[tid]
     old_damage = particle_damage[tid]
-    phi_front = q[0] - front_x
     y_rel = q[1] - center_y
     z_rel = q[2] - center_z
 
-    front_weight = wp.max(0.0, 1.0 - wp.abs(phi_front) / wp.max(process_width, 1.0e-6))
-    in_blade_window = wp.abs(y_rel) <= half_width_y and wp.abs(z_rel) <= half_width_z
+    front_weight = _knife_edge_process_weight(
+        q,
+        knife_edge_points,
+        knife_edge_point_count,
+        center_y,
+        half_width_y,
+        process_width,
+    )
     in_cut_wake = q[0] <= front_x + process_width and wp.abs(z_rel) <= half_width_z
-    active = front_weight > 0.0 and in_blade_window
+    active = front_weight > 0.0
 
     side = _signed_side(y_rel)
     if active or (old_damage > 0.0 and in_cut_wake):
@@ -147,9 +185,12 @@ def classify_xfem_tets_kernel(
     tet_cut_state: wp.array(dtype=wp.int32),
     tet_damage: wp.array(dtype=float),
     tet_cut_weight: wp.array(dtype=float),
+    knife_edge_points: wp.array(dtype=wp.vec3),
+    knife_edge_point_count: int,
     front_x: float,
     center_y: float,
     center_z: float,
+    half_width_y: float,
     half_width_z: float,
     process_width: float,
     damage_threshold: float,
@@ -174,8 +215,15 @@ def classify_xfem_tets_kernel(
     straddles_cut = min_y <= 0.0 and max_y >= 0.0
 
     centroid = (qi + qj + qk + ql) * 0.25
-    z_in = wp.abs(centroid[2] - center_z) <= half_width_z
-    front_weight = wp.max(0.0, 1.0 - wp.abs(centroid[0] - front_x) / wp.max(process_width, 1.0e-6))
+    front_weight = _knife_edge_process_weight(
+        centroid,
+        knife_edge_points,
+        knife_edge_point_count,
+        center_y,
+        half_width_y,
+        process_width,
+    )
+    z_in = front_weight > 0.0 or wp.abs(centroid[2] - center_z) <= half_width_z
     wake_weight = _xfem_smoothstep((front_x + process_width - centroid[0]) / wp.max(process_width, 1.0e-6))
     weight = wp.max(front_weight, wake_weight)
 

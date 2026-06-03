@@ -106,6 +106,37 @@ class TestXFEMCutSolver(unittest.TestCase):
         self.assertGreater(float(force_values[4]), 0.0)
         self.assertGreater(float(np.max(np.linalg.norm(enrichment, axis=1))), 0.0)
 
+    def test_solver_accepts_rigid_spline_knife_edge(self):
+        device = wp.get_device()
+        model = _make_soft_block_model(device)
+        solver = newton.solvers.SolverXFEMCut(model, iterations=2)
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+        contacts = model.contacts()
+
+        solver.set_knife_state(
+            front_x=0.0,
+            center_y=0.0,
+            center_z=0.08,
+            half_width_y=0.08,
+            half_width_z=0.18,
+            process_width=0.045,
+            edge_points=[
+                (-0.02, 0.0, -0.10),
+                (0.04, 0.0, 0.08),
+                (-0.02, 0.0, 0.26),
+            ],
+        )
+        state_0.clear_forces()
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+
+        edge_points = solver.knife_edge_points.numpy()[: solver.knife_edge_point_count]
+        force_values = solver.force_accum.numpy()
+
+        np.testing.assert_allclose(edge_points[1], np.array([0.04, 0.0, 0.08], dtype=np.float32), atol=1.0e-6)
+        self.assertGreater(float(force_values[0]), 0.0)
+
     def test_table_glue_keeps_bottom_vertices_near_rest_height(self):
         device = wp.get_device()
         model = _make_soft_block_model(device, dim_x=2, dim_y=2, dim_z=2)

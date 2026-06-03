@@ -26,13 +26,18 @@ import numpy as np
 import warp as wp
 
 
+MAX_KNIFE_EDGE_POINTS = 32
+
+
 @dataclass(frozen=True)
 class KnifeProfile:
-    """Axis-aligned blade front moving through a soft block.
+    """Rigid knife with a blade-edge spline moving through a soft block.
 
-    The blade front advances along x. The blade is centered at ``center_y`` and
-    ``center_z`` and affects particles inside the y/z blade window and inside a
-    finite cohesive process zone around the front.
+    The knife advances along x. The cutting geometry is a piecewise-linear edge
+    spline in the knife-local frame, with local points offset from
+    ``(x_at(t), center_y, center_z)``. The default is a straight edge spanning
+    ``half_width_z``. Forces and damage use a compact SDF-like process zone
+    around this rigid edge rather than an invisible front plane.
     """
 
     start_x: float = -0.08
@@ -42,6 +47,10 @@ class KnifeProfile:
     half_width_y: float = 0.06
     half_width_z: float = 0.34
     process_width: float = 0.045
+    edge_control_points: tuple[tuple[float, float, float], ...] = ()
+    blade_spine_depth: float = 0.18
+    handle_length: float = 0.20
+    handle_height: float = 0.075
 
     def x_at(self, time: float) -> float:
         return self.start_x + self.speed * time
@@ -50,36 +59,242 @@ class KnifeProfile:
         points = np.asarray(points)
         return points[..., 0] - self.x_at(time)
 
-    def cut_weights(self, points: np.ndarray, time: float) -> np.ndarray:
-        points = np.asarray(points)
-        phi = np.abs(self.signed_distance_x(points, time))
-        in_front = np.clip(1.0 - phi / max(self.process_width, 1.0e-12), 0.0, 1.0)
-        in_y = np.abs(points[..., 1] - self.center_y) <= self.half_width_y
-        in_z = np.abs(points[..., 2] - self.center_z) <= self.half_width_z
-        return np.where(in_y & in_z, in_front, 0.0).astype(np.float32)
-
-    def blade_segments(self, time: float, tail: float = 0.16) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return line segments that draw the blade rectangle and short handle."""
-
-        x = self.x_at(time)
-        y0 = self.center_y - self.half_width_y
-        y1 = self.center_y + self.half_width_y
-        z0 = self.center_z - self.half_width_z
-        z1 = self.center_z + self.half_width_z
-        points = np.array(
+    def _local_edge_points(self) -> np.ndarray:
+        if self.edge_control_points:
+            points = np.asarray(self.edge_control_points, dtype=np.float32)
+            if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] < 2:
+                raise ValueError("edge_control_points must have shape (N, 3) with N >= 2")
+            return points[:MAX_KNIFE_EDGE_POINTS].copy()
+        return np.array(
             [
-                [x, y0, z0],
-                [x, y1, z0],
-                [x, y1, z1],
-                [x, y0, z1],
-                [x - tail, self.center_y, z1],
+                [0.0, 0.0, -self.half_width_z],
+                [0.0, 0.0, self.half_width_z],
             ],
             dtype=np.float32,
         )
-        starts = np.array([points[0], points[1], points[2], points[3], points[4]], dtype=np.float32)
-        ends = np.array([points[1], points[2], points[3], points[0], [x, self.center_y, z1]], dtype=np.float32)
+
+    def edge_points(
+        self,
+        time: float,
+        *,
+        front_x: float | None = None,
+        center_y: float | None = None,
+        center_z: float | None = None,
+    ) -> np.ndarray:
+        """Return world-space points of the rigid blade-edge polyline."""
+
+        origin = np.array(
+            [
+                self.x_at(time) if front_x is None else float(front_x),
+                self.center_y if center_y is None else float(center_y),
+                self.center_z if center_z is None else float(center_z),
+            ],
+            dtype=np.float32,
+        )
+        return self._local_edge_points() + origin
+
+    def edge_distances(
+        self,
+        points: np.ndarray,
+        time: float,
+        *,
+        front_x: float | None = None,
+        center_y: float | None = None,
+        center_z: float | None = None,
+    ) -> np.ndarray:
+        """Distance from points to the blade process zone around the edge spline."""
+
+        points = np.asarray(points, dtype=np.float32)
+        original_shape = points.shape[:-1]
+        flat_points = points.reshape(-1, 3)
+        edge = self.edge_points(time, front_x=front_x, center_y=center_y, center_z=center_z)
+        best_d2 = np.full(flat_points.shape[0], np.inf, dtype=np.float32)
+
+        pxz = flat_points[:, [0, 2]]
+        for i in range(edge.shape[0] - 1):
+            a = edge[i]
+            b = edge[i + 1]
+            axz = a[[0, 2]]
+            bxz = b[[0, 2]]
+            ab = bxz - axz
+            denom = float(np.dot(ab, ab))
+            if denom <= 1.0e-12:
+                closest = np.broadcast_to(axz, pxz.shape)
+            else:
+                t = np.clip(np.sum((pxz - axz) * ab, axis=1) / denom, 0.0, 1.0)
+                closest = axz + t[:, None] * ab
+            d = pxz - closest
+            best_d2 = np.minimum(best_d2, np.sum(d * d, axis=1))
+
+        y_center = self.center_y if center_y is None else float(center_y)
+        y_out = np.maximum(np.abs(flat_points[:, 1] - y_center) - self.half_width_y, 0.0)
+        distance = np.sqrt(best_d2 + y_out * y_out)
+        return distance.reshape(original_shape)
+
+    def cut_weights(self, points: np.ndarray, time: float) -> np.ndarray:
+        distance = self.edge_distances(points, time)
+        return np.clip(1.0 - distance / max(self.process_width, 1.0e-12), 0.0, 1.0).astype(np.float32)
+
+    @staticmethod
+    def _box_mesh(
+        center: np.ndarray,
+        half_extent: np.ndarray,
+        vertex_offset: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        hx, hy, hz = half_extent
+        cx, cy, cz = center
+        vertices = np.array(
+            [
+                [cx - hx, cy - hy, cz - hz],
+                [cx + hx, cy - hy, cz - hz],
+                [cx + hx, cy + hy, cz - hz],
+                [cx - hx, cy + hy, cz - hz],
+                [cx - hx, cy - hy, cz + hz],
+                [cx + hx, cy - hy, cz + hz],
+                [cx + hx, cy + hy, cz + hz],
+                [cx - hx, cy + hy, cz + hz],
+            ],
+            dtype=np.float32,
+        )
+        indices = np.array(
+            [
+                [0, 1, 2],
+                [0, 2, 3],
+                [4, 6, 5],
+                [4, 7, 6],
+                [0, 4, 5],
+                [0, 5, 1],
+                [1, 5, 6],
+                [1, 6, 2],
+                [2, 6, 7],
+                [2, 7, 3],
+                [3, 7, 4],
+                [3, 4, 0],
+            ],
+            dtype=np.int32,
+        )
+        return vertices, indices + int(vertex_offset)
+
+    def blade_mesh(
+        self,
+        time: float,
+        *,
+        front_x: float | None = None,
+        center_y: float | None = None,
+        center_z: float | None = None,
+        include_handle: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return a triangle mesh for the rigid knife blade and optional handle."""
+
+        edge = self.edge_points(time, front_x=front_x, center_y=center_y, center_z=center_z)
+        spine_depth = max(float(self.blade_spine_depth), 1.0e-4)
+        half_y = max(float(self.half_width_y), 1.0e-4)
+        left_spine = edge + np.array([-spine_depth, -half_y, 0.0], dtype=np.float32)
+        right_spine = edge + np.array([-spine_depth, half_y, 0.0], dtype=np.float32)
+
+        vertices = np.vstack([edge, left_spine, right_spine]).astype(np.float32, copy=False)
+        n = edge.shape[0]
+        triangles: list[list[int]] = []
+        for i in range(n - 1):
+            e0 = i
+            e1 = i + 1
+            l0 = n + i
+            l1 = n + i + 1
+            r0 = 2 * n + i
+            r1 = 2 * n + i + 1
+            triangles.extend(
+                [
+                    [e0, l0, l1],
+                    [e0, l1, e1],
+                    [e0, e1, r1],
+                    [e0, r1, r0],
+                    [l0, r0, r1],
+                    [l0, r1, l1],
+                ]
+            )
+
+        triangles.extend([[0, 2 * n, n], [n - 1, n + n - 1, 3 * n - 1]])
+        indices = np.asarray(triangles, dtype=np.int32)
+
+        if include_handle:
+            y_center = self.center_y if center_y is None else float(center_y)
+            z_top = float(np.max(edge[:, 2]))
+            x_front = self.x_at(time) if front_x is None else float(front_x)
+            handle_length = max(float(self.handle_length), 1.0e-4)
+            handle_center = np.array(
+                [
+                    x_front - spine_depth - 0.5 * handle_length,
+                    y_center,
+                    z_top + 0.52 * max(float(self.handle_height), 1.0e-4),
+                ],
+                dtype=np.float32,
+            )
+            handle_half_extent = np.array(
+                [
+                    0.5 * handle_length,
+                    max(1.45 * half_y, 0.018),
+                    0.5 * max(float(self.handle_height), 1.0e-4),
+                ],
+                dtype=np.float32,
+            )
+            handle_vertices, handle_indices = self._box_mesh(handle_center, handle_half_extent, vertices.shape[0])
+            vertices = np.vstack([vertices, handle_vertices])
+            indices = np.vstack([indices, handle_indices])
+
+        return vertices.astype(np.float32, copy=False), indices.astype(np.int32, copy=False)
+
+    def blade_segments(self, time: float, tail: float = 0.16) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return line segments that draw the rigid blade outline and edge."""
+
+        edge = self.edge_points(time)
+        left_spine = edge + np.array([-tail, -self.half_width_y, 0.0], dtype=np.float32)
+        right_spine = edge + np.array([-tail, self.half_width_y, 0.0], dtype=np.float32)
+        starts = []
+        ends = []
+        for i in range(edge.shape[0] - 1):
+            starts.extend([edge[i], left_spine[i], right_spine[i]])
+            ends.extend([edge[i + 1], left_spine[i + 1], right_spine[i + 1]])
+        starts.extend([edge[0], edge[0], edge[-1], edge[-1], left_spine[0], left_spine[-1]])
+        ends.extend([left_spine[0], right_spine[0], left_spine[-1], right_spine[-1], right_spine[0], right_spine[-1]])
+        starts = np.asarray(starts, dtype=np.float32)
+        ends = np.asarray(ends, dtype=np.float32)
         colors = np.tile(np.array([[0.95, 0.95, 0.98]], dtype=np.float32), (starts.shape[0], 1))
         return starts, ends, colors
+
+
+def log_knife_mesh(
+    viewer,
+    device,
+    knife: KnifeProfile,
+    time: float,
+    prefix: str = "/cutting/knife",
+    blade_color: tuple[float, float, float] = (0.56, 0.61, 0.68),
+    edge_color: tuple[float, float, float] = (0.06, 0.07, 0.09),
+):
+    """Log the rigid knife as a shaded mesh plus a dark cutting edge."""
+
+    vertices, indices = knife.blade_mesh(time)
+    edge = knife.edge_points(time)
+    viewer.log_mesh(
+        f"{prefix}/rigid_blade",
+        wp.array(vertices, dtype=wp.vec3, device=device),
+        wp.array(indices.reshape(-1), dtype=wp.int32, device=device),
+        hidden=False,
+        backface_culling=False,
+        color=blade_color,
+        roughness=0.36,
+    )
+    if edge.shape[0] > 1:
+        starts = edge[:-1]
+        ends = edge[1:]
+        colors = np.tile(np.asarray(edge_color, dtype=np.float32), (starts.shape[0], 1))
+        viewer.log_lines(
+            f"{prefix}/edge",
+            wp.array(starts, dtype=wp.vec3, device=device),
+            wp.array(ends, dtype=wp.vec3, device=device),
+            wp.array(colors, dtype=wp.vec3, device=device),
+            width=0.022,
+        )
 
 
 @dataclass(frozen=True)
@@ -1198,6 +1413,37 @@ def summarize_force_profile(times: np.ndarray, forces: np.ndarray, damage: np.nd
     }
 
 
+@wp.func
+def _knife_edge_process_weight(
+    q: wp.vec3,
+    edge_points: wp.array(dtype=wp.vec3),
+    edge_point_count: int,
+    center_y: float,
+    half_width_y: float,
+    process_width: float,
+):
+    best_d2 = float(1.0e12)
+    for i in range(edge_point_count - 1):
+        a = edge_points[i]
+        b = edge_points[i + 1]
+        abx = b[0] - a[0]
+        abz = b[2] - a[2]
+        denom = abx * abx + abz * abz
+        t = float(0.0)
+        if denom > 1.0e-12:
+            t = ((q[0] - a[0]) * abx + (q[2] - a[2]) * abz) / denom
+            t = wp.min(1.0, wp.max(0.0, t))
+        cx = a[0] + t * abx
+        cz = a[2] + t * abz
+        dx = q[0] - cx
+        dz = q[2] - cz
+        best_d2 = wp.min(best_d2, dx * dx + dz * dz)
+
+    y_out = wp.max(0.0, wp.abs(q[1] - center_y) - half_width_y)
+    distance = wp.sqrt(best_d2 + y_out * y_out)
+    return wp.max(0.0, 1.0 - distance / wp.max(process_width, 1.0e-6))
+
+
 @wp.kernel
 def apply_mpm_knife_cut_kernel(
     particle_q: wp.array[wp.vec3],
@@ -1205,11 +1451,10 @@ def apply_mpm_knife_cut_kernel(
     damage: wp.array[wp.float32],
     colors: wp.array[wp.vec3],
     accum: wp.array[wp.float32],
-    knife_x: float,
+    knife_edge_points: wp.array(dtype=wp.vec3),
+    knife_edge_point_count: int,
     center_y: float,
-    center_z: float,
     half_width_y: float,
-    half_width_z: float,
     process_width: float,
     dt: float,
     particle_area: float,
@@ -1221,12 +1466,17 @@ def apply_mpm_knife_cut_kernel(
 ):
     tid = wp.tid()
     q = particle_q[tid]
-    phi = q[0] - knife_x
     y_rel = q[1] - center_y
-    z_rel = q[2] - center_z
-    weight = wp.max(0.0, 1.0 - wp.abs(phi) / wp.max(process_width, 1.0e-6))
+    weight = _knife_edge_process_weight(
+        q,
+        knife_edge_points,
+        knife_edge_point_count,
+        center_y,
+        half_width_y,
+        process_width,
+    )
 
-    active = weight > 0.0 and wp.abs(y_rel) <= half_width_y and wp.abs(z_rel) <= half_width_z
+    active = weight > 0.0
     old_damage = damage[tid]
     new_damage = old_damage
 
@@ -1263,11 +1513,10 @@ def apply_vbd_knife_cut_kernel(
     damage: wp.array[wp.float32],
     colors: wp.array[wp.vec3],
     accum: wp.array[wp.float32],
-    knife_x: float,
+    knife_edge_points: wp.array(dtype=wp.vec3),
+    knife_edge_point_count: int,
     center_y: float,
-    center_z: float,
     half_width_y: float,
-    half_width_z: float,
     process_width: float,
     dt: float,
     particle_area: float,
@@ -1279,12 +1528,17 @@ def apply_vbd_knife_cut_kernel(
 ):
     tid = wp.tid()
     q = particle_q[tid]
-    phi = q[0] - knife_x
     y_rel = q[1] - center_y
-    z_rel = q[2] - center_z
-    weight = wp.max(0.0, 1.0 - wp.abs(phi) / wp.max(process_width, 1.0e-6))
+    weight = _knife_edge_process_weight(
+        q,
+        knife_edge_points,
+        knife_edge_point_count,
+        center_y,
+        half_width_y,
+        process_width,
+    )
 
-    active = weight > 0.0 and wp.abs(y_rel) <= half_width_y and wp.abs(z_rel) <= half_width_z
+    active = weight > 0.0
     old_damage = damage[tid]
     new_damage = old_damage
 
@@ -1347,6 +1601,8 @@ def launch_mpm_knife_cut(
     device,
 ):
     accum.zero_()
+    edge_points_np = knife.edge_points(time_value)
+    edge_points = wp.array(edge_points_np, dtype=wp.vec3, device=device)
     wp.launch(
         apply_mpm_knife_cut_kernel,
         dim=state.particle_count,
@@ -1356,11 +1612,10 @@ def launch_mpm_knife_cut(
             damage,
             colors,
             accum,
-            knife.x_at(time_value),
+            edge_points,
+            int(edge_points_np.shape[0]),
             knife.center_y,
-            knife.center_z,
             knife.half_width_y,
-            knife.half_width_z,
             knife.process_width,
             dt,
             max(particle_volume, 1.0e-18) ** (2.0 / 3.0),
@@ -1387,6 +1642,8 @@ def launch_vbd_knife_cut(
     device,
 ):
     accum.zero_()
+    edge_points_np = knife.edge_points(time_value)
+    edge_points = wp.array(edge_points_np, dtype=wp.vec3, device=device)
     wp.launch(
         apply_vbd_knife_cut_kernel,
         dim=state.particle_count,
@@ -1397,11 +1654,10 @@ def launch_vbd_knife_cut(
             damage,
             colors,
             accum,
-            knife.x_at(time_value),
+            edge_points,
+            int(edge_points_np.shape[0]),
             knife.center_y,
-            knife.center_z,
             knife.half_width_y,
-            knife.half_width_z,
             knife.process_width,
             dt,
             max(particle_volume, 1.0e-18) ** (2.0 / 3.0),

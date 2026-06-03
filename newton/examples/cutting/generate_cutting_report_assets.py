@@ -17,6 +17,7 @@ import warp as wp
 import newton.examples
 from newton.examples.cutting.cutting_common import (
     AdaptiveCutSurfaceRemesher,
+    KnifeProfile,
     RuntimeStats,
     SplitCuboidRenderMesh,
     TetMeshCutSurfaceRenderer,
@@ -87,13 +88,12 @@ def _particle_colors(example) -> np.ndarray:
     return np.clip(_as_numpy_vec3(colors), 0.0, 1.0)
 
 
-def _knife_segments(example, time_value: float) -> tuple[np.ndarray, np.ndarray]:
+def _knife_profile_for_example(example, time_value: float) -> KnifeProfile | None:
     if hasattr(example, "_knife_state"):
         cfg = example.scenario
         front_x, center_z, _velocity = example._knife_state(time_value)
-        from newton.examples.cutting.cutting_common import KnifeProfile
-
-        blade = KnifeProfile(
+        base = getattr(example, "knife_profile", None)
+        return KnifeProfile(
             start_x=front_x,
             speed=0.0,
             center_y=cfg.knife_center_y,
@@ -101,15 +101,30 @@ def _knife_segments(example, time_value: float) -> tuple[np.ndarray, np.ndarray]
             half_width_y=cfg.knife_half_width_y,
             half_width_z=cfg.knife_half_width_z,
             process_width=cfg.process_width,
+            edge_control_points=base.edge_control_points if base is not None else (),
         )
-        starts, ends, _colors = blade.blade_segments(0.0)
-        return starts, ends
 
     knife = getattr(example, "knife", None)
     if knife is None:
-        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
-    starts, ends, _colors = knife.blade_segments(time_value)
-    return starts, ends
+        return None
+    return knife
+
+
+def _knife_geometry(example, time_value: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    knife = _knife_profile_for_example(example, time_value)
+    if knife is None:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.int32),
+            np.zeros((0, 3), dtype=np.float32),
+        )
+
+    render_time = 0.0 if hasattr(example, "_knife_state") else time_value
+    vertices, indices = knife.blade_mesh(render_time)
+    edge_points = knife.edge_points(render_time)
+    return vertices.astype(np.float32, copy=False), indices.astype(np.int32, copy=False), edge_points.astype(
+        np.float32, copy=False
+    )
 
 
 def _snapshot_render_geometry(example) -> tuple[dict[str, np.ndarray], dict[str, float]]:
@@ -180,15 +195,16 @@ def _snapshot_render_geometry(example) -> tuple[dict[str, np.ndarray], dict[str,
 
 def _snapshot(example) -> tuple[dict[str, object], dict[str, float]]:
     geometry, stats = _snapshot_render_geometry(example)
-    starts, ends = _knife_segments(example, example.sim_time)
+    knife_vertices, knife_indices, knife_edge_points = _knife_geometry(example, example.sim_time)
     particles = example.state_0.particle_q.numpy().astype(np.float32, copy=False)
     colors = _particle_colors(example)
     return {
         **geometry,
         "particles": particles.copy(),
         "particle_colors": colors.copy(),
-        "knife_starts": starts.astype(np.float32, copy=False),
-        "knife_ends": ends.astype(np.float32, copy=False),
+        "knife_vertices": knife_vertices.copy(),
+        "knife_indices": knife_indices.copy(),
+        "knife_edge_points": knife_edge_points.copy(),
         "time": float(example.sim_time),
     }, stats
 
@@ -268,15 +284,26 @@ def _render_frame(
             depthshade=False,
         )
 
-    starts = snapshot["knife_starts"]
-    ends = snapshot["knife_ends"]
-    for start, end in zip(starts, ends, strict=True):
+    knife_vertices = snapshot["knife_vertices"]
+    knife_indices = snapshot["knife_indices"]
+    knife_edge_points = snapshot["knife_edge_points"]
+    if len(knife_indices):
+        knife_tris = knife_vertices[knife_indices]
+        facecolors = np.tile(np.array([[0.52, 0.57, 0.64, 0.96]], dtype=np.float32), (len(knife_indices), 1))
+        knife_collection = Poly3DCollection(
+            knife_tris,
+            facecolors=facecolors,
+            edgecolors=(0.03, 0.04, 0.05, 0.28),
+            linewidths=0.16,
+        )
+        ax.add_collection3d(knife_collection)
+    if len(knife_edge_points) > 1:
         ax.plot(
-            [start[0], end[0]],
-            [start[1], end[1]],
-            [start[2], end[2]],
+            knife_edge_points[:, 0],
+            knife_edge_points[:, 1],
+            knife_edge_points[:, 2],
             color="#111827",
-            linewidth=2.3,
+            linewidth=4.4,
             alpha=0.96,
         )
 
@@ -330,7 +357,7 @@ def _bounds_from_snapshots(snapshots: list[dict[str, object]]) -> np.ndarray:
     mins = []
     maxs = []
     for snapshot in snapshots:
-        for key in ("surface_points", "wall_points", "particles"):
+        for key in ("surface_points", "wall_points", "particles", "knife_vertices"):
             points = snapshot[key]
             if len(points):
                 mins.append(np.min(points, axis=0))

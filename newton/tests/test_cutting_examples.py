@@ -47,6 +47,73 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertEqual(weights[3], 0.0)
         self.assertEqual(weights[4], 0.0)
 
+    def test_knife_edge_spline_drives_process_zone(self):
+        knife = KnifeProfile(
+            start_x=0.0,
+            speed=0.0,
+            center_y=0.0,
+            center_z=0.0,
+            half_width_y=0.04,
+            half_width_z=0.2,
+            process_width=0.025,
+            edge_control_points=((0.0, 0.0, -0.2), (0.045, 0.0, 0.0), (0.0, 0.0, 0.2)),
+        )
+        points = np.array(
+            [
+                [0.045, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.045, 0.07, 0.0],
+                [0.12, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+
+        weights = knife.cut_weights(points, time=0.0)
+
+        self.assertAlmostEqual(float(weights[0]), 1.0, places=5)
+        self.assertEqual(float(weights[1]), 0.0)
+        self.assertEqual(float(weights[2]), 0.0)
+        self.assertEqual(float(weights[3]), 0.0)
+
+    def test_knife_blade_mesh_has_visible_rigid_faces(self):
+        knife = KnifeProfile(start_x=0.1, speed=0.0, half_width_y=0.05, half_width_z=0.18)
+
+        vertices, indices = knife.blade_mesh(time=0.0)
+
+        self.assertEqual(vertices.shape[1], 3)
+        self.assertEqual(indices.shape[1], 3)
+        self.assertGreaterEqual(vertices.shape[0], 6)
+        self.assertGreaterEqual(indices.shape[0], 8)
+        self.assertLess(float(np.min(vertices[:, 0])), knife.x_at(0.0) - 0.08)
+        self.assertGreater(float(np.max(vertices[:, 1])), knife.center_y + knife.half_width_y * 0.9)
+        self.assertLess(float(np.min(vertices[:, 1])), knife.center_y - knife.half_width_y * 0.9)
+        self.assertLessEqual(float(np.max(vertices[:, 2])), knife.center_z + knife.half_width_z + 1.0e-6)
+
+    def test_particle_damage_prefers_spline_edge_over_old_front_plane(self):
+        points = np.array(
+            [
+                [0.045, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        damage = np.zeros(2, dtype=np.float32)
+        knife = KnifeProfile(
+            start_x=0.0,
+            speed=0.0,
+            half_width_y=0.04,
+            half_width_z=0.2,
+            process_width=0.025,
+            edge_control_points=((0.0, 0.0, -0.2), (0.045, 0.0, 0.0), (0.0, 0.0, 0.2)),
+        )
+        material = CutMaterial(fracture_energy=25.0, yield_stress=2.0e3, max_damage_rate=10.0)
+
+        update = compute_particle_cut_update(points, damage, knife, material, dt=0.02, particle_volume=1.0e-6)
+
+        self.assertGreater(update.damage[0], 0.0)
+        self.assertEqual(update.damage[1], 0.0)
+        self.assertEqual(update.active_count, 1)
+
     def test_particle_damage_monotonic_and_force_scales_with_toughness(self):
         points = np.array(
             [

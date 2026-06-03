@@ -1,0 +1,287 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+
+import numpy as np
+import warp as wp
+
+from ...core.types import override
+from ...sim import Contacts, Control, Model, State
+from ..flags import SolverNotifyFlags
+from ..solver import SolverBase
+from ..xpbd import SolverXPBD
+from .kernels import (
+    apply_xfem_knife_kernel,
+    apply_xfem_post_constraints_kernel,
+    classify_xfem_tets_kernel,
+    degrade_xfem_tets_kernel,
+)
+
+__all__ = ["SolverXFEMCut"]
+
+
+def _vec3_tuple(value: Sequence[float] | wp.vec3) -> tuple[float, float, float]:
+    if isinstance(value, wp.vec3):
+        return (float(value[0]), float(value[1]), float(value[2]))
+    if len(value) != 3:
+        raise ValueError("expected a 3-vector")
+    return (float(value[0]), float(value[1]), float(value[2]))
+
+
+class SolverXFEMCut(SolverBase):
+    """Prototype X-FEM-style cutting solver for tetrahedral soft bodies.
+
+    The solver is a Newton solver with solver-owned cut and enrichment state. It
+    uses XPBD as the elastic tetrahedral backbone and surrounds it with Warp
+    kernels for shifted-Heaviside cut classification, enriched side displacement,
+    cohesive damage, material softening, knife friction, and table/glue
+    projection. This makes the prototype usable for real-time cutting
+    exploration while keeping the X-FEM data path explicit and extensible.
+    """
+
+    def __init__(
+        self,
+        model: Model,
+        iterations: int = 8,
+        soft_body_relaxation: float = 0.9,
+        fracture_energy: float = 95.0,
+        yield_stress: float = 1.8e4,
+        max_damage_rate: float = 14.0,
+        separation_stiffness: float = 80.0,
+        separation_speed: float = 0.22,
+        force_scale: float = 0.42,
+        knife_friction_mu: float = 0.55,
+        friction_velocity_scale: float = 0.08,
+        damage_threshold: float = 0.22,
+        residual_stiffness: float = 0.08,
+        max_enrichment: float = 0.045,
+        max_visual_gap: float = 0.045,
+        table_z: float = 0.0,
+        table_glue_depth: float = 0.0,
+        table_glue_strength: float = 0.0,
+        table_friction: float = 0.8,
+    ):
+        super().__init__(model=model)
+
+        self.iterations = int(iterations)
+        self.fracture_energy = float(fracture_energy)
+        self.yield_stress = float(yield_stress)
+        self.max_damage_rate = float(max_damage_rate)
+        self.separation_stiffness = float(separation_stiffness)
+        self.separation_speed = float(separation_speed)
+        self.force_scale = float(force_scale)
+        self.knife_friction_mu = float(knife_friction_mu)
+        self.friction_velocity_scale = float(friction_velocity_scale)
+        self.damage_threshold = float(damage_threshold)
+        self.residual_stiffness = float(residual_stiffness)
+        self.max_enrichment = float(max_enrichment)
+        self.max_visual_gap = float(max_visual_gap)
+        self.table_z = float(table_z)
+        self.table_glue_depth = float(table_glue_depth)
+        self.table_glue_strength = float(table_glue_strength)
+        self.table_friction = float(table_friction)
+
+        self._base_solver = SolverXPBD(
+            model,
+            iterations=self.iterations,
+            soft_body_relaxation=soft_body_relaxation,
+            enable_restitution=False,
+        )
+
+        self.rest_particle_q = wp.clone(model.particle_q) if model.particle_count else None
+        self.particle_damage = wp.zeros(model.particle_count, dtype=float, device=model.device)
+        self.particle_cut_side = wp.zeros(model.particle_count, dtype=float, device=model.device)
+        self.particle_enrichment_q = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
+        self.particle_enrichment_qd = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
+        self.particle_colors = wp.full(
+            model.particle_count, wp.vec3(0.18, 0.58, 0.42), dtype=wp.vec3, device=model.device
+        )
+
+        self.tet_cut_state = wp.zeros(model.tet_count, dtype=wp.int32, device=model.device)
+        self.tet_damage = wp.zeros(model.tet_count, dtype=float, device=model.device)
+        self.tet_cut_weight = wp.zeros(model.tet_count, dtype=float, device=model.device)
+        self.base_tet_materials = wp.clone(model.tet_materials) if model.tet_count and model.tet_materials else None
+        self.force_accum = wp.zeros(6, dtype=float, device=model.device)
+
+        self.particle_area = self._estimate_particle_area()
+        self.set_knife_state(front_x=-1.0, center_y=0.0, center_z=0.0)
+
+    def _estimate_particle_area(self) -> float:
+        if self.model.particle_count == 0 or self.model.particle_q is None:
+            return 1.0
+        points = self.model.particle_q.numpy()
+        if points.size == 0:
+            return 1.0
+        extents = np.maximum(np.ptp(points, axis=0), 1.0e-4)
+        volume = float(math.prod(extents)) / max(float(points.shape[0]), 1.0)
+        return max(volume, 1.0e-18) ** (2.0 / 3.0)
+
+    def set_knife_state(
+        self,
+        *,
+        front_x: float,
+        center_y: float,
+        center_z: float,
+        half_width_y: float = 0.06,
+        half_width_z: float = 0.24,
+        process_width: float = 0.06,
+        knife_velocity: Sequence[float] | wp.vec3 = (0.0, 0.0, 0.0),
+        knife_tangent: Sequence[float] | wp.vec3 = (0.0, 0.0, 1.0),
+    ) -> None:
+        """Set the current blade state used by the next :meth:`step` call."""
+
+        tangent = np.asarray(_vec3_tuple(knife_tangent), dtype=np.float64)
+        norm = float(np.linalg.norm(tangent))
+        if norm <= 1.0e-12:
+            tangent = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            tangent = tangent / norm
+
+        self.knife_front_x = float(front_x)
+        self.knife_center_y = float(center_y)
+        self.knife_center_z = float(center_z)
+        self.knife_half_width_y = float(half_width_y)
+        self.knife_half_width_z = float(half_width_z)
+        self.knife_process_width = float(process_width)
+        self.knife_velocity = _vec3_tuple(knife_velocity)
+        self.knife_tangent = (float(tangent[0]), float(tangent[1]), float(tangent[2]))
+
+    def _classify_and_degrade(self, particle_q: wp.array) -> None:
+        model = self.model
+        if model.tet_count == 0 or model.tet_indices is None:
+            return
+
+        wp.launch(
+            classify_xfem_tets_kernel,
+            dim=model.tet_count,
+            inputs=[
+                particle_q,
+                self.particle_damage,
+                self.particle_cut_side,
+                model.tet_indices,
+                self.tet_cut_state,
+                self.tet_damage,
+                self.tet_cut_weight,
+                self.knife_front_x,
+                self.knife_center_y,
+                self.knife_center_z,
+                self.knife_half_width_z,
+                self.knife_process_width,
+                self.damage_threshold,
+            ],
+            device=model.device,
+        )
+
+        if model.tet_materials is not None and self.base_tet_materials is not None:
+            wp.launch(
+                degrade_xfem_tets_kernel,
+                dim=model.tet_count,
+                inputs=[
+                    self.tet_cut_state,
+                    self.tet_damage,
+                    model.tet_materials,
+                    self.base_tet_materials,
+                    self.residual_stiffness,
+                ],
+                device=model.device,
+            )
+
+    @override
+    def notify_model_changed(self, flags: int) -> None:
+        if flags & (
+            SolverNotifyFlags.BODY_PROPERTIES
+            | SolverNotifyFlags.BODY_INERTIAL_PROPERTIES
+            | SolverNotifyFlags.MODEL_PROPERTIES
+        ):
+            self._base_solver.notify_model_changed(flags)
+
+    @override
+    def step(
+        self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float
+    ) -> None:
+        model = self.model
+        if control is None:
+            control = model.control(clone_variables=False)
+
+        self.force_accum.zero_()
+
+        if model.particle_count:
+            wp.launch(
+                apply_xfem_knife_kernel,
+                dim=model.particle_count,
+                inputs=[
+                    state_in.particle_q,
+                    state_in.particle_qd,
+                    state_in.particle_f,
+                    model.particle_inv_mass,
+                    model.particle_flags,
+                    self.particle_damage,
+                    self.particle_cut_side,
+                    self.particle_enrichment_q,
+                    self.particle_enrichment_qd,
+                    self.particle_colors,
+                    self.force_accum,
+                    self.knife_front_x,
+                    self.knife_center_y,
+                    self.knife_center_z,
+                    self.knife_half_width_y,
+                    self.knife_half_width_z,
+                    self.knife_process_width,
+                    dt,
+                    self.particle_area,
+                    self.fracture_energy,
+                    self.yield_stress,
+                    self.max_damage_rate,
+                    self.separation_stiffness,
+                    self.separation_speed,
+                    self.force_scale,
+                    self.knife_friction_mu,
+                    self.friction_velocity_scale,
+                    wp.vec3(*self.knife_velocity),
+                    wp.vec3(*self.knife_tangent),
+                    self.max_enrichment,
+                ],
+                device=model.device,
+            )
+
+        if model.tet_count:
+            self._classify_and_degrade(state_in.particle_q)
+
+        self._base_solver.step(state_in, state_out, control, contacts, dt)
+
+        if model.particle_count and self.rest_particle_q is not None:
+            wp.launch(
+                apply_xfem_post_constraints_kernel,
+                dim=model.particle_count,
+                inputs=[
+                    state_out.particle_q,
+                    state_out.particle_qd,
+                    model.particle_inv_mass,
+                    model.particle_flags,
+                    self.rest_particle_q,
+                    self.particle_damage,
+                    self.particle_cut_side,
+                    self.particle_enrichment_q,
+                    self.knife_front_x,
+                    self.knife_center_y,
+                    self.knife_process_width,
+                    self.max_visual_gap,
+                    self.table_z,
+                    self.table_glue_depth,
+                    self.table_glue_strength,
+                    self.table_friction,
+                    dt,
+                ],
+                device=model.device,
+            )
+
+        if model.tet_count:
+            self._classify_and_degrade(state_out.particle_q)
+
+    @override
+    def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
+        self._base_solver.update_contacts(contacts, state)

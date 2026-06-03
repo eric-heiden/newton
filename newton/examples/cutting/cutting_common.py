@@ -131,18 +131,27 @@ def _cutting_deform_from_particles(
     rest_particle_points: wp.array(dtype=wp.vec3),
     particle_points: wp.array(dtype=wp.vec3),
     particle_count: int,
+    side_center_y: float,
 ):
     if particle_count <= 0:
         return rest_point
 
     weighted_delta = wp.vec3(0.0, 0.0, 0.0)
     weight_sum = float(0.0)
+    rest_side = -1.0
+    if rest_point[1] >= side_center_y:
+        rest_side = 1.0
     for i in range(particle_count):
         rest_particle = rest_particle_points[i]
         current_particle = particle_points[i]
         d = rest_point - rest_particle
         d2 = wp.dot(d, d)
         weight = 1.0 / wp.max(d2, 1.0e-10)
+        particle_side = -1.0
+        if rest_particle[1] >= side_center_y:
+            particle_side = 1.0
+        if rest_side * particle_side < 0.0:
+            weight = weight * 0.03
         weighted_delta = weighted_delta + (current_particle - rest_particle) * weight
         weight_sum = weight_sum + weight
 
@@ -161,13 +170,22 @@ def _cutting_write_quad(
     rest_particle_points: wp.array(dtype=wp.vec3),
     particle_points: wp.array(dtype=wp.vec3),
     particle_count: int,
+    side_center_y: float,
 ):
     vertex = quad_index * 4
     index = quad_index * 6
-    points[vertex + 0] = _cutting_deform_from_particles(a, rest_particle_points, particle_points, particle_count)
-    points[vertex + 1] = _cutting_deform_from_particles(b, rest_particle_points, particle_points, particle_count)
-    points[vertex + 2] = _cutting_deform_from_particles(c, rest_particle_points, particle_points, particle_count)
-    points[vertex + 3] = _cutting_deform_from_particles(d, rest_particle_points, particle_points, particle_count)
+    points[vertex + 0] = _cutting_deform_from_particles(
+        a, rest_particle_points, particle_points, particle_count, side_center_y
+    )
+    points[vertex + 1] = _cutting_deform_from_particles(
+        b, rest_particle_points, particle_points, particle_count, side_center_y
+    )
+    points[vertex + 2] = _cutting_deform_from_particles(
+        c, rest_particle_points, particle_points, particle_count, side_center_y
+    )
+    points[vertex + 3] = _cutting_deform_from_particles(
+        d, rest_particle_points, particle_points, particle_count, side_center_y
+    )
     indices[index + 0] = vertex + 0
     indices[index + 1] = vertex + 1
     indices[index + 2] = vertex + 2
@@ -249,6 +267,7 @@ def _build_adaptive_cut_surface_kernel(
                 rest_particle_points,
                 particle_points,
                 particle_count,
+                knife_center_y,
             )
         elif face_id == 1:
             _cutting_write_quad(
@@ -262,6 +281,7 @@ def _build_adaptive_cut_surface_kernel(
                 rest_particle_points,
                 particle_points,
                 particle_count,
+                knife_center_y,
             )
         else:
             z_id = face_id - 2
@@ -278,6 +298,7 @@ def _build_adaptive_cut_surface_kernel(
                 rest_particle_points,
                 particle_points,
                 particle_count,
+                knife_center_y,
             )
         return
 
@@ -317,6 +338,7 @@ def _build_adaptive_cut_surface_kernel(
             rest_particle_points,
             particle_points,
             particle_count,
+            knife_center_y,
         )
     else:
         _cutting_write_quad(
@@ -330,6 +352,7 @@ def _build_adaptive_cut_surface_kernel(
             rest_particle_points,
             particle_points,
             particle_count,
+            knife_center_y,
         )
 
 
@@ -384,6 +407,7 @@ def _build_adaptive_cut_wall_kernel(
         rest_particle_points,
         particle_points,
         particle_count,
+        knife_center_y,
     )
 
 
@@ -1178,6 +1202,8 @@ class ForceHistory:
         self.forces: list[float] = []
         self.active_counts: list[float] = []
         self.mean_damage: list[float] = []
+        self.normal_forces: list[float] = []
+        self.friction_forces: list[float] = []
 
     def append_from_accum(self, time_value: float, accum: wp.array, particle_count: int):
         values = accum.numpy()
@@ -1188,29 +1214,52 @@ class ForceHistory:
             float(values[2]) / max(float(particle_count), 1.0),
         )
 
-    def append_values(self, time_value: float, force: float, active_count: float, mean_damage: float):
+    def append_values(
+        self,
+        time_value: float,
+        force: float,
+        active_count: float,
+        mean_damage: float,
+        normal_force: float | None = None,
+        friction_force: float | None = None,
+    ):
         self.times.append(float(time_value))
         self.forces.append(float(force))
         self.active_counts.append(float(active_count))
         self.mean_damage.append(float(mean_damage))
+        if normal_force is not None or friction_force is not None:
+            self.normal_forces.append(float(normal_force or 0.0))
+            self.friction_forces.append(float(friction_force or 0.0))
 
     def summary(self) -> dict[str, float]:
         return summarize_force_profile(np.array(self.times), np.array(self.forces), np.array(self.mean_damage))
 
     def to_dict(self) -> dict[str, list[float]]:
-        return {
+        payload = {
             "time_s": self.times,
             "force_n": self.forces,
             "active_particles": self.active_counts,
             "mean_damage": self.mean_damage,
         }
+        if self.normal_forces or self.friction_forces:
+            payload["normal_force_n"] = self.normal_forces
+            payload["friction_force_n"] = self.friction_forces
+        return payload
 
     def write_csv(self, path: str | Path):
         path = Path(path)
         with path.open("w", encoding="utf-8") as f:
-            f.write("time_s,force_n,active_particles,mean_damage\n")
-            for row in zip(self.times, self.forces, self.active_counts, self.mean_damage, strict=True):
-                f.write(f"{row[0]:.8f},{row[1]:.8f},{row[2]:.0f},{row[3]:.8f}\n")
+            has_components = bool(self.normal_forces or self.friction_forces)
+            if has_components:
+                f.write("time_s,force_n,normal_force_n,friction_force_n,active_particles,mean_damage\n")
+                for i, row in enumerate(zip(self.times, self.forces, self.active_counts, self.mean_damage, strict=True)):
+                    normal = self.normal_forces[i] if i < len(self.normal_forces) else 0.0
+                    friction = self.friction_forces[i] if i < len(self.friction_forces) else 0.0
+                    f.write(f"{row[0]:.8f},{row[1]:.8f},{normal:.8f},{friction:.8f},{row[2]:.0f},{row[3]:.8f}\n")
+            else:
+                f.write("time_s,force_n,active_particles,mean_damage\n")
+                for row in zip(self.times, self.forces, self.active_counts, self.mean_damage, strict=True):
+                    f.write(f"{row[0]:.8f},{row[1]:.8f},{row[2]:.0f},{row[3]:.8f}\n")
 
 
 class StepTimer:
@@ -1307,6 +1356,10 @@ def write_force_plot(path: str | Path, history: ForceHistory, title: str):
     fig, ax_force = plt.subplots(figsize=(8, 4.5), dpi=160)
     ax_damage = ax_force.twinx()
     ax_force.plot(history.times, history.forces, color="#b91c1c", linewidth=2.0, label="knife force")
+    if history.normal_forces:
+        ax_force.plot(history.times, history.normal_forces, color="#f97316", linewidth=1.4, label="normal")
+    if history.friction_forces:
+        ax_force.plot(history.times, history.friction_forces, color="#7c3aed", linewidth=1.4, label="friction")
     ax_damage.plot(history.times, history.mean_damage, color="#1d4ed8", linewidth=1.8, label="mean damage")
     ax_force.set_xlabel("time [s]")
     ax_force.set_ylabel("force [N]", color="#b91c1c")

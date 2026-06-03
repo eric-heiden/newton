@@ -4,8 +4,10 @@
 import unittest
 
 import numpy as np
+import warp as wp
 
 from newton.examples.cutting.cutting_common import (
+    AdaptiveCutSurfaceRemesher,
     CutMaterial,
     KnifeProfile,
     SplitCuboidRenderMesh,
@@ -127,6 +129,58 @@ class TestCuttingCommon(unittest.TestCase):
         )
         np.testing.assert_allclose(
             moved_walls - static_walls, np.broadcast_to(translation, moved_walls.shape), atol=1.0e-5
+        )
+
+    def test_adaptive_cut_remesher_refines_near_knife(self):
+        knife = KnifeProfile(start_x=-0.25, speed=0.5, center_y=0.0, process_width=0.08)
+        remesher = AdaptiveCutSurfaceRemesher(
+            block_lo=(-0.5, -0.25, 0.0),
+            block_hi=(0.5, 0.25, 0.4),
+            knife=knife,
+            base_segments=8,
+            refine_factor=4,
+            refine_band=0.12,
+            height_segments=3,
+        )
+
+        stats = remesher.update(wp.get_device(), time=0.5)
+
+        self.assertGreater(stats.active_x_segments, remesher.base_segments)
+        self.assertGreater(stats.surface_triangle_count, 0)
+        self.assertGreater(stats.wall_triangle_count, 0)
+        self.assertLess(stats.min_active_dx, stats.coarse_dx)
+
+    def test_adaptive_cut_remesher_follows_particle_motion(self):
+        knife = KnifeProfile(start_x=-0.5, speed=0.0, center_y=0.0, process_width=0.08)
+        remesher = AdaptiveCutSurfaceRemesher(
+            block_lo=(-0.5, -0.25, 0.0),
+            block_hi=(0.5, 0.25, 0.4),
+            knife=knife,
+            base_segments=4,
+            refine_factor=2,
+            refine_band=0.1,
+            height_segments=2,
+        )
+        xs = np.linspace(-0.5, 0.5, 4, dtype=np.float32)
+        ys = np.linspace(-0.25, 0.25, 3, dtype=np.float32)
+        zs = np.linspace(0.0, 0.4, 3, dtype=np.float32)
+        rest_particles = np.array([[x, y, z] for x in xs for y in ys for z in zs], dtype=np.float32)
+        translation = np.array([0.08, -0.03, 0.05], dtype=np.float32)
+        moved_particles = rest_particles + translation
+
+        static_stats = remesher.update(wp.get_device(), time=1.5)
+        static_surface = remesher.surface_points_wp.numpy()[: static_stats.surface_vertex_count].copy()
+        moved_stats = remesher.update(
+            wp.get_device(),
+            time=1.5,
+            rest_particle_points=rest_particles,
+            particle_points=moved_particles,
+        )
+        moved_surface = remesher.surface_points_wp.numpy()[: moved_stats.surface_vertex_count]
+
+        self.assertEqual(static_stats.surface_vertex_count, moved_stats.surface_vertex_count)
+        np.testing.assert_allclose(
+            moved_surface - static_surface, np.broadcast_to(translation, moved_surface.shape), atol=1.0e-5
         )
 
 

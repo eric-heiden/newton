@@ -102,6 +102,291 @@ class ParticleCutUpdate:
     mean_damage: float
 
 
+@dataclass(frozen=True)
+class AdaptiveRemeshStats:
+    active_x_segments: int
+    surface_vertex_count: int
+    surface_triangle_count: int
+    wall_vertex_count: int
+    wall_triangle_count: int
+    coarse_dx: float
+    min_active_dx: float
+    max_active_dx: float
+
+
+@wp.func
+def _cutting_smoothstep(value: float):
+    x = wp.min(1.0, wp.max(0.0, value))
+    return x * x * (3.0 - 2.0 * x)
+
+
+@wp.func
+def _cutting_gap_at(x: float, knife_x: float, max_gap: float, front_width: float):
+    return max_gap * _cutting_smoothstep((knife_x - x) / front_width)
+
+
+@wp.func
+def _cutting_deform_from_particles(
+    rest_point: wp.vec3,
+    rest_particle_points: wp.array(dtype=wp.vec3),
+    particle_points: wp.array(dtype=wp.vec3),
+    particle_count: int,
+):
+    if particle_count <= 0:
+        return rest_point
+
+    weighted_delta = wp.vec3(0.0, 0.0, 0.0)
+    weight_sum = float(0.0)
+    for i in range(particle_count):
+        rest_particle = rest_particle_points[i]
+        current_particle = particle_points[i]
+        d = rest_point - rest_particle
+        d2 = wp.dot(d, d)
+        weight = 1.0 / wp.max(d2, 1.0e-10)
+        weighted_delta = weighted_delta + (current_particle - rest_particle) * weight
+        weight_sum = weight_sum + weight
+
+    return rest_point + weighted_delta / wp.max(weight_sum, 1.0e-10)
+
+
+@wp.func
+def _cutting_write_quad(
+    points: wp.array(dtype=wp.vec3),
+    indices: wp.array(dtype=wp.int32),
+    quad_index: int,
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+    d: wp.vec3,
+    rest_particle_points: wp.array(dtype=wp.vec3),
+    particle_points: wp.array(dtype=wp.vec3),
+    particle_count: int,
+):
+    vertex = quad_index * 4
+    index = quad_index * 6
+    points[vertex + 0] = _cutting_deform_from_particles(a, rest_particle_points, particle_points, particle_count)
+    points[vertex + 1] = _cutting_deform_from_particles(b, rest_particle_points, particle_points, particle_count)
+    points[vertex + 2] = _cutting_deform_from_particles(c, rest_particle_points, particle_points, particle_count)
+    points[vertex + 3] = _cutting_deform_from_particles(d, rest_particle_points, particle_points, particle_count)
+    indices[index + 0] = vertex + 0
+    indices[index + 1] = vertex + 1
+    indices[index + 2] = vertex + 2
+    indices[index + 3] = vertex + 0
+    indices[index + 4] = vertex + 2
+    indices[index + 5] = vertex + 3
+
+
+@wp.func
+def _cutting_write_empty_quad(points: wp.array(dtype=wp.vec3), indices: wp.array(dtype=wp.int32), quad_index: int):
+    vertex = quad_index * 4
+    index = quad_index * 6
+    zero = wp.vec3(0.0, 0.0, 0.0)
+    points[vertex + 0] = zero
+    points[vertex + 1] = zero
+    points[vertex + 2] = zero
+    points[vertex + 3] = zero
+    indices[index + 0] = 0
+    indices[index + 1] = 0
+    indices[index + 2] = 0
+    indices[index + 3] = 0
+    indices[index + 4] = 0
+    indices[index + 5] = 0
+
+
+@wp.kernel
+def _build_adaptive_cut_surface_kernel(
+    x_segments: wp.array(dtype=wp.vec2),
+    active_segment_count: int,
+    points: wp.array(dtype=wp.vec3),
+    indices: wp.array(dtype=wp.int32),
+    rest_particle_points: wp.array(dtype=wp.vec3),
+    particle_points: wp.array(dtype=wp.vec3),
+    particle_count: int,
+    block_lo: wp.vec3,
+    block_hi: wp.vec3,
+    knife_x: float,
+    knife_center_y: float,
+    max_gap: float,
+    front_width: float,
+    height_segments: int,
+    quads_per_x_segment: int,
+    cap_quad_offset: int,
+):
+    quad = wp.tid()
+    dz = (block_hi[2] - block_lo[2]) / float(height_segments)
+
+    if quad < cap_quad_offset:
+        segment_id = quad / quads_per_x_segment
+        local = quad - segment_id * quads_per_x_segment
+        if segment_id >= active_segment_count:
+            _cutting_write_empty_quad(points, indices, quad)
+            return
+
+        side_id = local / (height_segments + 2)
+        face_id = local - side_id * (height_segments + 2)
+        side = -1.0
+        if side_id == 1:
+            side = 1.0
+
+        segment = x_segments[segment_id]
+        x0 = segment[0]
+        x1 = segment[1]
+        y_outer = block_lo[1]
+        if side > 0.0:
+            y_outer = block_hi[1]
+        y_cut0 = knife_center_y + side * 0.5 * _cutting_gap_at(x0, knife_x, max_gap, front_width)
+        y_cut1 = knife_center_y + side * 0.5 * _cutting_gap_at(x1, knife_x, max_gap, front_width)
+
+        if face_id == 0:
+            _cutting_write_quad(
+                points,
+                indices,
+                quad,
+                wp.vec3(x0, y_outer, block_hi[2]),
+                wp.vec3(x1, y_outer, block_hi[2]),
+                wp.vec3(x1, y_cut1, block_hi[2]),
+                wp.vec3(x0, y_cut0, block_hi[2]),
+                rest_particle_points,
+                particle_points,
+                particle_count,
+            )
+        elif face_id == 1:
+            _cutting_write_quad(
+                points,
+                indices,
+                quad,
+                wp.vec3(x0, y_cut0, block_lo[2]),
+                wp.vec3(x1, y_cut1, block_lo[2]),
+                wp.vec3(x1, y_outer, block_lo[2]),
+                wp.vec3(x0, y_outer, block_lo[2]),
+                rest_particle_points,
+                particle_points,
+                particle_count,
+            )
+        else:
+            z_id = face_id - 2
+            z0 = block_lo[2] + float(z_id) * dz
+            z1 = z0 + dz
+            _cutting_write_quad(
+                points,
+                indices,
+                quad,
+                wp.vec3(x0, y_outer, z0),
+                wp.vec3(x1, y_outer, z0),
+                wp.vec3(x1, y_outer, z1),
+                wp.vec3(x0, y_outer, z1),
+                rest_particle_points,
+                particle_points,
+                particle_count,
+            )
+        return
+
+    cap_id = quad - cap_quad_offset
+    cap_count = 4 * height_segments
+    if cap_id >= cap_count:
+        _cutting_write_empty_quad(points, indices, quad)
+        return
+
+    end_id = cap_id / (2 * height_segments)
+    rem = cap_id - end_id * 2 * height_segments
+    side_id = rem / height_segments
+    z_id = rem - side_id * height_segments
+
+    side = -1.0
+    if side_id == 1:
+        side = 1.0
+    x = block_lo[0]
+    if end_id == 1:
+        x = block_hi[0]
+    y_outer = block_lo[1]
+    if side > 0.0:
+        y_outer = block_hi[1]
+    y_cut = knife_center_y + side * 0.5 * _cutting_gap_at(x, knife_x, max_gap, front_width)
+    z0 = block_lo[2] + float(z_id) * dz
+    z1 = z0 + dz
+
+    if end_id == 0:
+        _cutting_write_quad(
+            points,
+            indices,
+            quad,
+            wp.vec3(x, y_outer, z0),
+            wp.vec3(x, y_cut, z0),
+            wp.vec3(x, y_cut, z1),
+            wp.vec3(x, y_outer, z1),
+            rest_particle_points,
+            particle_points,
+            particle_count,
+        )
+    else:
+        _cutting_write_quad(
+            points,
+            indices,
+            quad,
+            wp.vec3(x, y_cut, z0),
+            wp.vec3(x, y_outer, z0),
+            wp.vec3(x, y_outer, z1),
+            wp.vec3(x, y_cut, z1),
+            rest_particle_points,
+            particle_points,
+            particle_count,
+        )
+
+
+@wp.kernel
+def _build_adaptive_cut_wall_kernel(
+    x_segments: wp.array(dtype=wp.vec2),
+    active_segment_count: int,
+    points: wp.array(dtype=wp.vec3),
+    indices: wp.array(dtype=wp.int32),
+    rest_particle_points: wp.array(dtype=wp.vec3),
+    particle_points: wp.array(dtype=wp.vec3),
+    particle_count: int,
+    block_lo: wp.vec3,
+    block_hi: wp.vec3,
+    knife_x: float,
+    knife_center_y: float,
+    max_gap: float,
+    front_width: float,
+    height_segments: int,
+):
+    quad = wp.tid()
+    quads_per_segment = 2 * height_segments
+    segment_id = quad / quads_per_segment
+    local = quad - segment_id * quads_per_segment
+    if segment_id >= active_segment_count:
+        _cutting_write_empty_quad(points, indices, quad)
+        return
+
+    side_id = local / height_segments
+    z_id = local - side_id * height_segments
+    side = -1.0
+    if side_id == 1:
+        side = 1.0
+
+    segment = x_segments[segment_id]
+    x0 = segment[0]
+    x1 = segment[1]
+    dz = (block_hi[2] - block_lo[2]) / float(height_segments)
+    z0 = block_lo[2] + float(z_id) * dz
+    z1 = z0 + dz
+    y_cut0 = knife_center_y + side * 0.5 * _cutting_gap_at(x0, knife_x, max_gap, front_width)
+    y_cut1 = knife_center_y + side * 0.5 * _cutting_gap_at(x1, knife_x, max_gap, front_width)
+
+    _cutting_write_quad(
+        points,
+        indices,
+        quad,
+        wp.vec3(x0, y_cut0, z0),
+        wp.vec3(x1, y_cut1, z0),
+        wp.vec3(x1, y_cut1, z1),
+        wp.vec3(x0, y_cut0, z1),
+        rest_particle_points,
+        particle_points,
+        particle_count,
+    )
+
+
 class SplitCuboidRenderMesh:
     """Render-only cuboid remesh with duplicated seam vertices and cut walls.
 
@@ -296,6 +581,251 @@ class SplitCuboidRenderMesh:
         )
 
 
+class AdaptiveCutSurfaceRemesher:
+    """Warp-backed render remesher with local refinement near the knife front.
+
+    The remesher uses fixed-capacity buffers so the geometry can be regenerated
+    every frame without changing allocation size. A small host-side schedule
+    decides which coarse x cells need refinement; Warp kernels emit duplicated
+    seam vertices, cut-wall triangles, and particle-motion deformation.
+    """
+
+    def __init__(
+        self,
+        block_lo: tuple[float, float, float] | np.ndarray,
+        block_hi: tuple[float, float, float] | np.ndarray,
+        knife: KnifeProfile,
+        max_gap: float = 0.12,
+        base_segments: int = 24,
+        refine_factor: int = 4,
+        refine_band: float | None = None,
+        height_segments: int = 6,
+        front_width: float | None = None,
+    ):
+        self.block_lo = np.asarray(block_lo, dtype=np.float32)
+        self.block_hi = np.asarray(block_hi, dtype=np.float32)
+        self.knife = knife
+        self.max_gap = float(max_gap)
+        self.base_segments = int(max(2, base_segments))
+        self.refine_factor = int(max(1, refine_factor))
+        self.refine_band = float(refine_band if refine_band is not None else 2.0 * knife.process_width)
+        self.height_segments = int(max(1, height_segments))
+        self.front_width = float(front_width if front_width is not None else max(2.0 * knife.process_width, 1.0e-4))
+
+        self.coarse_dx = float((self.block_hi[0] - self.block_lo[0]) / self.base_segments)
+        self.max_x_segments = self.base_segments * self.refine_factor
+        self.quads_per_x_segment = 2 * (self.height_segments + 2)
+        self.surface_cap_quads = 4 * self.height_segments
+        self.surface_max_quads = self.max_x_segments * self.quads_per_x_segment + self.surface_cap_quads
+        self.wall_max_quads = self.max_x_segments * 2 * self.height_segments
+
+        self.x_segments_np = np.zeros((self.max_x_segments, 2), dtype=np.float32)
+        self.empty_particles_np = np.zeros((0, 3), dtype=np.float32)
+
+        self.x_segments_wp: wp.array | None = None
+        self.surface_points_wp: wp.array | None = None
+        self.surface_indices_wp: wp.array | None = None
+        self.wall_points_wp: wp.array | None = None
+        self.wall_indices_wp: wp.array | None = None
+        self.empty_particles_wp: wp.array | None = None
+        self.device_key: str | None = None
+        self.last_stats = AdaptiveRemeshStats(
+            active_x_segments=0,
+            surface_vertex_count=0,
+            surface_triangle_count=0,
+            wall_vertex_count=0,
+            wall_triangle_count=0,
+            coarse_dx=self.coarse_dx,
+            min_active_dx=self.coarse_dx,
+            max_active_dx=self.coarse_dx,
+        )
+
+    @staticmethod
+    def _as_vec3_wp(points: np.ndarray | wp.array | None, device) -> tuple[wp.array | None, int]:
+        if points is None:
+            return None, 0
+        if isinstance(points, wp.array):
+            return points, len(points)
+        points_np = np.asarray(points, dtype=np.float32)
+        if points_np.ndim != 2 or points_np.shape[1] != 3:
+            raise ValueError("particle points must have shape (N, 3)")
+        return wp.array(points_np, dtype=wp.vec3, device=device), int(points_np.shape[0])
+
+    def _ensure_device_arrays(self, device):
+        device_key = str(device)
+        if self.surface_points_wp is not None and self.device_key == device_key:
+            return
+        self.device_key = device_key
+        self.x_segments_wp = wp.array(self.x_segments_np, dtype=wp.vec2, device=device)
+        self.surface_points_wp = wp.empty(self.surface_max_quads * 4, dtype=wp.vec3, device=device)
+        self.surface_indices_wp = wp.empty(self.surface_max_quads * 6, dtype=wp.int32, device=device)
+        self.wall_points_wp = wp.empty(self.wall_max_quads * 4, dtype=wp.vec3, device=device)
+        self.wall_indices_wp = wp.empty(self.wall_max_quads * 6, dtype=wp.int32, device=device)
+        self.empty_particles_wp = wp.array(self.empty_particles_np, dtype=wp.vec3, device=device)
+
+    def _build_x_segments(self, time: float) -> tuple[int, float, float]:
+        knife_x = self.knife.x_at(time)
+        coarse_nodes = np.linspace(self.block_lo[0], self.block_hi[0], self.base_segments + 1, dtype=np.float32)
+        count = 0
+        min_dx = float("inf")
+        max_dx = 0.0
+        self.x_segments_np.fill(0.0)
+
+        for i in range(self.base_segments):
+            x0 = float(coarse_nodes[i])
+            x1 = float(coarse_nodes[i + 1])
+            center = 0.5 * (x0 + x1)
+            splits = self.refine_factor if abs(center - knife_x) <= self.refine_band else 1
+            dx = (x1 - x0) / splits
+            for j in range(splits):
+                if count >= self.max_x_segments:
+                    break
+                a = x0 + j * dx
+                b = x0 + (j + 1) * dx
+                self.x_segments_np[count, 0] = a
+                self.x_segments_np[count, 1] = b
+                min_dx = min(min_dx, b - a)
+                max_dx = max(max_dx, b - a)
+                count += 1
+
+        if count == 0:
+            min_dx = self.coarse_dx
+            max_dx = self.coarse_dx
+        return count, float(min_dx), float(max_dx)
+
+    def update(
+        self,
+        device,
+        time: float,
+        rest_particle_points: np.ndarray | wp.array | None = None,
+        particle_points: np.ndarray | wp.array | None = None,
+    ) -> AdaptiveRemeshStats:
+        self._ensure_device_arrays(device)
+        active_x_segments, min_dx, max_dx = self._build_x_segments(time)
+        assert self.x_segments_wp is not None
+        assert self.surface_points_wp is not None
+        assert self.surface_indices_wp is not None
+        assert self.wall_points_wp is not None
+        assert self.wall_indices_wp is not None
+        assert self.empty_particles_wp is not None
+
+        rest_wp, rest_count = self._as_vec3_wp(rest_particle_points, device)
+        current_wp, current_count = self._as_vec3_wp(particle_points, device)
+        if rest_wp is None and current_wp is None:
+            rest_wp = self.empty_particles_wp
+            current_wp = self.empty_particles_wp
+            particle_count = 0
+        elif rest_wp is None or current_wp is None or rest_count != current_count:
+            raise ValueError("rest_particle_points and particle_points must be provided together with equal length")
+        else:
+            particle_count = rest_count
+
+        self.x_segments_wp.assign(self.x_segments_np)
+        block_lo = wp.vec3(float(self.block_lo[0]), float(self.block_lo[1]), float(self.block_lo[2]))
+        block_hi = wp.vec3(float(self.block_hi[0]), float(self.block_hi[1]), float(self.block_hi[2]))
+        knife_x = float(self.knife.x_at(time))
+
+        wp.launch(
+            _build_adaptive_cut_surface_kernel,
+            dim=self.surface_max_quads,
+            inputs=[
+                self.x_segments_wp,
+                active_x_segments,
+                self.surface_points_wp,
+                self.surface_indices_wp,
+                rest_wp,
+                current_wp,
+                particle_count,
+                block_lo,
+                block_hi,
+                knife_x,
+                float(self.knife.center_y),
+                self.max_gap,
+                self.front_width,
+                self.height_segments,
+                self.quads_per_x_segment,
+                active_x_segments * self.quads_per_x_segment,
+            ],
+            device=device,
+        )
+        wp.launch(
+            _build_adaptive_cut_wall_kernel,
+            dim=self.wall_max_quads,
+            inputs=[
+                self.x_segments_wp,
+                active_x_segments,
+                self.wall_points_wp,
+                self.wall_indices_wp,
+                rest_wp,
+                current_wp,
+                particle_count,
+                block_lo,
+                block_hi,
+                knife_x,
+                float(self.knife.center_y),
+                self.max_gap,
+                self.front_width,
+                self.height_segments,
+            ],
+            device=device,
+        )
+
+        active_surface_quads = active_x_segments * self.quads_per_x_segment + self.surface_cap_quads
+        active_wall_quads = active_x_segments * 2 * self.height_segments
+        self.last_stats = AdaptiveRemeshStats(
+            active_x_segments=active_x_segments,
+            surface_vertex_count=active_surface_quads * 4,
+            surface_triangle_count=active_surface_quads * 2,
+            wall_vertex_count=active_wall_quads * 4,
+            wall_triangle_count=active_wall_quads * 2,
+            coarse_dx=self.coarse_dx,
+            min_active_dx=min_dx,
+            max_active_dx=max_dx,
+        )
+        return self.last_stats
+
+    def log(
+        self,
+        viewer,
+        device,
+        time: float,
+        prefix: str = "/cutting/adaptive_remesh",
+        surface_color: tuple[float, float, float] = (0.18, 0.62, 0.95),
+        wall_color: tuple[float, float, float] = (0.95, 0.32, 0.42),
+        rest_particle_points: np.ndarray | wp.array | None = None,
+        particle_points: np.ndarray | wp.array | None = None,
+    ) -> AdaptiveRemeshStats:
+        stats = self.update(
+            device,
+            time,
+            rest_particle_points=rest_particle_points,
+            particle_points=particle_points,
+        )
+        assert self.surface_points_wp is not None
+        assert self.surface_indices_wp is not None
+        assert self.wall_points_wp is not None
+        assert self.wall_indices_wp is not None
+        viewer.log_mesh(
+            f"{prefix}/surface",
+            self.surface_points_wp,
+            self.surface_indices_wp,
+            hidden=False,
+            backface_culling=False,
+            color=surface_color,
+            roughness=0.68,
+        )
+        viewer.log_mesh(
+            f"{prefix}/cut_walls",
+            self.wall_points_wp,
+            self.wall_indices_wp,
+            hidden=self.knife.x_at(time) < self.block_lo[0],
+            backface_culling=False,
+            color=wall_color,
+            roughness=0.82,
+        )
+        return stats
+
+
 @dataclass
 class RuntimeStats:
     solver: str
@@ -313,6 +843,38 @@ class RuntimeStats:
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=True)
+
+
+def summarize_remesh_history(history: list[dict[str, float]]) -> dict[str, float]:
+    if not history:
+        return {
+            "frame_count": 0.0,
+            "mean_active_x_segments": 0.0,
+            "max_active_x_segments": 0.0,
+            "mean_surface_triangles": 0.0,
+            "max_surface_triangles": 0.0,
+            "mean_wall_triangles": 0.0,
+            "max_wall_triangles": 0.0,
+            "min_active_dx": 0.0,
+            "max_active_dx": 0.0,
+        }
+
+    active_x = np.array([row["active_x_segments"] for row in history], dtype=np.float32)
+    surface_triangles = np.array([row["surface_triangle_count"] for row in history], dtype=np.float32)
+    wall_triangles = np.array([row["wall_triangle_count"] for row in history], dtype=np.float32)
+    min_dx = np.array([row["min_active_dx"] for row in history], dtype=np.float32)
+    max_dx = np.array([row["max_active_dx"] for row in history], dtype=np.float32)
+    return {
+        "frame_count": float(len(history)),
+        "mean_active_x_segments": float(np.mean(active_x)),
+        "max_active_x_segments": float(np.max(active_x)),
+        "mean_surface_triangles": float(np.mean(surface_triangles)),
+        "max_surface_triangles": float(np.max(surface_triangles)),
+        "mean_wall_triangles": float(np.mean(wall_triangles)),
+        "max_wall_triangles": float(np.max(wall_triangles)),
+        "min_active_dx": float(np.min(min_dx)),
+        "max_active_dx": float(np.max(max_dx)),
+    }
 
 
 def compute_particle_cut_update(
@@ -869,6 +1431,15 @@ def export_artifacts(
     return artifacts
 
 
+def export_remesh_artifacts(output_dir: str | Path, solver_name: str, history: list[dict[str, float]]) -> Path | None:
+    if not history:
+        return None
+    output_dir = ensure_dir(output_dir)
+    path = output_dir / f"{solver_name}_adaptive_remesh_stats.json"
+    write_json(path, {"summary": summarize_remesh_history(history), "frames": history})
+    return path
+
+
 def add_cutting_artifact_args(parser):
     parser.add_argument(
         "--artifact-dir", type=str, default=None, help="Directory for MP4, force plot, and stats output."
@@ -908,6 +1479,10 @@ def run_cutting_example(example, args, solver_name: str):
         artifacts = export_artifacts(
             args.artifact_dir, solver_name, frames, example.force_history, stats, args.record_fps
         )
+        if hasattr(example, "remesh_history"):
+            remesh_path = export_remesh_artifacts(args.artifact_dir, solver_name, example.remesh_history)
+            if remesh_path is not None:
+                artifacts["adaptive_remesh_stats"] = str(remesh_path)
         print(json.dumps({"artifacts": artifacts, "stats": asdict(stats)}, indent=2, sort_keys=True))
 
     viewer.close()

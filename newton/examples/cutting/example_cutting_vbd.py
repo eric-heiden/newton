@@ -4,6 +4,7 @@
 """Mesh-based VBD cutting track for a soft cuboid and moving knife."""
 
 import argparse
+from dataclasses import asdict
 
 import numpy as np
 import warp as wp
@@ -11,6 +12,7 @@ import warp as wp
 import newton
 import newton.examples
 from newton.examples.cutting.cutting_common import (
+    AdaptiveCutSurfaceRemesher,
     CutMaterial,
     ForceHistory,
     KnifeProfile,
@@ -107,17 +109,28 @@ class Example:
         self.particle_volume = estimate_particle_volume_from_grid(tuple(self.block_size), self.model.particle_count)
         self.damage_threshold = args.tet_damage_threshold
         self.residual_stiffness = args.residual_stiffness
-        self.render_split_mesh = (
-            SplitCuboidRenderMesh(
+        self.remesh_history: list[dict[str, float]] = []
+        self.render_rest_particle_q_wp = wp.clone(self.state_0.particle_q) if args.render_split_mesh else None
+        self.render_split_mesh = None
+        if args.render_split_mesh and args.render_remesh_mode == "adaptive":
+            self.render_split_mesh = AdaptiveCutSurfaceRemesher(
+                self.block_pos,
+                self.block_pos + self.block_size,
+                self.knife,
+                max_gap=args.render_gap,
+                base_segments=args.adaptive_remesh_base_segments,
+                refine_factor=args.adaptive_remesh_refine_factor,
+                refine_band=args.adaptive_remesh_refine_band,
+                height_segments=args.adaptive_remesh_height_segments,
+            )
+        elif args.render_split_mesh:
+            self.render_split_mesh = SplitCuboidRenderMesh(
                 self.block_pos,
                 self.block_pos + self.block_size,
                 self.knife,
                 max_gap=args.render_gap,
                 segments=args.render_mesh_segments,
             )
-            if args.render_split_mesh
-            else None
-        )
         self.render_particle_radius = float(np.mean(self.model.particle_radius.numpy())) * args.render_particle_scale
 
         self.viewer.set_model(self.model)
@@ -180,14 +193,25 @@ class Example:
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         if self.render_split_mesh is not None:
-            self.render_split_mesh.log(
-                self.viewer,
-                self.model.device,
-                self.sim_time,
-                surface_color=(0.95, 0.58, 0.18),
-                rest_particle_points=self.render_rest_particle_q,
-                particle_points=self.state_0.particle_q.numpy(),
-            )
+            if isinstance(self.render_split_mesh, AdaptiveCutSurfaceRemesher):
+                stats = self.render_split_mesh.log(
+                    self.viewer,
+                    self.model.device,
+                    self.sim_time,
+                    surface_color=(0.95, 0.58, 0.18),
+                    rest_particle_points=self.render_rest_particle_q_wp,
+                    particle_points=self.state_0.particle_q,
+                )
+                self.remesh_history.append({"time_s": self.sim_time, **asdict(stats)})
+            else:
+                self.render_split_mesh.log(
+                    self.viewer,
+                    self.model.device,
+                    self.sim_time,
+                    surface_color=(0.95, 0.58, 0.18),
+                    rest_particle_points=self.render_rest_particle_q,
+                    particle_points=self.state_0.particle_q.numpy(),
+                )
         else:
             self.viewer.log_state(self.state_0)
         self.viewer.log_contacts(self.contacts, self.state_0)
@@ -240,9 +264,14 @@ class Example:
         parser.add_argument("--gravity", type=float, nargs=3, default=[0.0, 0.0, -9.81])
         parser.add_argument("--particle-radius", type=float, default=0.018)
         parser.add_argument("--render-split-mesh", action=argparse.BooleanOptionalAction, default=True)
+        parser.add_argument("--render-remesh-mode", type=str, default="adaptive", choices=["adaptive", "split"])
         parser.add_argument("--render-gap", type=float, default=0.14)
         parser.add_argument("--render-mesh-segments", type=int, default=56)
         parser.add_argument("--render-particle-scale", type=float, default=0.7)
+        parser.add_argument("--adaptive-remesh-base-segments", type=int, default=24)
+        parser.add_argument("--adaptive-remesh-refine-factor", type=int, default=4)
+        parser.add_argument("--adaptive-remesh-refine-band", type=float, default=0.13)
+        parser.add_argument("--adaptive-remesh-height-segments", type=int, default=6)
 
         parser.add_argument("--knife-start-x", type=float, default=-0.55)
         parser.add_argument("--knife-speed", type=float, default=0.75)

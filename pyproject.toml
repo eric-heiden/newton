@@ -89,6 +89,7 @@ examples = [
     "pyyaml>=6.0.2",
     "cbor2>=5.7.0",         # for binary recording format (.bin files) - more efficient than JSON
     "Pillow>=11.3.0",
+    "gmsh>=4.15.2",
 ]
 
 # OVRTX real-time ray tracing viewer

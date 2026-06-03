@@ -1722,6 +1722,17 @@ wheels = [
 ]
 
 [[package]]
+name = "gmsh"
+version = "4.15.2"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/19/a6/f3f74f53234c812ffa0191ce2aceb0811ea82bdf12867a73bebb03f28f7a/gmsh-4.15.2-py2.py3-none-macosx_10_15_x86_64.whl", hash = "sha256:9f5a97b6633e40be331cb777ab571cef96e6ff5979bb7b20aad2438724ca417b", size = 40171095, upload-time = "2026-03-24T19:33:46.37Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/b4/0d25938ad62ea4db6bcbdecbc77c72d05d8a6a679abe4addcd86167ffd77/gmsh-4.15.2-py2.py3-none-macosx_12_0_arm64.whl", hash = "sha256:f6649b3e59f49272e7ee8ab282ecb4d1a6e0d627e86cf3e3b1a83fd07417e4f8", size = 36427761, upload-time = "2026-03-24T19:33:51.161Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/d4/336becb1488ac4fbab205043987128839c8c62d54e2036b7e887bd009040/gmsh-4.15.2-py2.py3-none-manylinux_2_24_x86_64.whl", hash = "sha256:4076a948ce22625330d1413d4982e22b5c69fc2f0f7951f5df64c778cf54108c", size = 40006930, upload-time = "2026-03-24T19:33:55.549Z" },
+    { url = "https://files.pythonhosted.org/packages/78/e9/63c763c0d75544680800651d5ea8c7c3203ae4b5e054706f19a54021a7fb/gmsh-4.15.2-py2.py3-none-win_amd64.whl", hash = "sha256:7b36083bb410fa27c5d0e052929d1a9844a5b09169d66017b72b41aabd49d711", size = 42235999, upload-time = "2026-03-24T19:34:00.529Z" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3463,6 +3474,7 @@ dev = [
     { name = "coverage", extra = ["toml"] },
     { name = "fast-simplification" },
     { name = "gitpython" },
+    { name = "gmsh" },
     { name = "imgui-bundle" },
     { name = "meshio" },
     { name = "mujoco" },
@@ -3520,6 +3532,7 @@ examples = [
     { name = "coacd", marker = "python_full_version < '3.14' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
     { name = "fast-simplification" },
     { name = "gitpython" },
+    { name = "gmsh" },
     { name = "imgui-bundle" },
     { name = "meshio" },
     { name = "mujoco" },
@@ -3562,6 +3575,7 @@ notebook = [
     { name = "coacd", marker = "python_full_version < '3.14' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
     { name = "fast-simplification" },
     { name = "gitpython" },
+    { name = "gmsh" },
     { name = "imgui-bundle" },
     { name = "jupyter-server-proxy" },
     { name = "jupyterlab" },
@@ -3622,6 +3636,7 @@ torch-cu12 = [
     { name = "coacd", marker = "python_full_version < '3.14'" },
     { name = "fast-simplification" },
     { name = "gitpython" },
+    { name = "gmsh" },
     { name = "imgui-bundle" },
     { name = "meshio" },
     { name = "mujoco" },
@@ -3649,6 +3664,7 @@ torch-cu13 = [
     { name = "coacd", marker = "python_full_version < '3.14'" },
     { name = "fast-simplification" },
     { name = "gitpython" },
+    { name = "gmsh" },
     { name = "imgui-bundle" },
     { name = "meshio" },
     { name = "mujoco" },
@@ -3685,6 +3701,7 @@ requires-dist = [
     { name = "fast-simplification", marker = "extra == 'importers'", specifier = ">=0.1.11" },
     { name = "gitpython", marker = "extra == 'docs'", specifier = ">=3.1.47" },
     { name = "gitpython", marker = "extra == 'examples'", specifier = ">=3.1.47" },
+    { name = "gmsh", marker = "extra == 'examples'", specifier = ">=4.15.2" },
     { name = "imgui-bundle", marker = "extra == 'examples'", specifier = ">=1.92.0" },
     { name = "ipykernel", marker = "extra == 'docs'", specifier = ">=6.0.0,<7.0.0" },
     { name = "jupyter-server-proxy", marker = "extra == 'notebook'", specifier = ">=4.5.0" },

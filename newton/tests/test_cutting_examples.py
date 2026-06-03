@@ -14,6 +14,7 @@ from newton.examples.cutting.cutting_common import (
     compute_particle_cut_update,
     summarize_force_profile,
 )
+from newton.examples.cutting.example_cutting_xfem import build_half_cylinder_tet_mesh
 
 
 class TestCuttingCommon(unittest.TestCase):
@@ -81,7 +82,7 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertAlmostEqual(summary["force_impulse_ns"], 0.6)
         self.assertAlmostEqual(summary["final_mean_damage"], 0.75)
 
-    def test_split_cuboid_render_mesh_opens_only_behind_knife(self):
+    def test_split_cuboid_render_mesh_preserves_zero_kerf_without_particle_motion(self):
         knife = KnifeProfile(start_x=-0.5, speed=1.0, center_y=0.0, process_width=0.1)
         mesh = SplitCuboidRenderMesh(
             block_lo=(-1.0, -0.5, 0.0),
@@ -91,15 +92,14 @@ class TestCuttingCommon(unittest.TestCase):
             segments=8,
         )
 
-        closed_surface, closed_walls = mesh.build_points(time=-1.0)
-        open_surface, open_walls = mesh.build_points(time=1.5)
+        surface, walls = mesh.build_points(time=1.5)
 
-        self.assertEqual(closed_surface.shape, open_surface.shape)
-        self.assertEqual(closed_walls.shape, open_walls.shape)
-        self.assertEqual(mesh.gap_at(0.75, time=0.0), 0.0)
-        self.assertGreater(mesh.gap_at(-0.75, time=0.0), 0.0)
-        self.assertAlmostEqual(mesh.gap_at(-0.75, time=1.5), 0.2)
-        self.assertGreater(np.max(np.abs(open_walls[:, 1])), np.max(np.abs(closed_walls[:, 1])))
+        self.assertEqual(surface.shape[1], 3)
+        self.assertEqual(walls.shape[1], 3)
+        self.assertAlmostEqual(float(np.min(surface[:, 1])), -0.5)
+        self.assertAlmostEqual(float(np.max(surface[:, 1])), 0.5)
+        np.testing.assert_allclose(walls[:, 1], np.zeros(walls.shape[0]), atol=1.0e-6)
+        self.assertEqual(mesh.gap_at(-0.75, time=1.5), 0.0)
 
     def test_split_cuboid_render_mesh_follows_particle_motion(self):
         knife = KnifeProfile(start_x=-0.5, speed=0.0, center_y=0.0, process_width=0.1)
@@ -182,6 +182,45 @@ class TestCuttingCommon(unittest.TestCase):
         np.testing.assert_allclose(
             moved_surface - static_surface, np.broadcast_to(translation, moved_surface.shape), atol=1.0e-5
         )
+
+    def test_adaptive_cut_remesher_preserves_zero_kerf_without_particle_motion(self):
+        knife = KnifeProfile(start_x=-0.5, speed=1.0, center_y=0.0, process_width=0.08)
+        remesher = AdaptiveCutSurfaceRemesher(
+            block_lo=(-0.5, -0.25, 0.0),
+            block_hi=(0.5, 0.25, 0.4),
+            knife=knife,
+            max_gap=0.2,
+            base_segments=8,
+            refine_factor=2,
+            refine_band=0.1,
+            height_segments=3,
+        )
+
+        stats = remesher.update(wp.get_device(), time=0.8)
+        walls = remesher.wall_points_wp.numpy()[: stats.wall_vertex_count]
+        surface = remesher.surface_points_wp.numpy()[: stats.surface_vertex_count]
+
+        np.testing.assert_allclose(walls[:, 1], np.zeros(walls.shape[0]), atol=1.0e-6)
+        self.assertAlmostEqual(float(np.min(surface[:, 1])), -0.25, places=6)
+        self.assertAlmostEqual(float(np.max(surface[:, 1])), 0.25, places=6)
+
+    def test_half_cylinder_tet_mesh_is_curved_and_oriented(self):
+        vertices, tets = build_half_cylinder_tet_mesh(length=0.45, radius=0.12, target_edge=0.055)
+
+        self.assertEqual(vertices.shape[1], 3)
+        self.assertEqual(tets.shape[1], 4)
+        self.assertGreater(vertices.shape[0], 120)
+        self.assertGreater(tets.shape[0], 250)
+        self.assertAlmostEqual(float(np.min(vertices[:, 2])), 0.0, places=5)
+        self.assertGreater(float(np.max(vertices[:, 2])), 0.11)
+        self.assertGreater(np.unique(np.round(vertices[:, 1], 3)).size, 8)
+
+        a = vertices[tets[:, 0]]
+        b = vertices[tets[:, 1]]
+        c = vertices[tets[:, 2]]
+        d = vertices[tets[:, 3]]
+        signed_volumes = np.einsum("ij,ij->i", np.cross(b - a, c - a), d - a) / 6.0
+        self.assertTrue(np.all(signed_volumes > 0.0))
 
 
 if __name__ == "__main__":

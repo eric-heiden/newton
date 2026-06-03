@@ -17,9 +17,89 @@ from newton.examples.cutting.cutting_common import (
     ForceHistory,
     KnifeProfile,
     SplitCuboidRenderMesh,
+    TetMeshCutSurfaceRenderer,
     add_cutting_artifact_args,
     run_cutting_example,
 )
+
+
+def _orient_positive_tets(vertices: np.ndarray, tets: np.ndarray) -> np.ndarray:
+    a = vertices[tets[:, 0]]
+    b = vertices[tets[:, 1]]
+    c = vertices[tets[:, 2]]
+    d = vertices[tets[:, 3]]
+    signed_volumes = np.einsum("ij,ij->i", np.cross(b - a, c - a), d - a) / 6.0
+    flipped = signed_volumes < 0.0
+    if np.any(flipped):
+        tets = tets.copy()
+        tets[flipped, 2], tets[flipped, 3] = tets[flipped, 3], tets[flipped, 2].copy()
+    return tets
+
+
+def build_half_cylinder_tet_mesh(length: float, radius: float, target_edge: float) -> tuple[np.ndarray, np.ndarray]:
+    """Build an extruded half-cylinder tetrahedral mesh with a flat table face."""
+
+    try:
+        import gmsh
+    except ImportError as exc:
+        raise RuntimeError("gmsh is required for half-cylinder cutting scenarios; install the examples extra") from exc
+
+    length = float(length)
+    radius = float(radius)
+    target_edge = float(target_edge)
+    if length <= 0.0 or radius <= 0.0 or target_edge <= 0.0:
+        raise ValueError("length, radius, and target_edge must be positive")
+
+    initialized = bool(gmsh.isInitialized()) if hasattr(gmsh, "isInitialized") else False
+    if not initialized:
+        gmsh.initialize(["-"])
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.add("newton_half_cylinder")
+
+        p_left = gmsh.model.geo.addPoint(0.0, -radius, 0.0, target_edge)
+        p_top = gmsh.model.geo.addPoint(0.0, 0.0, radius, target_edge)
+        p_right = gmsh.model.geo.addPoint(0.0, radius, 0.0, target_edge)
+        p_center = gmsh.model.geo.addPoint(0.0, 0.0, 0.0, target_edge)
+        arc_left = gmsh.model.geo.addCircleArc(p_left, p_center, p_top)
+        arc_right = gmsh.model.geo.addCircleArc(p_top, p_center, p_right)
+        base = gmsh.model.geo.addLine(p_right, p_left)
+        loop = gmsh.model.geo.addCurveLoop([arc_left, arc_right, base])
+        section = gmsh.model.geo.addPlaneSurface([loop])
+        layers = max(2, int(round(length / target_edge)))
+        gmsh.model.geo.extrude([(2, section)], length, 0.0, 0.0, numElements=[layers], recombine=False)
+        gmsh.model.geo.synchronize()
+
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", 0.55 * target_edge)
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", target_edge)
+        gmsh.option.setNumber("Mesh.Optimize", 1)
+        gmsh.model.mesh.generate(3)
+
+        node_tags, coords, _params = gmsh.model.mesh.getNodes()
+        vertices = np.asarray(coords, dtype=np.float64).reshape(-1, 3)
+        vertices[np.abs(vertices) < 1.0e-12] = 0.0
+        tag_to_index = {int(tag): index for index, tag in enumerate(node_tags)}
+        element_types, _element_tags, element_nodes = gmsh.model.mesh.getElements(3)
+        tet_blocks = []
+        for element_type, nodes in zip(element_types, element_nodes, strict=True):
+            name, dim, order, node_count, *_ = gmsh.model.mesh.getElementProperties(element_type)
+            if name.startswith("Tetrahedron") and dim == 3 and order == 1 and node_count == 4:
+                tet_blocks.append(
+                    np.asarray([tag_to_index[int(node)] for node in nodes], dtype=np.int32).reshape(-1, 4)
+                )
+
+        if not tet_blocks:
+            raise RuntimeError("gmsh did not generate first-order tetrahedra for the half-cylinder mesh")
+        tets = _orient_positive_tets(vertices, np.vstack(tet_blocks).astype(np.int32, copy=False))
+        used_vertices = np.unique(tets.ravel())
+        remap = np.full(vertices.shape[0], -1, dtype=np.int32)
+        remap[used_vertices] = np.arange(used_vertices.shape[0], dtype=np.int32)
+        vertices = vertices[used_vertices]
+        tets = remap[tets]
+        return vertices.astype(np.float32), tets
+    finally:
+        if not initialized:
+            gmsh.finalize()
 
 
 @dataclass(frozen=True)
@@ -65,13 +145,22 @@ class XFEMScenario:
     camera_pos: tuple[float, float, float]
     camera_pitch: float
     camera_yaw: float
+    geometry: str = "grid"
+    tet_target_edge: float = 0.052
 
     @property
     def block_size(self) -> np.ndarray:
+        if self.geometry == "half_cylinder":
+            radius = 0.5 * self.dim_y * self.cell_y
+            return np.array([self.dim_x * self.cell_x, 2.0 * radius, radius], dtype=np.float32)
         return np.array(
             [self.dim_x * self.cell_x, self.dim_y * self.cell_y, self.dim_z * self.cell_z],
             dtype=np.float32,
         )
+
+    @property
+    def half_cylinder_radius(self) -> float:
+        return 0.5 * self.dim_y * self.cell_y
 
 
 SCENARIOS: dict[str, XFEMScenario] = {
@@ -128,8 +217,8 @@ SCENARIOS: dict[str, XFEMScenario] = {
         cell_y=0.052,
         cell_z=0.055,
         density=760.0,
-        k_mu=2.6e4,
-        k_lambda=4.6e4,
+        k_mu=5.0e3,
+        k_lambda=9.0e3,
         k_damp=2.0e-3,
         gravity=(0.0, 0.0, -9.81),
         fix_left=False,
@@ -145,12 +234,12 @@ SCENARIOS: dict[str, XFEMScenario] = {
         fracture_energy=75.0,
         yield_stress=1.15e4,
         max_damage_rate=18.0,
-        separation_speed=0.22,
+        separation_speed=0.18,
         force_scale=0.46,
         friction_mu=0.72,
         table_z=0.0,
         table_glue_depth=0.024,
-        table_glue_strength=0.78,
+        table_glue_strength=0.55,
         residual_stiffness=0.05,
         damage_threshold=0.18,
         max_visual_gap=0.045,
@@ -160,6 +249,8 @@ SCENARIOS: dict[str, XFEMScenario] = {
         camera_pos=(1.05, -1.18, 0.58),
         camera_pitch=-17.0,
         camera_yaw=128.0,
+        geometry="half_cylinder",
+        tet_target_edge=0.033,
     ),
     "paper_tearing": XFEMScenario(
         name="paper_tearing",
@@ -214,8 +305,8 @@ SCENARIOS: dict[str, XFEMScenario] = {
         cell_y=0.058,
         cell_z=0.047,
         density=410.0,
-        k_mu=1.25e4,
-        k_lambda=2.1e4,
+        k_mu=6.0e3,
+        k_lambda=1.0e4,
         k_damp=3.0e-3,
         gravity=(0.0, 0.0, -9.81),
         fix_left=False,
@@ -231,12 +322,12 @@ SCENARIOS: dict[str, XFEMScenario] = {
         fracture_energy=55.0,
         yield_stress=6.6e3,
         max_damage_rate=17.0,
-        separation_speed=0.3,
-        force_scale=0.38,
-        friction_mu=0.8,
+        separation_speed=0.12,
+        force_scale=0.22,
+        friction_mu=0.55,
         table_z=0.0,
-        table_glue_depth=0.018,
-        table_glue_strength=0.45,
+        table_glue_depth=0.065,
+        table_glue_strength=0.85,
         residual_stiffness=0.04,
         damage_threshold=0.16,
         max_visual_gap=0.06,
@@ -246,6 +337,8 @@ SCENARIOS: dict[str, XFEMScenario] = {
         camera_pos=(0.95, -1.12, 0.55),
         camera_pitch=-19.0,
         camera_yaw=128.0,
+        geometry="half_cylinder",
+        tet_target_edge=0.038,
     ),
 }
 
@@ -272,23 +365,50 @@ class Example:
 
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
-        builder.add_soft_grid(
-            pos=wp.vec3(*cfg.block_pos),
-            rot=wp.quat_identity(),
-            vel=wp.vec3(0.0, 0.0, 0.0),
-            dim_x=cfg.dim_x,
-            dim_y=cfg.dim_y,
-            dim_z=cfg.dim_z,
-            cell_x=cfg.cell_x,
-            cell_y=cfg.cell_y,
-            cell_z=cfg.cell_z,
-            density=cfg.density,
-            k_mu=cfg.k_mu,
-            k_lambda=cfg.k_lambda,
-            k_damp=cfg.k_damp,
-            fix_left=cfg.fix_left,
-            particle_radius=args.particle_radius,
-        )
+        self.generated_vertices: np.ndarray | None = None
+        self.generated_tets: np.ndarray | None = None
+        if cfg.geometry == "half_cylinder":
+            radius = cfg.half_cylinder_radius
+            self.generated_vertices, self.generated_tets = build_half_cylinder_tet_mesh(
+                length=float(self.block_size[0]),
+                radius=radius,
+                target_edge=cfg.tet_target_edge,
+            )
+            mesh_pos = (float(cfg.block_pos[0]), float(cfg.block_pos[1] + radius), float(cfg.block_pos[2]))
+            builder.add_soft_mesh(
+                pos=wp.vec3(*mesh_pos),
+                rot=wp.quat_identity(),
+                scale=1.0,
+                vel=wp.vec3(0.0, 0.0, 0.0),
+                vertices=self.generated_vertices.tolist(),
+                indices=self.generated_tets.reshape(-1).tolist(),
+                density=cfg.density,
+                k_mu=cfg.k_mu,
+                k_lambda=cfg.k_lambda,
+                k_damp=cfg.k_damp,
+                particle_radius=args.particle_radius,
+                label=f"xfem_{cfg.name}",
+            )
+        elif cfg.geometry == "grid":
+            builder.add_soft_grid(
+                pos=wp.vec3(*cfg.block_pos),
+                rot=wp.quat_identity(),
+                vel=wp.vec3(0.0, 0.0, 0.0),
+                dim_x=cfg.dim_x,
+                dim_y=cfg.dim_y,
+                dim_z=cfg.dim_z,
+                cell_x=cfg.cell_x,
+                cell_y=cfg.cell_y,
+                cell_z=cfg.cell_z,
+                density=cfg.density,
+                k_mu=cfg.k_mu,
+                k_lambda=cfg.k_lambda,
+                k_damp=cfg.k_damp,
+                fix_left=cfg.fix_left,
+                particle_radius=args.particle_radius,
+            )
+        else:
+            raise ValueError(f"Unsupported X-FEM geometry: {cfg.geometry}")
         builder.color()
 
         self.model = builder.finalize()
@@ -330,7 +450,17 @@ class Example:
             half_width_z=cfg.knife_half_width_z,
             process_width=cfg.process_width,
         )
-        if args.render_split_mesh and args.render_remesh_mode == "adaptive":
+        if args.render_split_mesh and cfg.geometry == "half_cylinder":
+            if self.model.tet_indices is None or self.model.tri_indices is None:
+                raise ValueError("half-cylinder X-FEM scenes require tetrahedra and generated surface triangles")
+            self.render_split_mesh = TetMeshCutSurfaceRenderer(
+                rest_points=self.render_rest_particle_q_wp.numpy(),
+                tet_indices=self.model.tet_indices.numpy(),
+                surface_indices=self.model.tri_indices.numpy(),
+                knife=self.knife_profile,
+                nominal_edge_length=cfg.tet_target_edge,
+            )
+        elif args.render_split_mesh and args.render_remesh_mode == "adaptive":
             self.render_split_mesh = AdaptiveCutSurfaceRemesher(
                 self.block_pos,
                 self.block_hi,
@@ -425,7 +555,21 @@ class Example:
         cfg = self.scenario
         self.viewer.begin_frame(self.sim_time)
         if self.render_split_mesh is not None:
-            if isinstance(self.render_split_mesh, AdaptiveCutSurfaceRemesher):
+            if isinstance(self.render_split_mesh, TetMeshCutSurfaceRenderer):
+                front_x, center_z, _knife_velocity = self._knife_state(self.sim_time)
+                stats = self.render_split_mesh.log(
+                    self.viewer,
+                    self.model.device,
+                    self.sim_time,
+                    current_points=self.state_0.particle_q,
+                    prefix=f"/cutting/xfem_{cfg.name}/tet_cut_surface",
+                    surface_color=cfg.surface_color,
+                    wall_color=cfg.wall_color,
+                    front_x=front_x,
+                    center_z=center_z,
+                )
+                self.remesh_history.append({"time_s": self.sim_time, **asdict(stats)})
+            elif isinstance(self.render_split_mesh, AdaptiveCutSurfaceRemesher):
                 stats = self.render_split_mesh.log(
                     self.viewer,
                     self.model.device,

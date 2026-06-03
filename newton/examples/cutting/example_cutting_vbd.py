@@ -94,6 +94,7 @@ class Example:
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
+        self.render_rest_particle_q = self.state_0.particle_q.numpy() if args.render_split_mesh else None
         self.control = self.model.control()
         self.contacts = self.model.contacts()
 
@@ -117,6 +118,7 @@ class Example:
             if args.render_split_mesh
             else None
         )
+        self.render_particle_radius = float(np.mean(self.model.particle_radius.numpy())) * args.render_particle_scale
 
         self.viewer.set_model(self.model)
         if hasattr(self.viewer, "set_camera"):
@@ -183,16 +185,21 @@ class Example:
                 self.model.device,
                 self.sim_time,
                 surface_color=(0.95, 0.58, 0.18),
+                rest_particle_points=self.render_rest_particle_q,
+                particle_points=self.state_0.particle_q.numpy(),
             )
         else:
             self.viewer.log_state(self.state_0)
         self.viewer.log_contacts(self.contacts, self.state_0)
-        self.viewer.log_points(
-            name="/cutting/vbd_damage_particles",
-            points=self.state_0.particle_q,
-            radii=self.model.particle_radius,
-            colors=self.particle_colors,
-        )
+        if self.render_particle_radius > 0.0:
+            self.viewer.log_points(
+                name="/cutting/vbd_damage_particles",
+                points=self.state_0.particle_q,
+                radii=self.render_particle_radius,
+                colors=self.particle_colors,
+            )
+        else:
+            self.viewer.log_points(name="/cutting/vbd_damage_particles", points=None, hidden=True)
         starts, ends, colors = self.knife.blade_segments(self.sim_time)
         self.viewer.log_lines(
             "/cutting/knife",
@@ -235,6 +242,7 @@ class Example:
         parser.add_argument("--render-split-mesh", action=argparse.BooleanOptionalAction, default=True)
         parser.add_argument("--render-gap", type=float, default=0.14)
         parser.add_argument("--render-mesh-segments", type=int, default=56)
+        parser.add_argument("--render-particle-scale", type=float, default=0.7)
 
         parser.add_argument("--knife-start-x", type=float, default=-0.55)
         parser.add_argument("--knife-speed", type=float, default=0.75)

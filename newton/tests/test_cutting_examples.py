@@ -99,6 +99,36 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertAlmostEqual(mesh.gap_at(-0.75, time=1.5), 0.2)
         self.assertGreater(np.max(np.abs(open_walls[:, 1])), np.max(np.abs(closed_walls[:, 1])))
 
+    def test_split_cuboid_render_mesh_follows_particle_motion(self):
+        knife = KnifeProfile(start_x=-0.5, speed=0.0, center_y=0.0, process_width=0.1)
+        mesh = SplitCuboidRenderMesh(
+            block_lo=(-1.0, -0.5, 0.0),
+            block_hi=(1.0, 0.5, 1.0),
+            knife=knife,
+            max_gap=0.2,
+            segments=4,
+        )
+        xs = np.linspace(-1.0, 1.0, 4, dtype=np.float32)
+        ys = np.linspace(-0.5, 0.5, 3, dtype=np.float32)
+        zs = np.linspace(0.0, 1.0, 3, dtype=np.float32)
+        rest_particles = np.array([[x, y, z] for x in xs for y in ys for z in zs], dtype=np.float32)
+        translation = np.array([0.12, -0.04, 0.07], dtype=np.float32)
+        moved_particles = rest_particles + translation
+
+        static_surface, static_walls = mesh.build_points(time=1.0)
+        moved_surface, moved_walls = mesh.build_points(
+            time=1.0,
+            rest_particle_points=rest_particles,
+            particle_points=moved_particles,
+        )
+
+        np.testing.assert_allclose(
+            moved_surface - static_surface, np.broadcast_to(translation, moved_surface.shape), atol=1.0e-5
+        )
+        np.testing.assert_allclose(
+            moved_walls - static_walls, np.broadcast_to(translation, moved_walls.shape), atol=1.0e-5
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

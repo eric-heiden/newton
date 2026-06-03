@@ -118,6 +118,7 @@ class SplitCuboidRenderMesh:
         max_gap: float = 0.12,
         segments: int = 48,
         front_width: float | None = None,
+        motion_sample_count: int = 16,
     ):
         self.block_lo = np.asarray(block_lo, dtype=np.float32)
         self.block_hi = np.asarray(block_hi, dtype=np.float32)
@@ -125,6 +126,7 @@ class SplitCuboidRenderMesh:
         self.max_gap = float(max_gap)
         self.segments = int(max(2, segments))
         self.front_width = float(front_width if front_width is not None else max(2.0 * knife.process_width, 1.0e-4))
+        self.motion_sample_count = int(max(1, motion_sample_count))
         self.x_values = np.linspace(self.block_lo[0], self.block_hi[0], self.segments + 1, dtype=np.float32)
 
         surface_points, wall_points = self.build_points(time=0.0)
@@ -159,7 +161,12 @@ class SplitCuboidRenderMesh:
         knife_x = self.knife.x_at(time)
         return self.max_gap * self._smoothstep((knife_x - float(x)) / self.front_width)
 
-    def build_points(self, time: float) -> tuple[np.ndarray, np.ndarray]:
+    def build_points(
+        self,
+        time: float,
+        rest_particle_points: np.ndarray | None = None,
+        particle_points: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         lo = self.block_lo
         hi = self.block_hi
         z0 = float(lo[2])
@@ -198,7 +205,45 @@ class SplitCuboidRenderMesh:
                         (x1, y_cut1, z1),
                     )
 
-        return np.asarray(surface, dtype=np.float32), np.asarray(walls, dtype=np.float32)
+        surface_np = np.asarray(surface, dtype=np.float32)
+        walls_np = np.asarray(walls, dtype=np.float32)
+        if rest_particle_points is not None or particle_points is not None:
+            surface_np = self._deform_points_with_particles(surface_np, rest_particle_points, particle_points)
+            walls_np = self._deform_points_with_particles(walls_np, rest_particle_points, particle_points)
+        return surface_np, walls_np
+
+    def _deform_points_with_particles(
+        self,
+        points: np.ndarray,
+        rest_particle_points: np.ndarray | None,
+        particle_points: np.ndarray | None,
+    ) -> np.ndarray:
+        if rest_particle_points is None or particle_points is None:
+            raise ValueError("rest_particle_points and particle_points must be provided together")
+        if points.size == 0:
+            return points
+
+        rest = np.asarray(rest_particle_points, dtype=np.float32)
+        current = np.asarray(particle_points, dtype=np.float32)
+        if rest.shape != current.shape or rest.ndim != 2 or rest.shape[1] != 3:
+            raise ValueError("particle motion arrays must have matching shape (N, 3)")
+        if rest.shape[0] == 0:
+            return points
+
+        k = min(self.motion_sample_count, rest.shape[0])
+        deltas = current - rest
+        d2 = np.sum((points[:, None, :] - rest[None, :, :]) ** 2, axis=2)
+        if k == rest.shape[0]:
+            nearest_d2 = d2
+            nearest_deltas = np.broadcast_to(deltas[None, :, :], (points.shape[0], rest.shape[0], 3))
+        else:
+            nearest = np.argpartition(d2, k - 1, axis=1)[:, :k]
+            nearest_d2 = np.take_along_axis(d2, nearest, axis=1)
+            nearest_deltas = deltas[nearest]
+
+        weights = 1.0 / np.maximum(nearest_d2, 1.0e-12)
+        sampled_delta = np.sum(nearest_deltas * weights[:, :, None], axis=1) / np.sum(weights, axis=1)[:, None]
+        return (points + sampled_delta).astype(np.float32)
 
     def _ensure_device_arrays(self, device):
         if self.surface_points_wp is not None:
@@ -216,9 +261,15 @@ class SplitCuboidRenderMesh:
         prefix: str = "/cutting/render_split",
         surface_color: tuple[float, float, float] = (0.18, 0.62, 0.95),
         wall_color: tuple[float, float, float] = (0.95, 0.32, 0.42),
+        rest_particle_points: np.ndarray | None = None,
+        particle_points: np.ndarray | None = None,
     ):
         self._ensure_device_arrays(device)
-        self.surface_points_np, self.wall_points_np = self.build_points(time)
+        self.surface_points_np, self.wall_points_np = self.build_points(
+            time,
+            rest_particle_points=rest_particle_points,
+            particle_points=particle_points,
+        )
         assert self.surface_points_wp is not None
         assert self.wall_points_wp is not None
         assert self.surface_indices_wp is not None

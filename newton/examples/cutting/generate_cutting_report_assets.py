@@ -161,6 +161,7 @@ def _snapshot_render_geometry(example) -> tuple[dict[str, np.ndarray], dict[str,
             front_x=front_x,
             center_z=center_z,
             enrichment_points=getattr(getattr(example, "solver", None), "particle_enrichment_q", None),
+            triangle_cut_state=getattr(getattr(example, "solver", None), "tri_cut_state", None),
         )
         surface_vertices = stats.surface_vertex_count
         wall_vertices = stats.wall_vertex_count
@@ -510,6 +511,11 @@ def _write_adaptive_remesh_plot(path: Path, root: Path) -> None:
             "#64748b",
         ),
         (
+            "X-FEM hanging cloth",
+            root / "xfem" / "hanging_cloth_cutoff" / "xfem_hanging_cloth_cutoff_adaptive_remesh_stats.json",
+            "#0ea5e9",
+        ),
+        (
             "X-FEM bread",
             root / "xfem" / "bread_tearing" / "xfem_bread_tearing_adaptive_remesh_stats.json",
             "#a16207",
@@ -643,6 +649,7 @@ def _run_benchmark_sweep(root: Path, frame_count: int) -> list[dict[str, object]
         ),
         ("X-FEM", "cuboid", XFEMExample, ["--scenario", "cuboid_slice", "--iterations", "10"]),
         ("X-FEM", "paper shell", XFEMExample, ["--scenario", "paper_tearing", "--iterations", "10"]),
+        ("X-FEM", "hanging cloth", XFEMExample, ["--scenario", "hanging_cloth_cutoff", "--iterations", "10"]),
         ("X-FEM", "bread half-cylinder", XFEMExample, ["--scenario", "bread_tearing", "--iterations", "10"]),
         ("X-FEM", "vegetable half-cylinder", XFEMExample, ["--scenario", "vegetable_sawing", "--iterations", "10"]),
     ]
@@ -764,7 +771,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--case",
         action="append",
-        choices=["mpm", "vbd", "xfem_cuboid", "xfem_vegetable", "xfem_paper", "xfem_bread"],
+        choices=["mpm", "vbd", "xfem_cuboid", "xfem_vegetable", "xfem_paper", "xfem_hanging", "xfem_bread"],
         help="Generate one case; repeat for multiple. Defaults to all.",
     )
     return parser
@@ -772,7 +779,9 @@ def create_parser() -> argparse.ArgumentParser:
 
 def main():
     args = create_parser().parse_args()
-    cases = set(args.case or ["mpm", "vbd", "xfem_cuboid", "xfem_vegetable", "xfem_paper", "xfem_bread"])
+    cases = set(
+        args.case or ["mpm", "vbd", "xfem_cuboid", "xfem_vegetable", "xfem_paper", "xfem_hanging", "xfem_bread"]
+    )
     root = args.output_root
     configs = {
         "mpm": (
@@ -820,6 +829,15 @@ def main():
             (0.94, 0.94, 0.90),
             (0.65, 0.16, 0.16),
         ),
+        "xfem_hanging": (
+            XFEMExample,
+            ["--scenario", "hanging_cloth_cutoff"],
+            root / "xfem" / "hanging_cloth_cutoff",
+            "xfem_hanging_cloth_cutoff",
+            "X-FEM hanging cloth cut-off",
+            (0.82, 0.88, 0.96),
+            (0.50, 0.14, 0.14),
+        ),
         "xfem_bread": (
             XFEMExample,
             ["--scenario", "bread_tearing"],
@@ -831,7 +849,7 @@ def main():
         ),
     }
 
-    case_order = ["mpm", "vbd", "xfem_cuboid", "xfem_vegetable", "xfem_paper", "xfem_bread"]
+    case_order = ["mpm", "vbd", "xfem_cuboid", "xfem_vegetable", "xfem_paper", "xfem_hanging", "xfem_bread"]
     selected_cases = [case_name for case_name in case_order if case_name in cases]
     if not selected_cases and not args.benchmark_sweep:
         return

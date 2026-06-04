@@ -18,6 +18,9 @@ from .kernels import (
     apply_xfem_knife_kernel,
     apply_xfem_post_constraints_kernel,
     classify_xfem_tets_kernel,
+    cut_xfem_cloth_edges_kernel,
+    cut_xfem_cloth_springs_kernel,
+    cut_xfem_cloth_triangles_kernel,
     degrade_xfem_tets_kernel,
 )
 
@@ -129,6 +132,23 @@ class SolverXFEMCut(SolverBase):
         self.tet_damage = wp.zeros(model.tet_count, dtype=float, device=model.device)
         self.tet_cut_weight = wp.zeros(model.tet_count, dtype=float, device=model.device)
         self.base_tet_materials = wp.clone(model.tet_materials) if model.tet_count and model.tet_materials else None
+
+        self.tri_cut_state = wp.zeros(model.tri_count, dtype=wp.int32, device=model.device)
+        self.spring_cut_state = wp.zeros(model.spring_count, dtype=wp.int32, device=model.device)
+        self.edge_cut_state = wp.zeros(model.edge_count, dtype=wp.int32, device=model.device)
+        self.base_spring_stiffness = (
+            wp.clone(model.spring_stiffness) if model.spring_count and model.spring_stiffness is not None else None
+        )
+        self.base_spring_damping = (
+            wp.clone(model.spring_damping) if model.spring_count and model.spring_damping is not None else None
+        )
+        self.base_edge_bending_properties = (
+            wp.clone(model.edge_bending_properties)
+            if model.edge_count and model.edge_bending_properties is not None
+            else None
+        )
+        self.cloth_cut_counts = wp.zeros(3, dtype=wp.int32, device=model.device)
+
         self.force_accum = wp.zeros(6, dtype=float, device=model.device)
         self.knife_edge_points = wp.zeros(MAX_XFEM_KNIFE_EDGE_POINTS, dtype=wp.vec3, device=model.device)
         self.knife_edge_point_count = 2
@@ -243,6 +263,84 @@ class SolverXFEMCut(SolverBase):
                 device=model.device,
             )
 
+    def _update_cloth_topology(self) -> None:
+        model = self.model
+        if self.rest_particle_q is None:
+            return
+
+        self.cloth_cut_counts.zero_()
+        if (
+            model.spring_count
+            and model.spring_indices is not None
+            and model.spring_stiffness is not None
+            and model.spring_damping is not None
+            and self.base_spring_stiffness is not None
+            and self.base_spring_damping is not None
+        ):
+            wp.launch(
+                cut_xfem_cloth_springs_kernel,
+                dim=model.spring_count,
+                inputs=[
+                    self.rest_particle_q,
+                    model.spring_indices,
+                    model.spring_stiffness,
+                    model.spring_damping,
+                    self.base_spring_stiffness,
+                    self.base_spring_damping,
+                    self.spring_cut_state,
+                    self.cloth_cut_counts,
+                    self.knife_front_x,
+                    self.knife_center_y,
+                    self.knife_center_z,
+                    self.knife_half_width_z,
+                    self.knife_process_width,
+                ],
+                device=model.device,
+            )
+
+        if (
+            model.edge_count
+            and model.edge_indices is not None
+            and model.edge_bending_properties is not None
+            and self.base_edge_bending_properties is not None
+        ):
+            wp.launch(
+                cut_xfem_cloth_edges_kernel,
+                dim=model.edge_count,
+                inputs=[
+                    self.rest_particle_q,
+                    model.edge_indices,
+                    model.edge_bending_properties,
+                    self.base_edge_bending_properties,
+                    self.edge_cut_state,
+                    self.cloth_cut_counts,
+                    self.knife_front_x,
+                    self.knife_center_y,
+                    self.knife_center_z,
+                    self.knife_half_width_z,
+                    self.knife_process_width,
+                ],
+                device=model.device,
+            )
+
+        if model.tri_count and model.tri_indices is not None:
+            wp.launch(
+                cut_xfem_cloth_triangles_kernel,
+                dim=model.tri_count,
+                inputs=[
+                    self.rest_particle_q,
+                    model.tri_indices,
+                    self.tri_cut_state,
+                    self.cloth_cut_counts,
+                    self.knife_front_x,
+                    self.knife_center_y,
+                    self.knife_center_z,
+                    self.knife_half_width_z,
+                    self.knife_process_width,
+                ],
+                device=model.device,
+            )
+
     @override
     def notify_model_changed(self, flags: int) -> None:
         if flags & (
@@ -305,6 +403,8 @@ class SolverXFEMCut(SolverBase):
 
         if model.tet_count:
             self._classify_and_degrade(state_in.particle_q)
+        if model.tri_count or model.spring_count or model.edge_count:
+            self._update_cloth_topology()
 
         self._base_solver.step(state_in, state_out, control, contacts, dt)
 

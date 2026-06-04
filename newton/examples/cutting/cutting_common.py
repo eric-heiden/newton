@@ -1605,6 +1605,7 @@ class ShellCutSurfaceRenderer:
         max_wall_triangles: int | None = None,
         max_visual_gap: float = 0.04,
         front_width: float | None = None,
+        render_seam_edges: bool = True,
     ):
         self.rest_points = np.asarray(rest_points, dtype=np.float32)
         self.base_surface_triangles_np = np.asarray(surface_indices, dtype=np.int32).reshape(-1, 3)
@@ -1612,6 +1613,7 @@ class ShellCutSurfaceRenderer:
         self.nominal_edge_length = float(max(nominal_edge_length, 1.0e-8))
         self.max_visual_gap = float(max_visual_gap)
         self.front_width = float(front_width if front_width is not None else max(2.0 * knife.process_width, 1.0e-4))
+        self.render_seam_edges = bool(render_seam_edges)
         self.seam_lift = 0.07 * self.nominal_edge_length
         self.max_surface_triangles = int(max_surface_triangles or max(1, 4 * len(self.base_surface_triangles_np)))
         self.max_wall_triangles = int(max_wall_triangles or max(1, 2 * len(self.base_surface_triangles_np)))
@@ -1719,6 +1721,24 @@ class ShellCutSurfaceRenderer:
             signed = float(point[1] - plane_y)
             return signed >= -eps if keep_positive else signed <= eps
 
+        def seam_point(
+            prev_rest: np.ndarray,
+            prev_render: np.ndarray,
+            prev_inside: bool,
+            curr_rest: np.ndarray,
+            curr_render: np.ndarray,
+            curr_inside: bool,
+        ) -> np.ndarray:
+            s0 = float(prev_rest[1] - plane_y)
+            s1 = float(curr_rest[1] - plane_y)
+            alpha = 0.0 if abs(s0 - s1) <= eps else s0 / (s0 - s1)
+            rest_hit = prev_rest + alpha * (curr_rest - prev_rest)
+            if prev_inside and not curr_inside:
+                return (rest_hit + (prev_render - prev_rest)).astype(np.float32)
+            if curr_inside and not prev_inside:
+                return (rest_hit + (curr_render - curr_rest)).astype(np.float32)
+            return (prev_render + alpha * (curr_render - prev_render)).astype(np.float32)
+
         for edge_id in range(3):
             prev_id = (edge_id + 2) % 3
             curr_rest = rest_tri[edge_id]
@@ -1729,10 +1749,9 @@ class ShellCutSurfaceRenderer:
             prev_inside = inside(prev_rest)
 
             if curr_inside != prev_inside:
-                s0 = float(prev_rest[1] - plane_y)
-                s1 = float(curr_rest[1] - plane_y)
-                alpha = 0.0 if abs(s0 - s1) <= eps else s0 / (s0 - s1)
-                out_render.append((prev_render + alpha * (curr_render - prev_render)).astype(np.float32))
+                out_render.append(
+                    seam_point(prev_rest, prev_render, prev_inside, curr_rest, curr_render, curr_inside)
+                )
             if curr_inside:
                 out_render.append(curr_render.astype(np.float32, copy=False))
 
@@ -1789,10 +1808,19 @@ class ShellCutSurfaceRenderer:
         front_x: float | None = None,
         center_z: float | None = None,
         enrichment_points: np.ndarray | wp.array | None = None,
+        triangle_cut_state: np.ndarray | wp.array | None = None,
     ) -> TetCutWallRenderStats:
         current_np = self._current_points_np(current_points)
         if current_np.shape != self.rest_points.shape:
             raise ValueError("current_points must match rest point shape")
+        cut_state_np = None
+        if triangle_cut_state is not None:
+            if isinstance(triangle_cut_state, wp.array):
+                cut_state_np = triangle_cut_state.numpy().astype(np.int32, copy=False)
+            else:
+                cut_state_np = np.asarray(triangle_cut_state, dtype=np.int32)
+            if cut_state_np.shape[0] < self.base_surface_triangles_np.shape[0]:
+                raise ValueError("triangle_cut_state must cover all shell triangles")
         if enrichment_points is None:
             render_negative_np = current_np
             render_positive_np = current_np
@@ -1821,12 +1849,13 @@ class ShellCutSurfaceRenderer:
         surface_triangles = 0
         wall_triangles = 0
         active_triangles = 0
-        for tri in self.base_surface_triangles_np:
+        for tri_id, tri in enumerate(self.base_surface_triangles_np):
             rest_tri = self.rest_points[tri]
             signed = rest_tri[:, 1] - plane_y
             touches_or_crosses = np.min(signed) <= eps and np.max(signed) >= -eps
             in_wake = self._surface_triangle_in_cut_wake(rest_tri, knife_x, z_lo, z_hi)
-            if touches_or_crosses and in_wake:
+            solver_cut = True if cut_state_np is None else int(cut_state_np[tri_id]) != 0
+            if touches_or_crosses and in_wake and solver_cut:
                 active_triangles += 1
                 negative = self._clip_triangle_by_side(rest_tri, render_negative_np[tri], plane_y, keep_positive=False)
                 positive = self._clip_triangle_by_side(rest_tri, render_positive_np[tri], plane_y, keep_positive=True)
@@ -1836,15 +1865,21 @@ class ShellCutSurfaceRenderer:
                 surface_triangles = self._append_surface_polygon(
                     surface_triangles, self._apply_visual_opening(positive, 1.0, knife_x)
                 )
-                for side, side_render_np in ((-1.0, render_negative_np), (1.0, render_positive_np)):
-                    segment = self._plane_segment(rest_tri, side_render_np[tri], plane_y)
-                    segment = self._apply_visual_opening(segment, side, knife_x)
-                    if segment is not None:
-                        wall_triangles = self._append_wall_quad(wall_triangles, segment[0], segment[1])
+                if self.render_seam_edges:
+                    for side, side_render_np in ((-1.0, render_negative_np), (1.0, render_positive_np)):
+                        segment = self._plane_segment(rest_tri, side_render_np[tri], plane_y)
+                        segment = self._apply_visual_opening(segment, side, knife_x)
+                        if segment is not None:
+                            wall_triangles = self._append_wall_quad(wall_triangles, segment[0], segment[1])
             else:
                 side = 1.0 if float(np.mean(rest_tri[:, 1])) >= plane_y else -1.0
                 side_render_np = render_positive_np if side > 0.0 else render_negative_np
-                render_tri = side_render_np[tri] if in_wake else render_np[tri]
+                if cut_state_np is not None and not solver_cut:
+                    render_tri = current_np[tri]
+                elif in_wake:
+                    render_tri = side_render_np[tri]
+                else:
+                    render_tri = render_np[tri]
                 surface_triangles = self._append_surface_triangle(
                     surface_triangles, render_tri[0], render_tri[1], render_tri[2]
                 )
@@ -1876,6 +1911,7 @@ class ShellCutSurfaceRenderer:
         front_x: float | None = None,
         center_z: float | None = None,
         enrichment_points: wp.array | np.ndarray | None = None,
+        triangle_cut_state: wp.array | np.ndarray | None = None,
     ) -> TetCutWallRenderStats:
         self._ensure_device_arrays(device)
         stats = self.update(
@@ -1884,6 +1920,7 @@ class ShellCutSurfaceRenderer:
             front_x=front_x,
             center_z=center_z,
             enrichment_points=enrichment_points,
+            triangle_cut_state=triangle_cut_state,
         )
         assert self.surface_points_wp is not None
         assert self.surface_indices_wp is not None

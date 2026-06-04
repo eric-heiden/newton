@@ -290,6 +290,182 @@ def degrade_xfem_tets_kernel(
     tet_materials[tid, 2] = base_tet_materials[tid, 2]
 
 
+@wp.func
+def _rest_segment_crosses_cloth_cut(
+    qi: wp.vec3,
+    qj: wp.vec3,
+    front_x: float,
+    center_y: float,
+    center_z: float,
+    half_width_z: float,
+    process_width: float,
+):
+    yi = qi[1] - center_y
+    yj = qj[1] - center_y
+    crosses = yi * yj < 0.0
+    mid = (qi + qj) * 0.5
+    reached = mid[0] <= front_x + process_width
+    z_in = wp.abs(mid[2] - center_z) <= half_width_z + process_width
+    return crosses and reached and z_in
+
+
+@wp.func
+def _rest_triangle_crosses_cloth_cut(
+    q0: wp.vec3,
+    q1: wp.vec3,
+    q2: wp.vec3,
+    front_x: float,
+    center_y: float,
+    center_z: float,
+    half_width_z: float,
+    process_width: float,
+):
+    y0 = q0[1] - center_y
+    y1 = q1[1] - center_y
+    y2 = q2[1] - center_y
+    min_y = wp.min(y0, wp.min(y1, y2))
+    max_y = wp.max(y0, wp.max(y1, y2))
+    centroid = (q0 + q1 + q2) / 3.0
+    reached = centroid[0] <= front_x + process_width
+    z_in = wp.abs(centroid[2] - center_z) <= half_width_z + process_width
+    return min_y < 0.0 and max_y > 0.0 and reached and z_in
+
+
+@wp.kernel
+def cut_xfem_cloth_springs_kernel(
+    rest_particle_q: wp.array(dtype=wp.vec3),
+    spring_indices: wp.array(dtype=wp.int32),
+    spring_stiffness: wp.array(dtype=float),
+    spring_damping: wp.array(dtype=float),
+    base_spring_stiffness: wp.array(dtype=float),
+    base_spring_damping: wp.array(dtype=float),
+    spring_cut_state: wp.array(dtype=wp.int32),
+    cut_counts: wp.array(dtype=wp.int32),
+    front_x: float,
+    center_y: float,
+    center_z: float,
+    half_width_z: float,
+    process_width: float,
+):
+    tid = wp.tid()
+    i = spring_indices[tid * 2 + 0]
+    j = spring_indices[tid * 2 + 1]
+    should_cut = _rest_segment_crosses_cloth_cut(
+        rest_particle_q[i],
+        rest_particle_q[j],
+        front_x,
+        center_y,
+        center_z,
+        half_width_z,
+        process_width,
+    )
+    if should_cut and spring_cut_state[tid] == 0:
+        spring_cut_state[tid] = 1
+        wp.atomic_add(cut_counts, 0, 1)
+
+    if spring_cut_state[tid] != 0:
+        spring_stiffness[tid] = 0.0
+        spring_damping[tid] = 0.0
+    else:
+        spring_stiffness[tid] = base_spring_stiffness[tid]
+        spring_damping[tid] = base_spring_damping[tid]
+
+
+@wp.kernel
+def cut_xfem_cloth_edges_kernel(
+    rest_particle_q: wp.array(dtype=wp.vec3),
+    edge_indices: wp.array2d(dtype=wp.int32),
+    edge_bending_properties: wp.array2d(dtype=float),
+    base_edge_bending_properties: wp.array2d(dtype=float),
+    edge_cut_state: wp.array(dtype=wp.int32),
+    cut_counts: wp.array(dtype=wp.int32),
+    front_x: float,
+    center_y: float,
+    center_z: float,
+    half_width_z: float,
+    process_width: float,
+):
+    tid = wp.tid()
+    i = edge_indices[tid, 0]
+    j = edge_indices[tid, 1]
+    k = edge_indices[tid, 2]
+    l = edge_indices[tid, 3]
+    if i < 0 or j < 0 or k < 0 or l < 0:
+        return
+
+    qi = rest_particle_q[i]
+    qj = rest_particle_q[j]
+    qk = rest_particle_q[k]
+    ql = rest_particle_q[l]
+    min_y = wp.min(wp.min(qi[1], qj[1]), wp.min(qk[1], ql[1])) - center_y
+    max_y = wp.max(wp.max(qi[1], qj[1]), wp.max(qk[1], ql[1])) - center_y
+    centroid = (qi + qj + qk + ql) * 0.25
+    reached = centroid[0] <= front_x + process_width
+    z_in = wp.abs(centroid[2] - center_z) <= half_width_z + process_width
+    should_cut = min_y < 0.0 and max_y > 0.0 and reached and z_in
+    if should_cut and edge_cut_state[tid] == 0:
+        edge_cut_state[tid] = 1
+        wp.atomic_add(cut_counts, 1, 1)
+
+    if edge_cut_state[tid] != 0:
+        edge_bending_properties[tid, 0] = 0.0
+        edge_bending_properties[tid, 1] = 0.0
+    else:
+        edge_bending_properties[tid, 0] = base_edge_bending_properties[tid, 0]
+        edge_bending_properties[tid, 1] = base_edge_bending_properties[tid, 1]
+
+
+@wp.kernel
+def cut_xfem_cloth_triangles_kernel(
+    rest_particle_q: wp.array(dtype=wp.vec3),
+    tri_indices: wp.array2d(dtype=wp.int32),
+    tri_cut_state: wp.array(dtype=wp.int32),
+    cut_counts: wp.array(dtype=wp.int32),
+    front_x: float,
+    center_y: float,
+    center_z: float,
+    half_width_z: float,
+    process_width: float,
+):
+    tid = wp.tid()
+    i = tri_indices[tid, 0]
+    j = tri_indices[tid, 1]
+    k = tri_indices[tid, 2]
+    should_cut = _rest_triangle_crosses_cloth_cut(
+        rest_particle_q[i],
+        rest_particle_q[j],
+        rest_particle_q[k],
+        front_x,
+        center_y,
+        center_z,
+        half_width_z,
+        process_width,
+    )
+    if should_cut and tri_cut_state[tid] == 0:
+        tri_cut_state[tid] = 1
+        wp.atomic_add(cut_counts, 2, 1)
+
+
+@wp.kernel
+def apply_xfem_cloth_wind_kernel(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_f: wp.array(dtype=wp.vec3),
+    particle_inv_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    rest_particle_q: wp.array(dtype=wp.vec3),
+    strength: float,
+    frequency_hz: float,
+    time: float,
+):
+    tid = wp.tid()
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or particle_inv_mass[tid] <= 0.0:
+        return
+    rest = rest_particle_q[tid]
+    phase = 6.28318530718 * frequency_hz * time + 8.0 * rest[0] + 3.0 * rest[1]
+    gust = 0.55 + 0.45 * wp.sin(phase)
+    particle_f[tid] = particle_f[tid] + wp.vec3(0.0, 0.0, strength * gust)
+
+
 @wp.kernel
 def apply_xfem_post_constraints_kernel(
     particle_q: wp.array(dtype=wp.vec3),

@@ -12,6 +12,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton._src.solvers.xfem_cut.kernels import apply_xfem_cloth_wind_kernel
 from newton.examples.cutting.cutting_common import (
     AdaptiveCutSurfaceRemesher,
     ForceHistory,
@@ -147,6 +148,13 @@ class XFEMScenario:
     camera_pos: tuple[float, float, float]
     camera_pitch: float
     camera_yaw: float
+    camera_target_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    fix_right: bool = False
+    fix_top: bool = False
+    fix_bottom: bool = False
+    wind_strength: float = 0.0
+    wind_frequency_hz: float = 0.0
+    up_axis: newton.Axis = newton.Axis.Z
     geometry: str = "grid"
     tet_target_edge: float = 0.052
 
@@ -273,7 +281,7 @@ SCENARIOS: dict[str, XFEMScenario] = {
         fix_left=True,
         knife_start_x=-0.58,
         knife_speed=0.46,
-        knife_center_y=0.0,
+        knife_center_y=0.0175,
         knife_center_z=0.035,
         knife_half_width_y=0.035,
         knife_half_width_z=0.090,
@@ -298,6 +306,55 @@ SCENARIOS: dict[str, XFEMScenario] = {
         camera_pos=(0.82, -1.12, 0.42),
         camera_pitch=-34.0,
         camera_yaw=126.0,
+        geometry="cloth_grid",
+    ),
+    "hanging_cloth_cutoff": XFEMScenario(
+        name="hanging_cloth_cutoff",
+        block_pos=(-0.56, -0.42, 0.02),
+        dim_x=36,
+        dim_y=28,
+        dim_z=0,
+        cell_x=0.030,
+        cell_y=0.030,
+        cell_z=0.0,
+        density=0.035,
+        k_mu=1.9e2,
+        k_lambda=1.9e2,
+        k_damp=2.0e-2,
+        gravity=(0.0, -0.15, 0.0),
+        fix_left=False,
+        knife_start_x=-0.62,
+        knife_speed=0.42,
+        knife_center_y=-0.105,
+        knife_center_z=0.02,
+        knife_half_width_y=0.030,
+        knife_half_width_z=0.075,
+        process_width=0.035,
+        saw_amplitude_z=0.0,
+        saw_frequency_hz=0.0,
+        fracture_energy=20.0,
+        yield_stress=1.4e3,
+        max_damage_rate=24.0,
+        separation_speed=0.16,
+        force_scale=0.14,
+        friction_mu=0.88,
+        table_z=0.0,
+        table_glue_depth=0.0,
+        table_glue_strength=0.0,
+        residual_stiffness=0.020,
+        damage_threshold=0.12,
+        max_visual_gap=0.045,
+        surface_color=(0.82, 0.88, 0.96),
+        wall_color=(0.50, 0.14, 0.14),
+        particle_color_scale=0.14,
+        camera_pos=(0.28, -0.24, 2.70),
+        camera_pitch=0.0,
+        camera_yaw=-90.0,
+        camera_target_offset=(0.20, -0.22, 0.0),
+        fix_top=True,
+        wind_strength=0.002,
+        wind_frequency_hz=0.55,
+        up_axis=newton.Axis.Y,
         geometry="cloth_grid",
     ),
     "bread_tearing": XFEMScenario(
@@ -368,8 +425,9 @@ class Example:
         self.block_size = cfg.block_size
         self.block_hi = self.block_pos + self.block_size
 
-        builder = newton.ModelBuilder()
-        builder.add_ground_plane()
+        builder = newton.ModelBuilder(up_axis=cfg.up_axis)
+        if cfg.name != "hanging_cloth_cutoff":
+            builder.add_ground_plane()
         self.generated_vertices: np.ndarray | None = None
         self.generated_tets: np.ndarray | None = None
         if cfg.geometry == "half_cylinder":
@@ -423,6 +481,9 @@ class Example:
                 cell_y=cfg.cell_y,
                 mass=max(cfg.density, 1.0e-5),
                 fix_left=cfg.fix_left,
+                fix_right=cfg.fix_right,
+                fix_top=cfg.fix_top,
+                fix_bottom=cfg.fix_bottom,
                 tri_ke=cfg.k_mu,
                 tri_ka=cfg.k_lambda,
                 tri_kd=cfg.k_damp,
@@ -497,6 +558,7 @@ class Example:
                 knife=self.knife_profile,
                 nominal_edge_length=max(cfg.cell_x, cfg.cell_y),
                 max_visual_gap=cfg.max_visual_gap,
+                render_seam_edges=False,
             )
         elif args.render_split_mesh and args.render_remesh_mode == "adaptive":
             self.render_split_mesh = AdaptiveCutSurfaceRemesher(
@@ -527,7 +589,7 @@ class Example:
         if hasattr(self.viewer, "set_camera"):
             self.viewer.set_camera(pos=wp.vec3(*cfg.camera_pos), pitch=cfg.camera_pitch, yaw=cfg.camera_yaw)
             if hasattr(self.viewer, "camera") and hasattr(self.viewer.camera, "look_at"):
-                center = self.block_pos + 0.5 * self.block_size
+                center = self.block_pos + 0.5 * self.block_size + np.array(cfg.camera_target_offset, dtype=np.float32)
                 self.viewer.camera.look_at(wp.vec3(float(center[0]), float(center[1]), float(center[2])))
 
     def _knife_state(self, time_value: float) -> tuple[float, float, tuple[float, float, float]]:
@@ -566,6 +628,22 @@ class Example:
 
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
+            if cfg.wind_strength > 0.0 and self.solver.rest_particle_q is not None:
+                wp.launch(
+                    apply_xfem_cloth_wind_kernel,
+                    dim=self.model.particle_count,
+                    inputs=[
+                        self.state_0.particle_q,
+                        self.state_0.particle_f,
+                        self.model.particle_inv_mass,
+                        self.model.particle_flags,
+                        self.solver.rest_particle_q,
+                        cfg.wind_strength,
+                        cfg.wind_frequency_hz,
+                        substep_time,
+                    ],
+                    device=self.model.device,
+                )
             self.model.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             values = self.solver.force_accum.numpy()
@@ -607,6 +685,7 @@ class Example:
                     front_x=front_x,
                     center_z=center_z,
                     enrichment_points=self.solver.particle_enrichment_q,
+                    triangle_cut_state=self.solver.tri_cut_state,
                 )
                 self.remesh_history.append({"time_s": self.sim_time, **asdict(stats)})
             elif isinstance(self.render_split_mesh, AdaptiveCutSurfaceRemesher):

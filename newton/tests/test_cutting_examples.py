@@ -228,6 +228,98 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertLess(float(np.max(np.linalg.norm(points, axis=1))), 2.0)
         self.assertGreater(max(example.force_history.active_counts), 0.0)
 
+    def test_xfem_cloth_cut_disables_constraints_online(self):
+        import sys
+
+        old_argv = sys.argv
+        try:
+            sys.argv = [
+                "test_cutting_examples",
+                "--viewer",
+                "null",
+                "--quiet",
+                "--scenario",
+                "paper_tearing",
+                "--num-frames",
+                "1",
+                "--substeps",
+                "4",
+                "--iterations",
+                "4",
+                "--no-render-split-mesh",
+            ]
+            viewer, args = newton.examples.init(XFEMExample.create_parser())
+            example = XFEMExample(viewer, args)
+            self.assertEqual(int(np.sum(example.solver.spring_cut_state.numpy())), 0)
+            for _ in range(45):
+                example.step()
+            spring_cut = example.solver.spring_cut_state.numpy()
+            edge_cut = example.solver.edge_cut_state.numpy()
+            tri_cut = example.solver.tri_cut_state.numpy()
+            spring_stiffness = example.model.spring_stiffness.numpy()
+            edge_stiffness = example.model.edge_bending_properties.numpy()[:, 0]
+            viewer.close()
+        finally:
+            sys.argv = old_argv
+
+        self.assertGreater(int(np.sum(spring_cut)), 0)
+        self.assertGreater(int(np.sum(edge_cut)), 0)
+        self.assertGreater(int(np.sum(tri_cut)), 0)
+        self.assertTrue(np.all(spring_stiffness[spring_cut > 0] == 0.0))
+        self.assertTrue(np.all(edge_stiffness[edge_cut > 0] == 0.0))
+
+    def test_hanging_cloth_cutoff_scenario_is_top_fixed_with_wind(self):
+        cfg = SCENARIOS["hanging_cloth_cutoff"]
+
+        self.assertEqual(cfg.geometry, "cloth_grid")
+        self.assertTrue(cfg.fix_top)
+        self.assertFalse(cfg.fix_left)
+        self.assertEqual(cfg.up_axis, newton.Axis.Y)
+        self.assertLess(cfg.gravity[1], 0.0)
+        self.assertGreater(cfg.wind_strength, 0.0)
+
+    def test_hanging_cloth_cutoff_remeshes_online(self):
+        import sys
+
+        old_argv = sys.argv
+        try:
+            sys.argv = [
+                "test_cutting_examples",
+                "--viewer",
+                "null",
+                "--quiet",
+                "--scenario",
+                "hanging_cloth_cutoff",
+                "--num-frames",
+                "1",
+                "--substeps",
+                "4",
+                "--iterations",
+                "4",
+                "--no-render-split-mesh",
+            ]
+            viewer, args = newton.examples.init(XFEMExample.create_parser())
+            example = XFEMExample(viewer, args)
+            initial_points = example.state_0.particle_q.numpy().copy()
+            for _ in range(90):
+                example.step()
+            spring_cut = example.solver.spring_cut_state.numpy()
+            edge_cut = example.solver.edge_cut_state.numpy()
+            tri_cut = example.solver.tri_cut_state.numpy()
+            points = example.state_0.particle_q.numpy()
+            top_row = np.isclose(initial_points[:, 1], np.max(initial_points[:, 1]))
+            lower_panel = initial_points[:, 1] < example.scenario.knife_center_y
+            viewer.close()
+        finally:
+            sys.argv = old_argv
+
+        self.assertEqual(example.model.up_axis, newton.Axis.Y)
+        self.assertGreater(int(np.sum(spring_cut)), 0)
+        self.assertGreater(int(np.sum(edge_cut)), 0)
+        self.assertGreater(int(np.sum(tri_cut)), 0)
+        np.testing.assert_allclose(points[top_row], initial_points[top_row], atol=1.0e-6)
+        self.assertLess(float(np.mean(points[lower_panel, 1] - initial_points[lower_panel, 1])), -0.01)
+
     def test_viewergl_sets_pyglet_headless_before_shader_import(self):
         source = inspect.getsource(RendererGL.__init__)
 
@@ -606,6 +698,75 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertGreater(float(np.max(rendered_points[:, 1])), 0.30)
         for tri in rendered_points[rendered_indices]:
             self.assertFalse(np.min(tri[:, 1]) < -1.0e-5 and np.max(tri[:, 1]) > 1.0e-5)
+
+    def test_shell_cut_surface_renderer_uses_online_cut_state(self):
+        rest_points = np.array(
+            [
+                [-0.2, -0.1, 0.0],
+                [0.2, -0.1, 0.0],
+                [-0.2, 0.1, 0.0],
+                [0.2, 0.1, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        triangles = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.int32)
+        knife = KnifeProfile(start_x=0.0, speed=0.0, center_y=0.0, center_z=0.0, half_width_z=0.04)
+        renderer = ShellCutSurfaceRenderer(
+            rest_points,
+            triangles,
+            knife,
+            nominal_edge_length=0.2,
+            max_visual_gap=0.08,
+            render_seam_edges=False,
+        )
+
+        uncut = np.zeros(triangles.shape[0], dtype=np.int32)
+        uncut_stats = renderer.update(rest_points, time=0.0, front_x=0.3, center_z=0.0, triangle_cut_state=uncut)
+        cut = np.ones(triangles.shape[0], dtype=np.int32)
+        cut_stats = renderer.update(rest_points, time=0.0, front_x=0.3, center_z=0.0, triangle_cut_state=cut)
+        rendered_points = renderer.surface_points_np[: cut_stats.surface_vertex_count]
+        rendered_indices = renderer.surface_indices_np[: cut_stats.surface_triangle_count * 3].reshape(-1, 3)
+
+        self.assertEqual(uncut_stats.surface_triangle_count, triangles.shape[0])
+        self.assertGreater(cut_stats.surface_triangle_count, uncut_stats.surface_triangle_count)
+        self.assertEqual(cut_stats.wall_triangle_count, 0)
+        for tri in rendered_points[rendered_indices]:
+            self.assertFalse(np.min(tri[:, 1]) < -1.0e-5 and np.max(tri[:, 1]) > 1.0e-5)
+
+    def test_shell_cut_surface_renderer_seam_follows_cut_side_motion(self):
+        rest_points = np.array(
+            [
+                [-0.2, -0.1, 0.0],
+                [0.2, -0.1, 0.0],
+                [-0.2, 0.1, 0.0],
+                [0.2, 0.1, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        current_points = rest_points.copy()
+        current_points[rest_points[:, 1] < 0.0, 1] -= 1.0
+        triangles = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.int32)
+        knife = KnifeProfile(start_x=0.0, speed=0.0, center_y=0.0, center_z=0.0, half_width_z=0.04)
+        renderer = ShellCutSurfaceRenderer(
+            rest_points,
+            triangles,
+            knife,
+            nominal_edge_length=0.2,
+            max_visual_gap=0.0,
+            render_seam_edges=False,
+        )
+
+        stats = renderer.update(
+            current_points,
+            time=0.0,
+            front_x=0.3,
+            center_z=0.0,
+            triangle_cut_state=np.ones(triangles.shape[0], dtype=np.int32),
+        )
+        rendered_points = renderer.surface_points_np[: stats.surface_vertex_count]
+
+        self.assertGreater(stats.surface_triangle_count, triangles.shape[0])
+        self.assertFalse(np.any((rendered_points[:, 1] > -0.9) & (rendered_points[:, 1] < -0.1)))
 
 
 if __name__ == "__main__":

@@ -351,7 +351,7 @@ SCENARIOS: dict[str, XFEMScenario] = {
         table_glue_strength=0.0,
         residual_stiffness=0.020,
         damage_threshold=0.12,
-        max_visual_gap=0.045,
+        max_visual_gap=0.020,
         surface_color=(0.82, 0.88, 0.96),
         wall_color=(0.50, 0.14, 0.14),
         particle_color_scale=0.14,
@@ -365,6 +365,7 @@ SCENARIOS: dict[str, XFEMScenario] = {
         wind_direction=(1.0, 0.0, 0.0),
         up_axis=newton.Axis.Y,
         geometry="cloth_grid",
+        render_seam_edges=True,
     ),
     "curved_cloth_spline_cut": XFEMScenario(
         name="curved_cloth_spline_cut",
@@ -376,10 +377,10 @@ SCENARIOS: dict[str, XFEMScenario] = {
         cell_y=0.028,
         cell_z=0.0,
         density=0.040,
-        k_mu=2.4e2,
-        k_lambda=2.4e2,
-        k_damp=6.0e-2,
-        gravity=(0.0, 0.0, 0.0),
+        k_mu=1.8e2,
+        k_lambda=1.8e2,
+        k_damp=8.0e-2,
+        gravity=(0.0, 0.0, -0.08),
         fix_left=True,
         knife_start_x=-0.75,
         knife_speed=0.31,
@@ -393,18 +394,18 @@ SCENARIOS: dict[str, XFEMScenario] = {
         fracture_energy=22.0,
         yield_stress=1.45e3,
         max_damage_rate=22.0,
-        separation_speed=0.0,
-        force_scale=0.0,
-        friction_mu=0.0,
+        separation_speed=0.024,
+        force_scale=0.040,
+        friction_mu=0.32,
         table_z=0.0,
         table_glue_depth=0.0,
         table_glue_strength=0.0,
         residual_stiffness=0.024,
         damage_threshold=0.13,
-        max_visual_gap=0.028,
+        max_visual_gap=0.012,
         surface_color=(0.89, 0.91, 0.84),
         wall_color=(0.62, 0.12, 0.14),
-        particle_color_scale=0.0,
+        particle_color_scale=0.10,
         camera_pos=(0.82, -1.22, 0.58),
         camera_pitch=-31.0,
         camera_yaw=124.0,
@@ -418,7 +419,7 @@ SCENARIOS: dict[str, XFEMScenario] = {
         cut_path_origin_x=-0.72,
         render_mesh_edges=False,
         render_seam_edges=True,
-        visual_topology_only=True,
+        visual_topology_only=False,
     ),
     "bread_tearing": XFEMScenario(
         name="bread_tearing",
@@ -687,20 +688,24 @@ class Example:
         frame_damage = 0.0
         for substep in range(self.sim_substeps):
             substep_time = self.sim_time + substep * self.sim_dt
-            front_x, center_y, center_z, knife_velocity = self._knife_state(substep_time)
+            front_x, blade_center_y, center_z, knife_velocity = self._knife_state(substep_time)
+            if cfg.geometry == "cloth_grid":
+                knife_tangent = tuple(float(v) for v in self.knife_profile.path_tangent_at_x(front_x))
+            else:
+                knife_tangent = (0.0, 0.0, 1.0)
             self.solver.set_knife_state(
                 front_x=front_x,
-                center_y=center_y,
+                center_y=cfg.knife_center_y,
                 center_z=center_z,
                 half_width_y=cfg.knife_half_width_y,
                 half_width_z=cfg.knife_half_width_z,
                 process_width=cfg.process_width,
                 knife_velocity=knife_velocity,
-                knife_tangent=(0.0, 0.0, 1.0),
+                knife_tangent=knife_tangent,
                 edge_points=self.knife_profile.edge_points(
                     substep_time,
                     front_x=front_x,
-                    center_y=center_y,
+                    center_y=blade_center_y,
                     center_z=center_z,
                 ),
                 cut_path_amplitude_y=cfg.cut_path_amplitude_y,
@@ -833,6 +838,10 @@ class Example:
             half_width_z=cfg.knife_half_width_z,
             process_width=cfg.process_width,
             edge_control_points=self.knife_profile.edge_control_points,
+            cut_path_amplitude_y=cfg.cut_path_amplitude_y,
+            cut_path_wavelength_x=cfg.cut_path_wavelength_x,
+            cut_path_phase=cfg.cut_path_phase,
+            cut_path_origin_x=cfg.cut_path_origin_x,
         )
         log_knife_mesh(self.viewer, self.model.device, blade, 0.0, prefix=f"/cutting/xfem_{cfg.name}/knife")
         self.viewer.end_frame()

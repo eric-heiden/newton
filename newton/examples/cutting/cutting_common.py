@@ -72,9 +72,40 @@ class KnifeProfile:
             return float(values)
         return values.astype(np.float32, copy=False)
 
+    def path_slope_at_x(self, x: float | np.ndarray) -> float | np.ndarray:
+        if abs(float(self.cut_path_amplitude_y)) <= 1.0e-12:
+            if np.isscalar(x):
+                return 0.0
+            return np.zeros_like(np.asarray(x, dtype=np.float32), dtype=np.float32)
+        x_np = np.asarray(x, dtype=np.float32)
+        wavelength = max(abs(float(self.cut_path_wavelength_x)), 1.0e-6)
+        phase = 2.0 * np.pi * (x_np - float(self.cut_path_origin_x)) / wavelength + float(self.cut_path_phase)
+        values = float(self.cut_path_amplitude_y) * (2.0 * np.pi / wavelength) * np.cos(phase)
+        if np.isscalar(x):
+            return float(values)
+        return values.astype(np.float32, copy=False)
+
+    def path_tangent_at_x(self, x: float | np.ndarray) -> np.ndarray:
+        slope = np.asarray(self.path_slope_at_x(x), dtype=np.float32)
+        tangent = np.stack(
+            [np.ones_like(slope, dtype=np.float32), slope, np.zeros_like(slope, dtype=np.float32)],
+            axis=-1,
+        )
+        tangent /= np.maximum(np.linalg.norm(tangent, axis=-1, keepdims=True), 1.0e-8)
+        if np.isscalar(x):
+            return tangent.reshape(3).astype(np.float32, copy=False)
+        return tangent.astype(np.float32, copy=False)
+
+    def path_normal_at_x(self, x: float | np.ndarray) -> np.ndarray:
+        tangent = self.path_tangent_at_x(x)
+        normal = np.stack([-tangent[..., 1], tangent[..., 0], np.zeros_like(tangent[..., 0])], axis=-1)
+        normal /= np.maximum(np.linalg.norm(normal, axis=-1, keepdims=True), 1.0e-8)
+        return normal.astype(np.float32, copy=False)
+
     def signed_cut_y(self, points: np.ndarray) -> np.ndarray:
         points = np.asarray(points, dtype=np.float32)
-        return points[..., 1] - self.center_y_at_x(points[..., 0])
+        slope = self.path_slope_at_x(points[..., 0])
+        return (points[..., 1] - self.center_y_at_x(points[..., 0])) / np.sqrt(1.0 + np.asarray(slope) ** 2)
 
     def signed_distance_x(self, points: np.ndarray, time: float) -> np.ndarray:
         points = np.asarray(points)
@@ -147,8 +178,28 @@ class KnifeProfile:
             d = pxz - closest
             best_d2 = np.minimum(best_d2, np.sum(d * d, axis=1))
 
-        y_center = self.center_y if center_y is None else float(center_y)
-        y_out = np.maximum(np.abs(flat_points[:, 1] - y_center) - self.half_width_y, 0.0)
+        if center_y is None:
+            signed_distance = self.signed_cut_y(flat_points)
+        else:
+            path = KnifeProfile(
+                start_x=self.start_x,
+                speed=self.speed,
+                center_y=float(center_y),
+                center_z=self.center_z,
+                half_width_y=self.half_width_y,
+                half_width_z=self.half_width_z,
+                process_width=self.process_width,
+                edge_control_points=self.edge_control_points,
+                blade_spine_depth=self.blade_spine_depth,
+                handle_length=self.handle_length,
+                handle_height=self.handle_height,
+                cut_path_amplitude_y=self.cut_path_amplitude_y,
+                cut_path_wavelength_x=self.cut_path_wavelength_x,
+                cut_path_phase=self.cut_path_phase,
+                cut_path_origin_x=self.cut_path_origin_x,
+            )
+            signed_distance = path.signed_cut_y(flat_points)
+        y_out = np.maximum(np.abs(signed_distance) - self.half_width_y, 0.0)
         distance = np.sqrt(best_d2 + y_out * y_out)
         return distance.reshape(original_shape)
 
@@ -208,10 +259,13 @@ class KnifeProfile:
         """Return a triangle mesh for the rigid knife blade and optional handle."""
 
         edge = self.edge_points(time, front_x=front_x, center_y=center_y, center_z=center_z)
+        x_front = self.x_at(time) if front_x is None else float(front_x)
+        tangent = self.path_tangent_at_x(x_front)
+        normal = self.path_normal_at_x(x_front)
         spine_depth = max(float(self.blade_spine_depth), 1.0e-4)
         half_y = max(float(self.half_width_y), 1.0e-4)
-        left_spine = edge + np.array([-spine_depth, -half_y, 0.0], dtype=np.float32)
-        right_spine = edge + np.array([-spine_depth, half_y, 0.0], dtype=np.float32)
+        left_spine = edge - spine_depth * tangent - half_y * normal
+        right_spine = edge - spine_depth * tangent + half_y * normal
 
         vertices = np.vstack([edge, left_spine, right_spine]).astype(np.float32, copy=False)
         n = edge.shape[0]
@@ -240,7 +294,6 @@ class KnifeProfile:
         if include_handle:
             y_center = self.center_y if center_y is None else float(center_y)
             z_top = float(np.max(edge[:, 2]))
-            x_front = self.x_at(time) if front_x is None else float(front_x)
             handle_length = max(float(self.handle_length), 1.0e-4)
             handle_center = np.array(
                 [
@@ -268,8 +321,10 @@ class KnifeProfile:
         """Return line segments that draw the rigid blade outline and edge."""
 
         edge = self.edge_points(time)
-        left_spine = edge + np.array([-tail, -self.half_width_y, 0.0], dtype=np.float32)
-        right_spine = edge + np.array([-tail, self.half_width_y, 0.0], dtype=np.float32)
+        tangent = self.path_tangent_at_x(self.x_at(time))
+        normal = self.path_normal_at_x(self.x_at(time))
+        left_spine = edge - float(tail) * tangent - float(self.half_width_y) * normal
+        right_spine = edge - float(tail) * tangent + float(self.half_width_y) * normal
         starts = []
         ends = []
         for i in range(edge.shape[0] - 1):

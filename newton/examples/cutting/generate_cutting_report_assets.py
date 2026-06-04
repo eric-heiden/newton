@@ -98,17 +98,21 @@ def _particle_colors(example) -> np.ndarray:
 def _knife_profile_for_example(example, time_value: float) -> KnifeProfile | None:
     if hasattr(example, "_knife_state"):
         cfg = example.scenario
-        front_x, center_z, _velocity = example._knife_state(time_value)
+        front_x, center_y, center_z, _velocity = example._knife_state(time_value)
         base = getattr(example, "knife_profile", None)
         return KnifeProfile(
             start_x=front_x,
             speed=0.0,
-            center_y=cfg.knife_center_y,
+            center_y=center_y,
             center_z=center_z,
             half_width_y=cfg.knife_half_width_y,
             half_width_z=cfg.knife_half_width_z,
             process_width=cfg.process_width,
             edge_control_points=base.edge_control_points if base is not None else (),
+            cut_path_amplitude_y=cfg.cut_path_amplitude_y,
+            cut_path_wavelength_x=cfg.cut_path_wavelength_x,
+            cut_path_phase=cfg.cut_path_phase,
+            cut_path_origin_x=cfg.cut_path_origin_x,
         )
 
     knife = getattr(example, "knife", None)

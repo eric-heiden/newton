@@ -253,6 +253,10 @@ class SolverXFEMCut(SolverBase):
                 self.knife_half_width_z,
                 self.knife_process_width,
                 self.damage_threshold,
+                self.cut_path_amplitude_y,
+                self.cut_path_wavelength_x,
+                self.cut_path_phase,
+                self.cut_path_origin_x,
             ],
             device=model.device,
         )

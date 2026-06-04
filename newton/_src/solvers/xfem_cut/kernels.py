@@ -45,6 +45,45 @@ def _cut_path_center_y(
 
 
 @wp.func
+def _cut_path_slope_y(
+    x: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
+):
+    if wp.abs(path_amplitude_y) <= 1.0e-12:
+        return float(0.0)
+    wavelength = wp.max(wp.abs(path_wavelength_x), 1.0e-6)
+    phase = 6.28318530718 * (x - path_origin_x) / wavelength + path_phase
+    return path_amplitude_y * (6.28318530718 / wavelength) * wp.cos(phase)
+
+
+@wp.func
+def _cut_path_tangent_xy(
+    x: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
+):
+    slope = _cut_path_slope_y(x, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+    return _safe_normalized(wp.vec3(1.0, slope, 0.0))
+
+
+@wp.func
+def _cut_path_normal_xy(
+    x: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
+):
+    tangent = _cut_path_tangent_xy(x, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+    return _safe_normalized(wp.vec3(-tangent[1], tangent[0], 0.0))
+
+
+@wp.func
 def _cut_path_signed_y(
     q: wp.vec3,
     center_y: float,
@@ -53,7 +92,7 @@ def _cut_path_signed_y(
     path_phase: float,
     path_origin_x: float,
 ):
-    return q[1] - _cut_path_center_y(
+    center = _cut_path_center_y(
         q[0],
         center_y,
         path_amplitude_y,
@@ -61,6 +100,8 @@ def _cut_path_signed_y(
         path_phase,
         path_origin_x,
     )
+    slope = _cut_path_slope_y(q[0], path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+    return (q[1] - center) / wp.sqrt(1.0 + slope * slope)
 
 
 @wp.func
@@ -71,6 +112,10 @@ def _knife_edge_process_weight(
     center_y: float,
     half_width_y: float,
     process_width: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
 ):
     best_d2 = float(1.0e12)
     for i in range(edge_point_count - 1):
@@ -89,7 +134,15 @@ def _knife_edge_process_weight(
         dz = q[2] - cz
         best_d2 = wp.min(best_d2, dx * dx + dz * dz)
 
-    y_out = wp.max(0.0, wp.abs(q[1] - center_y) - half_width_y)
+    signed_distance = _cut_path_signed_y(
+        q,
+        center_y,
+        path_amplitude_y,
+        path_wavelength_x,
+        path_phase,
+        path_origin_x,
+    )
+    y_out = wp.max(0.0, wp.abs(signed_distance) - half_width_y)
     distance = wp.sqrt(best_d2 + y_out * y_out)
     return wp.max(0.0, 1.0 - distance / wp.max(process_width, 1.0e-6))
 
@@ -140,15 +193,7 @@ def apply_xfem_knife_kernel(
     q = particle_q[tid]
     v = particle_qd[tid]
     old_damage = particle_damage[tid]
-    local_center_y = _cut_path_center_y(
-        q[0],
-        center_y,
-        path_amplitude_y,
-        path_wavelength_x,
-        path_phase,
-        path_origin_x,
-    )
-    y_rel = q[1] - local_center_y
+    signed_distance = _cut_path_signed_y(q, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
     z_rel = q[2] - center_z
 
     front_weight = _knife_edge_process_weight(
@@ -158,16 +203,20 @@ def apply_xfem_knife_kernel(
         center_y,
         half_width_y,
         process_width,
+        path_amplitude_y,
+        path_wavelength_x,
+        path_phase,
+        path_origin_x,
     )
     in_cut_wake = q[0] <= front_x + process_width and wp.abs(z_rel) <= half_width_z
     active = front_weight > 0.0
 
-    side = _signed_side(y_rel)
+    side = _signed_side(signed_distance)
     if active or (old_damage > 0.0 and in_cut_wake):
         particle_cut_side[tid] = side
 
     tangent = _safe_normalized(knife_tangent)
-    normal_dir = wp.vec3(0.0, side, 0.0)
+    normal_dir = _cut_path_normal_xy(q[0], path_amplitude_y, path_wavelength_x, path_phase, path_origin_x) * side
     new_damage = old_damage
     delta_damage = float(0.0)
     normal_force = float(0.0)
@@ -185,7 +234,7 @@ def apply_xfem_knife_kernel(
         )
 
     wake_weight = _xfem_smoothstep((front_x + process_width - q[0]) / wp.max(process_width, 1.0e-6))
-    side_wall_distance = wp.abs(q[1] - local_center_y)
+    side_wall_distance = wp.abs(signed_distance)
     near_cut_wall = _xfem_smoothstep((half_width_y + process_width - side_wall_distance) / wp.max(process_width, 1.0e-6))
     tangential_coupling = wp.max(front_weight, wake_weight * near_cut_wall * _xfem_smoothstep(new_damage))
     if tangential_coupling > 0.0:
@@ -258,6 +307,10 @@ def classify_xfem_tets_kernel(
     half_width_z: float,
     process_width: float,
     damage_threshold: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
 ):
     tid = wp.tid()
     i = tet_indices[tid, 0]
@@ -270,10 +323,10 @@ def classify_xfem_tets_kernel(
     qk = particle_q[k]
     ql = particle_q[l]
 
-    yi = qi[1] - center_y
-    yj = qj[1] - center_y
-    yk = qk[1] - center_y
-    yl = ql[1] - center_y
+    yi = _cut_path_signed_y(qi, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+    yj = _cut_path_signed_y(qj, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+    yk = _cut_path_signed_y(qk, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+    yl = _cut_path_signed_y(ql, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
     min_y = wp.min(wp.min(yi, yj), wp.min(yk, yl))
     max_y = wp.max(wp.max(yi, yj), wp.max(yk, yl))
     straddles_cut = min_y <= 0.0 and max_y >= 0.0
@@ -286,6 +339,10 @@ def classify_xfem_tets_kernel(
         center_y,
         half_width_y,
         process_width,
+        path_amplitude_y,
+        path_wavelength_x,
+        path_phase,
+        path_origin_x,
     )
     z_in = front_weight > 0.0 or wp.abs(centroid[2] - center_z) <= half_width_z
     wake_weight = _xfem_smoothstep((front_x + process_width - centroid[0]) / wp.max(process_width, 1.0e-6))
@@ -581,21 +638,29 @@ def apply_xfem_post_constraints_kernel(
 
     damage = particle_damage[tid]
     side = particle_cut_side[tid]
-    local_center_y = _cut_path_center_y(
-        q[0],
-        center_y,
-        path_amplitude_y,
-        path_wavelength_x,
-        path_phase,
-        path_origin_x,
-    )
     if inv_mass > 0.0 and damage > 1.0e-4 and side != 0.0 and q[0] <= front_x + 2.0 * process_width:
         min_sep = max_visual_gap * _xfem_smoothstep(damage)
-        current_sep = side * (q[1] - local_center_y)
+        signed_distance = _cut_path_signed_y(
+            q,
+            center_y,
+            path_amplitude_y,
+            path_wavelength_x,
+            path_phase,
+            path_origin_x,
+        )
+        current_sep = side * signed_distance
         if current_sep < min_sep:
-            q[1] = local_center_y + side * min_sep
-            if side * qd[1] < 0.0:
-                qd[1] = 0.0
+            normal_dir = _cut_path_normal_xy(
+                q[0],
+                path_amplitude_y,
+                path_wavelength_x,
+                path_phase,
+                path_origin_x,
+            ) * side
+            q = q + normal_dir * (min_sep - current_sep)
+            normal_velocity = wp.dot(qd, normal_dir)
+            if normal_velocity < 0.0:
+                qd = qd - normal_dir * normal_velocity
         q = q + particle_enrichment_q[tid] * (0.12 * damage)
 
     glue = wp.min(1.0, wp.max(0.0, table_glue_strength))

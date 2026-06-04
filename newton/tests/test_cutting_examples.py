@@ -211,7 +211,7 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertAlmostEqual(summary["force_impulse_ns"], 0.6)
         self.assertAlmostEqual(summary["final_mean_damage"], 0.75)
 
-    def test_split_cuboid_render_mesh_preserves_zero_kerf_without_particle_motion(self):
+    def test_split_cuboid_render_mesh_opens_visual_seam_without_shrinking_volume(self):
         knife = KnifeProfile(start_x=-0.5, speed=1.0, center_y=0.0, process_width=0.1)
         mesh = SplitCuboidRenderMesh(
             block_lo=(-1.0, -0.5, 0.0),
@@ -227,8 +227,10 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertEqual(walls.shape[1], 3)
         self.assertAlmostEqual(float(np.min(surface[:, 1])), -0.5)
         self.assertAlmostEqual(float(np.max(surface[:, 1])), 0.5)
-        np.testing.assert_allclose(walls[:, 1], np.zeros(walls.shape[0]), atol=1.0e-6)
-        self.assertEqual(mesh.gap_at(-0.75, time=1.5), 0.0)
+        self.assertLess(float(np.min(walls[:, 1])), -0.15)
+        self.assertGreater(float(np.max(walls[:, 1])), 0.15)
+        self.assertGreater(mesh.gap_at(-0.75, time=1.5), 0.0)
+        self.assertEqual(mesh.gap_at(1.25, time=1.5), 0.0)
 
     def test_split_cuboid_render_mesh_follows_particle_motion(self):
         knife = KnifeProfile(start_x=-0.5, speed=0.0, center_y=0.0, process_width=0.1)
@@ -400,7 +402,7 @@ class TestCuttingCommon(unittest.TestCase):
             atol=2.0e-3,
         )
 
-    def test_adaptive_cut_remesher_preserves_zero_kerf_without_particle_motion(self):
+    def test_adaptive_cut_remesher_opens_visual_seam_without_shrinking_volume(self):
         knife = KnifeProfile(start_x=-0.5, speed=1.0, center_y=0.0, process_width=0.08)
         remesher = AdaptiveCutSurfaceRemesher(
             block_lo=(-0.5, -0.25, 0.0),
@@ -417,7 +419,8 @@ class TestCuttingCommon(unittest.TestCase):
         walls = remesher.wall_points_wp.numpy()[: stats.wall_vertex_count]
         surface = remesher.surface_points_wp.numpy()[: stats.surface_vertex_count]
 
-        np.testing.assert_allclose(walls[:, 1], np.zeros(walls.shape[0]), atol=1.0e-6)
+        self.assertLess(float(np.min(walls[:, 1])), -0.15)
+        self.assertGreater(float(np.max(walls[:, 1])), 0.15)
         self.assertAlmostEqual(float(np.min(surface[:, 1])), -0.25, places=6)
         self.assertAlmostEqual(float(np.max(surface[:, 1])), 0.25, places=6)
 
@@ -461,6 +464,44 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertGreater(stats.surface_triangle_count, 1)
         for tri in rendered_points[rendered_indices]:
             self.assertFalse(np.min(tri[:, 1]) < -1.0e-6 and np.max(tri[:, 1]) > 1.0e-6)
+
+    def test_tet_cut_surface_renderer_opens_plane_touching_surface_triangles(self):
+        rest_points = np.array(
+            [
+                [-0.2, 0.0, 0.0],
+                [-0.2, 0.1, 0.0],
+                [-0.2, 0.0, 0.2],
+                [-0.2, -0.1, 0.0],
+                [-0.1, 0.0, 0.1],
+            ],
+            dtype=np.float32,
+        )
+        tets = np.array([[0, 1, 2, 4], [0, 2, 3, 4]], dtype=np.int32)
+        surface = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+        knife = KnifeProfile(
+            start_x=0.0,
+            speed=0.0,
+            center_y=0.0,
+            center_z=0.1,
+            half_width_z=0.25,
+            process_width=0.1,
+        )
+        renderer = TetMeshCutSurfaceRenderer(
+            rest_points,
+            tets,
+            surface,
+            knife,
+            nominal_edge_length=0.1,
+            max_visual_gap=0.04,
+        )
+
+        stats = renderer.update(rest_points, time=0.0, front_x=0.1, center_z=0.1)
+        rendered_points = renderer.surface_points_np[: stats.surface_vertex_count]
+        rendered_indices = renderer.surface_indices_np[: stats.surface_triangle_count * 3].reshape(-1, 3)
+
+        self.assertEqual(stats.surface_triangle_count, 2)
+        for tri in rendered_points[rendered_indices]:
+            self.assertTrue(np.all(tri[:, 1] > 0.01) or np.all(tri[:, 1] < -0.01))
 
 
 if __name__ == "__main__":

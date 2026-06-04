@@ -354,6 +354,17 @@ def _cutting_gap_at(x: float, knife_x: float, max_gap: float, front_width: float
     return max_gap * _cutting_smoothstep((knife_x - x) / front_width)
 
 
+def _cutting_visual_opening_y(x: float, side: float, knife_x: float, center_y: float, max_gap: float, front_width: float):
+    return center_y + side * _cutting_gap_at(x, knife_x, max_gap, front_width)
+
+
+@wp.func
+def _cutting_visual_opening_y_wp(
+    x: float, side: float, knife_x: float, center_y: float, max_gap: float, front_width: float
+):
+    return center_y + side * max_gap * _cutting_smoothstep((knife_x - x) / front_width)
+
+
 @wp.func
 def _cutting_deform_from_particles(
     rest_point: wp.vec3,
@@ -485,8 +496,8 @@ def _build_adaptive_cut_surface_kernel(
         y_outer = block_lo[1]
         if side > 0.0:
             y_outer = block_hi[1]
-        y_cut0 = knife_center_y
-        y_cut1 = knife_center_y
+        y_cut0 = _cutting_visual_opening_y_wp(x0, side, knife_x, knife_center_y, max_gap, front_width)
+        y_cut1 = _cutting_visual_opening_y_wp(x1, side, knife_x, knife_center_y, max_gap, front_width)
 
         if face_id == 0:
             _cutting_write_quad(
@@ -558,7 +569,7 @@ def _build_adaptive_cut_surface_kernel(
     y_outer = block_lo[1]
     if side > 0.0:
         y_outer = block_hi[1]
-    y_cut = knife_center_y
+    y_cut = _cutting_visual_opening_y_wp(x, side, knife_x, knife_center_y, max_gap, front_width)
     z0 = block_lo[2] + float(z_id) * dz
     z1 = z0 + dz
 
@@ -634,8 +645,8 @@ def _build_adaptive_cut_wall_kernel(
     dz = (block_hi[2] - block_lo[2]) / float(height_segments)
     z0 = block_lo[2] + float(z_id) * dz
     z1 = z0 + dz
-    y_cut0 = knife_center_y
-    y_cut1 = knife_center_y
+    y_cut0 = _cutting_visual_opening_y_wp(x0, side, knife_x, knife_center_y, max_gap, front_width)
+    y_cut1 = _cutting_visual_opening_y_wp(x1, side, knife_x, knife_center_y, max_gap, front_width)
 
     _cutting_write_quad(
         points,
@@ -716,7 +727,7 @@ class SplitCuboidRenderMesh:
         side_hints.extend([0.0] * 4)
 
     def gap_at(self, x: float, time: float) -> float:
-        return 0.0
+        return _cutting_gap_at(x, self.knife.x_at(time), self.max_gap, self.front_width)
 
     def build_points(
         self,
@@ -739,8 +750,8 @@ class SplitCuboidRenderMesh:
             for i in range(self.segments):
                 x0 = float(self.x_values[i])
                 x1 = float(self.x_values[i + 1])
-                y_cut0 = self.knife.center_y
-                y_cut1 = self.knife.center_y
+                y_cut0 = self.knife.center_y + side * self.gap_at(x0, time)
+                y_cut1 = self.knife.center_y + side * self.gap_at(x1, time)
 
                 self._append_quad(
                     surface,
@@ -1190,14 +1201,18 @@ class TetMeshCutSurfaceRenderer:
         knife: KnifeProfile,
         nominal_edge_length: float,
         max_wall_triangles: int | None = None,
+        max_visual_gap: float = 0.04,
+        front_width: float | None = None,
     ):
         self.rest_points = np.asarray(rest_points, dtype=np.float32)
         self.tet_indices = np.asarray(tet_indices, dtype=np.int32).reshape(-1, 4)
         self.base_surface_triangles_np = np.asarray(surface_indices, dtype=np.int32).reshape(-1, 3)
         self.knife = knife
         self.nominal_edge_length = float(max(nominal_edge_length, 1.0e-8))
+        self.max_visual_gap = float(max_visual_gap)
+        self.front_width = float(front_width if front_width is not None else max(2.0 * knife.process_width, 1.0e-4))
         self.max_surface_triangles = int(max(1, 3 * len(self.base_surface_triangles_np)))
-        self.max_wall_triangles = int(max_wall_triangles or max(1, 2 * len(self.tet_indices)))
+        self.max_wall_triangles = int(max_wall_triangles or max(1, 4 * len(self.tet_indices)))
 
         self.surface_points_np = np.zeros((self.max_surface_triangles * 3, 3), dtype=np.float32)
         self.surface_indices_np = np.arange(self.max_surface_triangles * 3, dtype=np.int32)
@@ -1290,8 +1305,29 @@ class TetMeshCutSurfaceRenderer:
         order = np.argsort(angles)
         return current_poly[order]
 
+    def _apply_visual_opening(self, polygon: np.ndarray, side: float, knife_x: float) -> np.ndarray:
+        if polygon is None or polygon.size == 0 or self.max_visual_gap <= 0.0:
+            return polygon
+        opened = np.asarray(polygon, dtype=np.float32).copy()
+        for i in range(opened.shape[0]):
+            opened_y = _cutting_visual_opening_y(
+                float(opened[i, 0]),
+                side,
+                knife_x,
+                float(self.knife.center_y),
+                self.max_visual_gap,
+                self.front_width,
+            )
+            if side > 0.0:
+                opened[i, 1] = max(float(opened[i, 1]), opened_y)
+            else:
+                opened[i, 1] = min(float(opened[i, 1]), opened_y)
+        return opened
+
     def _append_surface_triangle(self, triangle_count: int, a: np.ndarray, b: np.ndarray, c: np.ndarray) -> int:
         if triangle_count >= self.max_surface_triangles:
+            return triangle_count
+        if float(np.linalg.norm(np.cross(b - a, c - a))) <= 1.0e-10:
             return triangle_count
         vertex = triangle_count * 3
         self.surface_points_np[vertex + 0] = a
@@ -1364,22 +1400,32 @@ class TetMeshCutSurfaceRenderer:
         knife_x: float,
         z_lo: float,
         z_hi: float,
+        render_negative_np: np.ndarray | None = None,
+        render_positive_np: np.ndarray | None = None,
     ) -> int:
         self.surface_points_np[:, :] = hidden_anchor
         surface_triangles = 0
         plane_y = float(self.knife.center_y)
         eps = 1.0e-7
+        negative_np = render_np if render_negative_np is None else render_negative_np
+        positive_np = render_np if render_positive_np is None else render_positive_np
         for tri in self.base_surface_triangles_np:
             rest_tri = self.rest_points[tri]
-            render_tri = render_np[tri]
             signed = rest_tri[:, 1] - plane_y
-            crosses = np.min(signed) < -eps and np.max(signed) > eps
-            if crosses and self._surface_triangle_in_cut_wake(rest_tri, knife_x, z_lo, z_hi):
-                negative = self._clip_triangle_by_side(rest_tri, render_tri, plane_y, keep_positive=False)
-                positive = self._clip_triangle_by_side(rest_tri, render_tri, plane_y, keep_positive=True)
-                surface_triangles = self._append_surface_polygon(surface_triangles, negative)
-                surface_triangles = self._append_surface_polygon(surface_triangles, positive)
+            touches_or_crosses = np.min(signed) <= eps and np.max(signed) >= -eps
+            if touches_or_crosses and self._surface_triangle_in_cut_wake(rest_tri, knife_x, z_lo, z_hi):
+                negative = self._clip_triangle_by_side(rest_tri, negative_np[tri], plane_y, keep_positive=False)
+                positive = self._clip_triangle_by_side(rest_tri, positive_np[tri], plane_y, keep_positive=True)
+                surface_triangles = self._append_surface_polygon(
+                    surface_triangles, self._apply_visual_opening(negative, -1.0, knife_x)
+                )
+                surface_triangles = self._append_surface_polygon(
+                    surface_triangles, self._apply_visual_opening(positive, 1.0, knife_x)
+                )
             else:
+                side = 1.0 if float(np.mean(rest_tri[:, 1])) >= plane_y else -1.0
+                side_render_np = positive_np if side > 0.0 else negative_np
+                render_tri = side_render_np[tri]
                 surface_triangles = self._append_surface_triangle(
                     surface_triangles, render_tri[0], render_tri[1], render_tri[2]
                 )
@@ -1398,11 +1444,24 @@ class TetMeshCutSurfaceRenderer:
             raise ValueError("current_points must match rest point shape")
         if enrichment_points is None:
             render_np = current_np
+            render_negative_np = current_np
+            render_positive_np = current_np
         else:
             enrichment_np = self._current_points_np(enrichment_points)
             if enrichment_np.shape != self.rest_points.shape:
                 raise ValueError("enrichment_points must match rest point shape")
-            render_np = current_np + enrichment_np
+            # X-FEM rendering needs virtual nodes on both sides of the cut.  Do not
+            # interpolate one enriched position across a straddling face: that
+            # collapses the discontinuity and makes the opened material look like
+            # missing/deleted elements.  Instead render the negative and positive
+            # clipped pieces with side-specific Heaviside enrichment.
+            side_gap = np.abs(enrichment_np[:, 1:2])
+            side_gap = np.maximum(side_gap, np.linalg.norm(enrichment_np, axis=1, keepdims=True) * 0.35)
+            y_axis = np.asarray((0.0, 1.0, 0.0), dtype=np.float32)
+            render_negative_np = current_np - side_gap * y_axis
+            render_positive_np = current_np + side_gap * y_axis
+            rest_side = np.where(self.rest_points[:, 1:2] >= float(self.knife.center_y), 1.0, -1.0).astype(np.float32)
+            render_np = np.where(rest_side > 0.0, render_positive_np, render_negative_np)
 
         hidden_anchor = np.mean(current_np, axis=0, dtype=np.float64).astype(np.float32)
         self.surface_points_np[:, :] = hidden_anchor
@@ -1412,7 +1471,15 @@ class TetMeshCutSurfaceRenderer:
         z_lo = knife_center_z - self.knife.half_width_z - self.knife.process_width
         z_hi = knife_center_z + self.knife.half_width_z + self.knife.process_width
 
-        surface_triangles = self._update_surface_mesh(render_np, hidden_anchor, knife_x, z_lo, z_hi)
+        surface_triangles = self._update_surface_mesh(
+            render_np,
+            hidden_anchor,
+            knife_x,
+            z_lo,
+            z_hi,
+            render_negative_np=render_negative_np,
+            render_positive_np=render_positive_np,
+        )
         wall_triangles = 0
         active_tets = 0
         for tet in self.tet_indices:
@@ -1422,19 +1489,35 @@ class TetMeshCutSurfaceRenderer:
             if float(np.max(rest_tet[:, 2])) < z_lo or float(np.min(rest_tet[:, 2])) > z_hi:
                 continue
 
-            polygon = self._tet_plane_polygon(rest_tet, render_np[tet], float(self.knife.center_y))
-            if polygon is None:
+            polygons: dict[float, np.ndarray] = {}
+            for side, side_render_np in ((-1.0, render_negative_np), (1.0, render_positive_np)):
+                side_polygon = self._tet_plane_polygon(rest_tet, side_render_np[tet], float(self.knife.center_y))
+                if side_polygon is not None:
+                    polygons[side] = side_polygon
+            if not polygons:
                 continue
             active_tets += 1
 
-            for i in range(1, polygon.shape[0] - 1):
+            for side in (-1.0, 1.0):
+                polygon = polygons.get(side)
+                if polygon is None:
+                    continue
+                opened_polygon = self._apply_visual_opening(polygon, side, knife_x)
+                for i in range(1, opened_polygon.shape[0] - 1):
+                    if wall_triangles >= self.max_wall_triangles:
+                        break
+                    vertex = wall_triangles * 3
+                    if side < 0.0:
+                        self.wall_points_np[vertex + 0] = opened_polygon[0]
+                        self.wall_points_np[vertex + 1] = opened_polygon[i + 1]
+                        self.wall_points_np[vertex + 2] = opened_polygon[i]
+                    else:
+                        self.wall_points_np[vertex + 0] = opened_polygon[0]
+                        self.wall_points_np[vertex + 1] = opened_polygon[i]
+                        self.wall_points_np[vertex + 2] = opened_polygon[i + 1]
+                    wall_triangles += 1
                 if wall_triangles >= self.max_wall_triangles:
                     break
-                vertex = wall_triangles * 3
-                self.wall_points_np[vertex + 0] = polygon[0]
-                self.wall_points_np[vertex + 1] = polygon[i]
-                self.wall_points_np[vertex + 2] = polygon[i + 1]
-                wall_triangles += 1
             if wall_triangles >= self.max_wall_triangles:
                 break
 

@@ -152,11 +152,18 @@ def _snapshot_render_geometry(example) -> tuple[dict[str, np.ndarray], dict[str,
         center_z = None
         if hasattr(example, "_knife_state"):
             front_x, center_z, _velocity = example._knife_state(example.sim_time)
-        stats = render_mesh.update(example.state_0.particle_q, example.sim_time, front_x=front_x, center_z=center_z)
+        stats = render_mesh.update(
+            example.state_0.particle_q,
+            example.sim_time,
+            front_x=front_x,
+            center_z=center_z,
+            enrichment_points=getattr(getattr(example, "solver", None), "particle_enrichment_q", None),
+        )
+        surface_vertices = stats.surface_vertex_count
         wall_vertices = stats.wall_vertex_count
         return {
-            "surface_points": example.state_0.particle_q.numpy().astype(np.float32, copy=False),
-            "surface_indices": render_mesh.surface_indices_np.reshape(-1, 3).astype(np.int32, copy=False),
+            "surface_points": render_mesh.surface_points_np[:surface_vertices].copy(),
+            "surface_indices": np.arange(surface_vertices, dtype=np.int32).reshape(-1, 3),
             "wall_points": render_mesh.wall_points_np[:wall_vertices].copy(),
             "wall_indices": np.arange(wall_vertices, dtype=np.int32).reshape(-1, 3),
         }, asdict(stats)

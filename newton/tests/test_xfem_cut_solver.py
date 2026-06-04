@@ -106,6 +106,41 @@ class TestXFEMCutSolver(unittest.TestCase):
         self.assertGreater(float(force_values[4]), 0.0)
         self.assertGreater(float(np.max(np.linalg.norm(enrichment, axis=1))), 0.0)
 
+    def test_sawing_friction_drags_cut_material_with_knife(self):
+        device = wp.get_device()
+        model = _make_soft_block_model(device)
+        solver = newton.solvers.SolverXFEMCut(
+            model,
+            iterations=1,
+            max_damage_rate=30.0,
+            knife_friction_mu=1.4,
+            friction_velocity_scale=0.04,
+        )
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+        contacts = model.contacts()
+
+        solver.set_knife_state(
+            front_x=0.02,
+            center_y=0.0,
+            center_z=0.08,
+            half_width_y=0.08,
+            half_width_z=0.18,
+            process_width=0.08,
+            knife_velocity=(0.25, 0.0, 1.2),
+            knife_tangent=(0.0, 0.0, 1.0),
+        )
+        state_0.clear_forces()
+        solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
+
+        damage = solver.particle_damage.numpy()
+        qd_after = state_1.particle_qd.numpy()
+        coupled = damage > 1.0e-4
+        self.assertGreater(np.count_nonzero(coupled), 0)
+        self.assertGreater(float(np.mean(qd_after[coupled, 2])), 0.15)
+        self.assertGreater(float(solver.force_accum.numpy()[4]), 0.0)
+
     def test_solver_accepts_rigid_spline_knife_edge(self):
         device = wp.get_device()
         model = _make_soft_block_model(device)

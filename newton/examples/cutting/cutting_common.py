@@ -51,9 +51,30 @@ class KnifeProfile:
     blade_spine_depth: float = 0.18
     handle_length: float = 0.20
     handle_height: float = 0.075
+    cut_path_amplitude_y: float = 0.0
+    cut_path_wavelength_x: float = 1.0
+    cut_path_phase: float = 0.0
+    cut_path_origin_x: float = 0.0
 
     def x_at(self, time: float) -> float:
         return self.start_x + self.speed * time
+
+    def center_y_at_x(self, x: float | np.ndarray) -> float | np.ndarray:
+        if abs(float(self.cut_path_amplitude_y)) <= 1.0e-12:
+            if np.isscalar(x):
+                return float(self.center_y)
+            return np.full_like(np.asarray(x, dtype=np.float32), float(self.center_y), dtype=np.float32)
+        x_np = np.asarray(x, dtype=np.float32)
+        wavelength = max(abs(float(self.cut_path_wavelength_x)), 1.0e-6)
+        phase = 2.0 * np.pi * (x_np - float(self.cut_path_origin_x)) / wavelength + float(self.cut_path_phase)
+        values = float(self.center_y) + float(self.cut_path_amplitude_y) * np.sin(phase)
+        if np.isscalar(x):
+            return float(values)
+        return values.astype(np.float32, copy=False)
+
+    def signed_cut_y(self, points: np.ndarray) -> np.ndarray:
+        points = np.asarray(points, dtype=np.float32)
+        return points[..., 1] - self.center_y_at_x(points[..., 0])
 
     def signed_distance_x(self, points: np.ndarray, time: float) -> np.ndarray:
         points = np.asarray(points)
@@ -1271,6 +1292,7 @@ class TetMeshCutSurfaceRenderer:
         rest_tet: np.ndarray,
         render_tet: np.ndarray,
         plane_y: float,
+        keep_positive: bool,
         eps: float = 1.0e-7,
     ) -> np.ndarray | None:
         signed = rest_tet[:, 1] - plane_y
@@ -1292,7 +1314,9 @@ class TetMeshCutSurfaceRenderer:
             elif si * sj < 0.0:
                 alpha = si / (si - sj)
                 rest_point = rest_tet[i] + alpha * (rest_tet[j] - rest_tet[i])
-                current_point = render_tet[i] + alpha * (render_tet[j] - render_tet[i])
+                i_inside = si >= -eps if keep_positive else si <= eps
+                side_index = i if i_inside else j
+                current_point = rest_point + (render_tet[side_index] - rest_tet[side_index])
                 cls._append_unique(rest_hits, current_hits, rest_point, current_point, eps)
 
         if len(current_hits) < 3:
@@ -1350,12 +1374,29 @@ class TetMeshCutSurfaceRenderer:
         keep_positive: bool,
         eps: float = 1.0e-7,
     ) -> np.ndarray | None:
-        out_rest: list[np.ndarray] = []
         out_render: list[np.ndarray] = []
 
         def inside(point: np.ndarray) -> bool:
             signed = float(point[1] - plane_y)
             return signed >= -eps if keep_positive else signed <= eps
+
+        def seam_point(
+            prev_rest: np.ndarray,
+            prev_render: np.ndarray,
+            prev_inside: bool,
+            curr_rest: np.ndarray,
+            curr_render: np.ndarray,
+            curr_inside: bool,
+        ) -> np.ndarray:
+            s0 = float(prev_rest[1] - plane_y)
+            s1 = float(curr_rest[1] - plane_y)
+            alpha = 0.0 if abs(s0 - s1) <= eps else s0 / (s0 - s1)
+            rest_hit = prev_rest + alpha * (curr_rest - prev_rest)
+            if prev_inside and not curr_inside:
+                return (rest_hit + (prev_render - prev_rest)).astype(np.float32)
+            if curr_inside and not prev_inside:
+                return (rest_hit + (curr_render - curr_rest)).astype(np.float32)
+            return (prev_render + alpha * (curr_render - prev_render)).astype(np.float32)
 
         for edge_id in range(3):
             prev_id = (edge_id + 2) % 3
@@ -1367,13 +1408,10 @@ class TetMeshCutSurfaceRenderer:
             prev_inside = inside(prev_rest)
 
             if curr_inside != prev_inside:
-                s0 = float(prev_rest[1] - plane_y)
-                s1 = float(curr_rest[1] - plane_y)
-                alpha = 0.0 if abs(s0 - s1) <= eps else s0 / (s0 - s1)
-                out_rest.append((prev_rest + alpha * (curr_rest - prev_rest)).astype(np.float32))
-                out_render.append((prev_render + alpha * (curr_render - prev_render)).astype(np.float32))
+                out_render.append(
+                    seam_point(prev_rest, prev_render, prev_inside, curr_rest, curr_render, curr_inside)
+                )
             if curr_inside:
-                out_rest.append(curr_rest.astype(np.float32, copy=False))
                 out_render.append(curr_render.astype(np.float32, copy=False))
 
         if len(out_render) < 3:
@@ -1491,7 +1529,12 @@ class TetMeshCutSurfaceRenderer:
 
             polygons: dict[float, np.ndarray] = {}
             for side, side_render_np in ((-1.0, render_negative_np), (1.0, render_positive_np)):
-                side_polygon = self._tet_plane_polygon(rest_tet, side_render_np[tet], float(self.knife.center_y))
+                side_polygon = self._tet_plane_polygon(
+                    rest_tet,
+                    side_render_np[tet],
+                    float(self.knife.center_y),
+                    keep_positive=side > 0.0,
+                )
                 if side_polygon is not None:
                     polygons[side] = side_polygon
             if not polygons:
@@ -1606,6 +1649,7 @@ class ShellCutSurfaceRenderer:
         max_visual_gap: float = 0.04,
         front_width: float | None = None,
         render_seam_edges: bool = True,
+        render_surface_edges: bool = False,
     ):
         self.rest_points = np.asarray(rest_points, dtype=np.float32)
         self.base_surface_triangles_np = np.asarray(surface_indices, dtype=np.int32).reshape(-1, 3)
@@ -1614,18 +1658,24 @@ class ShellCutSurfaceRenderer:
         self.max_visual_gap = float(max_visual_gap)
         self.front_width = float(front_width if front_width is not None else max(2.0 * knife.process_width, 1.0e-4))
         self.render_seam_edges = bool(render_seam_edges)
+        self.render_surface_edges = bool(render_surface_edges)
         self.seam_lift = 0.07 * self.nominal_edge_length
         self.max_surface_triangles = int(max_surface_triangles or max(1, 4 * len(self.base_surface_triangles_np)))
         self.max_wall_triangles = int(max_wall_triangles or max(1, 2 * len(self.base_surface_triangles_np)))
+        self.max_edge_segments = int(max(1, 3 * self.max_surface_triangles))
 
         self.surface_points_np = np.zeros((self.max_surface_triangles * 3, 3), dtype=np.float32)
         self.surface_indices_np = np.arange(self.max_surface_triangles * 3, dtype=np.int32)
         self.wall_points_np = np.zeros((self.max_wall_triangles * 3, 3), dtype=np.float32)
         self.wall_indices_np = np.arange(self.max_wall_triangles * 3, dtype=np.int32)
+        self.edge_starts_np = np.zeros((self.max_edge_segments, 3), dtype=np.float32)
+        self.edge_ends_np = np.zeros((self.max_edge_segments, 3), dtype=np.float32)
         self.surface_points_wp: wp.array | None = None
         self.surface_indices_wp: wp.array | None = None
         self.wall_points_wp: wp.array | None = None
         self.wall_indices_wp: wp.array | None = None
+        self.edge_starts_wp: wp.array | None = None
+        self.edge_ends_wp: wp.array | None = None
         self.device_key: str | None = None
         self.last_stats = TetCutWallRenderStats(
             active_x_segments=0,
@@ -1648,6 +1698,8 @@ class ShellCutSurfaceRenderer:
         self.surface_indices_wp = wp.array(self.surface_indices_np, dtype=wp.int32, device=device)
         self.wall_points_wp = wp.array(self.wall_points_np, dtype=wp.vec3, device=device)
         self.wall_indices_wp = wp.array(self.wall_indices_np, dtype=wp.int32, device=device)
+        self.edge_starts_wp = wp.array(self.edge_starts_np, dtype=wp.vec3, device=device)
+        self.edge_ends_wp = wp.array(self.edge_ends_np, dtype=wp.vec3, device=device)
 
     @staticmethod
     def _current_points_np(points: np.ndarray | wp.array) -> np.ndarray:
@@ -1664,7 +1716,7 @@ class ShellCutSurfaceRenderer:
                 float(opened[i, 0]),
                 side,
                 knife_x,
-                float(self.knife.center_y),
+                float(self.knife.center_y_at_x(float(opened[i, 0]))),
                 self.max_visual_gap,
                 self.front_width,
             )
@@ -1707,30 +1759,31 @@ class ShellCutSurfaceRenderer:
         self.wall_points_np[vertex + 2] = a + lift
         return wall_count + 1
 
-    @staticmethod
     def _clip_triangle_by_side(
+        self,
         rest_tri: np.ndarray,
         render_tri: np.ndarray,
-        plane_y: float,
         keep_positive: bool,
         eps: float = 1.0e-7,
     ) -> np.ndarray | None:
         out_render: list[np.ndarray] = []
+        signed = self.knife.signed_cut_y(rest_tri)
 
-        def inside(point: np.ndarray) -> bool:
-            signed = float(point[1] - plane_y)
-            return signed >= -eps if keep_positive else signed <= eps
+        def inside_value(value: float) -> bool:
+            return value >= -eps if keep_positive else value <= eps
 
         def seam_point(
             prev_rest: np.ndarray,
             prev_render: np.ndarray,
             prev_inside: bool,
+            prev_signed: float,
             curr_rest: np.ndarray,
             curr_render: np.ndarray,
             curr_inside: bool,
+            curr_signed: float,
         ) -> np.ndarray:
-            s0 = float(prev_rest[1] - plane_y)
-            s1 = float(curr_rest[1] - plane_y)
+            s0 = float(prev_signed)
+            s1 = float(curr_signed)
             alpha = 0.0 if abs(s0 - s1) <= eps else s0 / (s0 - s1)
             rest_hit = prev_rest + alpha * (curr_rest - prev_rest)
             if prev_inside and not curr_inside:
@@ -1745,12 +1798,23 @@ class ShellCutSurfaceRenderer:
             curr_render = render_tri[edge_id]
             prev_rest = rest_tri[prev_id]
             prev_render = render_tri[prev_id]
-            curr_inside = inside(curr_rest)
-            prev_inside = inside(prev_rest)
+            curr_signed = float(signed[edge_id])
+            prev_signed = float(signed[prev_id])
+            curr_inside = inside_value(curr_signed)
+            prev_inside = inside_value(prev_signed)
 
             if curr_inside != prev_inside:
                 out_render.append(
-                    seam_point(prev_rest, prev_render, prev_inside, curr_rest, curr_render, curr_inside)
+                    seam_point(
+                        prev_rest,
+                        prev_render,
+                        prev_inside,
+                        prev_signed,
+                        curr_rest,
+                        curr_render,
+                        curr_inside,
+                        curr_signed,
+                    )
                 )
             if curr_inside:
                 out_render.append(curr_render.astype(np.float32, copy=False))
@@ -1759,9 +1823,14 @@ class ShellCutSurfaceRenderer:
             return None
         return np.asarray(out_render, dtype=np.float32)
 
-    @staticmethod
-    def _plane_segment(rest_tri: np.ndarray, render_tri: np.ndarray, plane_y: float, eps: float = 1.0e-7):
-        signed = rest_tri[:, 1] - plane_y
+    def _plane_segment(
+        self,
+        rest_tri: np.ndarray,
+        render_tri: np.ndarray,
+        keep_positive: bool,
+        eps: float = 1.0e-7,
+    ):
+        signed = self.knife.signed_cut_y(rest_tri)
         hits: list[np.ndarray] = []
         for edge_id in range(3):
             next_id = (edge_id + 1) % 3
@@ -1769,11 +1838,17 @@ class ShellCutSurfaceRenderer:
             s1 = float(signed[next_id])
             p0 = render_tri[edge_id]
             p1 = render_tri[next_id]
+            r0 = rest_tri[edge_id]
+            r1 = rest_tri[next_id]
             if abs(s0) <= eps:
                 hits.append(p0.astype(np.float32, copy=False))
             if s0 * s1 < 0.0:
                 alpha = s0 / (s0 - s1)
-                hits.append((p0 + alpha * (p1 - p0)).astype(np.float32))
+                rest_hit = r0 + alpha * (r1 - r0)
+                use_start = s0 >= -eps if keep_positive else s0 <= eps
+                side_rest = r0 if use_start else r1
+                side_render = p0 if use_start else p1
+                hits.append((rest_hit + (side_render - side_rest)).astype(np.float32))
             elif abs(s1) <= eps:
                 hits.append(p1.astype(np.float32, copy=False))
         if len(hits) < 2:
@@ -1787,6 +1862,23 @@ class ShellCutSurfaceRenderer:
         points = np.asarray(unique, dtype=np.float32)
         order = np.lexsort((points[:, 2], points[:, 0]))
         return points[order[[0, -1]]]
+
+    def _update_edge_overlay(self, hidden_anchor: np.ndarray, surface_triangles: int) -> int:
+        self.edge_starts_np[:, :] = hidden_anchor
+        self.edge_ends_np[:, :] = hidden_anchor
+        edge_count = 0
+        for tri_id in range(min(int(surface_triangles), self.max_surface_triangles)):
+            base = tri_id * 3
+            a = self.surface_points_np[base + 0]
+            b = self.surface_points_np[base + 1]
+            c = self.surface_points_np[base + 2]
+            for p0, p1 in ((a, b), (b, c), (c, a)):
+                if edge_count >= self.max_edge_segments:
+                    return edge_count
+                self.edge_starts_np[edge_count] = p0
+                self.edge_ends_np[edge_count] = p1
+                edge_count += 1
+        return edge_count
 
     def _surface_triangle_in_cut_wake(
         self,
@@ -1833,7 +1925,8 @@ class ShellCutSurfaceRenderer:
             y_axis = np.asarray((0.0, 1.0, 0.0), dtype=np.float32)
             render_negative_np = current_np - side_gap * y_axis
             render_positive_np = current_np + side_gap * y_axis
-        rest_side = np.where(self.rest_points[:, 1:2] >= float(self.knife.center_y), 1.0, -1.0).astype(np.float32)
+        rest_signed = self.knife.signed_cut_y(self.rest_points)[:, None]
+        rest_side = np.where(rest_signed >= 0.0, 1.0, -1.0).astype(np.float32)
         render_np = np.where(rest_side > 0.0, render_positive_np, render_negative_np)
 
         hidden_anchor = np.mean(current_np, axis=0, dtype=np.float64).astype(np.float32)
@@ -1843,7 +1936,6 @@ class ShellCutSurfaceRenderer:
         knife_center_z = float(self.knife.center_z if center_z is None else center_z)
         z_lo = knife_center_z - self.knife.half_width_z - self.knife.process_width
         z_hi = knife_center_z + self.knife.half_width_z + self.knife.process_width
-        plane_y = float(self.knife.center_y)
         eps = 1.0e-7
 
         surface_triangles = 0
@@ -1851,14 +1943,14 @@ class ShellCutSurfaceRenderer:
         active_triangles = 0
         for tri_id, tri in enumerate(self.base_surface_triangles_np):
             rest_tri = self.rest_points[tri]
-            signed = rest_tri[:, 1] - plane_y
+            signed = self.knife.signed_cut_y(rest_tri)
             touches_or_crosses = np.min(signed) <= eps and np.max(signed) >= -eps
             in_wake = self._surface_triangle_in_cut_wake(rest_tri, knife_x, z_lo, z_hi)
             solver_cut = True if cut_state_np is None else int(cut_state_np[tri_id]) != 0
             if touches_or_crosses and in_wake and solver_cut:
                 active_triangles += 1
-                negative = self._clip_triangle_by_side(rest_tri, render_negative_np[tri], plane_y, keep_positive=False)
-                positive = self._clip_triangle_by_side(rest_tri, render_positive_np[tri], plane_y, keep_positive=True)
+                negative = self._clip_triangle_by_side(rest_tri, render_negative_np[tri], keep_positive=False)
+                positive = self._clip_triangle_by_side(rest_tri, render_positive_np[tri], keep_positive=True)
                 surface_triangles = self._append_surface_polygon(
                     surface_triangles, self._apply_visual_opening(negative, -1.0, knife_x)
                 )
@@ -1867,12 +1959,12 @@ class ShellCutSurfaceRenderer:
                 )
                 if self.render_seam_edges:
                     for side, side_render_np in ((-1.0, render_negative_np), (1.0, render_positive_np)):
-                        segment = self._plane_segment(rest_tri, side_render_np[tri], plane_y)
+                        segment = self._plane_segment(rest_tri, side_render_np[tri], keep_positive=side > 0.0)
                         segment = self._apply_visual_opening(segment, side, knife_x)
                         if segment is not None:
                             wall_triangles = self._append_wall_quad(wall_triangles, segment[0], segment[1])
             else:
-                side = 1.0 if float(np.mean(rest_tri[:, 1])) >= plane_y else -1.0
+                side = 1.0 if float(np.mean(signed)) >= 0.0 else -1.0
                 side_render_np = render_positive_np if side > 0.0 else render_negative_np
                 if cut_state_np is not None and not solver_cut:
                     render_tri = current_np[tri]
@@ -1926,8 +2018,16 @@ class ShellCutSurfaceRenderer:
         assert self.surface_indices_wp is not None
         assert self.wall_points_wp is not None
         assert self.wall_indices_wp is not None
+        assert self.edge_starts_wp is not None
+        assert self.edge_ends_wp is not None
         self.surface_points_wp.assign(self.surface_points_np)
         self.wall_points_wp.assign(self.wall_points_np)
+        edge_count = 0
+        if self.render_surface_edges:
+            hidden_anchor = np.mean(self._current_points_np(current_points), axis=0, dtype=np.float64).astype(np.float32)
+            edge_count = self._update_edge_overlay(hidden_anchor, stats.surface_triangle_count)
+            self.edge_starts_wp.assign(self.edge_starts_np)
+            self.edge_ends_wp.assign(self.edge_ends_np)
         viewer.log_mesh(
             f"{prefix}/surface",
             self.surface_points_wp,
@@ -1948,6 +2048,15 @@ class ShellCutSurfaceRenderer:
             roughness=0.86,
             opacity=wall_opacity,
         )
+        if self.render_surface_edges:
+            viewer.log_lines(
+                f"{prefix}/surface_edges",
+                self.edge_starts_wp,
+                self.edge_ends_wp,
+                (0.08, 0.10, 0.12),
+                width=0.004,
+                hidden=edge_count == 0,
+            )
         return stats
 
 

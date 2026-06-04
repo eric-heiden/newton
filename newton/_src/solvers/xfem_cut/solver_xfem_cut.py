@@ -182,6 +182,10 @@ class SolverXFEMCut(SolverBase):
         knife_velocity: Sequence[float] | wp.vec3 = (0.0, 0.0, 0.0),
         knife_tangent: Sequence[float] | wp.vec3 = (0.0, 0.0, 1.0),
         edge_points: Sequence[Sequence[float]] | np.ndarray | None = None,
+        cut_path_amplitude_y: float = 0.0,
+        cut_path_wavelength_x: float = 1.0,
+        cut_path_phase: float = 0.0,
+        cut_path_origin_x: float = 0.0,
     ) -> None:
         """Set the current blade state used by the next :meth:`step` call."""
 
@@ -200,6 +204,10 @@ class SolverXFEMCut(SolverBase):
         self.knife_process_width = float(process_width)
         self.knife_velocity = _vec3_tuple(knife_velocity)
         self.knife_tangent = (float(tangent[0]), float(tangent[1]), float(tangent[2]))
+        self.cut_path_amplitude_y = float(cut_path_amplitude_y)
+        self.cut_path_wavelength_x = float(cut_path_wavelength_x)
+        self.cut_path_phase = float(cut_path_phase)
+        self.cut_path_origin_x = float(cut_path_origin_x)
 
         if edge_points is None:
             edge_np = np.array(
@@ -294,6 +302,10 @@ class SolverXFEMCut(SolverBase):
                     self.knife_center_z,
                     self.knife_half_width_z,
                     self.knife_process_width,
+                    self.cut_path_amplitude_y,
+                    self.cut_path_wavelength_x,
+                    self.cut_path_phase,
+                    self.cut_path_origin_x,
                 ],
                 device=model.device,
             )
@@ -319,6 +331,10 @@ class SolverXFEMCut(SolverBase):
                     self.knife_center_z,
                     self.knife_half_width_z,
                     self.knife_process_width,
+                    self.cut_path_amplitude_y,
+                    self.cut_path_wavelength_x,
+                    self.cut_path_phase,
+                    self.cut_path_origin_x,
                 ],
                 device=model.device,
             )
@@ -337,6 +353,10 @@ class SolverXFEMCut(SolverBase):
                     self.knife_center_z,
                     self.knife_half_width_z,
                     self.knife_process_width,
+                    self.cut_path_amplitude_y,
+                    self.cut_path_wavelength_x,
+                    self.cut_path_phase,
+                    self.cut_path_origin_x,
                 ],
                 device=model.device,
             )
@@ -397,6 +417,10 @@ class SolverXFEMCut(SolverBase):
                     wp.vec3(*self.knife_velocity),
                     wp.vec3(*self.knife_tangent),
                     self.max_enrichment,
+                    self.cut_path_amplitude_y,
+                    self.cut_path_wavelength_x,
+                    self.cut_path_phase,
+                    self.cut_path_origin_x,
                 ],
                 device=model.device,
             )
@@ -425,6 +449,10 @@ class SolverXFEMCut(SolverBase):
                     self.knife_center_y,
                     self.knife_process_width,
                     self.max_visual_gap,
+                    self.cut_path_amplitude_y,
+                    self.cut_path_wavelength_x,
+                    self.cut_path_phase,
+                    self.cut_path_origin_x,
                     self.table_z,
                     self.table_glue_depth,
                     self.table_glue_strength,

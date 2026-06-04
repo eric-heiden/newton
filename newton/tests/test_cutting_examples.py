@@ -178,6 +178,26 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertEqual(cfg.geometry, "cloth_grid")
         self.assertGreater(cfg.dim_y * cfg.cell_y, 0.55)
         self.assertEqual(cfg.dim_z, 0)
+        self.assertEqual(cfg.saw_amplitude_z, 0.0)
+        self.assertEqual(cfg.saw_frequency_hz, 0.0)
+        self.assertGreaterEqual(cfg.k_damp, 3.0e-2)
+
+    def test_hanging_cloth_wind_is_sideways_for_y_up_scene(self):
+        cfg = SCENARIOS["hanging_cloth_cutoff"]
+
+        self.assertEqual(cfg.up_axis, newton.Axis.Y)
+        self.assertAlmostEqual(float(cfg.wind_direction[1]), 0.0)
+        self.assertGreater(np.linalg.norm(np.asarray(cfg.wind_direction, dtype=np.float32)), 0.0)
+
+    def test_curved_cloth_spline_cut_scenario_is_large_nonstraight_sheet(self):
+        cfg = SCENARIOS["curved_cloth_spline_cut"]
+
+        self.assertEqual(cfg.geometry, "cloth_grid")
+        self.assertGreaterEqual(cfg.dim_x * cfg.dim_y, 1500)
+        self.assertGreater(cfg.cut_path_amplitude_y, 0.05)
+        self.assertGreater(cfg.cut_path_wavelength_x, 0.1)
+        self.assertTrue(cfg.render_seam_edges)
+        self.assertTrue(cfg.visual_topology_only)
 
     def test_xfem_shell_particle_area_uses_triangle_area(self):
         builder = newton.ModelBuilder()
@@ -319,6 +339,43 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertGreater(int(np.sum(tri_cut)), 0)
         np.testing.assert_allclose(points[top_row], initial_points[top_row], atol=1.0e-6)
         self.assertLess(float(np.mean(points[lower_panel, 1] - initial_points[lower_panel, 1])), -0.01)
+
+    def test_curved_cloth_spline_cut_remeshes_online(self):
+        import sys
+
+        old_argv = sys.argv
+        try:
+            sys.argv = [
+                "test_cutting_examples",
+                "--viewer",
+                "null",
+                "--quiet",
+                "--scenario",
+                "curved_cloth_spline_cut",
+                "--num-frames",
+                "1",
+                "--substeps",
+                "4",
+                "--iterations",
+                "4",
+                "--no-render-split-mesh",
+            ]
+            viewer, args = newton.examples.init(XFEMExample.create_parser())
+            example = XFEMExample(viewer, args)
+            for _ in range(70):
+                example.step()
+            spring_cut = example.solver.spring_cut_state.numpy()
+            edge_cut = example.solver.edge_cut_state.numpy()
+            tri_cut = example.solver.tri_cut_state.numpy()
+            points = example.state_0.particle_q.numpy()
+            viewer.close()
+        finally:
+            sys.argv = old_argv
+
+        self.assertGreater(int(np.sum(spring_cut)), 0)
+        self.assertGreater(int(np.sum(edge_cut)), 0)
+        self.assertGreater(int(np.sum(tri_cut)), 0)
+        self.assertLess(float(np.max(np.ptp(points, axis=0))), 1.6)
 
     def test_viewergl_sets_pyglet_headless_before_shader_import(self):
         source = inspect.getsource(RendererGL.__init__)
@@ -766,6 +823,66 @@ class TestCuttingCommon(unittest.TestCase):
         rendered_points = renderer.surface_points_np[: stats.surface_vertex_count]
 
         self.assertGreater(stats.surface_triangle_count, triangles.shape[0])
+        self.assertFalse(np.any((rendered_points[:, 1] > -0.9) & (rendered_points[:, 1] < -0.1)))
+
+    def test_tet_cut_surface_renderer_surface_seam_follows_cut_side_motion(self):
+        rest_points = np.array(
+            [
+                [-0.2, -0.1, 0.0],
+                [-0.2, 0.1, 0.0],
+                [-0.2, -0.1, 0.2],
+                [-0.1, 0.0, 0.1],
+            ],
+            dtype=np.float32,
+        )
+        current_points = rest_points.copy()
+        current_points[rest_points[:, 1] < 0.0, 1] -= 1.0
+        tets = np.array([[0, 1, 2, 3]], dtype=np.int32)
+        surface = np.array([[0, 1, 2]], dtype=np.int32)
+        knife = KnifeProfile(start_x=0.0, speed=0.0, center_y=0.0, center_z=0.1, half_width_z=0.25)
+        renderer = TetMeshCutSurfaceRenderer(
+            rest_points,
+            tets,
+            surface,
+            knife,
+            nominal_edge_length=0.1,
+            max_visual_gap=0.0,
+        )
+
+        stats = renderer.update(current_points, time=0.0, front_x=0.1, center_z=0.1)
+        rendered_points = renderer.surface_points_np[: stats.surface_vertex_count]
+
+        self.assertGreater(stats.surface_triangle_count, 1)
+        self.assertFalse(np.any((rendered_points[:, 1] > -0.9) & (rendered_points[:, 1] < -0.1)))
+
+    def test_tet_cut_surface_renderer_wall_seam_follows_cut_side_motion(self):
+        rest_points = np.array(
+            [
+                [-0.2, -0.1, 0.0],
+                [-0.2, 0.1, 0.0],
+                [-0.2, -0.1, 0.2],
+                [-0.1, 0.1, 0.2],
+            ],
+            dtype=np.float32,
+        )
+        current_points = rest_points.copy()
+        current_points[rest_points[:, 1] < 0.0, 1] -= 1.0
+        tets = np.array([[0, 1, 2, 3]], dtype=np.int32)
+        surface = np.array([[0, 1, 2]], dtype=np.int32)
+        knife = KnifeProfile(start_x=0.0, speed=0.0, center_y=0.0, center_z=0.1, half_width_z=0.25)
+        renderer = TetMeshCutSurfaceRenderer(
+            rest_points,
+            tets,
+            surface,
+            knife,
+            nominal_edge_length=0.1,
+            max_visual_gap=0.0,
+        )
+
+        stats = renderer.update(current_points, time=0.0, front_x=0.1, center_z=0.1)
+        rendered_points = renderer.wall_points_np[: stats.wall_vertex_count]
+
+        self.assertGreater(stats.wall_triangle_count, 0)
         self.assertFalse(np.any((rendered_points[:, 1] > -0.9) & (rendered_points[:, 1] < -0.1)))
 
 

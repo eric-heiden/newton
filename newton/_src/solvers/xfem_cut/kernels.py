@@ -29,6 +29,41 @@ def _signed_side(value: float):
 
 
 @wp.func
+def _cut_path_center_y(
+    x: float,
+    center_y: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
+):
+    if wp.abs(path_amplitude_y) <= 1.0e-12:
+        return center_y
+    wavelength = wp.max(wp.abs(path_wavelength_x), 1.0e-6)
+    phase = 6.28318530718 * (x - path_origin_x) / wavelength + path_phase
+    return center_y + path_amplitude_y * wp.sin(phase)
+
+
+@wp.func
+def _cut_path_signed_y(
+    q: wp.vec3,
+    center_y: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
+):
+    return q[1] - _cut_path_center_y(
+        q[0],
+        center_y,
+        path_amplitude_y,
+        path_wavelength_x,
+        path_phase,
+        path_origin_x,
+    )
+
+
+@wp.func
 def _knife_edge_process_weight(
     q: wp.vec3,
     edge_points: wp.array(dtype=wp.vec3),
@@ -93,6 +128,10 @@ def apply_xfem_knife_kernel(
     knife_velocity: wp.vec3,
     knife_tangent: wp.vec3,
     max_enrichment: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
 ):
     tid = wp.tid()
     if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
@@ -101,7 +140,15 @@ def apply_xfem_knife_kernel(
     q = particle_q[tid]
     v = particle_qd[tid]
     old_damage = particle_damage[tid]
-    y_rel = q[1] - center_y
+    local_center_y = _cut_path_center_y(
+        q[0],
+        center_y,
+        path_amplitude_y,
+        path_wavelength_x,
+        path_phase,
+        path_origin_x,
+    )
+    y_rel = q[1] - local_center_y
     z_rel = q[2] - center_z
 
     front_weight = _knife_edge_process_weight(
@@ -138,7 +185,7 @@ def apply_xfem_knife_kernel(
         )
 
     wake_weight = _xfem_smoothstep((front_x + process_width - q[0]) / wp.max(process_width, 1.0e-6))
-    side_wall_distance = wp.abs(q[1] - center_y)
+    side_wall_distance = wp.abs(q[1] - local_center_y)
     near_cut_wall = _xfem_smoothstep((half_width_y + process_width - side_wall_distance) / wp.max(process_width, 1.0e-6))
     tangential_coupling = wp.max(front_weight, wake_weight * near_cut_wall * _xfem_smoothstep(new_damage))
     if tangential_coupling > 0.0:
@@ -299,9 +346,13 @@ def _rest_segment_crosses_cloth_cut(
     center_z: float,
     half_width_z: float,
     process_width: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
 ):
-    yi = qi[1] - center_y
-    yj = qj[1] - center_y
+    yi = _cut_path_signed_y(qi, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+    yj = _cut_path_signed_y(qj, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
     crosses = yi * yj < 0.0
     mid = (qi + qj) * 0.5
     reached = mid[0] <= front_x + process_width
@@ -319,10 +370,14 @@ def _rest_triangle_crosses_cloth_cut(
     center_z: float,
     half_width_z: float,
     process_width: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
 ):
-    y0 = q0[1] - center_y
-    y1 = q1[1] - center_y
-    y2 = q2[1] - center_y
+    y0 = _cut_path_signed_y(q0, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+    y1 = _cut_path_signed_y(q1, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+    y2 = _cut_path_signed_y(q2, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
     min_y = wp.min(y0, wp.min(y1, y2))
     max_y = wp.max(y0, wp.max(y1, y2))
     centroid = (q0 + q1 + q2) / 3.0
@@ -346,6 +401,10 @@ def cut_xfem_cloth_springs_kernel(
     center_z: float,
     half_width_z: float,
     process_width: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
 ):
     tid = wp.tid()
     i = spring_indices[tid * 2 + 0]
@@ -358,6 +417,10 @@ def cut_xfem_cloth_springs_kernel(
         center_z,
         half_width_z,
         process_width,
+        path_amplitude_y,
+        path_wavelength_x,
+        path_phase,
+        path_origin_x,
     )
     if should_cut and spring_cut_state[tid] == 0:
         spring_cut_state[tid] = 1
@@ -384,6 +447,10 @@ def cut_xfem_cloth_edges_kernel(
     center_z: float,
     half_width_z: float,
     process_width: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
 ):
     tid = wp.tid()
     i = edge_indices[tid, 0]
@@ -397,8 +464,12 @@ def cut_xfem_cloth_edges_kernel(
     qj = rest_particle_q[j]
     qk = rest_particle_q[k]
     ql = rest_particle_q[l]
-    min_y = wp.min(wp.min(qi[1], qj[1]), wp.min(qk[1], ql[1])) - center_y
-    max_y = wp.max(wp.max(qi[1], qj[1]), wp.max(qk[1], ql[1])) - center_y
+    yi = _cut_path_signed_y(qi, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+    yj = _cut_path_signed_y(qj, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+    yk = _cut_path_signed_y(qk, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+    yl = _cut_path_signed_y(ql, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+    min_y = wp.min(wp.min(yi, yj), wp.min(yk, yl))
+    max_y = wp.max(wp.max(yi, yj), wp.max(yk, yl))
     centroid = (qi + qj + qk + ql) * 0.25
     reached = centroid[0] <= front_x + process_width
     z_in = wp.abs(centroid[2] - center_z) <= half_width_z + process_width
@@ -426,6 +497,10 @@ def cut_xfem_cloth_triangles_kernel(
     center_z: float,
     half_width_z: float,
     process_width: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
 ):
     tid = wp.tid()
     i = tri_indices[tid, 0]
@@ -440,6 +515,10 @@ def cut_xfem_cloth_triangles_kernel(
         center_z,
         half_width_z,
         process_width,
+        path_amplitude_y,
+        path_wavelength_x,
+        path_phase,
+        path_origin_x,
     )
     if should_cut and tri_cut_state[tid] == 0:
         tri_cut_state[tid] = 1
@@ -456,6 +535,7 @@ def apply_xfem_cloth_wind_kernel(
     strength: float,
     frequency_hz: float,
     time: float,
+    wind_direction: wp.vec3,
 ):
     tid = wp.tid()
     if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or particle_inv_mass[tid] <= 0.0:
@@ -463,7 +543,7 @@ def apply_xfem_cloth_wind_kernel(
     rest = rest_particle_q[tid]
     phase = 6.28318530718 * frequency_hz * time + 8.0 * rest[0] + 3.0 * rest[1]
     gust = 0.55 + 0.45 * wp.sin(phase)
-    particle_f[tid] = particle_f[tid] + wp.vec3(0.0, 0.0, strength * gust)
+    particle_f[tid] = particle_f[tid] + _safe_normalized(wind_direction) * (strength * gust)
 
 
 @wp.kernel
@@ -480,6 +560,10 @@ def apply_xfem_post_constraints_kernel(
     center_y: float,
     process_width: float,
     max_visual_gap: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
     table_z: float,
     table_glue_depth: float,
     table_glue_strength: float,
@@ -497,11 +581,19 @@ def apply_xfem_post_constraints_kernel(
 
     damage = particle_damage[tid]
     side = particle_cut_side[tid]
+    local_center_y = _cut_path_center_y(
+        q[0],
+        center_y,
+        path_amplitude_y,
+        path_wavelength_x,
+        path_phase,
+        path_origin_x,
+    )
     if inv_mass > 0.0 and damage > 1.0e-4 and side != 0.0 and q[0] <= front_x + 2.0 * process_width:
         min_sep = max_visual_gap * _xfem_smoothstep(damage)
-        current_sep = side * (q[1] - center_y)
+        current_sep = side * (q[1] - local_center_y)
         if current_sep < min_sep:
-            q[1] = center_y + side * min_sep
+            q[1] = local_center_y + side * min_sep
             if side * qd[1] < 0.0:
                 qd[1] = 0.0
         q = q + particle_enrichment_q[tid] * (0.12 * damage)

@@ -154,9 +154,17 @@ class XFEMScenario:
     fix_bottom: bool = False
     wind_strength: float = 0.0
     wind_frequency_hz: float = 0.0
+    wind_direction: tuple[float, float, float] = (0.0, 0.0, 1.0)
     up_axis: newton.Axis = newton.Axis.Z
     geometry: str = "grid"
     tet_target_edge: float = 0.052
+    cut_path_amplitude_y: float = 0.0
+    cut_path_wavelength_x: float = 1.0
+    cut_path_phase: float = 0.0
+    cut_path_origin_x: float = 0.0
+    render_mesh_edges: bool = False
+    render_seam_edges: bool = False
+    visual_topology_only: bool = False
 
     @property
     def block_size(self) -> np.ndarray:
@@ -276,7 +284,7 @@ SCENARIOS: dict[str, XFEMScenario] = {
         density=0.045,
         k_mu=2.8e2,
         k_lambda=2.8e2,
-        k_damp=1.5e-2,
+        k_damp=3.5e-2,
         gravity=(0.0, 0.0, -1.2),
         fix_left=True,
         knife_start_x=-0.58,
@@ -286,8 +294,8 @@ SCENARIOS: dict[str, XFEMScenario] = {
         knife_half_width_y=0.035,
         knife_half_width_z=0.090,
         process_width=0.040,
-        saw_amplitude_z=0.010,
-        saw_frequency_hz=3.2,
+        saw_amplitude_z=0.0,
+        saw_frequency_hz=0.0,
         fracture_energy=24.0,
         yield_stress=1.6e3,
         max_damage_rate=20.0,
@@ -352,10 +360,65 @@ SCENARIOS: dict[str, XFEMScenario] = {
         camera_yaw=-90.0,
         camera_target_offset=(0.20, -0.22, 0.0),
         fix_top=True,
-        wind_strength=0.002,
+        wind_strength=0.00075,
         wind_frequency_hz=0.55,
+        wind_direction=(1.0, 0.0, 0.0),
         up_axis=newton.Axis.Y,
         geometry="cloth_grid",
+    ),
+    "curved_cloth_spline_cut": XFEMScenario(
+        name="curved_cloth_spline_cut",
+        block_pos=(-0.72, -0.48, 0.030),
+        dim_x=54,
+        dim_y=34,
+        dim_z=0,
+        cell_x=0.028,
+        cell_y=0.028,
+        cell_z=0.0,
+        density=0.040,
+        k_mu=2.4e2,
+        k_lambda=2.4e2,
+        k_damp=6.0e-2,
+        gravity=(0.0, 0.0, 0.0),
+        fix_left=True,
+        knife_start_x=-0.75,
+        knife_speed=0.31,
+        knife_center_y=-0.01,
+        knife_center_z=0.038,
+        knife_half_width_y=0.036,
+        knife_half_width_z=0.095,
+        process_width=0.038,
+        saw_amplitude_z=0.0,
+        saw_frequency_hz=0.0,
+        fracture_energy=22.0,
+        yield_stress=1.45e3,
+        max_damage_rate=22.0,
+        separation_speed=0.0,
+        force_scale=0.0,
+        friction_mu=0.0,
+        table_z=0.0,
+        table_glue_depth=0.0,
+        table_glue_strength=0.0,
+        residual_stiffness=0.024,
+        damage_threshold=0.13,
+        max_visual_gap=0.028,
+        surface_color=(0.89, 0.91, 0.84),
+        wall_color=(0.62, 0.12, 0.14),
+        particle_color_scale=0.0,
+        camera_pos=(0.82, -1.22, 0.58),
+        camera_pitch=-31.0,
+        camera_yaw=124.0,
+        geometry="cloth_grid",
+        fix_right=True,
+        fix_top=True,
+        fix_bottom=True,
+        cut_path_amplitude_y=0.105,
+        cut_path_wavelength_x=0.54,
+        cut_path_phase=0.40,
+        cut_path_origin_x=-0.72,
+        render_mesh_edges=False,
+        render_seam_edges=True,
+        visual_topology_only=True,
     ),
     "bread_tearing": XFEMScenario(
         name="bread_tearing",
@@ -537,6 +600,10 @@ class Example:
             half_width_y=cfg.knife_half_width_y,
             half_width_z=cfg.knife_half_width_z,
             process_width=cfg.process_width,
+            cut_path_amplitude_y=cfg.cut_path_amplitude_y,
+            cut_path_wavelength_x=cfg.cut_path_wavelength_x,
+            cut_path_phase=cfg.cut_path_phase,
+            cut_path_origin_x=cfg.cut_path_origin_x,
         )
         if args.render_split_mesh and cfg.geometry == "half_cylinder":
             if self.model.tet_indices is None or self.model.tri_indices is None:
@@ -558,7 +625,8 @@ class Example:
                 knife=self.knife_profile,
                 nominal_edge_length=max(cfg.cell_x, cfg.cell_y),
                 max_visual_gap=cfg.max_visual_gap,
-                render_seam_edges=False,
+                render_seam_edges=cfg.render_seam_edges,
+                render_surface_edges=cfg.render_mesh_edges,
             )
         elif args.render_split_mesh and args.render_remesh_mode == "adaptive":
             self.render_split_mesh = AdaptiveCutSurfaceRemesher(
@@ -592,17 +660,23 @@ class Example:
                 center = self.block_pos + 0.5 * self.block_size + np.array(cfg.camera_target_offset, dtype=np.float32)
                 self.viewer.camera.look_at(wp.vec3(float(center[0]), float(center[1]), float(center[2])))
 
-    def _knife_state(self, time_value: float) -> tuple[float, float, tuple[float, float, float]]:
+    def _knife_state(self, time_value: float) -> tuple[float, float, float, tuple[float, float, float]]:
         cfg = self.scenario
         front_x = cfg.knife_start_x + cfg.knife_speed * time_value
+        center_y = float(self.knife_profile.center_y_at_x(front_x))
+        velocity_y = 0.0
+        if abs(cfg.cut_path_amplitude_y) > 1.0e-12:
+            wavelength = max(abs(cfg.cut_path_wavelength_x), 1.0e-6)
+            phase = 2.0 * math.pi * (front_x - cfg.cut_path_origin_x) / wavelength + cfg.cut_path_phase
+            velocity_y = cfg.cut_path_amplitude_y * (2.0 * math.pi / wavelength) * math.cos(phase) * cfg.knife_speed
         if cfg.saw_frequency_hz <= 0.0 or cfg.saw_amplitude_z == 0.0:
-            return front_x, cfg.knife_center_z, (cfg.knife_speed, 0.0, 0.0)
+            return front_x, center_y, cfg.knife_center_z, (cfg.knife_speed, velocity_y, 0.0)
 
         omega = 2.0 * math.pi * cfg.saw_frequency_hz
         phase = omega * time_value
         center_z = cfg.knife_center_z + cfg.saw_amplitude_z * math.sin(phase)
         velocity_z = cfg.saw_amplitude_z * omega * math.cos(phase)
-        return front_x, center_z, (cfg.knife_speed, 0.0, velocity_z)
+        return front_x, center_y, center_z, (cfg.knife_speed, velocity_y, velocity_z)
 
     def simulate(self):
         cfg = self.scenario
@@ -613,17 +687,26 @@ class Example:
         frame_damage = 0.0
         for substep in range(self.sim_substeps):
             substep_time = self.sim_time + substep * self.sim_dt
-            front_x, center_z, knife_velocity = self._knife_state(substep_time)
+            front_x, center_y, center_z, knife_velocity = self._knife_state(substep_time)
             self.solver.set_knife_state(
                 front_x=front_x,
-                center_y=cfg.knife_center_y,
+                center_y=center_y,
                 center_z=center_z,
                 half_width_y=cfg.knife_half_width_y,
                 half_width_z=cfg.knife_half_width_z,
                 process_width=cfg.process_width,
                 knife_velocity=knife_velocity,
                 knife_tangent=(0.0, 0.0, 1.0),
-                edge_points=self.knife_profile.edge_points(substep_time, front_x=front_x, center_z=center_z),
+                edge_points=self.knife_profile.edge_points(
+                    substep_time,
+                    front_x=front_x,
+                    center_y=center_y,
+                    center_z=center_z,
+                ),
+                cut_path_amplitude_y=cfg.cut_path_amplitude_y,
+                cut_path_wavelength_x=cfg.cut_path_wavelength_x,
+                cut_path_phase=cfg.cut_path_phase,
+                cut_path_origin_x=cfg.cut_path_origin_x,
             )
 
             self.state_0.clear_forces()
@@ -641,6 +724,7 @@ class Example:
                         cfg.wind_strength,
                         cfg.wind_frequency_hz,
                         substep_time,
+                        wp.vec3(*cfg.wind_direction),
                     ],
                     device=self.model.device,
                 )
@@ -653,6 +737,9 @@ class Example:
             frame_normal += float(values[3])
             frame_friction += float(values[4])
             self.state_0, self.state_1 = self.state_1, self.state_0
+            if cfg.visual_topology_only:
+                self.state_0.particle_q.assign(self.render_rest_particle_q_wp)
+                self.state_0.particle_qd.zero_()
 
         inv_substeps = 1.0 / max(float(self.sim_substeps), 1.0)
         self.force_history.append_values(
@@ -672,8 +759,8 @@ class Example:
         cfg = self.scenario
         self.viewer.begin_frame(self.sim_time)
         if self.render_split_mesh is not None:
-            if isinstance(self.render_split_mesh, (TetMeshCutSurfaceRenderer, ShellCutSurfaceRenderer)):
-                front_x, center_z, _knife_velocity = self._knife_state(self.sim_time)
+            if isinstance(self.render_split_mesh, ShellCutSurfaceRenderer):
+                front_x, _center_y, center_z, _knife_velocity = self._knife_state(self.sim_time)
                 stats = self.render_split_mesh.log(
                     self.viewer,
                     self.model.device,
@@ -686,6 +773,21 @@ class Example:
                     center_z=center_z,
                     enrichment_points=self.solver.particle_enrichment_q,
                     triangle_cut_state=self.solver.tri_cut_state,
+                )
+                self.remesh_history.append({"time_s": self.sim_time, **asdict(stats)})
+            elif isinstance(self.render_split_mesh, TetMeshCutSurfaceRenderer):
+                front_x, _center_y, center_z, _knife_velocity = self._knife_state(self.sim_time)
+                stats = self.render_split_mesh.log(
+                    self.viewer,
+                    self.model.device,
+                    self.sim_time,
+                    current_points=self.state_0.particle_q,
+                    prefix=f"/cutting/xfem_{cfg.name}/cut_surface",
+                    surface_color=cfg.surface_color,
+                    wall_color=cfg.wall_color,
+                    front_x=front_x,
+                    center_z=center_z,
+                    enrichment_points=self.solver.particle_enrichment_q,
                 )
                 self.remesh_history.append({"time_s": self.sim_time, **asdict(stats)})
             elif isinstance(self.render_split_mesh, AdaptiveCutSurfaceRemesher):
@@ -721,11 +823,11 @@ class Example:
                 radii=self.render_particle_radius,
                 colors=self.solver.particle_colors,
             )
-        front_x, center_z, _knife_velocity = self._knife_state(self.sim_time)
+        front_x, center_y, center_z, _knife_velocity = self._knife_state(self.sim_time)
         blade = KnifeProfile(
             start_x=front_x,
             speed=0.0,
-            center_y=cfg.knife_center_y,
+            center_y=center_y,
             center_z=center_z,
             half_width_y=cfg.knife_half_width_y,
             half_width_z=cfg.knife_half_width_z,

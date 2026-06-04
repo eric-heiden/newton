@@ -475,6 +475,7 @@ def _run_case(
     if frames:
         _write_png(frames[min(44, len(frames) - 1)], output_dir / f"{solver_name}_frame_44.png")
         _write_png(frames[min(89, len(frames) - 1)], output_dir / f"{solver_name}_frame_89.png")
+        _write_png(frames[-1], output_dir / f"{solver_name}_frame_{len(frames) - 1}.png")
     write_force_plot(output_dir / f"{solver_name}_force_profile.png", example.force_history, f"{title} knife cut")
     example.force_history.write_csv(output_dir / f"{solver_name}_force_profile.csv")
     write_json(output_dir / f"{solver_name}_force_history.json", example.force_history.to_dict())

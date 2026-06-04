@@ -143,6 +143,7 @@ class TestCuttingCommon(unittest.TestCase):
 
         self.assertIn("capture_viewer_frame", source)
         self.assertNotIn("_render_frame(", source)
+        self.assertIn("frame_{len(frames) - 1}.png", source)
 
     def test_report_generator_reuses_viewergl_across_cases(self):
         source = inspect.getsource(generate_cutting_report_assets.main)

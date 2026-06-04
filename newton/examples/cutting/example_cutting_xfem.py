@@ -165,6 +165,7 @@ class XFEMScenario:
     render_mesh_edges: bool = False
     render_seam_edges: bool = False
     visual_topology_only: bool = False
+    render_cut_refine_factor: int = 1
 
     @property
     def block_size(self) -> np.ndarray:
@@ -315,6 +316,7 @@ SCENARIOS: dict[str, XFEMScenario] = {
         camera_pitch=-34.0,
         camera_yaw=126.0,
         geometry="cloth_grid",
+        render_cut_refine_factor=2,
     ),
     "hanging_cloth_cutoff": XFEMScenario(
         name="hanging_cloth_cutoff",
@@ -365,7 +367,8 @@ SCENARIOS: dict[str, XFEMScenario] = {
         wind_direction=(1.0, 0.0, 0.0),
         up_axis=newton.Axis.Y,
         geometry="cloth_grid",
-        render_seam_edges=True,
+        render_seam_edges=False,
+        render_cut_refine_factor=2,
     ),
     "curved_cloth_spline_cut": XFEMScenario(
         name="curved_cloth_spline_cut",
@@ -418,8 +421,9 @@ SCENARIOS: dict[str, XFEMScenario] = {
         cut_path_phase=0.40,
         cut_path_origin_x=-0.72,
         render_mesh_edges=False,
-        render_seam_edges=True,
+        render_seam_edges=False,
         visual_topology_only=False,
+        render_cut_refine_factor=3,
     ),
     "bread_tearing": XFEMScenario(
         name="bread_tearing",
@@ -628,6 +632,7 @@ class Example:
                 max_visual_gap=cfg.max_visual_gap,
                 render_seam_edges=cfg.render_seam_edges,
                 render_surface_edges=cfg.render_mesh_edges,
+                cut_refine_factor=cfg.render_cut_refine_factor,
             )
         elif args.render_split_mesh and args.render_remesh_mode == "adaptive":
             self.render_split_mesh = AdaptiveCutSurfaceRemesher(

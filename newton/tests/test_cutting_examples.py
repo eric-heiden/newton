@@ -181,6 +181,7 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertEqual(cfg.saw_amplitude_z, 0.0)
         self.assertEqual(cfg.saw_frequency_hz, 0.0)
         self.assertGreaterEqual(cfg.k_damp, 3.0e-2)
+        self.assertGreaterEqual(cfg.render_cut_refine_factor, 2)
 
     def test_hanging_cloth_wind_is_sideways_for_y_up_scene(self):
         cfg = SCENARIOS["hanging_cloth_cutoff"]
@@ -188,8 +189,8 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertEqual(cfg.up_axis, newton.Axis.Y)
         self.assertAlmostEqual(float(cfg.wind_direction[1]), 0.0)
         self.assertGreater(np.linalg.norm(np.asarray(cfg.wind_direction, dtype=np.float32)), 0.0)
-        self.assertTrue(cfg.render_seam_edges)
         self.assertLessEqual(cfg.max_visual_gap, 0.025)
+        self.assertGreaterEqual(cfg.render_cut_refine_factor, 2)
 
     def test_curved_cloth_spline_cut_scenario_is_large_nonstraight_sheet(self):
         cfg = SCENARIOS["curved_cloth_spline_cut"]
@@ -198,11 +199,11 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertGreaterEqual(cfg.dim_x * cfg.dim_y, 1500)
         self.assertGreater(cfg.cut_path_amplitude_y, 0.05)
         self.assertGreater(cfg.cut_path_wavelength_x, 0.1)
-        self.assertTrue(cfg.render_seam_edges)
         self.assertFalse(cfg.visual_topology_only)
         self.assertGreater(cfg.force_scale, 0.0)
         self.assertGreater(cfg.friction_mu, 0.0)
         self.assertGreater(cfg.separation_speed, 0.0)
+        self.assertGreaterEqual(cfg.render_cut_refine_factor, 3)
 
     def test_knife_blade_mesh_yaws_with_curved_cut_path(self):
         knife = KnifeProfile(
@@ -779,7 +780,7 @@ class TestCuttingCommon(unittest.TestCase):
         knife = KnifeProfile(start_x=-0.3, speed=0.0, center_y=0.0, center_z=0.0, half_width_z=0.04)
         renderer = ShellCutSurfaceRenderer(rest_points, triangles, knife, nominal_edge_length=0.2, max_visual_gap=0.08)
 
-        stats = renderer.update(rest_points, time=0.0, front_x=0.3, center_z=0.0)
+        stats = renderer.update(rest_points, time=0.0, front_x=0.5, center_z=0.0)
         rendered_points = renderer.surface_points_np[: stats.surface_vertex_count]
         rendered_indices = renderer.surface_indices_np[: stats.surface_triangle_count * 3].reshape(-1, 3)
 
@@ -841,7 +842,7 @@ class TestCuttingCommon(unittest.TestCase):
         )
 
         self.assertGreater(stats.surface_triangle_count, triangles.shape[0])
-        self.assertGreater(stats.wall_triangle_count, 0)
+        self.assertGreater(renderer.last_edge_segment_count, 0)
         self.assertAlmostEqual(float(rendered_area), float(original_area), places=5)
 
     def test_shell_cut_surface_renderer_uses_online_cut_state(self):
@@ -877,6 +878,184 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertEqual(cut_stats.wall_triangle_count, 0)
         for tri in rendered_points[rendered_indices]:
             self.assertFalse(np.min(tri[:, 1]) < -1.0e-5 and np.max(tri[:, 1]) > 1.0e-5)
+
+    def test_shell_cut_surface_renderer_remeshes_partially_traversed_triangle(self):
+        rest_points = np.array(
+            [
+                [-0.2, -0.1, 0.0],
+                [0.2, -0.1, 0.0],
+                [0.2, 0.1, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        triangles = np.array([[0, 1, 2]], dtype=np.int32)
+        knife = KnifeProfile(start_x=0.0, speed=0.0, center_y=0.0, center_z=0.0, half_width_z=0.04)
+        renderer = ShellCutSurfaceRenderer(
+            rest_points,
+            triangles,
+            knife,
+            nominal_edge_length=0.2,
+            max_visual_gap=0.0,
+            render_seam_edges=True,
+        )
+
+        stats = renderer.update(
+            rest_points,
+            time=0.0,
+            front_x=0.0,
+            center_z=0.0,
+            triangle_cut_state=np.ones(triangles.shape[0], dtype=np.int32),
+        )
+        rendered_points = renderer.surface_points_np[: stats.surface_vertex_count]
+        seam_points = np.vstack(
+            [
+                renderer.edge_starts_np[: renderer.last_edge_segment_count],
+                renderer.edge_ends_np[: renderer.last_edge_segment_count],
+            ]
+        )
+
+        self.assertGreater(stats.surface_triangle_count, 2)
+        self.assertGreater(
+            np.count_nonzero(np.isclose(rendered_points[:, 0], 0.0, atol=1.0e-6)),
+            2,
+        )
+        if renderer.last_edge_segment_count:
+            self.assertLessEqual(float(np.max(seam_points[:, 0])), 1.0e-6)
+
+    def test_shell_cut_surface_renderer_clips_curved_path_by_tangent_front(self):
+        knife = KnifeProfile(
+            start_x=0.0,
+            speed=0.0,
+            center_y=0.0,
+            center_z=0.0,
+            half_width_z=0.04,
+            cut_path_amplitude_y=0.11,
+            cut_path_wavelength_x=0.52,
+            cut_path_phase=0.3,
+            cut_path_origin_x=-0.2,
+        )
+        front_x = 0.0
+        front = np.array([front_x, knife.center_y_at_x(front_x), 0.0], dtype=np.float32)
+        tangent = knife.path_tangent_at_x(front_x)
+        normal = knife.path_normal_at_x(front_x)
+        rest_points = np.array(
+            [
+                front - 0.08 * tangent - 0.055 * normal,
+                front + 0.10 * tangent - 0.055 * normal,
+                front + 0.10 * tangent + 0.055 * normal,
+            ],
+            dtype=np.float32,
+        )
+        triangles = np.array([[0, 1, 2]], dtype=np.int32)
+        renderer = ShellCutSurfaceRenderer(
+            rest_points,
+            triangles,
+            knife,
+            nominal_edge_length=0.05,
+            max_visual_gap=0.0,
+            render_seam_edges=True,
+        )
+
+        stats = renderer.update(
+            rest_points,
+            time=0.0,
+            front_x=front_x,
+            center_z=0.0,
+            triangle_cut_state=np.ones(triangles.shape[0], dtype=np.int32),
+        )
+        seam_points = np.vstack(
+            [
+                renderer.edge_starts_np[: renderer.last_edge_segment_count],
+                renderer.edge_ends_np[: renderer.last_edge_segment_count],
+            ]
+        )
+        front_distance = np.dot(seam_points - front, tangent) if renderer.last_edge_segment_count else np.zeros(0)
+
+        self.assertGreater(stats.surface_triangle_count, 2)
+        if renderer.last_edge_segment_count:
+            self.assertLessEqual(float(np.max(front_distance)), 1.0e-6)
+
+    def test_shell_cut_surface_renderer_refines_active_cut_front(self):
+        rest_points = np.array(
+            [
+                [-0.25, -0.12, 0.0],
+                [0.25, -0.12, 0.0],
+                [0.25, 0.12, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        triangles = np.array([[0, 1, 2]], dtype=np.int32)
+        knife = KnifeProfile(start_x=0.0, speed=0.0, center_y=0.0, center_z=0.0, half_width_z=0.04)
+        coarse = ShellCutSurfaceRenderer(
+            rest_points,
+            triangles,
+            knife,
+            nominal_edge_length=0.2,
+            max_visual_gap=0.0,
+            render_seam_edges=True,
+        )
+        refined = ShellCutSurfaceRenderer(
+            rest_points,
+            triangles,
+            knife,
+            nominal_edge_length=0.2,
+            max_visual_gap=0.0,
+            render_seam_edges=True,
+            cut_refine_factor=3,
+        )
+
+        coarse_stats = coarse.update(
+            rest_points,
+            time=0.0,
+            front_x=0.0,
+            center_z=0.0,
+            triangle_cut_state=np.ones(triangles.shape[0], dtype=np.int32),
+        )
+        refined_stats = refined.update(
+            rest_points,
+            time=0.0,
+            front_x=0.0,
+            center_z=0.0,
+            triangle_cut_state=np.ones(triangles.shape[0], dtype=np.int32),
+        )
+
+        self.assertGreater(refined_stats.surface_triangle_count, coarse_stats.surface_triangle_count)
+        self.assertGreaterEqual(refined.last_edge_segment_count, coarse.last_edge_segment_count)
+
+    def test_shell_cut_surface_renderer_caps_visual_enrichment_gap(self):
+        rest_points = np.array(
+            [
+                [-0.2, -0.1, 0.0],
+                [0.2, -0.1, 0.0],
+                [-0.2, 0.1, 0.0],
+                [0.2, 0.1, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        triangles = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.int32)
+        enrichment = np.tile(np.array([[0.0, 0.0, 1.0]], dtype=np.float32), (rest_points.shape[0], 1))
+        knife = KnifeProfile(start_x=0.0, speed=0.0, center_y=0.0, center_z=0.0, half_width_z=0.04)
+        renderer = ShellCutSurfaceRenderer(
+            rest_points,
+            triangles,
+            knife,
+            nominal_edge_length=0.2,
+            max_visual_gap=0.02,
+            render_seam_edges=True,
+        )
+
+        stats = renderer.update(
+            rest_points,
+            time=0.0,
+            front_x=0.3,
+            center_z=0.0,
+            enrichment_points=enrichment,
+            triangle_cut_state=np.ones(triangles.shape[0], dtype=np.int32),
+        )
+        rendered_points = renderer.surface_points_np[: stats.surface_vertex_count]
+
+        self.assertLessEqual(float(np.max(rendered_points[:, 1])), 0.12 + 1.0e-6)
+        self.assertGreaterEqual(float(np.min(rendered_points[:, 1])), -0.12 - 1.0e-6)
 
     def test_shell_cut_surface_renderer_seam_follows_cut_side_motion(self):
         rest_points = np.array(

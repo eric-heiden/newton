@@ -158,7 +158,7 @@ def _snapshot_render_geometry(example) -> tuple[dict[str, np.ndarray], dict[str,
         front_x = None
         center_z = None
         if hasattr(example, "_knife_state"):
-            front_x, center_z, _velocity = example._knife_state(example.sim_time)
+            front_x, _center_y, center_z, _velocity = example._knife_state(example.sim_time)
         stats = render_mesh.update(
             example.state_0.particle_q,
             example.sim_time,

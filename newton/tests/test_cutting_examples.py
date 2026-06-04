@@ -7,18 +7,22 @@ import inspect
 import numpy as np
 import warp as wp
 
+import newton
 from newton.examples.cutting.cutting_common import (
     AdaptiveCutSurfaceRemesher,
     CutMaterial,
     KnifeProfile,
+    ShellCutSurfaceRenderer,
     SplitCuboidRenderMesh,
     TetMeshCutSurfaceRenderer,
     compute_particle_cut_update,
     encode_mp4,
     summarize_force_profile,
 )
-from newton.examples.cutting.example_cutting_xfem import build_half_cylinder_tet_mesh
+from newton.examples.cutting.example_cutting_xfem import Example as XFEMExample
+from newton.examples.cutting.example_cutting_xfem import SCENARIOS, build_half_cylinder_tet_mesh
 from newton.examples.cutting import generate_cutting_report_assets
+from newton.solvers import SolverXFEMCut
 from newton._src.viewer.gl.opengl import MeshGL, RendererGL
 from newton._src.solvers.xfem_cut.kernels import apply_xfem_knife_kernel
 from newton.viewer import ViewerNull
@@ -150,6 +154,79 @@ class TestCuttingCommon(unittest.TestCase):
 
         self.assertIn("shared_viewer", source)
         self.assertIn("shared_viewer.close()", source)
+
+    def test_report_generator_defaults_to_six_second_viewergl_videos(self):
+        parser = generate_cutting_report_assets.create_parser()
+        args = parser.parse_args([])
+
+        self.assertEqual(args.frames, 360)
+        self.assertEqual(args.video_fps, 60.0)
+
+    def test_report_generator_can_write_complexity_benchmarks(self):
+        source = inspect.getsource(generate_cutting_report_assets)
+
+        self.assertIn("--benchmark-sweep", source)
+        self.assertIn("benchmark_results.json", source)
+        self.assertIn("adaptive_remesh_profile.png", source)
+        self.assertIn("particle_count", source)
+        self.assertIn("tet_count", source)
+        self.assertIn("tri_count", source)
+
+    def test_paper_tearing_scenario_is_wide_cloth_sheet(self):
+        cfg = SCENARIOS["paper_tearing"]
+
+        self.assertEqual(cfg.geometry, "cloth_grid")
+        self.assertGreater(cfg.dim_y * cfg.cell_y, 0.55)
+        self.assertEqual(cfg.dim_z, 0)
+
+    def test_xfem_shell_particle_area_uses_triangle_area(self):
+        builder = newton.ModelBuilder()
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, -0.5, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=1,
+            dim_y=1,
+            cell_x=1.0,
+            cell_y=1.0,
+            mass=0.1,
+            tri_ke=1.0,
+            tri_ka=1.0,
+            tri_kd=0.0,
+        )
+        model = builder.finalize()
+
+        solver = SolverXFEMCut(model)
+
+        self.assertAlmostEqual(solver.particle_area, 0.25, places=5)
+
+    def test_paper_tearing_cloth_stays_bounded_until_knife_engages(self):
+        import sys
+
+        old_argv = sys.argv
+        try:
+            sys.argv = [
+                "test_cutting_examples",
+                "--viewer",
+                "null",
+                "--quiet",
+                "--scenario",
+                "paper_tearing",
+                "--num-frames",
+                "1",
+                "--no-render-split-mesh",
+            ]
+            viewer, args = newton.examples.init(XFEMExample.create_parser())
+            example = XFEMExample(viewer, args)
+            for _ in range(24):
+                example.step()
+            points = example.state_0.particle_q.numpy()
+            viewer.close()
+        finally:
+            sys.argv = old_argv
+
+        self.assertLess(float(np.max(np.linalg.norm(points, axis=1))), 2.0)
+        self.assertGreater(max(example.force_history.active_counts), 0.0)
 
     def test_viewergl_sets_pyglet_headless_before_shader_import(self):
         source = inspect.getsource(RendererGL.__init__)
@@ -503,6 +580,32 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertEqual(stats.surface_triangle_count, 2)
         for tri in rendered_points[rendered_indices]:
             self.assertTrue(np.all(tri[:, 1] > 0.01) or np.all(tri[:, 1] < -0.01))
+
+    def test_shell_cut_surface_renderer_splits_triangles_without_collapsing_sheet(self):
+        rest_points = np.array(
+            [
+                [-0.4, -0.35, 0.0],
+                [0.0, -0.35, 0.0],
+                [0.4, -0.35, 0.0],
+                [-0.4, 0.35, 0.0],
+                [0.0, 0.35, 0.0],
+                [0.4, 0.35, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        triangles = np.array([[0, 1, 3], [1, 4, 3], [1, 2, 4], [2, 5, 4]], dtype=np.int32)
+        knife = KnifeProfile(start_x=-0.3, speed=0.0, center_y=0.0, center_z=0.0, half_width_z=0.04)
+        renderer = ShellCutSurfaceRenderer(rest_points, triangles, knife, nominal_edge_length=0.2, max_visual_gap=0.08)
+
+        stats = renderer.update(rest_points, time=0.0, front_x=0.3, center_z=0.0)
+        rendered_points = renderer.surface_points_np[: stats.surface_vertex_count]
+        rendered_indices = renderer.surface_indices_np[: stats.surface_triangle_count * 3].reshape(-1, 3)
+
+        self.assertGreater(stats.surface_triangle_count, triangles.shape[0])
+        self.assertLess(float(np.min(rendered_points[:, 1])), -0.30)
+        self.assertGreater(float(np.max(rendered_points[:, 1])), 0.30)
+        for tri in rendered_points[rendered_indices]:
+            self.assertFalse(np.min(tri[:, 1]) < -1.0e-5 and np.max(tri[:, 1]) > 1.0e-5)
 
 
 if __name__ == "__main__":

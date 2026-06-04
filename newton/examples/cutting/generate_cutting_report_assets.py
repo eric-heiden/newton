@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import sys
 import time
 from dataclasses import asdict
@@ -19,6 +21,7 @@ from newton.examples.cutting.cutting_common import (
     AdaptiveCutSurfaceRemesher,
     KnifeProfile,
     RuntimeStats,
+    ShellCutSurfaceRenderer,
     SplitCuboidRenderMesh,
     TetMeshCutSurfaceRenderer,
     capture_viewer_frame,
@@ -147,7 +150,7 @@ def _snapshot_render_geometry(example) -> tuple[dict[str, np.ndarray], dict[str,
             "wall_indices": np.zeros((0, 3), dtype=np.int32),
         }, {}
 
-    if isinstance(render_mesh, TetMeshCutSurfaceRenderer):
+    if isinstance(render_mesh, (TetMeshCutSurfaceRenderer, ShellCutSurfaceRenderer)):
         front_x = None
         center_z = None
         if hasattr(example, "_knife_state"):
@@ -414,6 +417,250 @@ def _make_runtime_stats(
     )
 
 
+def _write_benchmark_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "method",
+        "case",
+        "geometry",
+        "particle_count",
+        "tet_count",
+        "tri_count",
+        "edge_count",
+        "spring_count",
+        "frame_count",
+        "substeps",
+        "iterations",
+        "sim_seconds",
+        "wall_seconds",
+        "mean_step_ms",
+        "sim_fps",
+        "peak_force_n",
+        "mean_force_n",
+        "final_mean_damage",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fields})
+
+
+def _write_benchmark_plot(path: Path, rows: list[dict[str, object]]) -> None:
+    if not rows:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+    except ImportError:
+        return
+
+    labels = [f"{row['method']} {row['case']}" for row in rows]
+    step_ms = [float(row["mean_step_ms"]) for row in rows]
+    elements = [
+        max(int(row["particle_count"]) + int(row["tet_count"]) + int(row["tri_count"]), 1)
+        for row in rows
+    ]
+    colors = [
+        {"MPM": "#2563eb", "VBD": "#f97316", "X-FEM": "#16a34a"}.get(str(row["method"]), "#64748b")
+        for row in rows
+    ]
+
+    fig, (ax_ms, ax_scale) = plt.subplots(1, 2, figsize=(13.5, 4.8), dpi=150)
+    ax_ms.bar(np.arange(len(rows)), step_ms, color=colors)
+    ax_ms.set_xticks(np.arange(len(rows)), labels, rotation=45, ha="right", fontsize=7)
+    ax_ms.set_ylabel("mean physics step [ms/frame]")
+    ax_ms.set_title("Null-viewer physics cost")
+    ax_ms.grid(axis="y", color="#d1d5db", alpha=0.65)
+
+    for method in ("MPM", "VBD", "X-FEM"):
+        xs = [elements[i] for i, row in enumerate(rows) if row["method"] == method]
+        ys = [step_ms[i] for i, row in enumerate(rows) if row["method"] == method]
+        if xs:
+            ax_scale.plot(xs, ys, marker="o", linewidth=1.8, label=method)
+    ax_scale.set_xscale("log")
+    ax_scale.set_xlabel("particles + tets + triangles")
+    ax_scale.set_ylabel("mean physics step [ms/frame]")
+    ax_scale.set_title("Complexity trend")
+    ax_scale.grid(True, which="both", color="#d1d5db", alpha=0.65)
+    ax_scale.legend()
+
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _write_adaptive_remesh_plot(path: Path, root: Path) -> None:
+    cases = [
+        ("MPM cuboid", root / "mpm" / "mpm_adaptive_remesh_stats.json", "#2563eb"),
+        ("VBD cuboid", root / "vbd" / "vbd_adaptive_remesh_stats.json", "#f97316"),
+        ("X-FEM cuboid", root / "xfem" / "cuboid_slice" / "xfem_cuboid_slice_adaptive_remesh_stats.json", "#16a34a"),
+        (
+            "X-FEM vegetable",
+            root / "xfem" / "vegetable_sawing" / "xfem_vegetable_sawing_adaptive_remesh_stats.json",
+            "#84cc16",
+        ),
+        (
+            "X-FEM paper shell",
+            root / "xfem" / "paper_tearing" / "xfem_paper_tearing_adaptive_remesh_stats.json",
+            "#64748b",
+        ),
+        (
+            "X-FEM bread",
+            root / "xfem" / "bread_tearing" / "xfem_bread_tearing_adaptive_remesh_stats.json",
+            "#a16207",
+        ),
+    ]
+    histories: list[tuple[str, list[dict[str, float]], str]] = []
+    for label, stats_path, color in cases:
+        if not stats_path.exists():
+            continue
+        try:
+            data = json.loads(stats_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        frames = data.get("frames", [])
+        if frames:
+            histories.append((label, frames, color))
+    if not histories:
+        return
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+    except ImportError:
+        return
+
+    fig, (ax_active, ax_tris) = plt.subplots(1, 2, figsize=(13.5, 4.8), dpi=150)
+    for label, frames, color in histories:
+        times = np.asarray([float(frame.get("time_s", i)) for i, frame in enumerate(frames)], dtype=np.float32)
+        active = np.asarray([float(frame.get("active_x_segments", 0.0)) for frame in frames], dtype=np.float32)
+        surface = np.asarray([float(frame.get("surface_triangle_count", 0.0)) for frame in frames], dtype=np.float32)
+        walls = np.asarray([float(frame.get("wall_triangle_count", 0.0)) for frame in frames], dtype=np.float32)
+        ax_active.plot(times, active, color=color, linewidth=1.7, label=label)
+        ax_tris.plot(times, surface, color=color, linewidth=1.4, label=f"{label} surface")
+        ax_tris.plot(times, walls, color=color, linewidth=1.2, linestyle="--", alpha=0.78)
+
+    ax_active.set_title("Active remesh/cut support")
+    ax_active.set_xlabel("time [s]")
+    ax_active.set_ylabel("active x segments, cut tets, or cut triangles")
+    ax_active.grid(True, color="#d1d5db", alpha=0.65)
+    ax_active.legend(fontsize=7)
+
+    ax_tris.set_title("Generated render triangles")
+    ax_tris.set_xlabel("time [s]")
+    ax_tris.set_ylabel("triangle count")
+    ax_tris.grid(True, color="#d1d5db", alpha=0.65)
+
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _run_benchmark_case(
+    method: str,
+    case: str,
+    example_cls,
+    argv: list[str],
+    frame_count: int,
+) -> dict[str, object]:
+    viewer, args = _parse_example_args(
+        example_cls,
+        [*argv, "--num-frames", str(frame_count), "--no-render-split-mesh"],
+        viewer_name="null",
+        headless=False,
+    )
+    try:
+        example = example_cls(viewer, args)
+        step_times: list[float] = []
+        for _frame in range(frame_count):
+            start = time.perf_counter()
+            example.step()
+            step_times.append(time.perf_counter() - start)
+        wall_seconds = float(np.sum(step_times))
+        summary = summarize_force_profile(
+            np.array(example.force_history.times),
+            np.array(example.force_history.forces),
+            np.array(example.force_history.mean_damage),
+        )
+        row = {
+            "method": method,
+            "case": case,
+            "geometry": getattr(getattr(example, "scenario", None), "geometry", "cuboid"),
+            "particle_count": int(example.model.particle_count),
+            "tet_count": int(example.model.tet_count),
+            "tri_count": int(example.model.tri_count),
+            "edge_count": int(example.model.edge_count),
+            "spring_count": int(example.model.spring_count),
+            "frame_count": int(frame_count),
+            "substeps": int(getattr(example, "sim_substeps", 1)),
+            "iterations": int(getattr(example, "iterations", getattr(getattr(example, "solver", None), "iterations", 0))),
+            "sim_seconds": float(example.sim_time),
+            "wall_seconds": wall_seconds,
+            "mean_step_ms": float(1.0e3 * np.mean(step_times)) if step_times else 0.0,
+            "sim_fps": float(frame_count / wall_seconds) if wall_seconds > 0.0 else 0.0,
+            "peak_force_n": summary["peak_force_n"],
+            "mean_force_n": summary["mean_force_n"],
+            "final_mean_damage": summary["final_mean_damage"],
+        }
+    finally:
+        viewer.close()
+    print(
+        f"benchmark {method} {case}: {row['particle_count']} particles, {row['tet_count']} tets, "
+        f"{row['tri_count']} tris, {row['mean_step_ms']:.2f} ms/frame"
+    )
+    return row
+
+
+def _run_benchmark_sweep(root: Path, frame_count: int) -> list[dict[str, object]]:
+    cases = [
+        ("MPM", "coarse", MPMExample, ["--particles-per-cell", "1", "--voxel-size", "0.090"]),
+        ("MPM", "default", MPMExample, ["--particles-per-cell", "2", "--voxel-size", "0.075"]),
+        ("MPM", "fine", MPMExample, ["--particles-per-cell", "3", "--voxel-size", "0.070"]),
+        (
+            "VBD",
+            "coarse",
+            VBDExample,
+            ["--dim-x", "10", "--dim-y", "5", "--dim-z", "4", "--iterations", "6"],
+        ),
+        (
+            "VBD",
+            "default",
+            VBDExample,
+            ["--dim-x", "14", "--dim-y", "7", "--dim-z", "6", "--iterations", "8"],
+        ),
+        (
+            "VBD",
+            "fine",
+            VBDExample,
+            ["--dim-x", "18", "--dim-y", "9", "--dim-z", "7", "--iterations", "8"],
+        ),
+        ("X-FEM", "cuboid", XFEMExample, ["--scenario", "cuboid_slice", "--iterations", "10"]),
+        ("X-FEM", "paper shell", XFEMExample, ["--scenario", "paper_tearing", "--iterations", "10"]),
+        ("X-FEM", "bread half-cylinder", XFEMExample, ["--scenario", "bread_tearing", "--iterations", "10"]),
+        ("X-FEM", "vegetable half-cylinder", XFEMExample, ["--scenario", "vegetable_sawing", "--iterations", "10"]),
+    ]
+    rows = [_run_benchmark_case(method, case, cls, argv, frame_count) for method, case, cls, argv in cases]
+    path_json = root / "benchmark_results.json"
+    write_json(
+        path_json,
+        {
+            "hardware": collect_hardware_details(),
+            "frame_count": frame_count,
+            "rows": rows,
+        },
+    )
+    _write_benchmark_csv(root / "benchmark_results.csv", rows)
+    _write_benchmark_plot(root / "benchmark_results.png", rows)
+    return rows
+
+
 def _run_case(
     name: str,
     example_cls,
@@ -506,8 +753,14 @@ def create_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("/home/horde/repos/academic-website-reports/cutting/assets/newton_baselines"),
     )
-    parser.add_argument("--frames", type=int, default=90)
-    parser.add_argument("--video-fps", type=float, default=30.0)
+    parser.add_argument("--frames", type=int, default=360)
+    parser.add_argument("--video-fps", type=float, default=60.0)
+    parser.add_argument(
+        "--benchmark-sweep",
+        action="store_true",
+        help="Run null-viewer physics benchmarks over several geometry complexities and write benchmark_results.json.",
+    )
+    parser.add_argument("--benchmark-frames", type=int, default=120)
     parser.add_argument(
         "--case",
         action="append",
@@ -580,8 +833,11 @@ def main():
 
     case_order = ["mpm", "vbd", "xfem_cuboid", "xfem_vegetable", "xfem_paper", "xfem_bread"]
     selected_cases = [case_name for case_name in case_order if case_name in cases]
-    if not selected_cases:
+    if not selected_cases and not args.benchmark_sweep:
         return
+
+    if args.benchmark_sweep:
+        _run_benchmark_sweep(root, args.benchmark_frames)
 
     import newton.viewer  # noqa: PLC0415
 
@@ -604,6 +860,7 @@ def main():
             )
     finally:
         shared_viewer.close()
+    _write_adaptive_remesh_plot(root / "adaptive_remesh_profile.png", root)
 
 
 if __name__ == "__main__":

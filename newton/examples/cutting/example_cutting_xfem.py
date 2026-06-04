@@ -16,6 +16,7 @@ from newton.examples.cutting.cutting_common import (
     AdaptiveCutSurfaceRemesher,
     ForceHistory,
     KnifeProfile,
+    ShellCutSurfaceRenderer,
     SplitCuboidRenderMesh,
     TetMeshCutSurfaceRenderer,
     add_cutting_artifact_args,
@@ -154,6 +155,8 @@ class XFEMScenario:
         if self.geometry == "half_cylinder":
             radius = 0.5 * self.dim_y * self.cell_y
             return np.array([self.dim_x * self.cell_x, 2.0 * radius, radius], dtype=np.float32)
+        if self.geometry == "cloth_grid":
+            return np.array([self.dim_x * self.cell_x, self.dim_y * self.cell_y, 0.0], dtype=np.float32)
         return np.array(
             [self.dim_x * self.cell_x, self.dim_y * self.cell_y, self.dim_z * self.cell_z],
             dtype=np.float32,
@@ -255,46 +258,47 @@ SCENARIOS: dict[str, XFEMScenario] = {
     ),
     "paper_tearing": XFEMScenario(
         name="paper_tearing",
-        block_pos=(-0.38, -0.13, 0.018),
-        dim_x=14,
-        dim_y=6,
-        dim_z=1,
-        cell_x=0.052,
-        cell_y=0.041,
-        cell_z=0.032,
-        density=260.0,
-        k_mu=1.6e3,
-        k_lambda=2.2e3,
-        k_damp=2.0e-3,
-        gravity=(0.0, 0.0, -2.0),
+        block_pos=(-0.56, -0.35, 0.026),
+        dim_x=32,
+        dim_y=20,
+        dim_z=0,
+        cell_x=0.035,
+        cell_y=0.035,
+        cell_z=0.0,
+        density=0.045,
+        k_mu=2.8e2,
+        k_lambda=2.8e2,
+        k_damp=1.5e-2,
+        gravity=(0.0, 0.0, -1.2),
         fix_left=True,
-        knife_start_x=-0.42,
-        knife_speed=0.55,
+        knife_start_x=-0.58,
+        knife_speed=0.46,
         knife_center_y=0.0,
-        knife_center_z=0.024,
-        knife_half_width_y=0.055,
-        knife_half_width_z=0.075,
-        process_width=0.05,
-        saw_amplitude_z=0.012,
-        saw_frequency_hz=3.0,
-        fracture_energy=38.0,
-        yield_stress=2.8e3,
-        max_damage_rate=18.0,
-        separation_speed=0.22,
-        force_scale=0.24,
-        friction_mu=1.1,
+        knife_center_z=0.035,
+        knife_half_width_y=0.035,
+        knife_half_width_z=0.090,
+        process_width=0.040,
+        saw_amplitude_z=0.010,
+        saw_frequency_hz=3.2,
+        fracture_energy=24.0,
+        yield_stress=1.6e3,
+        max_damage_rate=20.0,
+        separation_speed=0.075,
+        force_scale=0.16,
+        friction_mu=0.78,
         table_z=0.0,
         table_glue_depth=0.0,
         table_glue_strength=0.0,
         residual_stiffness=0.025,
         damage_threshold=0.14,
-        max_visual_gap=0.03,
+        max_visual_gap=0.034,
         surface_color=(0.94, 0.94, 0.90),
         wall_color=(0.65, 0.16, 0.16),
-        particle_color_scale=0.35,
-        camera_pos=(0.68, -0.85, 0.34),
-        camera_pitch=-26.0,
-        camera_yaw=132.0,
+        particle_color_scale=0.18,
+        camera_pos=(0.82, -1.12, 0.42),
+        camera_pitch=-34.0,
+        camera_yaw=126.0,
+        geometry="cloth_grid",
     ),
     "bread_tearing": XFEMScenario(
         name="bread_tearing",
@@ -408,6 +412,28 @@ class Example:
                 fix_left=cfg.fix_left,
                 particle_radius=args.particle_radius,
             )
+        elif cfg.geometry == "cloth_grid":
+            builder.add_cloth_grid(
+                pos=wp.vec3(*cfg.block_pos),
+                rot=wp.quat_identity(),
+                vel=wp.vec3(0.0, 0.0, 0.0),
+                dim_x=cfg.dim_x,
+                dim_y=cfg.dim_y,
+                cell_x=cfg.cell_x,
+                cell_y=cfg.cell_y,
+                mass=max(cfg.density, 1.0e-5),
+                fix_left=cfg.fix_left,
+                tri_ke=cfg.k_mu,
+                tri_ka=cfg.k_lambda,
+                tri_kd=cfg.k_damp,
+                edge_ke=max(0.015 * cfg.k_mu, 1.0),
+                edge_kd=cfg.k_damp,
+                add_springs=True,
+                spring_ke=cfg.k_mu,
+                spring_kd=max(cfg.k_damp, 1.0e-4),
+                particle_radius=args.particle_radius,
+                label=f"xfem_{cfg.name}",
+            )
         else:
             raise ValueError(f"Unsupported X-FEM geometry: {cfg.geometry}")
         builder.color()
@@ -460,6 +486,16 @@ class Example:
                 surface_indices=self.model.tri_indices.numpy(),
                 knife=self.knife_profile,
                 nominal_edge_length=cfg.tet_target_edge,
+                max_visual_gap=cfg.max_visual_gap,
+            )
+        elif args.render_split_mesh and cfg.geometry == "cloth_grid":
+            if self.model.tri_indices is None:
+                raise ValueError("cloth-grid X-FEM scenes require generated surface triangles")
+            self.render_split_mesh = ShellCutSurfaceRenderer(
+                rest_points=self.render_rest_particle_q_wp.numpy(),
+                surface_indices=self.model.tri_indices.numpy(),
+                knife=self.knife_profile,
+                nominal_edge_length=max(cfg.cell_x, cfg.cell_y),
                 max_visual_gap=cfg.max_visual_gap,
             )
         elif args.render_split_mesh and args.render_remesh_mode == "adaptive":
@@ -558,14 +594,14 @@ class Example:
         cfg = self.scenario
         self.viewer.begin_frame(self.sim_time)
         if self.render_split_mesh is not None:
-            if isinstance(self.render_split_mesh, TetMeshCutSurfaceRenderer):
+            if isinstance(self.render_split_mesh, (TetMeshCutSurfaceRenderer, ShellCutSurfaceRenderer)):
                 front_x, center_z, _knife_velocity = self._knife_state(self.sim_time)
                 stats = self.render_split_mesh.log(
                     self.viewer,
                     self.model.device,
                     self.sim_time,
                     current_points=self.state_0.particle_q,
-                    prefix=f"/cutting/xfem_{cfg.name}/tet_cut_surface",
+                    prefix=f"/cutting/xfem_{cfg.name}/cut_surface",
                     surface_color=cfg.surface_color,
                     wall_color=cfg.wall_color,
                     front_x=front_x,

@@ -139,6 +139,10 @@ class SolverXFEMCut(SolverBase):
     def _estimate_particle_area(self) -> float:
         if self.model.particle_count == 0 or self.model.particle_q is None:
             return 1.0
+        if self.model.tet_count == 0 and self.model.tri_count and self.model.tri_areas is not None:
+            tri_areas = self.model.tri_areas.numpy()
+            total_area = float(np.sum(tri_areas)) if tri_areas.size else 0.0
+            return max(total_area / max(float(self.model.particle_count), 1.0), 1.0e-12)
         points = self.model.particle_q.numpy()
         if points.size == 0:
             return 1.0

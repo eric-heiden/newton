@@ -1586,6 +1586,334 @@ class TetMeshCutSurfaceRenderer:
         return stats
 
 
+class ShellCutSurfaceRenderer:
+    """Render a thin triangle sheet with an opened X-FEM-style cut wake.
+
+    This renderer is the shell counterpart of :class:`TetMeshCutSurfaceRenderer`.
+    It keeps the full cloth surface visible, clips triangles that cross the cut
+    plane behind the knife into side-specific polygons, and duplicates the seam
+    vertices so the two paper sides can separate without deleting material.
+    """
+
+    def __init__(
+        self,
+        rest_points: np.ndarray,
+        surface_indices: np.ndarray,
+        knife: KnifeProfile,
+        nominal_edge_length: float,
+        max_surface_triangles: int | None = None,
+        max_wall_triangles: int | None = None,
+        max_visual_gap: float = 0.04,
+        front_width: float | None = None,
+    ):
+        self.rest_points = np.asarray(rest_points, dtype=np.float32)
+        self.base_surface_triangles_np = np.asarray(surface_indices, dtype=np.int32).reshape(-1, 3)
+        self.knife = knife
+        self.nominal_edge_length = float(max(nominal_edge_length, 1.0e-8))
+        self.max_visual_gap = float(max_visual_gap)
+        self.front_width = float(front_width if front_width is not None else max(2.0 * knife.process_width, 1.0e-4))
+        self.seam_lift = 0.07 * self.nominal_edge_length
+        self.max_surface_triangles = int(max_surface_triangles or max(1, 4 * len(self.base_surface_triangles_np)))
+        self.max_wall_triangles = int(max_wall_triangles or max(1, 2 * len(self.base_surface_triangles_np)))
+
+        self.surface_points_np = np.zeros((self.max_surface_triangles * 3, 3), dtype=np.float32)
+        self.surface_indices_np = np.arange(self.max_surface_triangles * 3, dtype=np.int32)
+        self.wall_points_np = np.zeros((self.max_wall_triangles * 3, 3), dtype=np.float32)
+        self.wall_indices_np = np.arange(self.max_wall_triangles * 3, dtype=np.int32)
+        self.surface_points_wp: wp.array | None = None
+        self.surface_indices_wp: wp.array | None = None
+        self.wall_points_wp: wp.array | None = None
+        self.wall_indices_wp: wp.array | None = None
+        self.device_key: str | None = None
+        self.last_stats = TetCutWallRenderStats(
+            active_x_segments=0,
+            surface_vertex_count=0,
+            surface_triangle_count=0,
+            wall_vertex_count=0,
+            wall_triangle_count=0,
+            coarse_dx=self.nominal_edge_length,
+            min_active_dx=self.nominal_edge_length,
+            max_active_dx=self.nominal_edge_length,
+            active_tet_count=0,
+        )
+
+    def _ensure_device_arrays(self, device):
+        device_key = str(device)
+        if self.wall_points_wp is not None and self.device_key == device_key:
+            return
+        self.device_key = device_key
+        self.surface_points_wp = wp.array(self.surface_points_np, dtype=wp.vec3, device=device)
+        self.surface_indices_wp = wp.array(self.surface_indices_np, dtype=wp.int32, device=device)
+        self.wall_points_wp = wp.array(self.wall_points_np, dtype=wp.vec3, device=device)
+        self.wall_indices_wp = wp.array(self.wall_indices_np, dtype=wp.int32, device=device)
+
+    @staticmethod
+    def _current_points_np(points: np.ndarray | wp.array) -> np.ndarray:
+        if isinstance(points, wp.array):
+            return points.numpy().astype(np.float32, copy=False)
+        return np.asarray(points, dtype=np.float32)
+
+    def _apply_visual_opening(self, polygon: np.ndarray | None, side: float, knife_x: float) -> np.ndarray | None:
+        if polygon is None or polygon.size == 0 or self.max_visual_gap <= 0.0:
+            return polygon
+        opened = np.asarray(polygon, dtype=np.float32).copy()
+        for i in range(opened.shape[0]):
+            opened_y = _cutting_visual_opening_y(
+                float(opened[i, 0]),
+                side,
+                knife_x,
+                float(self.knife.center_y),
+                self.max_visual_gap,
+                self.front_width,
+            )
+            if side > 0.0:
+                opened[i, 1] = max(float(opened[i, 1]), opened_y)
+            else:
+                opened[i, 1] = min(float(opened[i, 1]), opened_y)
+        return opened
+
+    def _append_surface_triangle(self, triangle_count: int, a: np.ndarray, b: np.ndarray, c: np.ndarray) -> int:
+        if triangle_count >= self.max_surface_triangles:
+            return triangle_count
+        if float(np.linalg.norm(np.cross(b - a, c - a))) <= 1.0e-10:
+            return triangle_count
+        vertex = triangle_count * 3
+        self.surface_points_np[vertex + 0] = a
+        self.surface_points_np[vertex + 1] = b
+        self.surface_points_np[vertex + 2] = c
+        return triangle_count + 1
+
+    def _append_surface_polygon(self, triangle_count: int, polygon: np.ndarray | None) -> int:
+        if polygon is None or polygon.shape[0] < 3:
+            return triangle_count
+        for i in range(1, polygon.shape[0] - 1):
+            triangle_count = self._append_surface_triangle(triangle_count, polygon[0], polygon[i], polygon[i + 1])
+        return triangle_count
+
+    def _append_wall_quad(self, wall_count: int, a: np.ndarray, b: np.ndarray) -> int:
+        if wall_count + 1 >= self.max_wall_triangles:
+            return wall_count
+        lift = np.asarray((0.0, 0.0, self.seam_lift), dtype=np.float32)
+        vertex = wall_count * 3
+        self.wall_points_np[vertex + 0] = a
+        self.wall_points_np[vertex + 1] = b
+        self.wall_points_np[vertex + 2] = b + lift
+        wall_count += 1
+        vertex = wall_count * 3
+        self.wall_points_np[vertex + 0] = a
+        self.wall_points_np[vertex + 1] = b + lift
+        self.wall_points_np[vertex + 2] = a + lift
+        return wall_count + 1
+
+    @staticmethod
+    def _clip_triangle_by_side(
+        rest_tri: np.ndarray,
+        render_tri: np.ndarray,
+        plane_y: float,
+        keep_positive: bool,
+        eps: float = 1.0e-7,
+    ) -> np.ndarray | None:
+        out_render: list[np.ndarray] = []
+
+        def inside(point: np.ndarray) -> bool:
+            signed = float(point[1] - plane_y)
+            return signed >= -eps if keep_positive else signed <= eps
+
+        for edge_id in range(3):
+            prev_id = (edge_id + 2) % 3
+            curr_rest = rest_tri[edge_id]
+            curr_render = render_tri[edge_id]
+            prev_rest = rest_tri[prev_id]
+            prev_render = render_tri[prev_id]
+            curr_inside = inside(curr_rest)
+            prev_inside = inside(prev_rest)
+
+            if curr_inside != prev_inside:
+                s0 = float(prev_rest[1] - plane_y)
+                s1 = float(curr_rest[1] - plane_y)
+                alpha = 0.0 if abs(s0 - s1) <= eps else s0 / (s0 - s1)
+                out_render.append((prev_render + alpha * (curr_render - prev_render)).astype(np.float32))
+            if curr_inside:
+                out_render.append(curr_render.astype(np.float32, copy=False))
+
+        if len(out_render) < 3:
+            return None
+        return np.asarray(out_render, dtype=np.float32)
+
+    @staticmethod
+    def _plane_segment(rest_tri: np.ndarray, render_tri: np.ndarray, plane_y: float, eps: float = 1.0e-7):
+        signed = rest_tri[:, 1] - plane_y
+        hits: list[np.ndarray] = []
+        for edge_id in range(3):
+            next_id = (edge_id + 1) % 3
+            s0 = float(signed[edge_id])
+            s1 = float(signed[next_id])
+            p0 = render_tri[edge_id]
+            p1 = render_tri[next_id]
+            if abs(s0) <= eps:
+                hits.append(p0.astype(np.float32, copy=False))
+            if s0 * s1 < 0.0:
+                alpha = s0 / (s0 - s1)
+                hits.append((p0 + alpha * (p1 - p0)).astype(np.float32))
+            elif abs(s1) <= eps:
+                hits.append(p1.astype(np.float32, copy=False))
+        if len(hits) < 2:
+            return None
+        unique: list[np.ndarray] = []
+        for hit in hits:
+            if not any(float(np.linalg.norm(hit - existing)) <= eps for existing in unique):
+                unique.append(hit)
+        if len(unique) < 2:
+            return None
+        points = np.asarray(unique, dtype=np.float32)
+        order = np.lexsort((points[:, 2], points[:, 0]))
+        return points[order[[0, -1]]]
+
+    def _surface_triangle_in_cut_wake(
+        self,
+        rest_tri: np.ndarray,
+        knife_x: float,
+        z_lo: float,
+        z_hi: float,
+    ) -> bool:
+        if float(np.min(rest_tri[:, 0])) > knife_x:
+            return False
+        if float(np.max(rest_tri[:, 2])) < z_lo or float(np.min(rest_tri[:, 2])) > z_hi:
+            return False
+        return True
+
+    def update(
+        self,
+        current_points: np.ndarray | wp.array,
+        time: float,
+        front_x: float | None = None,
+        center_z: float | None = None,
+        enrichment_points: np.ndarray | wp.array | None = None,
+    ) -> TetCutWallRenderStats:
+        current_np = self._current_points_np(current_points)
+        if current_np.shape != self.rest_points.shape:
+            raise ValueError("current_points must match rest point shape")
+        if enrichment_points is None:
+            render_negative_np = current_np
+            render_positive_np = current_np
+        else:
+            enrichment_np = self._current_points_np(enrichment_points)
+            if enrichment_np.shape != self.rest_points.shape:
+                raise ValueError("enrichment_points must match rest point shape")
+            side_gap = np.minimum(np.abs(enrichment_np[:, 1:2]), self.max_visual_gap)
+            side_gap = np.maximum(side_gap, np.linalg.norm(enrichment_np, axis=1, keepdims=True) * 0.25)
+            y_axis = np.asarray((0.0, 1.0, 0.0), dtype=np.float32)
+            render_negative_np = current_np - side_gap * y_axis
+            render_positive_np = current_np + side_gap * y_axis
+        rest_side = np.where(self.rest_points[:, 1:2] >= float(self.knife.center_y), 1.0, -1.0).astype(np.float32)
+        render_np = np.where(rest_side > 0.0, render_positive_np, render_negative_np)
+
+        hidden_anchor = np.mean(current_np, axis=0, dtype=np.float64).astype(np.float32)
+        self.surface_points_np[:, :] = hidden_anchor
+        self.wall_points_np[:, :] = hidden_anchor
+        knife_x = float(self.knife.x_at(time) if front_x is None else front_x)
+        knife_center_z = float(self.knife.center_z if center_z is None else center_z)
+        z_lo = knife_center_z - self.knife.half_width_z - self.knife.process_width
+        z_hi = knife_center_z + self.knife.half_width_z + self.knife.process_width
+        plane_y = float(self.knife.center_y)
+        eps = 1.0e-7
+
+        surface_triangles = 0
+        wall_triangles = 0
+        active_triangles = 0
+        for tri in self.base_surface_triangles_np:
+            rest_tri = self.rest_points[tri]
+            signed = rest_tri[:, 1] - plane_y
+            touches_or_crosses = np.min(signed) <= eps and np.max(signed) >= -eps
+            in_wake = self._surface_triangle_in_cut_wake(rest_tri, knife_x, z_lo, z_hi)
+            if touches_or_crosses and in_wake:
+                active_triangles += 1
+                negative = self._clip_triangle_by_side(rest_tri, render_negative_np[tri], plane_y, keep_positive=False)
+                positive = self._clip_triangle_by_side(rest_tri, render_positive_np[tri], plane_y, keep_positive=True)
+                surface_triangles = self._append_surface_polygon(
+                    surface_triangles, self._apply_visual_opening(negative, -1.0, knife_x)
+                )
+                surface_triangles = self._append_surface_polygon(
+                    surface_triangles, self._apply_visual_opening(positive, 1.0, knife_x)
+                )
+                for side, side_render_np in ((-1.0, render_negative_np), (1.0, render_positive_np)):
+                    segment = self._plane_segment(rest_tri, side_render_np[tri], plane_y)
+                    segment = self._apply_visual_opening(segment, side, knife_x)
+                    if segment is not None:
+                        wall_triangles = self._append_wall_quad(wall_triangles, segment[0], segment[1])
+            else:
+                side = 1.0 if float(np.mean(rest_tri[:, 1])) >= plane_y else -1.0
+                side_render_np = render_positive_np if side > 0.0 else render_negative_np
+                render_tri = side_render_np[tri] if in_wake else render_np[tri]
+                surface_triangles = self._append_surface_triangle(
+                    surface_triangles, render_tri[0], render_tri[1], render_tri[2]
+                )
+
+        self.last_stats = TetCutWallRenderStats(
+            active_x_segments=int(active_triangles),
+            surface_vertex_count=int(surface_triangles * 3),
+            surface_triangle_count=int(surface_triangles),
+            wall_vertex_count=int(wall_triangles * 3),
+            wall_triangle_count=int(wall_triangles),
+            coarse_dx=self.nominal_edge_length,
+            min_active_dx=self.nominal_edge_length,
+            max_active_dx=self.nominal_edge_length,
+            active_tet_count=0,
+        )
+        return self.last_stats
+
+    def log(
+        self,
+        viewer,
+        device,
+        time: float,
+        current_points: wp.array,
+        prefix: str = "/cutting/shell_cut_surface",
+        surface_color: tuple[float, float, float] = (0.94, 0.94, 0.90),
+        wall_color: tuple[float, float, float] = (0.65, 0.16, 0.16),
+        surface_opacity: float = 0.92,
+        wall_opacity: float = 0.95,
+        front_x: float | None = None,
+        center_z: float | None = None,
+        enrichment_points: wp.array | np.ndarray | None = None,
+    ) -> TetCutWallRenderStats:
+        self._ensure_device_arrays(device)
+        stats = self.update(
+            current_points,
+            time,
+            front_x=front_x,
+            center_z=center_z,
+            enrichment_points=enrichment_points,
+        )
+        assert self.surface_points_wp is not None
+        assert self.surface_indices_wp is not None
+        assert self.wall_points_wp is not None
+        assert self.wall_indices_wp is not None
+        self.surface_points_wp.assign(self.surface_points_np)
+        self.wall_points_wp.assign(self.wall_points_np)
+        viewer.log_mesh(
+            f"{prefix}/surface",
+            self.surface_points_wp,
+            self.surface_indices_wp,
+            hidden=False,
+            backface_culling=False,
+            color=surface_color,
+            roughness=0.78,
+            opacity=surface_opacity,
+        )
+        viewer.log_mesh(
+            f"{prefix}/tear_edges",
+            self.wall_points_wp,
+            self.wall_indices_wp,
+            hidden=stats.wall_triangle_count == 0,
+            backface_culling=False,
+            color=wall_color,
+            roughness=0.86,
+            opacity=wall_opacity,
+        )
+        return stats
+
+
 @dataclass
 class RuntimeStats:
     solver: str

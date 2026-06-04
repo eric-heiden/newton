@@ -283,16 +283,12 @@ class MeshGL:
             self.opacity = float(np.clip(opacity, 0.0, 1.0))
         self._sort_center = None
 
-        # only update indices the first time (no topology changes)
-        if self.indices is None:
-            self.indices = wp.clone(indices).view(dtype=wp.uint32)
-            self.num_indices = int(len(self.indices))
-
-            host_indices = self.indices.numpy()
-            gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.ebo)
-            gl.glBufferData(
-                gl.GL_ELEMENT_ARRAY_BUFFER, host_indices.nbytes, host_indices.ctypes.data, gl.GL_STATIC_DRAW
-            )
+        if len(indices) != self.num_indices:
+            raise RuntimeError("Number of indices does not match")
+        self.indices = wp.clone(indices).view(dtype=wp.uint32)
+        host_indices = self.indices.numpy()
+        gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.ebo)
+        gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, host_indices.nbytes, host_indices.ctypes.data, gl.GL_STATIC_DRAW)
 
         # If normals are missing, compute them before packing vertex data.
         if points is not None and normals is None:

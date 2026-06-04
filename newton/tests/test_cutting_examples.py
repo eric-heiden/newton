@@ -12,13 +12,15 @@ from newton.examples.cutting.cutting_common import (
     CutMaterial,
     KnifeProfile,
     SplitCuboidRenderMesh,
+    TetMeshCutSurfaceRenderer,
     compute_particle_cut_update,
     encode_mp4,
     summarize_force_profile,
 )
 from newton.examples.cutting.example_cutting_xfem import build_half_cylinder_tet_mesh
 from newton.examples.cutting import generate_cutting_report_assets
-from newton._src.viewer.gl.opengl import RendererGL
+from newton._src.viewer.gl.opengl import MeshGL, RendererGL
+from newton._src.solvers.xfem_cut.kernels import apply_xfem_knife_kernel
 from newton.viewer import ViewerNull
 
 
@@ -163,6 +165,17 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertIn("macro_block_size=1)", source)
         self.assertNotIn("macro_block_size=16", source)
 
+    def test_viewergl_mesh_updates_index_buffer_each_frame(self):
+        source = inspect.getsource(MeshGL.update)
+
+        self.assertNotIn("only update indices the first time", source)
+        self.assertIn("host_indices = self.indices.numpy()", source)
+
+    def test_xfem_knife_kernel_has_direct_saw_friction_drag(self):
+        source = inspect.getsource(apply_xfem_knife_kernel)
+
+        self.assertIn("friction_drag_velocity", source)
+
     def test_particle_damage_monotonic_and_force_scales_with_toughness(self):
         points = np.array(
             [
@@ -247,6 +260,47 @@ class TestCuttingCommon(unittest.TestCase):
             moved_walls - static_walls, np.broadcast_to(translation, moved_walls.shape), atol=1.0e-5
         )
 
+    def test_split_cuboid_zero_kerf_vertices_follow_their_own_side(self):
+        knife = KnifeProfile(start_x=-0.5, speed=0.0, center_y=0.0, process_width=0.08)
+        mesh = SplitCuboidRenderMesh(
+            block_lo=(-0.5, -0.25, 0.0),
+            block_hi=(0.5, 0.25, 0.4),
+            knife=knife,
+            segments=2,
+        )
+        rest_particles = np.array(
+            [
+                [-0.25, -0.25, 0.0],
+                [-0.25, -0.25, 0.4],
+                [-0.25, 0.25, 0.0],
+                [-0.25, 0.25, 0.4],
+                [0.25, -0.25, 0.0],
+                [0.25, -0.25, 0.4],
+                [0.25, 0.25, 0.0],
+                [0.25, 0.25, 0.4],
+            ],
+            dtype=np.float32,
+        )
+        negative_delta = np.array([0.0, -0.04, -0.08], dtype=np.float32)
+        positive_delta = np.array([0.0, 0.04, 0.08], dtype=np.float32)
+        moved_particles = rest_particles.copy()
+        moved_particles[rest_particles[:, 1] < 0.0] += negative_delta
+        moved_particles[rest_particles[:, 1] > 0.0] += positive_delta
+
+        static_surface, _static_walls = mesh.build_points(time=1.0)
+        moved_surface, _moved_walls = mesh.build_points(
+            time=1.0,
+            rest_particle_points=rest_particles,
+            particle_points=moved_particles,
+        )
+
+        negative_side_first_quad_delta = moved_surface[:4] - static_surface[:4]
+        np.testing.assert_allclose(
+            negative_side_first_quad_delta,
+            np.broadcast_to(negative_delta, negative_side_first_quad_delta.shape),
+            atol=2.0e-3,
+        )
+
     def test_adaptive_cut_remesher_refines_near_knife(self):
         knife = KnifeProfile(start_x=-0.25, speed=0.5, center_y=0.0, process_width=0.08)
         remesher = AdaptiveCutSurfaceRemesher(
@@ -299,6 +353,53 @@ class TestCuttingCommon(unittest.TestCase):
             moved_surface - static_surface, np.broadcast_to(translation, moved_surface.shape), atol=1.0e-5
         )
 
+    def test_adaptive_cut_remesher_zero_kerf_vertices_follow_their_own_side(self):
+        knife = KnifeProfile(start_x=-0.5, speed=0.0, center_y=0.0, process_width=0.08)
+        remesher = AdaptiveCutSurfaceRemesher(
+            block_lo=(-0.5, -0.25, 0.0),
+            block_hi=(0.5, 0.25, 0.4),
+            knife=knife,
+            base_segments=2,
+            refine_factor=1,
+            refine_band=0.1,
+            height_segments=2,
+        )
+        rest_particles = np.array(
+            [
+                [-0.25, -0.25, 0.0],
+                [-0.25, -0.25, 0.4],
+                [-0.25, 0.25, 0.0],
+                [-0.25, 0.25, 0.4],
+                [0.25, -0.25, 0.0],
+                [0.25, -0.25, 0.4],
+                [0.25, 0.25, 0.0],
+                [0.25, 0.25, 0.4],
+            ],
+            dtype=np.float32,
+        )
+        negative_delta = np.array([0.0, -0.04, -0.08], dtype=np.float32)
+        positive_delta = np.array([0.0, 0.04, 0.08], dtype=np.float32)
+        moved_particles = rest_particles.copy()
+        moved_particles[rest_particles[:, 1] < 0.0] += negative_delta
+        moved_particles[rest_particles[:, 1] > 0.0] += positive_delta
+
+        static_stats = remesher.update(wp.get_device(), time=1.0)
+        static_surface = remesher.surface_points_wp.numpy()[: static_stats.surface_vertex_count].copy()
+        moved_stats = remesher.update(
+            wp.get_device(),
+            time=1.0,
+            rest_particle_points=rest_particles,
+            particle_points=moved_particles,
+        )
+        moved_surface = remesher.surface_points_wp.numpy()[: moved_stats.surface_vertex_count]
+
+        negative_side_first_quad_delta = moved_surface[:4] - static_surface[:4]
+        np.testing.assert_allclose(
+            negative_side_first_quad_delta,
+            np.broadcast_to(negative_delta, negative_side_first_quad_delta.shape),
+            atol=2.0e-3,
+        )
+
     def test_adaptive_cut_remesher_preserves_zero_kerf_without_particle_motion(self):
         knife = KnifeProfile(start_x=-0.5, speed=1.0, center_y=0.0, process_width=0.08)
         remesher = AdaptiveCutSurfaceRemesher(
@@ -337,6 +438,29 @@ class TestCuttingCommon(unittest.TestCase):
         d = vertices[tets[:, 3]]
         signed_volumes = np.einsum("ij,ij->i", np.cross(b - a, c - a), d - a) / 6.0
         self.assertTrue(np.all(signed_volumes > 0.0))
+
+    def test_tet_cut_surface_renderer_splits_surface_triangles_in_cut_wake(self):
+        rest_points = np.array(
+            [
+                [-0.2, -0.1, 0.0],
+                [-0.2, 0.1, 0.0],
+                [-0.2, -0.1, 0.2],
+                [-0.1, 0.0, 0.1],
+            ],
+            dtype=np.float32,
+        )
+        tets = np.array([[0, 1, 2, 3]], dtype=np.int32)
+        surface = np.array([[0, 1, 2]], dtype=np.int32)
+        knife = KnifeProfile(start_x=0.0, speed=0.0, center_y=0.0, center_z=0.1, half_width_z=0.25)
+        renderer = TetMeshCutSurfaceRenderer(rest_points, tets, surface, knife, nominal_edge_length=0.1)
+
+        stats = renderer.update(rest_points, time=0.0, front_x=0.1, center_z=0.1)
+        rendered_points = renderer.surface_points_np[: stats.surface_vertex_count]
+        rendered_indices = renderer.surface_indices_np[: stats.surface_triangle_count * 3].reshape(-1, 3)
+
+        self.assertGreater(stats.surface_triangle_count, 1)
+        for tri in rendered_points[rendered_indices]:
+            self.assertFalse(np.min(tri[:, 1]) < -1.0e-6 and np.max(tri[:, 1]) > 1.0e-6)
 
 
 if __name__ == "__main__":

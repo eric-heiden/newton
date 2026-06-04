@@ -140,13 +140,21 @@ def apply_xfem_knife_kernel(
             rel_tangent_speed / wp.max(friction_velocity_scale, 1.0e-6)
         )
         friction_force = tangent * friction_force_signed
+        tangent_speed_delta = wp.dot(knife_velocity, tangent) - wp.dot(v, tangent)
+        friction_drag_fraction = wp.min(1.0, knife_friction_mu * front_weight * 24.0 * dt)
+        friction_drag_velocity = tangent * (tangent_speed_delta * friction_drag_fraction)
 
         particle_f[tid] = particle_f[tid] + normal_dir * normal_force + friction_force
+        drag_force_equiv = float(0.0)
         if particle_inv_mass[tid] > 0.0:
+            drag_force_equiv = wp.abs(tangent_speed_delta * friction_drag_fraction) / (
+                particle_inv_mass[tid] * wp.max(dt, 1.0e-6)
+            )
             particle_qd[tid] = (
                 v
                 + normal_dir * (separation_speed * delta_damage)
                 + friction_force * particle_inv_mass[tid] * dt
+                + friction_drag_velocity
             )
 
         target_enrichment = normal_dir * (max_enrichment * _xfem_smoothstep(new_damage))
@@ -160,10 +168,10 @@ def apply_xfem_knife_kernel(
         particle_enrichment_q[tid] = enrich_q
         particle_enrichment_qd[tid] = enrich_qd
 
-        wp.atomic_add(force_accum, 0, wp.abs(normal_force) + wp.abs(friction_force_signed))
+        wp.atomic_add(force_accum, 0, wp.abs(normal_force) + wp.abs(friction_force_signed) + drag_force_equiv)
         wp.atomic_add(force_accum, 1, 1.0)
         wp.atomic_add(force_accum, 3, wp.abs(normal_force))
-        wp.atomic_add(force_accum, 4, wp.abs(friction_force_signed))
+        wp.atomic_add(force_accum, 4, wp.abs(friction_force_signed) + drag_force_equiv)
 
     wp.atomic_add(force_accum, 2, new_damage)
     if new_damage > 1.0e-4:

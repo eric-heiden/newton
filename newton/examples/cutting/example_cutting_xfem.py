@@ -569,6 +569,7 @@ class Example:
                     wall_color=cfg.wall_color,
                     front_x=front_x,
                     center_z=center_z,
+                    enrichment_points=self.solver.particle_enrichment_q,
                 )
                 self.remesh_history.append({"time_s": self.sim_time, **asdict(stats)})
             elif isinstance(self.render_split_mesh, AdaptiveCutSurfaceRemesher):

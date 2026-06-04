@@ -361,15 +361,18 @@ def _cutting_deform_from_particles(
     particle_points: wp.array(dtype=wp.vec3),
     particle_count: int,
     side_center_y: float,
+    side_hint: float,
 ):
     if particle_count <= 0:
         return rest_point
 
     weighted_delta = wp.vec3(0.0, 0.0, 0.0)
     weight_sum = float(0.0)
-    rest_side = -1.0
-    if rest_point[1] >= side_center_y:
-        rest_side = 1.0
+    rest_side = side_hint
+    if rest_side == 0.0:
+        rest_side = -1.0
+        if rest_point[1] >= side_center_y:
+            rest_side = 1.0
     for i in range(particle_count):
         rest_particle = rest_particle_points[i]
         current_particle = particle_points[i]
@@ -380,7 +383,7 @@ def _cutting_deform_from_particles(
         if rest_particle[1] >= side_center_y:
             particle_side = 1.0
         if rest_side * particle_side < 0.0:
-            weight = weight * 0.03
+            weight = 0.0
         weighted_delta = weighted_delta + (current_particle - rest_particle) * weight
         weight_sum = weight_sum + weight
 
@@ -400,20 +403,21 @@ def _cutting_write_quad(
     particle_points: wp.array(dtype=wp.vec3),
     particle_count: int,
     side_center_y: float,
+    side_hint: float,
 ):
     vertex = quad_index * 4
     index = quad_index * 6
     points[vertex + 0] = _cutting_deform_from_particles(
-        a, rest_particle_points, particle_points, particle_count, side_center_y
+        a, rest_particle_points, particle_points, particle_count, side_center_y, side_hint
     )
     points[vertex + 1] = _cutting_deform_from_particles(
-        b, rest_particle_points, particle_points, particle_count, side_center_y
+        b, rest_particle_points, particle_points, particle_count, side_center_y, side_hint
     )
     points[vertex + 2] = _cutting_deform_from_particles(
-        c, rest_particle_points, particle_points, particle_count, side_center_y
+        c, rest_particle_points, particle_points, particle_count, side_center_y, side_hint
     )
     points[vertex + 3] = _cutting_deform_from_particles(
-        d, rest_particle_points, particle_points, particle_count, side_center_y
+        d, rest_particle_points, particle_points, particle_count, side_center_y, side_hint
     )
     indices[index + 0] = vertex + 0
     indices[index + 1] = vertex + 1
@@ -497,6 +501,7 @@ def _build_adaptive_cut_surface_kernel(
                 particle_points,
                 particle_count,
                 knife_center_y,
+                side,
             )
         elif face_id == 1:
             _cutting_write_quad(
@@ -511,6 +516,7 @@ def _build_adaptive_cut_surface_kernel(
                 particle_points,
                 particle_count,
                 knife_center_y,
+                side,
             )
         else:
             z_id = face_id - 2
@@ -528,6 +534,7 @@ def _build_adaptive_cut_surface_kernel(
                 particle_points,
                 particle_count,
                 knife_center_y,
+                side,
             )
         return
 
@@ -568,6 +575,7 @@ def _build_adaptive_cut_surface_kernel(
             particle_points,
             particle_count,
             knife_center_y,
+            side,
         )
     else:
         _cutting_write_quad(
@@ -582,6 +590,7 @@ def _build_adaptive_cut_surface_kernel(
             particle_points,
             particle_count,
             knife_center_y,
+            side,
         )
 
 
@@ -640,6 +649,7 @@ def _build_adaptive_cut_wall_kernel(
         particle_points,
         particle_count,
         knife_center_y,
+        side,
     )
 
 
@@ -696,12 +706,14 @@ class SplitCuboidRenderMesh:
         return x * x * (3.0 - 2.0 * x)
 
     @staticmethod
-    def _append_quad(vertices: list[list[float]], a, b, c, d):
+    def _append_quad(vertices: list[list[float]], side_hints: list[float], side_hint: float, a, b, c, d):
         vertices.extend([list(a), list(b), list(c), list(d)])
+        side_hints.extend([float(side_hint)] * 4)
 
     @staticmethod
-    def _append_empty_quad(vertices: list[list[float]]):
+    def _append_empty_quad(vertices: list[list[float]], side_hints: list[float]):
         vertices.extend([[0.0, 0.0, 0.0]] * 4)
+        side_hints.extend([0.0] * 4)
 
     def gap_at(self, x: float, time: float) -> float:
         return 0.0
@@ -717,7 +729,9 @@ class SplitCuboidRenderMesh:
         z0 = float(lo[2])
         z1 = float(hi[2])
         surface: list[list[float]] = []
+        surface_side_hints: list[float] = []
         walls: list[list[float]] = []
+        wall_side_hints: list[float] = []
         knife_x = self.knife.x_at(time)
 
         for side in (-1.0, 1.0):
@@ -728,24 +742,52 @@ class SplitCuboidRenderMesh:
                 y_cut0 = self.knife.center_y
                 y_cut1 = self.knife.center_y
 
-                self._append_quad(surface, (x0, y_outer, z1), (x1, y_outer, z1), (x1, y_cut1, z1), (x0, y_cut0, z1))
-                self._append_quad(surface, (x0, y_cut0, z0), (x1, y_cut1, z0), (x1, y_outer, z0), (x0, y_outer, z0))
-                self._append_quad(surface, (x0, y_outer, z0), (x1, y_outer, z0), (x1, y_outer, z1), (x0, y_outer, z1))
+                self._append_quad(
+                    surface,
+                    surface_side_hints,
+                    side,
+                    (x0, y_outer, z1),
+                    (x1, y_outer, z1),
+                    (x1, y_cut1, z1),
+                    (x0, y_cut0, z1),
+                )
+                self._append_quad(
+                    surface,
+                    surface_side_hints,
+                    side,
+                    (x0, y_cut0, z0),
+                    (x1, y_cut1, z0),
+                    (x1, y_outer, z0),
+                    (x0, y_outer, z0),
+                )
+                self._append_quad(
+                    surface,
+                    surface_side_hints,
+                    side,
+                    (x0, y_outer, z0),
+                    (x1, y_outer, z0),
+                    (x1, y_outer, z1),
+                    (x0, y_outer, z1),
+                )
                 if x0 < knife_x:
                     wall_x1 = min(x1, knife_x)
                     self._append_quad(
                         walls,
+                        wall_side_hints,
+                        side,
                         (x0, y_cut0, z0),
                         (wall_x1, y_cut1, z0),
                         (wall_x1, y_cut1, z1),
                         (x0, y_cut0, z1),
                     )
                 else:
-                    self._append_empty_quad(walls)
+                    self._append_empty_quad(walls, wall_side_hints)
 
                 if i == 0:
                     self._append_quad(
                         surface,
+                        surface_side_hints,
+                        side,
                         (x0, y_outer, z0),
                         (x0, y_cut0, z0),
                         (x0, y_cut0, z1),
@@ -754,6 +796,8 @@ class SplitCuboidRenderMesh:
                 if i == self.segments - 1:
                     self._append_quad(
                         surface,
+                        surface_side_hints,
+                        side,
                         (x1, y_cut1, z0),
                         (x1, y_outer, z0),
                         (x1, y_outer, z1),
@@ -763,8 +807,12 @@ class SplitCuboidRenderMesh:
         surface_np = np.asarray(surface, dtype=np.float32)
         walls_np = np.asarray(walls, dtype=np.float32)
         if rest_particle_points is not None or particle_points is not None:
-            surface_np = self._deform_points_with_particles(surface_np, rest_particle_points, particle_points)
-            walls_np = self._deform_points_with_particles(walls_np, rest_particle_points, particle_points)
+            surface_np = self._deform_points_with_particles(
+                surface_np, rest_particle_points, particle_points, np.asarray(surface_side_hints, dtype=np.float32)
+            )
+            walls_np = self._deform_points_with_particles(
+                walls_np, rest_particle_points, particle_points, np.asarray(wall_side_hints, dtype=np.float32)
+            )
         return surface_np, walls_np
 
     def _deform_points_with_particles(
@@ -772,6 +820,7 @@ class SplitCuboidRenderMesh:
         points: np.ndarray,
         rest_particle_points: np.ndarray | None,
         particle_points: np.ndarray | None,
+        side_hints: np.ndarray | None = None,
     ) -> np.ndarray:
         if rest_particle_points is None or particle_points is None:
             raise ValueError("rest_particle_points and particle_points must be provided together")
@@ -797,7 +846,21 @@ class SplitCuboidRenderMesh:
             nearest_deltas = deltas[nearest]
 
         weights = 1.0 / np.maximum(nearest_d2, 1.0e-12)
-        sampled_delta = np.sum(nearest_deltas * weights[:, :, None], axis=1) / np.sum(weights, axis=1)[:, None]
+        if side_hints is not None:
+            rest_sides = np.where(rest[:, 1] >= self.knife.center_y, 1.0, -1.0).astype(np.float32)
+            point_sides = np.asarray(side_hints, dtype=np.float32).reshape(-1)
+            point_sides = np.where(
+                point_sides == 0.0,
+                np.where(points[:, 1] >= self.knife.center_y, 1.0, -1.0),
+                point_sides,
+            )
+            if k == rest.shape[0]:
+                nearest_sides = np.broadcast_to(rest_sides[None, :], (points.shape[0], rest.shape[0]))
+            else:
+                nearest_sides = rest_sides[nearest]
+            weights = np.where(nearest_sides * point_sides[:, None] < 0.0, 0.0, weights)
+        weight_sum = np.maximum(np.sum(weights, axis=1), 1.0e-12)
+        sampled_delta = np.sum(nearest_deltas * weights[:, :, None], axis=1) / weight_sum[:, None]
         return (points + sampled_delta).astype(np.float32)
 
     def _ensure_device_arrays(self, device):
@@ -1130,21 +1193,25 @@ class TetMeshCutSurfaceRenderer:
     ):
         self.rest_points = np.asarray(rest_points, dtype=np.float32)
         self.tet_indices = np.asarray(tet_indices, dtype=np.int32).reshape(-1, 4)
-        self.surface_indices_np = np.asarray(surface_indices, dtype=np.int32).reshape(-1, 3).ravel()
+        self.base_surface_triangles_np = np.asarray(surface_indices, dtype=np.int32).reshape(-1, 3)
         self.knife = knife
         self.nominal_edge_length = float(max(nominal_edge_length, 1.0e-8))
+        self.max_surface_triangles = int(max(1, 3 * len(self.base_surface_triangles_np)))
         self.max_wall_triangles = int(max_wall_triangles or max(1, 2 * len(self.tet_indices)))
 
+        self.surface_points_np = np.zeros((self.max_surface_triangles * 3, 3), dtype=np.float32)
+        self.surface_indices_np = np.arange(self.max_surface_triangles * 3, dtype=np.int32)
         self.wall_points_np = np.zeros((self.max_wall_triangles * 3, 3), dtype=np.float32)
         self.wall_indices_np = np.arange(self.max_wall_triangles * 3, dtype=np.int32)
+        self.surface_points_wp: wp.array | None = None
         self.surface_indices_wp: wp.array | None = None
         self.wall_points_wp: wp.array | None = None
         self.wall_indices_wp: wp.array | None = None
         self.device_key: str | None = None
         self.last_stats = TetCutWallRenderStats(
             active_x_segments=0,
-            surface_vertex_count=int(self.rest_points.shape[0]),
-            surface_triangle_count=int(len(self.surface_indices_np) // 3),
+            surface_vertex_count=0,
+            surface_triangle_count=0,
             wall_vertex_count=0,
             wall_triangle_count=0,
             coarse_dx=self.nominal_edge_length,
@@ -1158,6 +1225,7 @@ class TetMeshCutSurfaceRenderer:
         if self.wall_points_wp is not None and self.device_key == device_key:
             return
         self.device_key = device_key
+        self.surface_points_wp = wp.array(self.surface_points_np, dtype=wp.vec3, device=device)
         self.surface_indices_wp = wp.array(self.surface_indices_np, dtype=wp.int32, device=device)
         self.wall_points_wp = wp.array(self.wall_points_np, dtype=wp.vec3, device=device)
         self.wall_indices_wp = wp.array(self.wall_indices_np, dtype=wp.int32, device=device)
@@ -1186,7 +1254,7 @@ class TetMeshCutSurfaceRenderer:
     def _tet_plane_polygon(
         cls,
         rest_tet: np.ndarray,
-        current_tet: np.ndarray,
+        render_tet: np.ndarray,
         plane_y: float,
         eps: float = 1.0e-7,
     ) -> np.ndarray | None:
@@ -1200,16 +1268,16 @@ class TetMeshCutSurfaceRenderer:
             si = float(signed[i])
             sj = float(signed[j])
             if abs(si) <= eps and abs(sj) <= eps:
-                cls._append_unique(rest_hits, current_hits, rest_tet[i], current_tet[i], eps)
-                cls._append_unique(rest_hits, current_hits, rest_tet[j], current_tet[j], eps)
+                cls._append_unique(rest_hits, current_hits, rest_tet[i], render_tet[i], eps)
+                cls._append_unique(rest_hits, current_hits, rest_tet[j], render_tet[j], eps)
             elif abs(si) <= eps:
-                cls._append_unique(rest_hits, current_hits, rest_tet[i], current_tet[i], eps)
+                cls._append_unique(rest_hits, current_hits, rest_tet[i], render_tet[i], eps)
             elif abs(sj) <= eps:
-                cls._append_unique(rest_hits, current_hits, rest_tet[j], current_tet[j], eps)
+                cls._append_unique(rest_hits, current_hits, rest_tet[j], render_tet[j], eps)
             elif si * sj < 0.0:
                 alpha = si / (si - sj)
                 rest_point = rest_tet[i] + alpha * (rest_tet[j] - rest_tet[i])
-                current_point = current_tet[i] + alpha * (current_tet[j] - current_tet[i])
+                current_point = render_tet[i] + alpha * (render_tet[j] - render_tet[i])
                 cls._append_unique(rest_hits, current_hits, rest_point, current_point, eps)
 
         if len(current_hits) < 3:
@@ -1222,24 +1290,129 @@ class TetMeshCutSurfaceRenderer:
         order = np.argsort(angles)
         return current_poly[order]
 
+    def _append_surface_triangle(self, triangle_count: int, a: np.ndarray, b: np.ndarray, c: np.ndarray) -> int:
+        if triangle_count >= self.max_surface_triangles:
+            return triangle_count
+        vertex = triangle_count * 3
+        self.surface_points_np[vertex + 0] = a
+        self.surface_points_np[vertex + 1] = b
+        self.surface_points_np[vertex + 2] = c
+        return triangle_count + 1
+
+    def _append_surface_polygon(self, triangle_count: int, polygon: np.ndarray | None) -> int:
+        if polygon is None or polygon.shape[0] < 3:
+            return triangle_count
+        for i in range(1, polygon.shape[0] - 1):
+            triangle_count = self._append_surface_triangle(triangle_count, polygon[0], polygon[i], polygon[i + 1])
+        return triangle_count
+
+    @staticmethod
+    def _clip_triangle_by_side(
+        rest_tri: np.ndarray,
+        render_tri: np.ndarray,
+        plane_y: float,
+        keep_positive: bool,
+        eps: float = 1.0e-7,
+    ) -> np.ndarray | None:
+        out_rest: list[np.ndarray] = []
+        out_render: list[np.ndarray] = []
+
+        def inside(point: np.ndarray) -> bool:
+            signed = float(point[1] - plane_y)
+            return signed >= -eps if keep_positive else signed <= eps
+
+        for edge_id in range(3):
+            prev_id = (edge_id + 2) % 3
+            curr_rest = rest_tri[edge_id]
+            curr_render = render_tri[edge_id]
+            prev_rest = rest_tri[prev_id]
+            prev_render = render_tri[prev_id]
+            curr_inside = inside(curr_rest)
+            prev_inside = inside(prev_rest)
+
+            if curr_inside != prev_inside:
+                s0 = float(prev_rest[1] - plane_y)
+                s1 = float(curr_rest[1] - plane_y)
+                alpha = 0.0 if abs(s0 - s1) <= eps else s0 / (s0 - s1)
+                out_rest.append((prev_rest + alpha * (curr_rest - prev_rest)).astype(np.float32))
+                out_render.append((prev_render + alpha * (curr_render - prev_render)).astype(np.float32))
+            if curr_inside:
+                out_rest.append(curr_rest.astype(np.float32, copy=False))
+                out_render.append(curr_render.astype(np.float32, copy=False))
+
+        if len(out_render) < 3:
+            return None
+        return np.asarray(out_render, dtype=np.float32)
+
+    def _surface_triangle_in_cut_wake(
+        self,
+        rest_tri: np.ndarray,
+        knife_x: float,
+        z_lo: float,
+        z_hi: float,
+    ) -> bool:
+        if float(np.min(rest_tri[:, 0])) > knife_x:
+            return False
+        if float(np.max(rest_tri[:, 2])) < z_lo or float(np.min(rest_tri[:, 2])) > z_hi:
+            return False
+        return True
+
+    def _update_surface_mesh(
+        self,
+        render_np: np.ndarray,
+        hidden_anchor: np.ndarray,
+        knife_x: float,
+        z_lo: float,
+        z_hi: float,
+    ) -> int:
+        self.surface_points_np[:, :] = hidden_anchor
+        surface_triangles = 0
+        plane_y = float(self.knife.center_y)
+        eps = 1.0e-7
+        for tri in self.base_surface_triangles_np:
+            rest_tri = self.rest_points[tri]
+            render_tri = render_np[tri]
+            signed = rest_tri[:, 1] - plane_y
+            crosses = np.min(signed) < -eps and np.max(signed) > eps
+            if crosses and self._surface_triangle_in_cut_wake(rest_tri, knife_x, z_lo, z_hi):
+                negative = self._clip_triangle_by_side(rest_tri, render_tri, plane_y, keep_positive=False)
+                positive = self._clip_triangle_by_side(rest_tri, render_tri, plane_y, keep_positive=True)
+                surface_triangles = self._append_surface_polygon(surface_triangles, negative)
+                surface_triangles = self._append_surface_polygon(surface_triangles, positive)
+            else:
+                surface_triangles = self._append_surface_triangle(
+                    surface_triangles, render_tri[0], render_tri[1], render_tri[2]
+                )
+        return surface_triangles
+
     def update(
         self,
         current_points: np.ndarray | wp.array,
         time: float,
         front_x: float | None = None,
         center_z: float | None = None,
+        enrichment_points: np.ndarray | wp.array | None = None,
     ) -> TetCutWallRenderStats:
         current_np = self._current_points_np(current_points)
         if current_np.shape != self.rest_points.shape:
             raise ValueError("current_points must match rest point shape")
+        if enrichment_points is None:
+            render_np = current_np
+        else:
+            enrichment_np = self._current_points_np(enrichment_points)
+            if enrichment_np.shape != self.rest_points.shape:
+                raise ValueError("enrichment_points must match rest point shape")
+            render_np = current_np + enrichment_np
 
         hidden_anchor = np.mean(current_np, axis=0, dtype=np.float64).astype(np.float32)
+        self.surface_points_np[:, :] = hidden_anchor
         self.wall_points_np[:, :] = hidden_anchor
         knife_x = float(self.knife.x_at(time) if front_x is None else front_x)
         knife_center_z = float(self.knife.center_z if center_z is None else center_z)
         z_lo = knife_center_z - self.knife.half_width_z - self.knife.process_width
         z_hi = knife_center_z + self.knife.half_width_z + self.knife.process_width
 
+        surface_triangles = self._update_surface_mesh(render_np, hidden_anchor, knife_x, z_lo, z_hi)
         wall_triangles = 0
         active_tets = 0
         for tet in self.tet_indices:
@@ -1249,7 +1422,7 @@ class TetMeshCutSurfaceRenderer:
             if float(np.max(rest_tet[:, 2])) < z_lo or float(np.min(rest_tet[:, 2])) > z_hi:
                 continue
 
-            polygon = self._tet_plane_polygon(rest_tet, current_np[tet], float(self.knife.center_y))
+            polygon = self._tet_plane_polygon(rest_tet, render_np[tet], float(self.knife.center_y))
             if polygon is None:
                 continue
             active_tets += 1
@@ -1267,8 +1440,8 @@ class TetMeshCutSurfaceRenderer:
 
         self.last_stats = TetCutWallRenderStats(
             active_x_segments=active_tets,
-            surface_vertex_count=int(self.rest_points.shape[0]),
-            surface_triangle_count=int(len(self.surface_indices_np) // 3),
+            surface_vertex_count=int(surface_triangles * 3),
+            surface_triangle_count=int(surface_triangles),
             wall_vertex_count=int(wall_triangles * 3),
             wall_triangle_count=int(wall_triangles),
             coarse_dx=self.nominal_edge_length,
@@ -1291,16 +1464,25 @@ class TetMeshCutSurfaceRenderer:
         wall_opacity: float = 1.0,
         front_x: float | None = None,
         center_z: float | None = None,
+        enrichment_points: wp.array | np.ndarray | None = None,
     ) -> TetCutWallRenderStats:
         self._ensure_device_arrays(device)
-        stats = self.update(current_points, time, front_x=front_x, center_z=center_z)
+        stats = self.update(
+            current_points,
+            time,
+            front_x=front_x,
+            center_z=center_z,
+            enrichment_points=enrichment_points,
+        )
+        assert self.surface_points_wp is not None
         assert self.surface_indices_wp is not None
         assert self.wall_points_wp is not None
         assert self.wall_indices_wp is not None
+        self.surface_points_wp.assign(self.surface_points_np)
         self.wall_points_wp.assign(self.wall_points_np)
         viewer.log_mesh(
             f"{prefix}/surface",
-            current_points,
+            self.surface_points_wp,
             self.surface_indices_wp,
             hidden=False,
             backface_culling=False,

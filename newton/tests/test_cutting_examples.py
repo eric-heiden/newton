@@ -206,6 +206,41 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertGreater(cfg.separation_speed, 0.0)
         self.assertGreaterEqual(cfg.render_cut_refine_factor, 3)
 
+    def test_curved_cloth_spline_cut_uses_compact_turning_knife(self):
+        cfg = SCENARIOS["curved_cloth_spline_cut"]
+        blade_spine_depth = getattr(cfg, "blade_spine_depth", 0.18)
+
+        self.assertLessEqual(cfg.knife_half_width_y, 0.024)
+        self.assertLessEqual(cfg.knife_half_width_z, 0.060)
+        self.assertLessEqual(cfg.process_width, 0.030)
+        self.assertLessEqual(blade_spine_depth, 0.090)
+
+        knife = KnifeProfile(
+            start_x=cfg.knife_start_x,
+            speed=0.0,
+            center_y=cfg.knife_center_y,
+            center_z=cfg.knife_center_z,
+            half_width_y=cfg.knife_half_width_y,
+            half_width_z=cfg.knife_half_width_z,
+            process_width=cfg.process_width,
+            blade_spine_depth=blade_spine_depth,
+            cut_path_amplitude_y=cfg.cut_path_amplitude_y,
+            cut_path_wavelength_x=cfg.cut_path_wavelength_x,
+            cut_path_phase=cfg.cut_path_phase,
+            cut_path_origin_x=cfg.cut_path_origin_x,
+        )
+        vertices, _indices = knife.blade_mesh(time=0.0)
+        tangent = knife.path_tangent_at_x(cfg.knife_start_x)
+        normal = knife.path_normal_at_x(cfg.knife_start_x)
+
+        tangent_span = float(np.ptp(vertices @ tangent))
+        normal_span = float(np.ptp(vertices @ normal))
+        z_span = float(np.ptp(vertices[:, 2]))
+
+        self.assertLessEqual(tangent_span, 0.10)
+        self.assertLessEqual(normal_span, 0.050)
+        self.assertLessEqual(z_span, 0.13)
+
     def test_knife_blade_mesh_yaws_with_curved_cut_path(self):
         knife = KnifeProfile(
             start_x=-0.4,
@@ -379,7 +414,6 @@ class TestCuttingCommon(unittest.TestCase):
                 "4",
                 "--iterations",
                 "4",
-                "--no-render-split-mesh",
             ]
             viewer, args = newton.examples.init(XFEMExample.create_parser())
             example = XFEMExample(viewer, args)
@@ -392,6 +426,20 @@ class TestCuttingCommon(unittest.TestCase):
             points = example.state_0.particle_q.numpy()
             solver_center_y = example.solver.knife_center_y
             max_force = max(example.force_history.forces)
+            front_x, _center_y, center_z, _knife_velocity = example._knife_state(example.sim_time)
+            remesh_stats = example.render_split_mesh.update(
+                example.state_0.particle_q,
+                example.sim_time,
+                front_x=front_x,
+                center_z=center_z,
+                enrichment_points=example.solver.particle_enrichment_q,
+                triangle_cut_state=example.solver.tri_cut_state,
+            )
+            rendered_points = example.render_split_mesh.surface_points_np[: remesh_stats.surface_vertex_count]
+            rendered_indices = example.render_split_mesh.surface_indices_np[
+                : remesh_stats.surface_triangle_count * 3
+            ].reshape(-1, 3)
+            max_rendered_triangle_span = np.max(np.ptp(rendered_points[rendered_indices], axis=1), axis=0)
             viewer.close()
         finally:
             sys.argv = old_argv
@@ -403,6 +451,9 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertGreater(float(max_force), 0.0)
         self.assertGreater(float(np.max(np.linalg.norm(points - initial_points, axis=1))), 1.0e-4)
         self.assertLess(float(np.max(np.ptp(points, axis=0))), 1.6)
+        self.assertGreater(remesh_stats.surface_triangle_count, example.model.tri_count)
+        self.assertEqual(remesh_stats.wall_triangle_count, 0)
+        self.assertLess(float(np.max(max_rendered_triangle_span)), 0.09)
 
     def test_viewergl_sets_pyglet_headless_before_shader_import(self):
         source = inspect.getsource(RendererGL.__init__)

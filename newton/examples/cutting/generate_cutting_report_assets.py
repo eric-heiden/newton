@@ -109,6 +109,7 @@ def _knife_profile_for_example(example, time_value: float) -> KnifeProfile | Non
             half_width_z=cfg.knife_half_width_z,
             process_width=cfg.process_width,
             edge_control_points=base.edge_control_points if base is not None else (),
+            blade_spine_depth=cfg.blade_spine_depth,
             cut_path_amplitude_y=cfg.cut_path_amplitude_y,
             cut_path_wavelength_x=cfg.cut_path_wavelength_x,
             cut_path_phase=cfg.cut_path_phase,

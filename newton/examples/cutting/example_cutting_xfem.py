@@ -127,6 +127,7 @@ class XFEMScenario:
     knife_center_z: float
     knife_half_width_y: float
     knife_half_width_z: float
+    blade_spine_depth: float
     process_width: float
     saw_amplitude_z: float
     saw_frequency_hz: float
@@ -206,6 +207,7 @@ SCENARIOS: dict[str, XFEMScenario] = {
         knife_center_z=0.22,
         knife_half_width_y=0.065,
         knife_half_width_z=0.24,
+        blade_spine_depth=0.18,
         process_width=0.06,
         saw_amplitude_z=0.0,
         saw_frequency_hz=0.0,
@@ -249,6 +251,7 @@ SCENARIOS: dict[str, XFEMScenario] = {
         knife_center_z=0.14,
         knife_half_width_y=0.06,
         knife_half_width_z=0.18,
+        blade_spine_depth=0.18,
         process_width=0.055,
         saw_amplitude_z=0.065,
         saw_frequency_hz=2.4,
@@ -294,6 +297,7 @@ SCENARIOS: dict[str, XFEMScenario] = {
         knife_center_z=0.035,
         knife_half_width_y=0.035,
         knife_half_width_z=0.090,
+        blade_spine_depth=0.18,
         process_width=0.040,
         saw_amplitude_z=0.0,
         saw_frequency_hz=0.0,
@@ -339,6 +343,7 @@ SCENARIOS: dict[str, XFEMScenario] = {
         knife_center_z=0.02,
         knife_half_width_y=0.030,
         knife_half_width_z=0.075,
+        blade_spine_depth=0.18,
         process_width=0.035,
         saw_amplitude_z=0.0,
         saw_frequency_hz=0.0,
@@ -389,9 +394,10 @@ SCENARIOS: dict[str, XFEMScenario] = {
         knife_speed=0.31,
         knife_center_y=-0.01,
         knife_center_z=0.038,
-        knife_half_width_y=0.036,
-        knife_half_width_z=0.095,
-        process_width=0.038,
+        knife_half_width_y=0.020,
+        knife_half_width_z=0.055,
+        blade_spine_depth=0.075,
+        process_width=0.026,
         saw_amplitude_z=0.0,
         saw_frequency_hz=0.0,
         fracture_energy=22.0,
@@ -446,6 +452,7 @@ SCENARIOS: dict[str, XFEMScenario] = {
         knife_center_z=0.12,
         knife_half_width_y=0.075,
         knife_half_width_z=0.17,
+        blade_spine_depth=0.18,
         process_width=0.07,
         saw_amplitude_z=0.05,
         saw_frequency_hz=1.8,
@@ -605,6 +612,7 @@ class Example:
             half_width_y=cfg.knife_half_width_y,
             half_width_z=cfg.knife_half_width_z,
             process_width=cfg.process_width,
+            blade_spine_depth=cfg.blade_spine_depth,
             cut_path_amplitude_y=cfg.cut_path_amplitude_y,
             cut_path_wavelength_x=cfg.cut_path_wavelength_x,
             cut_path_phase=cfg.cut_path_phase,
@@ -843,6 +851,7 @@ class Example:
             half_width_z=cfg.knife_half_width_z,
             process_width=cfg.process_width,
             edge_control_points=self.knife_profile.edge_control_points,
+            blade_spine_depth=cfg.blade_spine_depth,
             cut_path_amplitude_y=cfg.cut_path_amplitude_y,
             cut_path_wavelength_x=cfg.cut_path_wavelength_x,
             cut_path_phase=cfg.cut_path_phase,

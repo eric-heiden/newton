@@ -7,6 +7,8 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.geometry import ParticleFlags
+from newton._src.solvers.xfem_cut.kernels import apply_xfem_knife_kernel
 
 
 def _make_soft_block_model(device, *, dim_x=3, dim_y=2, dim_z=2):
@@ -140,6 +142,75 @@ class TestXFEMCutSolver(unittest.TestCase):
         self.assertGreater(np.count_nonzero(coupled), 0)
         self.assertGreater(float(np.mean(qd_after[coupled, 2])), 0.15)
         self.assertGreater(float(solver.force_accum.numpy()[4]), 0.0)
+
+    def test_knife_friction_drag_does_not_move_position_before_integrator(self):
+        device = wp.get_device()
+        particle_q = wp.array(np.array([[0.0, 0.0, 0.0]], dtype=np.float32), dtype=wp.vec3, device=device)
+        particle_qd = wp.zeros(1, dtype=wp.vec3, device=device)
+        particle_f = wp.zeros(1, dtype=wp.vec3, device=device)
+        particle_inv_mass = wp.array(np.array([1.0], dtype=np.float32), dtype=float, device=device)
+        particle_flags = wp.array(np.array([ParticleFlags.ACTIVE], dtype=np.int32), dtype=wp.int32, device=device)
+        particle_damage = wp.zeros(1, dtype=float, device=device)
+        particle_cut_side = wp.zeros(1, dtype=float, device=device)
+        particle_enrichment_q = wp.zeros(1, dtype=wp.vec3, device=device)
+        particle_enrichment_qd = wp.zeros(1, dtype=wp.vec3, device=device)
+        particle_colors = wp.zeros(1, dtype=wp.vec3, device=device)
+        force_accum = wp.zeros(6, dtype=float, device=device)
+        knife_edge_points = wp.array(
+            np.array([[0.0, 0.0, -0.1], [0.0, 0.0, 0.1]], dtype=np.float32),
+            dtype=wp.vec3,
+            device=device,
+        )
+
+        wp.launch(
+            apply_xfem_knife_kernel,
+            dim=1,
+            inputs=[
+                particle_q,
+                particle_qd,
+                particle_f,
+                particle_inv_mass,
+                particle_flags,
+                particle_damage,
+                particle_cut_side,
+                particle_enrichment_q,
+                particle_enrichment_qd,
+                particle_colors,
+                force_accum,
+                knife_edge_points,
+                2,
+                0.05,
+                0.0,
+                0.0,
+                0.05,
+                0.1,
+                0.1,
+                0.01,
+                1.0,
+                10.0,
+                10.0,
+                20.0,
+                80.0,
+                0.0,
+                0.0,
+                1.0,
+                0.04,
+                wp.vec3(0.0, 0.0, 1.0),
+                wp.vec3(0.0, 0.0, 1.0),
+                0.045,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+            ],
+            device=device,
+        )
+
+        q_after = particle_q.numpy()
+        qd_after = particle_qd.numpy()
+
+        np.testing.assert_allclose(q_after[0], np.zeros(3, dtype=np.float32), atol=1.0e-7)
+        self.assertGreater(float(qd_after[0, 2]), 0.0)
 
     def test_solver_accepts_rigid_spline_knife_edge(self):
         device = wp.get_device()

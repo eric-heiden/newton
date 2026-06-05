@@ -1,13 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-import unittest
 import inspect
+import sys
+import unittest
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.xfem_cut.kernels import apply_xfem_knife_kernel
+from newton._src.viewer.gl.opengl import MeshGL, RendererGL
+from newton.examples.cutting import generate_cutting_report_assets
 from newton.examples.cutting.cutting_common import (
     AdaptiveCutSurfaceRemesher,
     CutMaterial,
@@ -19,12 +23,9 @@ from newton.examples.cutting.cutting_common import (
     encode_mp4,
     summarize_force_profile,
 )
-from newton.examples.cutting.example_cutting_xfem import Example as XFEMExample
 from newton.examples.cutting.example_cutting_xfem import SCENARIOS, build_half_cylinder_tet_mesh
-from newton.examples.cutting import generate_cutting_report_assets
+from newton.examples.cutting.example_cutting_xfem import Example as XFEMExample
 from newton.solvers import SolverXFEMCut
-from newton._src.viewer.gl.opengl import MeshGL, RendererGL
-from newton._src.solvers.xfem_cut.kernels import apply_xfem_knife_kernel
 from newton.viewer import ViewerNull
 
 
@@ -249,8 +250,6 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertAlmostEqual(solver.particle_area, 0.25, places=5)
 
     def test_paper_tearing_cloth_stays_bounded_until_knife_engages(self):
-        import sys
-
         old_argv = sys.argv
         try:
             sys.argv = [
@@ -277,8 +276,6 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertGreater(max(example.force_history.active_counts), 0.0)
 
     def test_xfem_cloth_cut_disables_constraints_online(self):
-        import sys
-
         old_argv = sys.argv
         try:
             sys.argv = [
@@ -327,8 +324,6 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertGreater(cfg.wind_strength, 0.0)
 
     def test_hanging_cloth_cutoff_remeshes_online(self):
-        import sys
-
         old_argv = sys.argv
         try:
             sys.argv = [
@@ -369,8 +364,6 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertLess(float(np.mean(points[lower_panel, 1] - initial_points[lower_panel, 1])), -0.01)
 
     def test_curved_cloth_spline_cut_remeshes_online(self):
-        import sys
-
         old_argv = sys.argv
         try:
             sys.argv = [

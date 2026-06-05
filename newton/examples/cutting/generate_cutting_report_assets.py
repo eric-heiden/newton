@@ -133,8 +133,10 @@ def _knife_geometry(example, time_value: float) -> tuple[np.ndarray, np.ndarray,
     render_time = 0.0 if hasattr(example, "_knife_state") else time_value
     vertices, indices = knife.blade_mesh(render_time)
     edge_points = knife.edge_points(render_time)
-    return vertices.astype(np.float32, copy=False), indices.astype(np.int32, copy=False), edge_points.astype(
-        np.float32, copy=False
+    return (
+        vertices.astype(np.float32, copy=False),
+        indices.astype(np.int32, copy=False),
+        edge_points.astype(np.float32, copy=False),
     )
 
 
@@ -253,7 +255,7 @@ def _render_frame(
     surface_color: tuple[float, float, float],
     wall_color: tuple[float, float, float],
 ) -> np.ndarray:
-    import matplotlib
+    import matplotlib  # noqa: PLC0415
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # noqa: PLC0415
@@ -457,7 +459,7 @@ def _write_benchmark_plot(path: Path, rows: list[dict[str, object]]) -> None:
     if not rows:
         return
     try:
-        import matplotlib
+        import matplotlib  # noqa: PLC0415
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt  # noqa: PLC0415
@@ -466,13 +468,9 @@ def _write_benchmark_plot(path: Path, rows: list[dict[str, object]]) -> None:
 
     labels = [f"{row['method']} {row['case']}" for row in rows]
     step_ms = [float(row["mean_step_ms"]) for row in rows]
-    elements = [
-        max(int(row["particle_count"]) + int(row["tet_count"]) + int(row["tri_count"]), 1)
-        for row in rows
-    ]
+    elements = [max(int(row["particle_count"]) + int(row["tet_count"]) + int(row["tri_count"]), 1) for row in rows]
     colors = [
-        {"MPM": "#2563eb", "VBD": "#f97316", "X-FEM": "#16a34a"}.get(str(row["method"]), "#64748b")
-        for row in rows
+        {"MPM": "#2563eb", "VBD": "#f97316", "X-FEM": "#16a34a"}.get(str(row["method"]), "#64748b") for row in rows
     ]
 
     fig, (ax_ms, ax_scale) = plt.subplots(1, 2, figsize=(13.5, 4.8), dpi=150)
@@ -545,7 +543,7 @@ def _write_adaptive_remesh_plot(path: Path, root: Path) -> None:
         return
 
     try:
-        import matplotlib
+        import matplotlib  # noqa: PLC0415
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt  # noqa: PLC0415
@@ -615,7 +613,9 @@ def _run_benchmark_case(
             "spring_count": int(example.model.spring_count),
             "frame_count": int(frame_count),
             "substeps": int(getattr(example, "sim_substeps", 1)),
-            "iterations": int(getattr(example, "iterations", getattr(getattr(example, "solver", None), "iterations", 0))),
+            "iterations": int(
+                getattr(example, "iterations", getattr(getattr(example, "solver", None), "iterations", 0))
+            ),
             "sim_seconds": float(example.sim_time),
             "wall_seconds": wall_seconds,
             "mean_step_ms": float(1.0e3 * np.mean(step_times)) if step_times else 0.0,

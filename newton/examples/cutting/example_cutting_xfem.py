@@ -43,7 +43,7 @@ def build_half_cylinder_tet_mesh(length: float, radius: float, target_edge: floa
     """Build an extruded half-cylinder tetrahedral mesh with a flat table face."""
 
     try:
-        import gmsh
+        import gmsh  # noqa: PLC0415
     except ImportError as exc:
         raise RuntimeError("gmsh is required for half-cylinder cutting scenarios; install the examples extra") from exc
 

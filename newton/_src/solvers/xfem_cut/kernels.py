@@ -107,7 +107,7 @@ def _cut_path_signed_y(
 @wp.func
 def _knife_edge_process_weight(
     q: wp.vec3,
-    edge_points: wp.array(dtype=wp.vec3),
+    edge_points: wp.array[wp.vec3],
     edge_point_count: int,
     center_y: float,
     half_width_y: float,
@@ -149,18 +149,18 @@ def _knife_edge_process_weight(
 
 @wp.kernel
 def apply_xfem_knife_kernel(
-    particle_q: wp.array(dtype=wp.vec3),
-    particle_qd: wp.array(dtype=wp.vec3),
-    particle_f: wp.array(dtype=wp.vec3),
-    particle_inv_mass: wp.array(dtype=float),
-    particle_flags: wp.array(dtype=wp.int32),
-    particle_damage: wp.array(dtype=float),
-    particle_cut_side: wp.array(dtype=float),
-    particle_enrichment_q: wp.array(dtype=wp.vec3),
-    particle_enrichment_qd: wp.array(dtype=wp.vec3),
-    particle_colors: wp.array(dtype=wp.vec3),
-    force_accum: wp.array(dtype=float),
-    knife_edge_points: wp.array(dtype=wp.vec3),
+    particle_q: wp.array[wp.vec3],
+    particle_qd: wp.array[wp.vec3],
+    particle_f: wp.array[wp.vec3],
+    particle_inv_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_damage: wp.array[float],
+    particle_cut_side: wp.array[float],
+    particle_enrichment_q: wp.array[wp.vec3],
+    particle_enrichment_qd: wp.array[wp.vec3],
+    particle_colors: wp.array[wp.vec3],
+    force_accum: wp.array[float],
+    knife_edge_points: wp.array[wp.vec3],
     knife_edge_point_count: int,
     front_x: float,
     center_y: float,
@@ -235,12 +235,16 @@ def apply_xfem_knife_kernel(
 
     wake_weight = _xfem_smoothstep((front_x + process_width - q[0]) / wp.max(process_width, 1.0e-6))
     side_wall_distance = wp.abs(signed_distance)
-    near_cut_wall = _xfem_smoothstep((half_width_y + process_width - side_wall_distance) / wp.max(process_width, 1.0e-6))
+    near_cut_wall = _xfem_smoothstep(
+        (half_width_y + process_width - side_wall_distance) / wp.max(process_width, 1.0e-6)
+    )
     tangential_coupling = wp.max(front_weight, wake_weight * near_cut_wall * _xfem_smoothstep(new_damage))
     if tangential_coupling > 0.0:
         rel_tangent_speed = wp.dot(v - knife_velocity, tangent)
-        friction_force_signed = -knife_friction_mu * wp.abs(normal_force) * wp.tanh(
-            rel_tangent_speed / wp.max(friction_velocity_scale, 1.0e-6)
+        friction_force_signed = (
+            -knife_friction_mu
+            * wp.abs(normal_force)
+            * wp.tanh(rel_tangent_speed / wp.max(friction_velocity_scale, 1.0e-6))
         )
         friction_force = tangent * friction_force_signed
         tangent_speed_delta = wp.dot(knife_velocity, tangent) - wp.dot(v, tangent)
@@ -253,7 +257,6 @@ def apply_xfem_knife_kernel(
             drag_force_equiv = wp.abs(tangent_speed_delta * friction_drag_fraction) / (
                 particle_inv_mass[tid] * wp.max(dt, 1.0e-6)
             )
-            particle_q[tid] = q + friction_drag_velocity * dt
             particle_qd[tid] = (
                 v
                 + normal_dir * (separation_speed * delta_damage)
@@ -291,14 +294,14 @@ def apply_xfem_knife_kernel(
 
 @wp.kernel
 def classify_xfem_tets_kernel(
-    particle_q: wp.array(dtype=wp.vec3),
-    particle_damage: wp.array(dtype=float),
-    particle_cut_side: wp.array(dtype=float),
-    tet_indices: wp.array2d(dtype=wp.int32),
-    tet_cut_state: wp.array(dtype=wp.int32),
-    tet_damage: wp.array(dtype=float),
-    tet_cut_weight: wp.array(dtype=float),
-    knife_edge_points: wp.array(dtype=wp.vec3),
+    particle_q: wp.array[wp.vec3],
+    particle_damage: wp.array[float],
+    particle_cut_side: wp.array[float],
+    tet_indices: wp.array2d[wp.int32],
+    tet_cut_state: wp.array[wp.int32],
+    tet_damage: wp.array[float],
+    tet_cut_weight: wp.array[float],
+    knife_edge_points: wp.array[wp.vec3],
     knife_edge_point_count: int,
     front_x: float,
     center_y: float,
@@ -348,9 +351,7 @@ def classify_xfem_tets_kernel(
     wake_weight = _xfem_smoothstep((front_x + process_width - centroid[0]) / wp.max(process_width, 1.0e-6))
     weight = wp.max(front_weight, wake_weight)
 
-    mean_damage = 0.25 * (
-        particle_damage[i] + particle_damage[j] + particle_damage[k] + particle_damage[l]
-    )
+    mean_damage = 0.25 * (particle_damage[i] + particle_damage[j] + particle_damage[k] + particle_damage[l])
     old_tet_damage = tet_damage[tid]
     new_tet_damage = old_tet_damage
     state = tet_cut_state[tid]
@@ -377,10 +378,10 @@ def classify_xfem_tets_kernel(
 
 @wp.kernel
 def degrade_xfem_tets_kernel(
-    tet_cut_state: wp.array(dtype=wp.int32),
-    tet_damage: wp.array(dtype=float),
-    tet_materials: wp.array2d(dtype=float),
-    base_tet_materials: wp.array2d(dtype=float),
+    tet_cut_state: wp.array[wp.int32],
+    tet_damage: wp.array[float],
+    tet_materials: wp.array2d[float],
+    base_tet_materials: wp.array2d[float],
     residual_stiffness: float,
 ):
     tid = wp.tid()
@@ -445,14 +446,14 @@ def _rest_triangle_crosses_cloth_cut(
 
 @wp.kernel
 def cut_xfem_cloth_springs_kernel(
-    rest_particle_q: wp.array(dtype=wp.vec3),
-    spring_indices: wp.array(dtype=wp.int32),
-    spring_stiffness: wp.array(dtype=float),
-    spring_damping: wp.array(dtype=float),
-    base_spring_stiffness: wp.array(dtype=float),
-    base_spring_damping: wp.array(dtype=float),
-    spring_cut_state: wp.array(dtype=wp.int32),
-    cut_counts: wp.array(dtype=wp.int32),
+    rest_particle_q: wp.array[wp.vec3],
+    spring_indices: wp.array[wp.int32],
+    spring_stiffness: wp.array[float],
+    spring_damping: wp.array[float],
+    base_spring_stiffness: wp.array[float],
+    base_spring_damping: wp.array[float],
+    spring_cut_state: wp.array[wp.int32],
+    cut_counts: wp.array[wp.int32],
     front_x: float,
     center_y: float,
     center_z: float,
@@ -493,12 +494,12 @@ def cut_xfem_cloth_springs_kernel(
 
 @wp.kernel
 def cut_xfem_cloth_edges_kernel(
-    rest_particle_q: wp.array(dtype=wp.vec3),
-    edge_indices: wp.array2d(dtype=wp.int32),
-    edge_bending_properties: wp.array2d(dtype=float),
-    base_edge_bending_properties: wp.array2d(dtype=float),
-    edge_cut_state: wp.array(dtype=wp.int32),
-    cut_counts: wp.array(dtype=wp.int32),
+    rest_particle_q: wp.array[wp.vec3],
+    edge_indices: wp.array2d[wp.int32],
+    edge_bending_properties: wp.array2d[float],
+    base_edge_bending_properties: wp.array2d[float],
+    edge_cut_state: wp.array[wp.int32],
+    cut_counts: wp.array[wp.int32],
     front_x: float,
     center_y: float,
     center_z: float,
@@ -545,10 +546,10 @@ def cut_xfem_cloth_edges_kernel(
 
 @wp.kernel
 def cut_xfem_cloth_triangles_kernel(
-    rest_particle_q: wp.array(dtype=wp.vec3),
-    tri_indices: wp.array2d(dtype=wp.int32),
-    tri_cut_state: wp.array(dtype=wp.int32),
-    cut_counts: wp.array(dtype=wp.int32),
+    rest_particle_q: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    tri_cut_state: wp.array[wp.int32],
+    cut_counts: wp.array[wp.int32],
     front_x: float,
     center_y: float,
     center_z: float,
@@ -584,11 +585,11 @@ def cut_xfem_cloth_triangles_kernel(
 
 @wp.kernel
 def apply_xfem_cloth_wind_kernel(
-    particle_q: wp.array(dtype=wp.vec3),
-    particle_f: wp.array(dtype=wp.vec3),
-    particle_inv_mass: wp.array(dtype=float),
-    particle_flags: wp.array(dtype=wp.int32),
-    rest_particle_q: wp.array(dtype=wp.vec3),
+    particle_q: wp.array[wp.vec3],
+    particle_f: wp.array[wp.vec3],
+    particle_inv_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    rest_particle_q: wp.array[wp.vec3],
     strength: float,
     frequency_hz: float,
     time: float,
@@ -605,14 +606,14 @@ def apply_xfem_cloth_wind_kernel(
 
 @wp.kernel
 def apply_xfem_post_constraints_kernel(
-    particle_q: wp.array(dtype=wp.vec3),
-    particle_qd: wp.array(dtype=wp.vec3),
-    particle_inv_mass: wp.array(dtype=float),
-    particle_flags: wp.array(dtype=wp.int32),
-    rest_particle_q: wp.array(dtype=wp.vec3),
-    particle_damage: wp.array(dtype=float),
-    particle_cut_side: wp.array(dtype=float),
-    particle_enrichment_q: wp.array(dtype=wp.vec3),
+    particle_q: wp.array[wp.vec3],
+    particle_qd: wp.array[wp.vec3],
+    particle_inv_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    rest_particle_q: wp.array[wp.vec3],
+    particle_damage: wp.array[float],
+    particle_cut_side: wp.array[float],
+    particle_enrichment_q: wp.array[wp.vec3],
     front_x: float,
     center_y: float,
     process_width: float,
@@ -650,13 +651,16 @@ def apply_xfem_post_constraints_kernel(
         )
         current_sep = side * signed_distance
         if current_sep < min_sep:
-            normal_dir = _cut_path_normal_xy(
-                q[0],
-                path_amplitude_y,
-                path_wavelength_x,
-                path_phase,
-                path_origin_x,
-            ) * side
+            normal_dir = (
+                _cut_path_normal_xy(
+                    q[0],
+                    path_amplitude_y,
+                    path_wavelength_x,
+                    path_phase,
+                    path_origin_x,
+                )
+                * side
+            )
             q = q + normal_dir * (min_sep - current_sep)
             normal_velocity = wp.dot(qd, normal_dir)
             if normal_velocity < 0.0:

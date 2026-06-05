@@ -25,7 +25,6 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-
 MAX_KNIFE_EDGE_POINTS = 32
 
 
@@ -430,7 +429,9 @@ def _cutting_gap_at(x: float, knife_x: float, max_gap: float, front_width: float
     return max_gap * _cutting_smoothstep((knife_x - x) / front_width)
 
 
-def _cutting_visual_opening_y(x: float, side: float, knife_x: float, center_y: float, max_gap: float, front_width: float):
+def _cutting_visual_opening_y(
+    x: float, side: float, knife_x: float, center_y: float, max_gap: float, front_width: float
+):
     return center_y + side * _cutting_gap_at(x, knife_x, max_gap, front_width)
 
 
@@ -444,8 +445,8 @@ def _cutting_visual_opening_y_wp(
 @wp.func
 def _cutting_deform_from_particles(
     rest_point: wp.vec3,
-    rest_particle_points: wp.array(dtype=wp.vec3),
-    particle_points: wp.array(dtype=wp.vec3),
+    rest_particle_points: wp.array[wp.vec3],
+    particle_points: wp.array[wp.vec3],
     particle_count: int,
     side_center_y: float,
     side_hint: float,
@@ -479,15 +480,15 @@ def _cutting_deform_from_particles(
 
 @wp.func
 def _cutting_write_quad(
-    points: wp.array(dtype=wp.vec3),
-    indices: wp.array(dtype=wp.int32),
+    points: wp.array[wp.vec3],
+    indices: wp.array[wp.int32],
     quad_index: int,
     a: wp.vec3,
     b: wp.vec3,
     c: wp.vec3,
     d: wp.vec3,
-    rest_particle_points: wp.array(dtype=wp.vec3),
-    particle_points: wp.array(dtype=wp.vec3),
+    rest_particle_points: wp.array[wp.vec3],
+    particle_points: wp.array[wp.vec3],
     particle_count: int,
     side_center_y: float,
     side_hint: float,
@@ -515,7 +516,7 @@ def _cutting_write_quad(
 
 
 @wp.func
-def _cutting_write_empty_quad(points: wp.array(dtype=wp.vec3), indices: wp.array(dtype=wp.int32), quad_index: int):
+def _cutting_write_empty_quad(points: wp.array[wp.vec3], indices: wp.array[wp.int32], quad_index: int):
     vertex = quad_index * 4
     index = quad_index * 6
     zero = wp.vec3(0.0, 0.0, 0.0)
@@ -533,12 +534,12 @@ def _cutting_write_empty_quad(points: wp.array(dtype=wp.vec3), indices: wp.array
 
 @wp.kernel
 def _build_adaptive_cut_surface_kernel(
-    x_segments: wp.array(dtype=wp.vec2),
+    x_segments: wp.array[wp.vec2],
     active_segment_count: int,
-    points: wp.array(dtype=wp.vec3),
-    indices: wp.array(dtype=wp.int32),
-    rest_particle_points: wp.array(dtype=wp.vec3),
-    particle_points: wp.array(dtype=wp.vec3),
+    points: wp.array[wp.vec3],
+    indices: wp.array[wp.int32],
+    rest_particle_points: wp.array[wp.vec3],
+    particle_points: wp.array[wp.vec3],
     particle_count: int,
     block_lo: wp.vec3,
     block_hi: wp.vec3,
@@ -683,12 +684,12 @@ def _build_adaptive_cut_surface_kernel(
 
 @wp.kernel
 def _build_adaptive_cut_wall_kernel(
-    x_segments: wp.array(dtype=wp.vec2),
+    x_segments: wp.array[wp.vec2],
     wall_segment_count: int,
-    points: wp.array(dtype=wp.vec3),
-    indices: wp.array(dtype=wp.int32),
-    rest_particle_points: wp.array(dtype=wp.vec3),
-    particle_points: wp.array(dtype=wp.vec3),
+    points: wp.array[wp.vec3],
+    indices: wp.array[wp.int32],
+    rest_particle_points: wp.array[wp.vec3],
+    particle_points: wp.array[wp.vec3],
     particle_count: int,
     block_lo: wp.vec3,
     block_hi: wp.vec3,
@@ -1463,9 +1464,7 @@ class TetMeshCutSurfaceRenderer:
             prev_inside = inside(prev_rest)
 
             if curr_inside != prev_inside:
-                out_render.append(
-                    seam_point(prev_rest, prev_render, prev_inside, curr_rest, curr_render, curr_inside)
-                )
+                out_render.append(seam_point(prev_rest, prev_render, prev_inside, curr_rest, curr_render, curr_inside))
             if curr_inside:
                 out_render.append(curr_render.astype(np.float32, copy=False))
 
@@ -1829,11 +1828,9 @@ class ShellCutSurfaceRenderer:
 
     @staticmethod
     def _interpolate_triangle(triangle: np.ndarray, u: float, v: float) -> np.ndarray:
-        return (
-            triangle[0]
-            + float(u) * (triangle[1] - triangle[0])
-            + float(v) * (triangle[2] - triangle[0])
-        ).astype(np.float32)
+        return (triangle[0] + float(u) * (triangle[1] - triangle[0]) + float(v) * (triangle[2] - triangle[0])).astype(
+            np.float32
+        )
 
     def _iter_refined_triangle_patches(
         self,
@@ -2111,7 +2108,10 @@ class ShellCutSurfaceRenderer:
         edge_segments = 0
         active_triangles = 0
         front_scalar = self._front_scalar_fn(knife_x)
-        cut_scalar = lambda point: float(self.knife.signed_cut_y(np.asarray(point, dtype=np.float32)[None, :])[0])
+
+        def cut_scalar(point: np.ndarray) -> float:
+            return float(self.knife.signed_cut_y(np.asarray(point, dtype=np.float32)[None, :])[0])
+
         for tri_id, tri in enumerate(self.base_surface_triangles_np):
             rest_tri = self.rest_points[tri]
             signed = self.knife.signed_cut_y(rest_tri)
@@ -2126,7 +2126,7 @@ class ShellCutSurfaceRenderer:
                     render_positive_np[tri],
                     self.cut_refine_factor,
                 ):
-                    current_rest, current_render = self._clip_polygon_by_scalar(
+                    _current_rest, current_render = self._clip_polygon_by_scalar(
                         patch_rest,
                         patch_current,
                         front_scalar,
@@ -2251,7 +2251,9 @@ class ShellCutSurfaceRenderer:
         self.wall_points_wp.assign(self.wall_points_np)
         edge_count = self.last_edge_segment_count
         if self.render_surface_edges:
-            hidden_anchor = np.mean(self._current_points_np(current_points), axis=0, dtype=np.float64).astype(np.float32)
+            hidden_anchor = np.mean(self._current_points_np(current_points), axis=0, dtype=np.float64).astype(
+                np.float32
+            )
             edge_count = self._update_edge_overlay(hidden_anchor, stats.surface_triangle_count, edge_count=edge_count)
         self.edge_starts_wp.assign(self.edge_starts_np)
         self.edge_ends_wp.assign(self.edge_ends_np)
@@ -2395,7 +2397,7 @@ def summarize_force_profile(times: np.ndarray, forces: np.ndarray, damage: np.nd
 @wp.func
 def _knife_edge_process_weight(
     q: wp.vec3,
-    edge_points: wp.array(dtype=wp.vec3),
+    edge_points: wp.array[wp.vec3],
     edge_point_count: int,
     center_y: float,
     half_width_y: float,
@@ -2430,7 +2432,7 @@ def apply_mpm_knife_cut_kernel(
     damage: wp.array[wp.float32],
     colors: wp.array[wp.vec3],
     accum: wp.array[wp.float32],
-    knife_edge_points: wp.array(dtype=wp.vec3),
+    knife_edge_points: wp.array[wp.vec3],
     knife_edge_point_count: int,
     center_y: float,
     half_width_y: float,
@@ -2492,7 +2494,7 @@ def apply_vbd_knife_cut_kernel(
     damage: wp.array[wp.float32],
     colors: wp.array[wp.vec3],
     accum: wp.array[wp.float32],
-    knife_edge_points: wp.array(dtype=wp.vec3),
+    knife_edge_points: wp.array[wp.vec3],
     knife_edge_point_count: int,
     center_y: float,
     half_width_y: float,
@@ -2730,7 +2732,9 @@ class ForceHistory:
             has_components = bool(self.normal_forces or self.friction_forces)
             if has_components:
                 f.write("time_s,force_n,normal_force_n,friction_force_n,active_particles,mean_damage\n")
-                for i, row in enumerate(zip(self.times, self.forces, self.active_counts, self.mean_damage, strict=True)):
+                for i, row in enumerate(
+                    zip(self.times, self.forces, self.active_counts, self.mean_damage, strict=True)
+                ):
                     normal = self.normal_forces[i] if i < len(self.normal_forces) else 0.0
                     friction = self.friction_forces[i] if i < len(self.friction_forces) else 0.0
                     f.write(f"{row[0]:.8f},{row[1]:.8f},{normal:.8f},{friction:.8f},{row[2]:.0f},{row[3]:.8f}\n")

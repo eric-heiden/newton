@@ -548,6 +548,8 @@ def cut_xfem_cloth_edges_kernel(
 def cut_xfem_cloth_triangles_kernel(
     rest_particle_q: wp.array[wp.vec3],
     tri_indices: wp.array2d[wp.int32],
+    tri_materials: wp.array2d[float],
+    base_tri_materials: wp.array2d[float],
     tri_cut_state: wp.array[wp.int32],
     cut_counts: wp.array[wp.int32],
     front_x: float,
@@ -581,6 +583,17 @@ def cut_xfem_cloth_triangles_kernel(
     if should_cut and tri_cut_state[tid] == 0:
         tri_cut_state[tid] = 1
         wp.atomic_add(cut_counts, 2, 1)
+
+    if tri_cut_state[tid] != 0:
+        tri_materials[tid, 0] = 0.0
+        tri_materials[tid, 1] = 0.0
+        tri_materials[tid, 2] = 0.0
+    else:
+        tri_materials[tid, 0] = base_tri_materials[tid, 0]
+        tri_materials[tid, 1] = base_tri_materials[tid, 1]
+        tri_materials[tid, 2] = base_tri_materials[tid, 2]
+        tri_materials[tid, 3] = base_tri_materials[tid, 3]
+        tri_materials[tid, 4] = base_tri_materials[tid, 4]
 
 
 @wp.kernel

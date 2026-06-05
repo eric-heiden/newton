@@ -13,6 +13,7 @@ from ...core.types import override
 from ...sim import Contacts, Control, Model, State
 from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
+from ..vbd import SolverVBD
 from ..xpbd import SolverXPBD
 from .kernels import (
     apply_xfem_knife_kernel,
@@ -60,14 +61,16 @@ def _resample_polyline(points: np.ndarray, sample_count: int) -> np.ndarray:
 
 
 class SolverXFEMCut(SolverBase):
-    """Prototype X-FEM-style cutting solver for tetrahedral soft bodies.
+    """Prototype X-FEM-style cutting solver for soft solids and shell cloth.
 
-    The solver is a Newton solver with solver-owned cut and enrichment state. It
-    uses XPBD as the elastic tetrahedral backbone and surrounds it with Warp
-    kernels for shifted-Heaviside cut classification, enriched side displacement,
-    cohesive damage, material softening, knife friction, and table/glue
-    projection. This makes the prototype usable for real-time cutting
-    exploration while keeping the X-FEM data path explicit and extensible.
+    The solver owns cut and enrichment state, then delegates the underlying
+    material response to the appropriate Newton solver: XPBD for tetrahedral
+    soft solids and VBD for triangle shell cloth. Warp kernels add
+    shifted-Heaviside cut classification, enriched side displacement, cohesive
+    damage, online material/topology softening, knife friction, and table/glue
+    projection around that base solve. This keeps the X-FEM data path explicit
+    and extensible while preserving the material model expected by each mesh
+    type.
     """
 
     def __init__(
@@ -112,12 +115,16 @@ class SolverXFEMCut(SolverBase):
         self.table_glue_strength = float(table_glue_strength)
         self.table_friction = float(table_friction)
 
-        self._base_solver = SolverXPBD(
-            model,
-            iterations=self.iterations,
-            soft_body_relaxation=soft_body_relaxation,
-            enable_restitution=False,
-        )
+        self._uses_shell_cloth_solver = model.tet_count == 0 and model.tri_count > 0
+        if self._uses_shell_cloth_solver:
+            self._base_solver = SolverVBD(model, iterations=self.iterations, particle_enable_self_contact=False)
+        else:
+            self._base_solver = SolverXPBD(
+                model,
+                iterations=self.iterations,
+                soft_body_relaxation=soft_body_relaxation,
+                enable_restitution=False,
+            )
 
         self.rest_particle_q = wp.clone(model.particle_q) if model.particle_count else None
         self.particle_damage = wp.zeros(model.particle_count, dtype=float, device=model.device)
@@ -134,6 +141,9 @@ class SolverXFEMCut(SolverBase):
         self.base_tet_materials = wp.clone(model.tet_materials) if model.tet_count and model.tet_materials else None
 
         self.tri_cut_state = wp.zeros(model.tri_count, dtype=wp.int32, device=model.device)
+        self.base_tri_materials = (
+            wp.clone(model.tri_materials) if model.tri_count and model.tri_materials is not None else None
+        )
         self.spring_cut_state = wp.zeros(model.spring_count, dtype=wp.int32, device=model.device)
         self.edge_cut_state = wp.zeros(model.edge_count, dtype=wp.int32, device=model.device)
         self.base_spring_stiffness = (
@@ -277,7 +287,7 @@ class SolverXFEMCut(SolverBase):
 
     def _update_cloth_topology(self) -> None:
         model = self.model
-        if self.rest_particle_q is None:
+        if self.rest_particle_q is None or not self._uses_shell_cloth_solver:
             return
 
         self.cloth_cut_counts.zero_()
@@ -343,13 +353,20 @@ class SolverXFEMCut(SolverBase):
                 device=model.device,
             )
 
-        if model.tri_count and model.tri_indices is not None:
+        if (
+            model.tri_count
+            and model.tri_indices is not None
+            and model.tri_materials is not None
+            and self.base_tri_materials is not None
+        ):
             wp.launch(
                 cut_xfem_cloth_triangles_kernel,
                 dim=model.tri_count,
                 inputs=[
                     self.rest_particle_q,
                     model.tri_indices,
+                    model.tri_materials,
+                    self.base_tri_materials,
                     self.tri_cut_state,
                     self.cloth_cut_counts,
                     self.knife_front_x,

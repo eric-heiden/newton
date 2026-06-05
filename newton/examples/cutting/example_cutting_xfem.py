@@ -564,9 +564,7 @@ class Example:
                 tri_kd=cfg.k_damp,
                 edge_ke=max(0.015 * cfg.k_mu, 1.0),
                 edge_kd=cfg.k_damp,
-                add_springs=True,
-                spring_ke=cfg.k_mu,
-                spring_kd=max(cfg.k_damp, 1.0e-4),
+                add_springs=False,
                 particle_radius=args.particle_radius,
                 label=f"xfem_{cfg.name}",
             )

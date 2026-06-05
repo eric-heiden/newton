@@ -350,9 +350,9 @@ SCENARIOS: dict[str, XFEMScenario] = {
         fracture_energy=20.0,
         yield_stress=1.4e3,
         max_damage_rate=24.0,
-        separation_speed=0.16,
-        force_scale=0.14,
-        friction_mu=0.88,
+        separation_speed=0.0,
+        force_scale=0.020,
+        friction_mu=0.15,
         table_z=0.0,
         table_glue_depth=0.0,
         table_glue_strength=0.0,
@@ -403,9 +403,9 @@ SCENARIOS: dict[str, XFEMScenario] = {
         fracture_energy=22.0,
         yield_stress=1.45e3,
         max_damage_rate=22.0,
-        separation_speed=0.024,
-        force_scale=0.040,
-        friction_mu=0.32,
+        separation_speed=0.0,
+        force_scale=0.002,
+        friction_mu=0.03,
         table_z=0.0,
         table_glue_depth=0.0,
         table_glue_strength=0.0,
@@ -480,6 +480,154 @@ SCENARIOS: dict[str, XFEMScenario] = {
 }
 
 
+def _scenario_cut_center_y(cfg: XFEMScenario, x: float) -> float:
+    if abs(cfg.cut_path_amplitude_y) <= 1.0e-12:
+        return float(cfg.knife_center_y)
+    wavelength = max(abs(cfg.cut_path_wavelength_x), 1.0e-6)
+    phase = 2.0 * math.pi * (float(x) - cfg.cut_path_origin_x) / wavelength + cfg.cut_path_phase
+    return float(cfg.knife_center_y + cfg.cut_path_amplitude_y * math.sin(phase))
+
+
+def _scenario_cut_signed_y(cfg: XFEMScenario, point: np.ndarray) -> float:
+    x = float(point[0])
+    center_y = _scenario_cut_center_y(cfg, x)
+    if abs(cfg.cut_path_amplitude_y) <= 1.0e-12:
+        return float(point[1] - center_y)
+    wavelength = max(abs(cfg.cut_path_wavelength_x), 1.0e-6)
+    phase = 2.0 * math.pi * (x - cfg.cut_path_origin_x) / wavelength + cfg.cut_path_phase
+    slope = cfg.cut_path_amplitude_y * (2.0 * math.pi / wavelength) * math.cos(phase)
+    return float((point[1] - center_y) / math.sqrt(1.0 + slope * slope))
+
+
+def _build_virtual_node_cloth_grid(
+    cfg: XFEMScenario,
+) -> tuple[list[wp.vec3], list[int], list[tuple[int, int]]]:
+    """Build a cloth grid pre-split along the scenario cut path."""
+
+    base_vertices: list[np.ndarray] = []
+
+    def grid_index(x: int, y: int) -> int:
+        return y * (cfg.dim_x + 1) + x
+
+    for y in range(cfg.dim_y + 1):
+        for x in range(cfg.dim_x + 1):
+            base_vertices.append(
+                np.asarray(
+                    (
+                        cfg.block_pos[0] + x * cfg.cell_x,
+                        cfg.block_pos[1] + y * cfg.cell_y,
+                        cfg.block_pos[2],
+                    ),
+                    dtype=np.float32,
+                )
+            )
+
+    base_triangles: list[tuple[int, int, int]] = []
+    for y in range(1, cfg.dim_y + 1):
+        for x in range(1, cfg.dim_x + 1):
+            v0 = grid_index(x - 1, y - 1)
+            v1 = grid_index(x, y - 1)
+            v2 = grid_index(x, y)
+            v3 = grid_index(x - 1, y)
+            base_triangles.append((v0, v1, v3))
+            base_triangles.append((v1, v2, v3))
+
+    signed = np.asarray([_scenario_cut_signed_y(cfg, point) for point in base_vertices], dtype=np.float64)
+    snap_band = 0.10 * min(cfg.cell_x, cfg.cell_y)
+    signed[np.abs(signed) <= snap_band] = 0.0
+    vertices: list[np.ndarray] = []
+    indices: list[int] = []
+    seam_pairs: list[tuple[int, int]] = []
+    original_vertices: dict[tuple[int, int], int] = {}
+    intersections: dict[tuple[int, int], tuple[int, int]] = {}
+    eps = 1.0e-8
+
+    def append_vertex(point: np.ndarray) -> int:
+        vertices.append(np.asarray(point, dtype=np.float32))
+        return len(vertices) - 1
+
+    def side_key(side: int) -> int:
+        return 1 if side >= 0 else -1
+
+    def original_vertex(vertex_id: int, side: int) -> int:
+        key = (vertex_id, side_key(side))
+        if key not in original_vertices:
+            original_vertices[key] = append_vertex(base_vertices[vertex_id])
+            if abs(float(signed[vertex_id])) <= eps:
+                other_key = (vertex_id, -side_key(side))
+                if other_key in original_vertices:
+                    neg = original_vertices[(vertex_id, -1)]
+                    pos = original_vertices[(vertex_id, 1)]
+                    if neg != pos and (neg, pos) not in seam_pairs and (pos, neg) not in seam_pairs:
+                        seam_pairs.append((neg, pos))
+        return original_vertices[key]
+
+    def intersection_vertices(a: int, b: int) -> tuple[int, int]:
+        key = (min(a, b), max(a, b))
+        if key in intersections:
+            return intersections[key]
+        sa = float(signed[a])
+        sb = float(signed[b])
+        denom = sa - sb
+        alpha = 0.5 if abs(denom) <= eps else float(np.clip(sa / denom, 0.0, 1.0))
+        point = base_vertices[a] + alpha * (base_vertices[b] - base_vertices[a])
+        neg = append_vertex(point)
+        pos = append_vertex(point)
+        intersections[key] = (neg, pos)
+        seam_pairs.append((neg, pos))
+        return intersections[key]
+
+    def vertex_for_side(vertex_id: int, side: int) -> int:
+        if abs(float(signed[vertex_id])) <= eps:
+            return original_vertex(vertex_id, side)
+        return original_vertex(vertex_id, 1 if signed[vertex_id] > 0.0 else -1)
+
+    def polygon_for_side(triangle: tuple[int, int, int], side: int) -> list[int]:
+        keep_positive = side > 0
+        polygon: list[int] = []
+        for edge in range(3):
+            current = triangle[edge]
+            nxt = triangle[(edge + 1) % 3]
+            s_current = float(signed[current])
+            s_next = float(signed[nxt])
+            current_inside = s_current >= -eps if keep_positive else s_current <= eps
+            next_inside = s_next >= -eps if keep_positive else s_next <= eps
+            if current_inside:
+                polygon.append(vertex_for_side(current, side))
+            if current_inside != next_inside:
+                neg, pos = intersection_vertices(current, nxt)
+                polygon.append(pos if keep_positive else neg)
+        deduped: list[int] = []
+        for vertex in polygon:
+            if not deduped or vertex != deduped[-1]:
+                deduped.append(vertex)
+        if len(deduped) >= 2 and deduped[0] == deduped[-1]:
+            deduped.pop()
+        return deduped
+
+    def append_polygon(polygon: list[int]) -> None:
+        if len(polygon) < 3:
+            return
+        for i in range(1, len(polygon) - 1):
+            tri = (polygon[0], polygon[i], polygon[i + 1])
+            a, b, c = (vertices[index] for index in tri)
+            if float(np.linalg.norm(np.cross(b - a, c - a))) <= 1.0e-12:
+                continue
+            indices.extend(tri)
+
+    for triangle in base_triangles:
+        tri_signed = signed[list(triangle)]
+        if np.all(tri_signed >= -eps):
+            append_polygon([original_vertex(vertex, 1) for vertex in triangle])
+        elif np.all(tri_signed <= eps):
+            append_polygon([original_vertex(vertex, -1) for vertex in triangle])
+        else:
+            append_polygon(polygon_for_side(triangle, -1))
+            append_polygon(polygon_for_side(triangle, 1))
+
+    return [wp.vec3(float(v[0]), float(v[1]), float(v[2])) for v in vertices], indices, seam_pairs
+
+
 class Example:
     """X-FEM cut-cell/enrichment solver scenarios."""
 
@@ -546,19 +694,18 @@ class Example:
                 particle_radius=args.particle_radius,
             )
         elif cfg.geometry == "cloth_grid":
-            builder.add_cloth_grid(
-                pos=wp.vec3(*cfg.block_pos),
+            start_particle = len(builder.particle_q)
+            vertices, indices, seam_pairs = _build_virtual_node_cloth_grid(cfg)
+            total_area = cfg.cell_x * cfg.cell_y * cfg.dim_x * cfg.dim_y
+            total_mass = max(cfg.density, 1.0e-5) * (cfg.dim_x + 1) * (cfg.dim_y + 1)
+            builder.add_cloth_mesh(
+                pos=wp.vec3(0.0, 0.0, 0.0),
                 rot=wp.quat_identity(),
+                scale=1.0,
                 vel=wp.vec3(0.0, 0.0, 0.0),
-                dim_x=cfg.dim_x,
-                dim_y=cfg.dim_y,
-                cell_x=cfg.cell_x,
-                cell_y=cfg.cell_y,
-                mass=max(cfg.density, 1.0e-5),
-                fix_left=cfg.fix_left,
-                fix_right=cfg.fix_right,
-                fix_top=cfg.fix_top,
-                fix_bottom=cfg.fix_bottom,
+                vertices=vertices,
+                indices=indices,
+                density=total_mass / max(total_area, 1.0e-8),
                 tri_ke=cfg.k_mu,
                 tri_ka=cfg.k_lambda,
                 tri_kd=cfg.k_damp,
@@ -568,6 +715,28 @@ class Example:
                 particle_radius=args.particle_radius,
                 label=f"xfem_{cfg.name}",
             )
+            cohesive_ke = max(18.0 * cfg.k_mu, 2.5e3)
+            cohesive_kd = max(6.0 * cfg.k_damp, 2.0e-2)
+            for a, b in seam_pairs:
+                builder.add_spring(start_particle + a, start_particle + b, cohesive_ke, cohesive_kd, control=0.0)
+
+            x0 = float(cfg.block_pos[0])
+            y0 = float(cfg.block_pos[1])
+            x1 = x0 + cfg.dim_x * cfg.cell_x
+            y1 = y0 + cfg.dim_y * cfg.cell_y
+            for vertex_id, point in enumerate(vertices):
+                idx = start_particle + vertex_id
+                px = float(point[0])
+                py = float(point[1])
+                fixed = (
+                    (cfg.fix_left and abs(px - x0) <= 1.0e-6)
+                    or (cfg.fix_right and abs(px - x1) <= 1.0e-6)
+                    or (cfg.fix_bottom and abs(py - y0) <= 1.0e-6)
+                    or (cfg.fix_top and abs(py - y1) <= 1.0e-6)
+                )
+                if fixed:
+                    builder.particle_flags[idx] = builder.particle_flags[idx] & ~newton.ParticleFlags.ACTIVE
+                    builder.particle_mass[idx] = 0.0
         else:
             raise ValueError(f"Unsupported X-FEM geometry: {cfg.geometry}")
         builder.color()
@@ -787,7 +956,7 @@ class Example:
                     wall_color=cfg.wall_color,
                     front_x=front_x,
                     center_z=center_z,
-                    enrichment_points=self.solver.particle_enrichment_q,
+                    enrichment_points=None,
                     triangle_cut_state=self.solver.tri_cut_state,
                 )
                 self.remesh_history.append({"time_s": self.sim_time, **asdict(stats)})

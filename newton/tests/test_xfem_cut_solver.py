@@ -195,6 +195,7 @@ class TestXFEMCutSolver(unittest.TestCase):
                 0.0,
                 1.0,
                 0.04,
+                0.0,
                 wp.vec3(0.0, 0.0, 1.0),
                 wp.vec3(0.0, 0.0, 1.0),
                 0.045,

@@ -29,6 +29,13 @@ from newton.solvers import SolverVBD, SolverXFEMCut
 from newton.viewer import ViewerNull
 
 
+def _triangle_areas(points: np.ndarray, triangles: np.ndarray) -> np.ndarray:
+    a = points[triangles[:, 0]]
+    b = points[triangles[:, 1]]
+    c = points[triangles[:, 2]]
+    return 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
+
+
 class TestCuttingCommon(unittest.TestCase):
     def test_knife_cut_weights_are_localized_to_process_zone(self):
         knife = KnifeProfile(
@@ -203,7 +210,7 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertFalse(cfg.visual_topology_only)
         self.assertGreater(cfg.force_scale, 0.0)
         self.assertGreater(cfg.friction_mu, 0.0)
-        self.assertGreater(cfg.separation_speed, 0.0)
+        self.assertGreaterEqual(cfg.separation_speed, 0.0)
         self.assertGreaterEqual(cfg.render_cut_refine_factor, 3)
 
     def test_curved_cloth_spline_cut_uses_compact_turning_knife(self):
@@ -309,7 +316,7 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertIsInstance(base_solver, SolverVBD)
         self.assertGreater(float(np.max(example.model.tri_materials.numpy()[:, :2])), 0.0)
 
-    def test_xfem_cloth_cut_disables_membrane_triangles_online(self):
+    def test_xfem_cloth_uses_virtual_node_cohesive_seam(self):
         old_argv = sys.argv
         try:
             sys.argv = [
@@ -318,7 +325,37 @@ class TestCuttingCommon(unittest.TestCase):
                 "null",
                 "--quiet",
                 "--scenario",
-                "paper_tearing",
+                "hanging_cloth_cutoff",
+                "--num-frames",
+                "1",
+                "--no-render-split-mesh",
+            ]
+            viewer, args = newton.examples.init(XFEMExample.create_parser())
+            example = XFEMExample(viewer, args)
+            rest_lengths = (
+                example.model.spring_rest_length.numpy()
+                if example.model.spring_rest_length is not None
+                else np.zeros(0, dtype=np.float32)
+            )
+            viewer.close()
+        finally:
+            sys.argv = old_argv
+
+        self.assertGreater(example.model.spring_count, 0)
+        cfg = SCENARIOS["hanging_cloth_cutoff"]
+        self.assertGreater(example.model.particle_count, (cfg.dim_x + 1) * (cfg.dim_y + 1))
+        self.assertLess(float(np.max(rest_lengths)), 1.0e-6)
+
+    def test_xfem_cloth_cut_releases_cohesive_seam_springs_online(self):
+        old_argv = sys.argv
+        try:
+            sys.argv = [
+                "test_cutting_examples",
+                "--viewer",
+                "null",
+                "--quiet",
+                "--scenario",
+                "hanging_cloth_cutoff",
                 "--num-frames",
                 "1",
                 "--substeps",
@@ -329,18 +366,53 @@ class TestCuttingCommon(unittest.TestCase):
             ]
             viewer, args = newton.examples.init(XFEMExample.create_parser())
             example = XFEMExample(viewer, args)
-            base_tri_materials = example.solver.base_tri_materials.numpy().copy()
-            for _ in range(45):
+            self.assertGreater(example.model.spring_count, 0)
+            for _ in range(90):
                 example.step()
-            tri_cut = example.solver.tri_cut_state.numpy()
-            tri_materials = example.model.tri_materials.numpy()
+            spring_cut = example.solver.spring_cut_state.numpy()
+            spring_stiffness = example.model.spring_stiffness.numpy()
             viewer.close()
         finally:
             sys.argv = old_argv
 
-        self.assertGreater(int(np.sum(tri_cut)), 0)
-        self.assertTrue(np.all(tri_materials[tri_cut > 0, :2] == 0.0))
-        np.testing.assert_allclose(tri_materials[tri_cut == 0, :2], base_tri_materials[tri_cut == 0, :2])
+        self.assertGreater(int(np.sum(spring_cut)), 0)
+        self.assertLess(int(np.sum(spring_cut)), int(spring_cut.shape[0]))
+        self.assertTrue(np.all(spring_stiffness[spring_cut > 0] == 0.0))
+
+    def test_xfem_hanging_cloth_area_stays_bounded_after_cut_release(self):
+        old_argv = sys.argv
+        try:
+            sys.argv = [
+                "test_cutting_examples",
+                "--viewer",
+                "null",
+                "--quiet",
+                "--scenario",
+                "hanging_cloth_cutoff",
+                "--num-frames",
+                "1",
+                "--substeps",
+                "4",
+                "--iterations",
+                "4",
+                "--no-render-split-mesh",
+            ]
+            viewer, args = newton.examples.init(XFEMExample.create_parser())
+            example = XFEMExample(viewer, args)
+            rest = example.render_rest_particle_q_wp.numpy()
+            tris = example.model.tri_indices.numpy().reshape(-1, 3)
+            rest_area = _triangle_areas(rest, tris)
+            for _ in range(180):
+                example.step()
+            current = example.state_0.particle_q.numpy()
+            current_area = _triangle_areas(current, tris)
+            viewer.close()
+        finally:
+            sys.argv = old_argv
+
+        area_ratio = current_area / np.maximum(rest_area, 1.0e-12)
+        self.assertLess(float(current_area.sum() / rest_area.sum()), 1.08)
+        self.assertLess(float(np.max(area_ratio)), 2.0)
 
     def test_paper_tearing_cloth_stays_bounded_until_knife_engages(self):
         old_argv = sys.argv
@@ -368,7 +440,7 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertLess(float(np.max(np.linalg.norm(points, axis=1))), 2.0)
         self.assertGreater(max(example.force_history.active_counts), 0.0)
 
-    def test_xfem_cloth_cut_disables_constraints_online(self):
+    def test_xfem_cloth_cut_preserves_membrane_and_releases_cohesive_seam(self):
         old_argv = sys.argv
         try:
             sys.argv = [
@@ -393,23 +465,19 @@ class TestCuttingCommon(unittest.TestCase):
                 example.step()
             spring_cut = example.solver.spring_cut_state.numpy()
             edge_cut = example.solver.edge_cut_state.numpy()
-            tri_cut = example.solver.tri_cut_state.numpy()
             spring_stiffness = example.model.spring_stiffness.numpy() if example.model.spring_count else None
             edge_stiffness = example.model.edge_bending_properties.numpy()[:, 0]
             tri_materials = example.model.tri_materials.numpy()
+            base_tri_materials = example.solver.base_tri_materials.numpy()
             viewer.close()
         finally:
             sys.argv = old_argv
 
-        if example.model.spring_count:
-            self.assertGreater(int(np.sum(spring_cut)), 0)
-            self.assertTrue(np.all(spring_stiffness[spring_cut > 0] == 0.0))
-        else:
-            self.assertEqual(int(spring_cut.shape[0]), 0)
-        self.assertGreater(int(np.sum(edge_cut)), 0)
-        self.assertGreater(int(np.sum(tri_cut)), 0)
-        self.assertTrue(np.all(edge_stiffness[edge_cut > 0] == 0.0))
-        self.assertTrue(np.all(tri_materials[tri_cut > 0, :2] == 0.0))
+        self.assertGreater(int(np.sum(spring_cut)), 0)
+        self.assertTrue(np.all(spring_stiffness[spring_cut > 0] == 0.0))
+        if int(np.sum(edge_cut)) > 0:
+            self.assertTrue(np.all(edge_stiffness[edge_cut > 0] == 0.0))
+        np.testing.assert_allclose(tri_materials[:, :2], base_tri_materials[:, :2])
 
     def test_hanging_cloth_cutoff_scenario_is_top_fixed_with_wind(self):
         cfg = SCENARIOS["hanging_cloth_cutoff"]
@@ -455,12 +523,9 @@ class TestCuttingCommon(unittest.TestCase):
             sys.argv = old_argv
 
         self.assertEqual(example.model.up_axis, newton.Axis.Y)
-        if example.model.spring_count:
-            self.assertGreater(int(np.sum(spring_cut)), 0)
-        else:
-            self.assertEqual(int(spring_cut.shape[0]), 0)
-        self.assertGreater(int(np.sum(edge_cut)), 0)
-        self.assertGreater(int(np.sum(tri_cut)), 0)
+        self.assertGreater(int(np.sum(spring_cut)), 0)
+        self.assertGreaterEqual(int(np.sum(edge_cut)), 0)
+        self.assertGreaterEqual(int(np.sum(tri_cut)), 0)
         np.testing.assert_allclose(points[top_row], initial_points[top_row], atol=1.0e-6)
         self.assertLess(float(np.mean(points[lower_panel, 1] - initial_points[lower_panel, 1])), -0.01)
 
@@ -484,12 +549,17 @@ class TestCuttingCommon(unittest.TestCase):
             viewer, args = newton.examples.init(XFEMExample.create_parser())
             example = XFEMExample(viewer, args)
             initial_points = example.state_0.particle_q.numpy().copy()
+            rest_points = example.render_rest_particle_q_wp.numpy().copy()
+            tri_indices = example.model.tri_indices.numpy().reshape(-1, 3)
+            rest_area = _triangle_areas(rest_points, tri_indices)
             for _ in range(70):
                 example.step()
             spring_cut = example.solver.spring_cut_state.numpy()
             edge_cut = example.solver.edge_cut_state.numpy()
             tri_cut = example.solver.tri_cut_state.numpy()
             points = example.state_0.particle_q.numpy()
+            velocities = example.state_0.particle_qd.numpy()
+            current_area = _triangle_areas(points, tri_indices)
             solver_center_y = example.solver.knife_center_y
             max_force = max(example.force_history.forces)
             front_x, _center_y, center_z, _knife_velocity = example._knife_state(example.sim_time)
@@ -498,7 +568,7 @@ class TestCuttingCommon(unittest.TestCase):
                 example.sim_time,
                 front_x=front_x,
                 center_z=center_z,
-                enrichment_points=example.solver.particle_enrichment_q,
+                enrichment_points=None,
                 triangle_cut_state=example.solver.tri_cut_state,
             )
             rendered_points = example.render_split_mesh.surface_points_np[: remesh_stats.surface_vertex_count]
@@ -510,16 +580,18 @@ class TestCuttingCommon(unittest.TestCase):
         finally:
             sys.argv = old_argv
 
-        if example.model.spring_count:
-            self.assertGreater(int(np.sum(spring_cut)), 0)
-        else:
-            self.assertEqual(int(spring_cut.shape[0]), 0)
+        self.assertGreater(int(np.sum(spring_cut)), 0)
         self.assertGreater(int(np.sum(edge_cut)), 0)
         self.assertGreater(int(np.sum(tri_cut)), 0)
         self.assertAlmostEqual(float(solver_center_y), SCENARIOS["curved_cloth_spline_cut"].knife_center_y)
         self.assertGreater(float(max_force), 0.0)
+        self.assertTrue(np.isfinite(points).all())
+        self.assertTrue(np.isfinite(velocities).all())
         self.assertGreater(float(np.max(np.linalg.norm(points - initial_points, axis=1))), 1.0e-4)
         self.assertLess(float(np.max(np.ptp(points, axis=0))), 1.6)
+        area_ratio = current_area / np.maximum(rest_area, 1.0e-12)
+        self.assertLess(float(current_area.sum() / rest_area.sum()), 1.05)
+        self.assertLess(float(np.max(area_ratio)), 2.0)
         self.assertGreater(remesh_stats.surface_triangle_count, example.model.tri_count)
         self.assertEqual(remesh_stats.wall_triangle_count, 0)
         self.assertLess(float(np.max(max_rendered_triangle_span)), 0.09)

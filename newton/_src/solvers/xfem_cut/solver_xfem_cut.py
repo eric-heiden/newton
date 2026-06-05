@@ -86,6 +86,7 @@ class SolverXFEMCut(SolverBase):
         force_scale: float = 0.42,
         knife_friction_mu: float = 0.55,
         friction_velocity_scale: float = 0.08,
+        max_knife_velocity_delta: float | None = None,
         damage_threshold: float = 0.22,
         residual_stiffness: float = 0.08,
         max_enrichment: float = 0.045,
@@ -116,6 +117,10 @@ class SolverXFEMCut(SolverBase):
         self.table_friction = float(table_friction)
 
         self._uses_shell_cloth_solver = model.tet_count == 0 and model.tri_count > 0
+        if max_knife_velocity_delta is None:
+            self.max_knife_velocity_delta = 0.12 if self._uses_shell_cloth_solver else 0.0
+        else:
+            self.max_knife_velocity_delta = max(0.0, float(max_knife_velocity_delta))
         if self._uses_shell_cloth_solver:
             self._base_solver = SolverVBD(model, iterations=self.iterations, particle_enable_self_contact=False)
         else:
@@ -435,6 +440,7 @@ class SolverXFEMCut(SolverBase):
                     self.force_scale,
                     self.knife_friction_mu,
                     self.friction_velocity_scale,
+                    self.max_knife_velocity_delta,
                     wp.vec3(*self.knife_velocity),
                     wp.vec3(*self.knife_tangent),
                     self.max_enrichment,
@@ -453,7 +459,7 @@ class SolverXFEMCut(SolverBase):
 
         self._base_solver.step(state_in, state_out, control, contacts, dt)
 
-        if model.particle_count and self.rest_particle_q is not None:
+        if model.particle_count and self.rest_particle_q is not None and not self._uses_shell_cloth_solver:
             wp.launch(
                 apply_xfem_post_constraints_kernel,
                 dim=model.particle_count,

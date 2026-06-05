@@ -167,7 +167,7 @@ def _snapshot_render_geometry(example) -> tuple[dict[str, np.ndarray], dict[str,
             example.sim_time,
             front_x=front_x,
             center_z=center_z,
-            enrichment_points=getattr(getattr(example, "solver", None), "particle_enrichment_q", None),
+            enrichment_points=None,
             triangle_cut_state=getattr(getattr(example, "solver", None), "tri_cut_state", None),
         )
         surface_vertices = stats.surface_vertex_count

@@ -178,6 +178,7 @@ def apply_xfem_knife_kernel(
     force_scale: float,
     knife_friction_mu: float,
     friction_velocity_scale: float,
+    max_knife_velocity_delta: float,
     knife_velocity: wp.vec3,
     knife_tangent: wp.vec3,
     max_enrichment: float,
@@ -246,28 +247,46 @@ def apply_xfem_knife_kernel(
             * wp.abs(normal_force)
             * wp.tanh(rel_tangent_speed / wp.max(friction_velocity_scale, 1.0e-6))
         )
-        friction_force = tangent * friction_force_signed
+        force_scale_factor = float(1.0)
+        applied_force = normal_dir * normal_force + tangent * friction_force_signed
+        if particle_inv_mass[tid] > 0.0 and max_knife_velocity_delta > 0.0:
+            max_force = max_knife_velocity_delta / (particle_inv_mass[tid] * wp.max(dt, 1.0e-6))
+            applied_force_length = wp.length(applied_force)
+            if applied_force_length > max_force:
+                force_scale_factor = max_force / wp.max(applied_force_length, 1.0e-8)
+                applied_force = applied_force * force_scale_factor
+
         tangent_speed_delta = wp.dot(knife_velocity, tangent) - wp.dot(v, tangent)
         friction_drag_fraction = wp.min(1.0, knife_friction_mu * tangential_coupling * 85.0 * dt)
         friction_drag_velocity = tangent * (tangent_speed_delta * friction_drag_fraction)
+        direct_velocity_delta = normal_dir * (separation_speed * delta_damage) + friction_drag_velocity
+        velocity_delta = direct_velocity_delta
+        direct_velocity_scale = float(1.0)
 
-        particle_f[tid] = particle_f[tid] + normal_dir * normal_force + friction_force
+        particle_f[tid] = particle_f[tid] + applied_force
         drag_force_equiv = float(0.0)
         if particle_inv_mass[tid] > 0.0:
-            drag_force_equiv = wp.abs(tangent_speed_delta * friction_drag_fraction) / (
-                particle_inv_mass[tid] * wp.max(dt, 1.0e-6)
-            )
-            particle_qd[tid] = (
-                v
-                + normal_dir * (separation_speed * delta_damage)
-                + friction_force * particle_inv_mass[tid] * dt
-                + friction_drag_velocity
-            )
+            force_velocity_delta = applied_force * particle_inv_mass[tid] * dt
+            velocity_delta = velocity_delta + force_velocity_delta
+            if max_knife_velocity_delta > 0.0:
+                velocity_delta_length = wp.length(velocity_delta)
+                if velocity_delta_length > max_knife_velocity_delta:
+                    direct_velocity_scale = max_knife_velocity_delta / velocity_delta_length
+                    velocity_delta = velocity_delta * direct_velocity_scale
 
-        wp.atomic_add(force_accum, 0, wp.abs(normal_force) + wp.abs(friction_force_signed) + drag_force_equiv)
+            drag_force_equiv = (
+                wp.length(direct_velocity_delta) * direct_velocity_scale / (particle_inv_mass[tid] * wp.max(dt, 1.0e-6))
+            )
+            particle_qd[tid] = v + velocity_delta
+
+        wp.atomic_add(
+            force_accum,
+            0,
+            force_scale_factor * (wp.abs(normal_force) + wp.abs(friction_force_signed)) + drag_force_equiv,
+        )
         wp.atomic_add(force_accum, 1, tangential_coupling)
-        wp.atomic_add(force_accum, 3, wp.abs(normal_force))
-        wp.atomic_add(force_accum, 4, wp.abs(friction_force_signed) + drag_force_equiv)
+        wp.atomic_add(force_accum, 3, force_scale_factor * wp.abs(normal_force))
+        wp.atomic_add(force_accum, 4, force_scale_factor * wp.abs(friction_force_signed) + drag_force_equiv)
 
     if active:
         target_enrichment = normal_dir * (max_enrichment * _xfem_smoothstep(new_damage))
@@ -467,9 +486,20 @@ def cut_xfem_cloth_springs_kernel(
     tid = wp.tid()
     i = spring_indices[tid * 2 + 0]
     j = spring_indices[tid * 2 + 1]
-    should_cut = _rest_segment_crosses_cloth_cut(
-        rest_particle_q[i],
-        rest_particle_q[j],
+    qi = rest_particle_q[i]
+    qj = rest_particle_q[j]
+    mid = (qi + qj) * 0.5
+    zero_rest_seam = wp.length(qi - qj) <= 1.0e-7
+    seam_reached = (
+        zero_rest_seam
+        and mid[0] <= front_x + process_width
+        and wp.abs(mid[2] - center_z) <= half_width_z + process_width
+        and wp.abs(_cut_path_signed_y(mid, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x))
+        <= process_width
+    )
+    should_cut = seam_reached or _rest_segment_crosses_cloth_cut(
+        qi,
+        qj,
         front_x,
         center_y,
         center_z,
@@ -584,16 +614,11 @@ def cut_xfem_cloth_triangles_kernel(
         tri_cut_state[tid] = 1
         wp.atomic_add(cut_counts, 2, 1)
 
-    if tri_cut_state[tid] != 0:
-        tri_materials[tid, 0] = 0.0
-        tri_materials[tid, 1] = 0.0
-        tri_materials[tid, 2] = 0.0
-    else:
-        tri_materials[tid, 0] = base_tri_materials[tid, 0]
-        tri_materials[tid, 1] = base_tri_materials[tid, 1]
-        tri_materials[tid, 2] = base_tri_materials[tid, 2]
-        tri_materials[tid, 3] = base_tri_materials[tid, 3]
-        tri_materials[tid, 4] = base_tri_materials[tid, 4]
+    tri_materials[tid, 0] = base_tri_materials[tid, 0]
+    tri_materials[tid, 1] = base_tri_materials[tid, 1]
+    tri_materials[tid, 2] = base_tri_materials[tid, 2]
+    tri_materials[tid, 3] = base_tri_materials[tid, 3]
+    tri_materials[tid, 4] = base_tri_materials[tid, 4]
 
 
 @wp.kernel

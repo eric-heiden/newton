@@ -23,6 +23,7 @@ from .kernels import (
     cut_xfem_cloth_springs_kernel,
     cut_xfem_cloth_triangles_kernel,
     degrade_xfem_tets_kernel,
+    enforce_xfem_cloth_seam_collision_kernel,
 )
 
 __all__ = ["SolverXFEMCut"]
@@ -95,6 +96,8 @@ class SolverXFEMCut(SolverBase):
         table_glue_depth: float = 0.0,
         table_glue_strength: float = 0.0,
         table_friction: float = 0.8,
+        seam_collision_thickness: float | None = None,
+        seam_collision_damping: float = 1.0,
     ):
         super().__init__(model=model)
 
@@ -115,8 +118,15 @@ class SolverXFEMCut(SolverBase):
         self.table_glue_depth = float(table_glue_depth)
         self.table_glue_strength = float(table_glue_strength)
         self.table_friction = float(table_friction)
+        self.seam_collision_damping = float(seam_collision_damping)
 
         self._uses_shell_cloth_solver = model.tet_count == 0 and model.tri_count > 0
+        if seam_collision_thickness is None:
+            self.seam_collision_thickness = (
+                min(0.004, 0.18 * self.max_visual_gap) if self._uses_shell_cloth_solver else 0.0
+            )
+        else:
+            self.seam_collision_thickness = max(0.0, float(seam_collision_thickness))
         if max_knife_velocity_delta is None:
             self.max_knife_velocity_delta = 0.12 if self._uses_shell_cloth_solver else 0.0
         else:
@@ -458,6 +468,34 @@ class SolverXFEMCut(SolverBase):
             self._update_cloth_topology()
 
         self._base_solver.step(state_in, state_out, control, contacts, dt)
+
+        if (
+            self._uses_shell_cloth_solver
+            and self.rest_particle_q is not None
+            and self.seam_collision_thickness > 0.0
+            and model.spring_count
+            and model.spring_indices is not None
+        ):
+            wp.launch(
+                enforce_xfem_cloth_seam_collision_kernel,
+                dim=model.spring_count,
+                inputs=[
+                    state_out.particle_q,
+                    state_out.particle_qd,
+                    model.particle_inv_mass,
+                    model.particle_flags,
+                    self.rest_particle_q,
+                    model.spring_indices,
+                    self.spring_cut_state,
+                    self.seam_collision_thickness,
+                    self.seam_collision_damping,
+                    self.cut_path_amplitude_y,
+                    self.cut_path_wavelength_x,
+                    self.cut_path_phase,
+                    self.cut_path_origin_x,
+                ],
+                device=model.device,
+            )
 
         if model.particle_count and self.rest_particle_q is not None and not self._uses_shell_cloth_solver:
             wp.launch(

@@ -4,6 +4,7 @@
 import inspect
 import sys
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
@@ -179,6 +180,61 @@ class TestCuttingCommon(unittest.TestCase):
         self.assertIn("particle_count", source)
         self.assertIn("tet_count", source)
         self.assertIn("tri_count", source)
+
+    def test_report_generator_collects_cloth_quality_frame_stats(self):
+        device = wp.get_device()
+        rest = wp.array(
+            np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.2, -0.001, 0.0],
+                    [0.2, -0.001, 0.0],
+                ],
+                dtype=np.float32,
+            ),
+            dtype=wp.vec3,
+            device=device,
+        )
+        current = wp.array(
+            np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.2, 0.01, 0.0],
+                    [0.2, -0.01, 0.0],
+                ],
+                dtype=np.float32,
+            ),
+            dtype=wp.vec3,
+            device=device,
+        )
+        example = SimpleNamespace(
+            sim_time=0.25,
+            knife_profile=KnifeProfile(center_y=0.0),
+            render_rest_particle_q_wp=rest,
+            state_0=SimpleNamespace(particle_q=current),
+            model=SimpleNamespace(
+                tet_count=0,
+                tri_count=1,
+                tri_indices=wp.array(np.array([[0, 1, 2]], dtype=np.int32), dtype=wp.int32, device=device),
+                spring_count=1,
+                spring_indices=wp.array(np.array([3, 4], dtype=np.int32), dtype=wp.int32, device=device),
+            ),
+            solver=SimpleNamespace(
+                spring_cut_state=wp.array(np.array([1], dtype=np.int32), dtype=wp.int32, device=device)
+            ),
+        )
+
+        frame = generate_cutting_report_assets._collect_cloth_quality_frame(example)
+
+        self.assertIsNotNone(frame)
+        self.assertAlmostEqual(frame["total_area_ratio"], 1.0)
+        self.assertEqual(frame["released_seam_count"], 1)
+        self.assertLess(frame["min_released_seam_gap_m"], 0.0)
+        self.assertTrue(frame["finite_geometry"])
 
     def test_paper_tearing_scenario_is_wide_cloth_sheet(self):
         cfg = SCENARIOS["paper_tearing"]

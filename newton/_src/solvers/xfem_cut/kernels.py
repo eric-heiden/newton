@@ -622,6 +622,75 @@ def cut_xfem_cloth_triangles_kernel(
 
 
 @wp.kernel
+def enforce_xfem_cloth_seam_collision_kernel(
+    particle_q: wp.array[wp.vec3],
+    particle_qd: wp.array[wp.vec3],
+    particle_inv_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    rest_particle_q: wp.array[wp.vec3],
+    spring_indices: wp.array[wp.int32],
+    spring_cut_state: wp.array[wp.int32],
+    seam_collision_thickness: float,
+    seam_collision_damping: float,
+    path_amplitude_y: float,
+    path_wavelength_x: float,
+    path_phase: float,
+    path_origin_x: float,
+):
+    tid = wp.tid()
+    if spring_cut_state[tid] == 0 or seam_collision_thickness <= 0.0:
+        return
+
+    i = spring_indices[tid * 2 + 0]
+    j = spring_indices[tid * 2 + 1]
+    rest_i = rest_particle_q[i]
+    rest_j = rest_particle_q[j]
+    if wp.length(rest_i - rest_j) > 1.0e-7:
+        return
+
+    wi = float(0.0)
+    wj = float(0.0)
+    if (particle_flags[i] & ParticleFlags.ACTIVE) != 0 and particle_inv_mass[i] > 0.0:
+        wi = particle_inv_mass[i]
+    if (particle_flags[j] & ParticleFlags.ACTIVE) != 0 and particle_inv_mass[j] > 0.0:
+        wj = particle_inv_mass[j]
+    weight_sum = wi + wj
+    if weight_sum <= 0.0:
+        return
+
+    mid_rest = (rest_i + rest_j) * 0.5
+    normal = _cut_path_normal_xy(
+        mid_rest[0],
+        path_amplitude_y,
+        path_wavelength_x,
+        path_phase,
+        path_origin_x,
+    )
+
+    qi = particle_q[i]
+    qj = particle_q[j]
+    gap = wp.dot(qj - qi, normal)
+    if gap < seam_collision_thickness:
+        deficit = seam_collision_thickness - gap
+        qi = qi - normal * (deficit * wi / weight_sum)
+        qj = qj + normal * (deficit * wj / weight_sum)
+
+        qdi = particle_qd[i]
+        qdj = particle_qd[j]
+        rel_normal_velocity = wp.dot(qdj - qdi, normal)
+        damping = wp.min(1.0, wp.max(0.0, seam_collision_damping))
+        if rel_normal_velocity < 0.0 and damping > 0.0:
+            velocity_correction = -rel_normal_velocity * damping
+            qdi = qdi - normal * (velocity_correction * wi / weight_sum)
+            qdj = qdj + normal * (velocity_correction * wj / weight_sum)
+            particle_qd[i] = qdi
+            particle_qd[j] = qdj
+
+        particle_q[i] = qi
+        particle_q[j] = qj
+
+
+@wp.kernel
 def apply_xfem_cloth_wind_kernel(
     particle_q: wp.array[wp.vec3],
     particle_f: wp.array[wp.vec3],

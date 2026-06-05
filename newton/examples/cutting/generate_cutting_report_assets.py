@@ -389,6 +389,126 @@ def _bounds_from_snapshots(snapshots: list[dict[str, object]]) -> np.ndarray:
     return np.vstack([np.min(np.vstack(mins), axis=0), np.max(np.vstack(maxs), axis=0)]).astype(np.float32)
 
 
+def _triangle_areas(points: np.ndarray, triangles: np.ndarray) -> np.ndarray:
+    if len(triangles) == 0:
+        return np.zeros(0, dtype=np.float32)
+    a = points[triangles[:, 0]]
+    b = points[triangles[:, 1]]
+    c = points[triangles[:, 2]]
+    return (0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)).astype(np.float32, copy=False)
+
+
+def _collect_cloth_quality_frame(example) -> dict[str, float | int | bool] | None:
+    model = getattr(example, "model", None)
+    if model is None or getattr(model, "tet_count", 0) != 0 or getattr(model, "tri_count", 0) == 0:
+        return None
+    if getattr(model, "tri_indices", None) is None:
+        return None
+
+    rest_wp = getattr(example, "render_rest_particle_q_wp", None)
+    if rest_wp is None and hasattr(example, "solver"):
+        rest_wp = getattr(example.solver, "rest_particle_q", None)
+    if rest_wp is None:
+        return None
+
+    rest_points = rest_wp.numpy().astype(np.float32, copy=False)
+    current_points = example.state_0.particle_q.numpy().astype(np.float32, copy=False)
+    tri_indices = model.tri_indices.numpy().reshape(-1, 3).astype(np.int32, copy=False)
+    rest_area = _triangle_areas(rest_points, tri_indices)
+    current_area = _triangle_areas(current_points, tri_indices)
+    area_ratio = current_area / np.maximum(rest_area, 1.0e-12)
+    finite_ratio = area_ratio[np.isfinite(area_ratio)]
+
+    frame: dict[str, float | int | bool] = {
+        "time_s": float(getattr(example, "sim_time", 0.0)),
+        "triangle_count": int(tri_indices.shape[0]),
+        "finite_geometry": bool(np.isfinite(current_points).all() and np.isfinite(area_ratio).all()),
+        "total_area_m2": float(np.sum(current_area)),
+        "rest_area_m2": float(np.sum(rest_area)),
+        "total_area_ratio": float(np.sum(current_area) / max(float(np.sum(rest_area)), 1.0e-12)),
+        "max_triangle_area_ratio": float(np.max(finite_ratio)) if finite_ratio.size else 0.0,
+        "p99_triangle_area_ratio": float(np.percentile(finite_ratio, 99.0)) if finite_ratio.size else 0.0,
+        "min_triangle_area_m2": float(np.min(current_area)) if current_area.size else 0.0,
+        "max_triangle_area_m2": float(np.max(current_area)) if current_area.size else 0.0,
+        "released_seam_count": 0,
+        "min_released_seam_gap_m": 0.0,
+        "p05_released_seam_gap_m": 0.0,
+        "mean_released_seam_gap_m": 0.0,
+    }
+
+    solver = getattr(example, "solver", None)
+    if (
+        solver is None
+        or getattr(model, "spring_count", 0) == 0
+        or getattr(model, "spring_indices", None) is None
+        or getattr(solver, "spring_cut_state", None) is None
+    ):
+        return frame
+
+    spring_indices = model.spring_indices.numpy().reshape(-1, 2).astype(np.int32, copy=False)
+    spring_cut = solver.spring_cut_state.numpy().astype(np.int32, copy=False)
+    rest_delta = rest_points[spring_indices[:, 0]] - rest_points[spring_indices[:, 1]]
+    released = (np.linalg.norm(rest_delta, axis=1) <= 1.0e-7) & (spring_cut != 0)
+    if not np.any(released):
+        return frame
+
+    seam_pairs = spring_indices[released]
+    rest_mid = 0.5 * (rest_points[seam_pairs[:, 0]] + rest_points[seam_pairs[:, 1]])
+    knife = getattr(example, "knife_profile", None)
+    if knife is None:
+        normals = np.tile(np.array([[0.0, 1.0, 0.0]], dtype=np.float32), (seam_pairs.shape[0], 1))
+    else:
+        normals = np.asarray(knife.path_normal_at_x(rest_mid[:, 0]), dtype=np.float32)
+    gaps = np.einsum(
+        "ij,ij->i",
+        current_points[seam_pairs[:, 1]] - current_points[seam_pairs[:, 0]],
+        normals,
+    )
+    finite_gaps = gaps[np.isfinite(gaps)]
+    if finite_gaps.size:
+        frame["released_seam_count"] = int(finite_gaps.size)
+        frame["min_released_seam_gap_m"] = float(np.min(finite_gaps))
+        frame["p05_released_seam_gap_m"] = float(np.percentile(finite_gaps, 5.0))
+        frame["mean_released_seam_gap_m"] = float(np.mean(finite_gaps))
+    return frame
+
+
+def _summarize_cloth_quality_history(
+    frames: list[dict[str, float | int | bool]],
+) -> dict[str, float | int | bool | None]:
+    if not frames:
+        return {}
+    released_frames = [frame for frame in frames if int(frame.get("released_seam_count", 0)) > 0]
+    return {
+        "frame_count": int(len(frames)),
+        "finite_geometry": bool(all(bool(frame.get("finite_geometry", False)) for frame in frames)),
+        "max_total_area_ratio": float(max(float(frame["total_area_ratio"]) for frame in frames)),
+        "max_triangle_area_ratio": float(max(float(frame["max_triangle_area_ratio"]) for frame in frames)),
+        "max_p99_triangle_area_ratio": float(max(float(frame["p99_triangle_area_ratio"]) for frame in frames)),
+        "max_released_seam_count": int(max(int(frame.get("released_seam_count", 0)) for frame in frames)),
+        "min_released_seam_gap_m": (
+            float(min(float(frame["min_released_seam_gap_m"]) for frame in released_frames))
+            if released_frames
+            else None
+        ),
+        "min_p05_released_seam_gap_m": (
+            float(min(float(frame["p05_released_seam_gap_m"]) for frame in released_frames))
+            if released_frames
+            else None
+        ),
+    }
+
+
+def _write_cloth_quality_stats(
+    output_dir: Path, solver_name: str, frames: list[dict[str, float | int | bool]]
+) -> Path | None:
+    if not frames:
+        return None
+    path = output_dir / f"{solver_name}_cloth_quality_stats.json"
+    write_json(path, {"summary": _summarize_cloth_quality_history(frames), "frames": frames})
+    return path
+
+
 def _write_png(frame: np.ndarray, path: Path):
     try:
         from PIL import Image  # noqa: PLC0415
@@ -716,6 +836,7 @@ def _run_case(
         viewer.hide_loading_splash()
 
     frames: list[np.ndarray] = []
+    cloth_quality_frames: list[dict[str, float | int | bool]] = []
     step_times: list[float] = []
     render_times: list[float] = []
     try:
@@ -723,6 +844,9 @@ def _run_case(
             step_start = time.perf_counter()
             example.step()
             step_times.append(time.perf_counter() - step_start)
+            cloth_quality_frame = _collect_cloth_quality_frame(example)
+            if cloth_quality_frame is not None:
+                cloth_quality_frames.append(cloth_quality_frame)
 
             render_start = time.perf_counter()
             example.render()
@@ -755,6 +879,7 @@ def _run_case(
     (output_dir / f"{solver_name}_runtime_stats.json").write_text(stats.to_json() + "\n", encoding="utf-8")
     remesh_history = getattr(example, "remesh_history", [])
     remesh_path = export_remesh_artifacts(output_dir, solver_name, remesh_history)
+    cloth_quality_path = _write_cloth_quality_stats(output_dir, solver_name, cloth_quality_frames)
     print(
         f"{name}: {frame_count} frames, {example.model.particle_count} particles, "
         f"{example.model.tet_count} tets, peak {stats.peak_force_n:.2f} N, "
@@ -762,6 +887,8 @@ def _run_case(
     )
     if remesh_path is not None:
         print(f"{name}: remesh stats {remesh_path}")
+    if cloth_quality_path is not None:
+        print(f"{name}: cloth quality stats {cloth_quality_path}")
 
 
 def create_parser() -> argparse.ArgumentParser:

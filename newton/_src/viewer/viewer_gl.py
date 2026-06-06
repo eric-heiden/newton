@@ -1199,6 +1199,11 @@ class ViewerGL(ViewerBase):
         radius_scale: float = 1.0,
         thickness_scale: float = 1.0,
         smoothing_iterations: int = 2,
+        smoothing_radius: float = 1.0,
+        reflection_strength: float = 0.055,
+        refraction_strength: float = 0.018,
+        caustic_strength: float = 0.0,
+        caustic_scale: float = 55.0,
         hidden: bool = False,
     ):
         """Log particles for screen-space fluid rendering."""
@@ -1207,7 +1212,19 @@ class ViewerGL(ViewerBase):
         if points is None:
             if name in self.fluids:
                 self.fluids[name].update(
-                    None, None, color, opacity, radius_scale, thickness_scale, smoothing_iterations, True
+                    None,
+                    None,
+                    color,
+                    opacity,
+                    radius_scale,
+                    thickness_scale,
+                    smoothing_iterations,
+                    smoothing_radius,
+                    reflection_strength,
+                    refraction_strength,
+                    caustic_strength,
+                    caustic_scale,
+                    True,
                 )
             return
 
@@ -1218,7 +1235,19 @@ class ViewerGL(ViewerBase):
             self.fluids[name]._resize(max(count, self.fluids[name].capacity * 2))
 
         self.fluids[name].update(
-            points, radii, color, opacity, radius_scale, thickness_scale, smoothing_iterations, hidden
+            points,
+            radii,
+            color,
+            opacity,
+            radius_scale,
+            thickness_scale,
+            smoothing_iterations,
+            smoothing_radius,
+            reflection_strength,
+            refraction_strength,
+            caustic_strength,
+            caustic_scale,
+            hidden,
         )
 
     _SH_C0 = 0.28209479177387814

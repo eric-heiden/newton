@@ -73,6 +73,11 @@ class Example:
         self.viewer.fluid_radius_scale = args.fluid_radius_scale
         self.viewer.fluid_thickness_scale = args.fluid_thickness_scale
         self.viewer.fluid_smoothing_iterations = args.fluid_smoothing_iterations
+        self.viewer.fluid_smoothing_radius = args.fluid_smoothing_radius
+        self.viewer.fluid_reflection_strength = args.fluid_reflection_strength
+        self.viewer.fluid_refraction_strength = args.fluid_refraction_strength
+        self.viewer.fluid_caustic_strength = args.fluid_caustic_strength
+        self.viewer.fluid_caustic_scale = args.fluid_caustic_scale
         self.viewer.set_camera(pos=wp.vec3(args.camera_pos), pitch=args.camera_pitch, yaw=args.camera_yaw)
 
         if hasattr(self.viewer, "register_ui_callback"):
@@ -206,6 +211,11 @@ class Example:
         parser.add_argument("--fluid-radius-scale", type=float, default=1.35)
         parser.add_argument("--fluid-thickness-scale", type=float, default=1.8)
         parser.add_argument("--fluid-smoothing-iterations", type=int, default=4)
+        parser.add_argument("--fluid-smoothing-radius", type=float, default=1.4)
+        parser.add_argument("--fluid-reflection-strength", type=float, default=0.07)
+        parser.add_argument("--fluid-refraction-strength", type=float, default=0.022)
+        parser.add_argument("--fluid-caustic-strength", type=float, default=0.16)
+        parser.add_argument("--fluid-caustic-scale", type=float, default=70.0)
 
         parser.add_argument("--camera-pos", type=float, nargs=3, default=(1.15, -1.35, 0.78))
         parser.add_argument("--camera-pitch", type=float, default=-20.0)

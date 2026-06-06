@@ -959,6 +959,11 @@ class FluidGL:
         self.radius_scale = 1.0
         self.thickness_scale = 1.0
         self.smoothing_iterations = 2
+        self.smoothing_radius = 1.0
+        self.reflection_strength = 0.055
+        self.refraction_strength = 0.018
+        self.caustic_strength = 0.0
+        self.caustic_scale = 55.0
 
         self.vao = gl.GLuint()
         self.vbo = gl.GLuint()
@@ -994,6 +999,11 @@ class FluidGL:
         radius_scale: float,
         thickness_scale: float,
         smoothing_iterations: int,
+        smoothing_radius: float,
+        reflection_strength: float,
+        refraction_strength: float,
+        caustic_strength: float,
+        caustic_scale: float,
         hidden: bool,
     ):
         if points is None:
@@ -1013,6 +1023,11 @@ class FluidGL:
         self.radius_scale = float(max(radius_scale, 0.0))
         self.thickness_scale = float(max(thickness_scale, 0.0))
         self.smoothing_iterations = max(int(smoothing_iterations), 0)
+        self.smoothing_radius = float(max(smoothing_radius, 0.0))
+        self.reflection_strength = float(max(reflection_strength, 0.0))
+        self.refraction_strength = float(max(refraction_strength, 0.0))
+        self.caustic_strength = float(max(caustic_strength, 0.0))
+        self.caustic_scale = float(max(caustic_scale, 1.0))
 
         particle_data = np.empty((count, 4), dtype=np.float32)
         particle_data[:, :3] = points.numpy()
@@ -2020,7 +2035,9 @@ class RendererGL:
         gl.glDrawElements(gl.GL_TRIANGLES, len(self._frame_indices), gl.GL_UNSIGNED_INT, None)
         gl.glBindVertexArray(0)
 
-    def _blur_fluid_depth(self, source_texture, target_texture, direction: tuple[float, float]) -> None:
+    def _blur_fluid_depth(
+        self, source_texture, target_texture, direction: tuple[float, float], filter_radius: float
+    ) -> None:
         gl = RendererGL.gl
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._fluid_blur_fbo)
         gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, target_texture, 0)
@@ -2036,6 +2053,7 @@ class RendererGL:
                 texture_unit=0,
                 texel_size=(1.0 / max(self._screen_width, 1), 1.0 / max(self._screen_height, 1)),
                 direction=direction,
+                filter_radius=filter_radius,
                 max_depth_delta=0.25,
             )
             self._draw_frame_quad()
@@ -2106,9 +2124,9 @@ class RendererGL:
         depth_texture = self._fluid_depth_texture
         scratch_texture = self._fluid_depth_smooth_texture
         for _ in range(material_fluid.smoothing_iterations):
-            self._blur_fluid_depth(depth_texture, scratch_texture, (1.0, 0.0))
+            self._blur_fluid_depth(depth_texture, scratch_texture, (1.0, 0.0), material_fluid.smoothing_radius)
             depth_texture, scratch_texture = scratch_texture, depth_texture
-            self._blur_fluid_depth(depth_texture, scratch_texture, (0.0, 1.0))
+            self._blur_fluid_depth(depth_texture, scratch_texture, (0.0, 1.0), material_fluid.smoothing_radius)
             depth_texture, scratch_texture = scratch_texture, depth_texture
 
         # Composite over the frame color.
@@ -2141,8 +2159,10 @@ class RendererGL:
                 texel_size=(1.0 / max(self._screen_width, 1), 1.0 / max(self._screen_height, 1)),
                 water_color=material_fluid.color,
                 opacity=material_fluid.opacity,
-                reflection_strength=0.055,
-                refraction_strength=0.018,
+                reflection_strength=material_fluid.reflection_strength,
+                refraction_strength=material_fluid.refraction_strength,
+                caustic_strength=material_fluid.caustic_strength,
+                caustic_scale=material_fluid.caustic_scale,
                 sun_direction_view=(float(sun_view[0]), float(sun_view[1]), float(sun_view[2])),
             )
             self._draw_frame_quad()

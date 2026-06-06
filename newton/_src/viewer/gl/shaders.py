@@ -559,6 +559,7 @@ out float FragValue;
 uniform sampler2D depth_texture;
 uniform vec2 texel_size;
 uniform vec2 direction;
+uniform float filter_radius;
 uniform float max_depth_delta;
 
 void main()
@@ -574,7 +575,7 @@ void main()
     float weight_sum = weights[0];
 
     for (int i = 1; i < 5; ++i) {
-        vec2 offset = direction * texel_size * float(i);
+        vec2 offset = direction * texel_size * filter_radius * float(i);
         float d0 = texture(depth_texture, TexCoord + offset).r;
         float d1 = texture(depth_texture, TexCoord - offset).r;
         float w = weights[i];
@@ -607,6 +608,8 @@ uniform vec3 water_color;
 uniform float opacity;
 uniform float reflection_strength;
 uniform float refraction_strength;
+uniform float caustic_strength;
+uniform float caustic_scale;
 uniform vec3 sun_direction_view;
 
 vec3 reconstruct_view_pos(vec2 uv, float linear_depth)
@@ -635,6 +638,18 @@ vec3 fluid_normal(vec2 uv, float depth)
     return n;
 }
 
+float caustic_pattern(vec2 uv, vec3 n, float depth, float thickness)
+{
+    vec2 p = (uv + n.xy * 0.045 + vec2(depth * 0.013, -depth * 0.009)) * caustic_scale;
+    float a = sin(p.x + 0.65 * sin(p.y * 1.31));
+    float b = sin(0.73 * p.y + 0.55 * sin(p.x * 1.17));
+    float c = sin(1.42 * (p.x + p.y) + 0.4 * sin(p.x - p.y));
+    float lines = (a + b + c) / 3.0;
+    lines = smoothstep(0.52, 0.96, lines);
+    float focus = smoothstep(0.02, 0.22, thickness) * (1.0 - smoothstep(1.8, 4.5, thickness));
+    return lines * focus;
+}
+
 void main()
 {
     float depth = texture(fluid_depth_texture, TexCoord).r;
@@ -661,6 +676,7 @@ void main()
     vec3 water = mix(scene, water_color, 0.55);
     water = mix(water, reflected, clamp(0.18 + 0.65 * fresnel, 0.0, 0.85));
     water += vec3(spec);
+    water += caustic_strength * caustic_pattern(TexCoord, n, depth, thickness) * vec3(0.65, 0.9, 1.0);
 
     FragColor = vec4(mix(scene, water, alpha), 1.0);
 }
@@ -950,6 +966,7 @@ class FluidBlurShader(ShaderGL):
             self.loc_depth_texture = self._get_uniform_location("depth_texture")
             self.loc_texel_size = self._get_uniform_location("texel_size")
             self.loc_direction = self._get_uniform_location("direction")
+            self.loc_filter_radius = self._get_uniform_location("filter_radius")
             self.loc_max_depth_delta = self._get_uniform_location("max_depth_delta")
 
     def update(
@@ -957,12 +974,14 @@ class FluidBlurShader(ShaderGL):
         texture_unit: int,
         texel_size: tuple[float, float],
         direction: tuple[float, float],
+        filter_radius: float,
         max_depth_delta: float,
     ):
         with self:
             self._gl.glUniform1i(self.loc_depth_texture, texture_unit)
             self._gl.glUniform2f(self.loc_texel_size, texel_size[0], texel_size[1])
             self._gl.glUniform2f(self.loc_direction, direction[0], direction[1])
+            self._gl.glUniform1f(self.loc_filter_radius, float(filter_radius))
             self._gl.glUniform1f(self.loc_max_depth_delta, max_depth_delta)
 
 
@@ -987,6 +1006,8 @@ class FluidCompositeShader(ShaderGL):
             self.loc_opacity = self._get_uniform_location("opacity")
             self.loc_reflection_strength = self._get_uniform_location("reflection_strength")
             self.loc_refraction_strength = self._get_uniform_location("refraction_strength")
+            self.loc_caustic_strength = self._get_uniform_location("caustic_strength")
+            self.loc_caustic_scale = self._get_uniform_location("caustic_scale")
             self.loc_sun_direction_view = self._get_uniform_location("sun_direction_view")
 
     def update(
@@ -1000,6 +1021,8 @@ class FluidCompositeShader(ShaderGL):
         opacity: float,
         reflection_strength: float,
         refraction_strength: float,
+        caustic_strength: float,
+        caustic_scale: float,
         sun_direction_view: tuple[float, float, float],
     ):
         with self:
@@ -1012,6 +1035,8 @@ class FluidCompositeShader(ShaderGL):
             self._gl.glUniform1f(self.loc_opacity, float(opacity))
             self._gl.glUniform1f(self.loc_reflection_strength, float(reflection_strength))
             self._gl.glUniform1f(self.loc_refraction_strength, float(refraction_strength))
+            self._gl.glUniform1f(self.loc_caustic_strength, float(caustic_strength))
+            self._gl.glUniform1f(self.loc_caustic_scale, float(caustic_scale))
             self._gl.glUniform3f(self.loc_sun_direction_view, *sun_direction_view)
 
 

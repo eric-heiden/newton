@@ -152,6 +152,11 @@ class ViewerBase(ABC):
         self.fluid_radius_scale = 1.35
         self.fluid_thickness_scale = 1.0
         self.fluid_smoothing_iterations = 2
+        self.fluid_smoothing_radius = 1.0
+        self.fluid_reflection_strength = 0.055
+        self.fluid_refraction_strength = 0.018
+        self.fluid_caustic_strength = 0.0
+        self.fluid_caustic_scale = 55.0
 
         self.gaussians_max_points = 100_000  # Max number of points to visualize per gaussian
 
@@ -1206,6 +1211,11 @@ class ViewerBase(ABC):
         radius_scale: float = 1.0,
         thickness_scale: float = 1.0,
         smoothing_iterations: int = 2,
+        smoothing_radius: float = 1.0,
+        reflection_strength: float = 0.055,
+        refraction_strength: float = 0.018,
+        caustic_strength: float = 0.0,
+        caustic_scale: float = 55.0,
         hidden: bool = False,
     ):
         """Log particle samples as a fluid surface.
@@ -1223,6 +1233,11 @@ class ViewerBase(ABC):
             radius_scale: Rendering-only multiplier applied to particle radii.
             thickness_scale: Multiplier applied to accumulated optical thickness.
             smoothing_iterations: Number of screen-space depth smoothing passes.
+            smoothing_radius: Pixel-spacing multiplier for each bilateral blur tap.
+            reflection_strength: Strength of the screen-color reflection sample.
+            refraction_strength: Strength of the normal-based scene refraction offset.
+            caustic_strength: Strength of the procedural caustic highlight pattern.
+            caustic_scale: Spatial frequency of the procedural caustic pattern.
             hidden: Whether the fluid batch should be hidden.
         """
         self.log_points(name, points, radii=radii, colors=color, hidden=hidden)
@@ -2369,6 +2384,11 @@ class ViewerBase(ABC):
                     radius_scale=self.fluid_radius_scale,
                     thickness_scale=self.fluid_thickness_scale,
                     smoothing_iterations=self.fluid_smoothing_iterations,
+                    smoothing_radius=self.fluid_smoothing_radius,
+                    reflection_strength=self.fluid_reflection_strength,
+                    refraction_strength=self.fluid_refraction_strength,
+                    caustic_strength=self.fluid_caustic_strength,
+                    caustic_scale=self.fluid_caustic_scale,
                     hidden=False,
                 )
             else:

@@ -415,29 +415,6 @@ def degrade_xfem_tets_kernel(
 
 
 @wp.func
-def _rest_segment_crosses_cloth_cut(
-    qi: wp.vec3,
-    qj: wp.vec3,
-    front_x: float,
-    center_y: float,
-    center_z: float,
-    half_width_z: float,
-    process_width: float,
-    path_amplitude_y: float,
-    path_wavelength_x: float,
-    path_phase: float,
-    path_origin_x: float,
-):
-    yi = _cut_path_signed_y(qi, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
-    yj = _cut_path_signed_y(qj, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
-    crosses = yi * yj < 0.0
-    mid = (qi + qj) * 0.5
-    reached = mid[0] <= front_x + process_width
-    z_in = wp.abs(mid[2] - center_z) <= half_width_z + process_width
-    return crosses and reached and z_in
-
-
-@wp.func
 def _rest_triangle_crosses_cloth_cut(
     q0: wp.vec3,
     q1: wp.vec3,
@@ -461,65 +438,6 @@ def _rest_triangle_crosses_cloth_cut(
     reached = centroid[0] <= front_x + process_width
     z_in = wp.abs(centroid[2] - center_z) <= half_width_z + process_width
     return min_y < 0.0 and max_y > 0.0 and reached and z_in
-
-
-@wp.kernel
-def cut_xfem_cloth_springs_kernel(
-    rest_particle_q: wp.array[wp.vec3],
-    spring_indices: wp.array[wp.int32],
-    spring_stiffness: wp.array[float],
-    spring_damping: wp.array[float],
-    base_spring_stiffness: wp.array[float],
-    base_spring_damping: wp.array[float],
-    spring_cut_state: wp.array[wp.int32],
-    cut_counts: wp.array[wp.int32],
-    front_x: float,
-    center_y: float,
-    center_z: float,
-    half_width_z: float,
-    process_width: float,
-    path_amplitude_y: float,
-    path_wavelength_x: float,
-    path_phase: float,
-    path_origin_x: float,
-):
-    tid = wp.tid()
-    i = spring_indices[tid * 2 + 0]
-    j = spring_indices[tid * 2 + 1]
-    qi = rest_particle_q[i]
-    qj = rest_particle_q[j]
-    mid = (qi + qj) * 0.5
-    zero_rest_seam = wp.length(qi - qj) <= 1.0e-7
-    seam_reached = (
-        zero_rest_seam
-        and mid[0] <= front_x + process_width
-        and wp.abs(mid[2] - center_z) <= half_width_z + process_width
-        and wp.abs(_cut_path_signed_y(mid, center_y, path_amplitude_y, path_wavelength_x, path_phase, path_origin_x))
-        <= process_width
-    )
-    should_cut = seam_reached or _rest_segment_crosses_cloth_cut(
-        qi,
-        qj,
-        front_x,
-        center_y,
-        center_z,
-        half_width_z,
-        process_width,
-        path_amplitude_y,
-        path_wavelength_x,
-        path_phase,
-        path_origin_x,
-    )
-    if should_cut and spring_cut_state[tid] == 0:
-        spring_cut_state[tid] = 1
-        wp.atomic_add(cut_counts, 0, 1)
-
-    if spring_cut_state[tid] != 0:
-        spring_stiffness[tid] = 0.0
-        spring_damping[tid] = 0.0
-    else:
-        spring_stiffness[tid] = base_spring_stiffness[tid]
-        spring_damping[tid] = base_spring_damping[tid]
 
 
 @wp.kernel
@@ -622,72 +540,54 @@ def cut_xfem_cloth_triangles_kernel(
 
 
 @wp.kernel
-def enforce_xfem_cloth_seam_collision_kernel(
-    particle_q: wp.array[wp.vec3],
-    particle_qd: wp.array[wp.vec3],
-    particle_inv_mass: wp.array[float],
-    particle_flags: wp.array[wp.int32],
+def update_xfem_shell_enrichment_kernel(
     rest_particle_q: wp.array[wp.vec3],
-    spring_indices: wp.array[wp.int32],
-    spring_cut_state: wp.array[wp.int32],
-    seam_collision_thickness: float,
-    seam_collision_damping: float,
+    particle_flags: wp.array[wp.int32],
+    particle_enrichment_q: wp.array[wp.vec3],
+    particle_enrichment_qd: wp.array[wp.vec3],
+    front_x: float,
+    center_y: float,
+    center_z: float,
+    half_width_z: float,
+    process_width: float,
+    dt: float,
+    max_enrichment: float,
     path_amplitude_y: float,
     path_wavelength_x: float,
     path_phase: float,
     path_origin_x: float,
 ):
     tid = wp.tid()
-    if spring_cut_state[tid] == 0 or seam_collision_thickness <= 0.0:
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
         return
 
-    i = spring_indices[tid * 2 + 0]
-    j = spring_indices[tid * 2 + 1]
-    rest_i = rest_particle_q[i]
-    rest_j = rest_particle_q[j]
-    if wp.length(rest_i - rest_j) > 1.0e-7:
-        return
+    rest = rest_particle_q[tid]
+    reached = rest[0] <= front_x + process_width and wp.abs(rest[2] - center_z) <= half_width_z + process_width
+    q = particle_enrichment_q[tid]
+    qd = particle_enrichment_qd[tid]
+    if reached:
+        signed_distance = _cut_path_signed_y(
+            rest,
+            center_y,
+            path_amplitude_y,
+            path_wavelength_x,
+            path_phase,
+            path_origin_x,
+        )
+        side = _signed_side(signed_distance)
+        wake = _xfem_smoothstep((front_x + process_width - rest[0]) / wp.max(2.0 * process_width, 1.0e-6))
+        normal = _cut_path_normal_xy(rest[0], path_amplitude_y, path_wavelength_x, path_phase, path_origin_x)
+        target = normal * (side * max_enrichment * wake)
+        qd = qd * 0.88 + (target - q) * (42.0 * dt)
+        q = q + qd * dt
+        q_len = wp.length(q)
+        if q_len > max_enrichment:
+            q = q * (max_enrichment / wp.max(q_len, 1.0e-8))
+    else:
+        qd = qd * wp.max(0.0, 1.0 - 12.0 * dt)
 
-    wi = float(0.0)
-    wj = float(0.0)
-    if (particle_flags[i] & ParticleFlags.ACTIVE) != 0 and particle_inv_mass[i] > 0.0:
-        wi = particle_inv_mass[i]
-    if (particle_flags[j] & ParticleFlags.ACTIVE) != 0 and particle_inv_mass[j] > 0.0:
-        wj = particle_inv_mass[j]
-    weight_sum = wi + wj
-    if weight_sum <= 0.0:
-        return
-
-    mid_rest = (rest_i + rest_j) * 0.5
-    normal = _cut_path_normal_xy(
-        mid_rest[0],
-        path_amplitude_y,
-        path_wavelength_x,
-        path_phase,
-        path_origin_x,
-    )
-
-    qi = particle_q[i]
-    qj = particle_q[j]
-    gap = wp.dot(qj - qi, normal)
-    if gap < seam_collision_thickness:
-        deficit = seam_collision_thickness - gap
-        qi = qi - normal * (deficit * wi / weight_sum)
-        qj = qj + normal * (deficit * wj / weight_sum)
-
-        qdi = particle_qd[i]
-        qdj = particle_qd[j]
-        rel_normal_velocity = wp.dot(qdj - qdi, normal)
-        damping = wp.min(1.0, wp.max(0.0, seam_collision_damping))
-        if rel_normal_velocity < 0.0 and damping > 0.0:
-            velocity_correction = -rel_normal_velocity * damping
-            qdi = qdi - normal * (velocity_correction * wi / weight_sum)
-            qdj = qdj + normal * (velocity_correction * wj / weight_sum)
-            particle_qd[i] = qdi
-            particle_qd[j] = qdj
-
-        particle_q[i] = qi
-        particle_q[j] = qj
+    particle_enrichment_q[tid] = q
+    particle_enrichment_qd[tid] = qd
 
 
 @wp.kernel

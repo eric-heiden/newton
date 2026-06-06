@@ -20,10 +20,9 @@ from .kernels import (
     apply_xfem_post_constraints_kernel,
     classify_xfem_tets_kernel,
     cut_xfem_cloth_edges_kernel,
-    cut_xfem_cloth_springs_kernel,
     cut_xfem_cloth_triangles_kernel,
     degrade_xfem_tets_kernel,
-    enforce_xfem_cloth_seam_collision_kernel,
+    update_xfem_shell_enrichment_kernel,
 )
 
 __all__ = ["SolverXFEMCut"]
@@ -67,11 +66,11 @@ class SolverXFEMCut(SolverBase):
     The solver owns cut and enrichment state, then delegates the underlying
     material response to the appropriate Newton solver: XPBD for tetrahedral
     soft solids and VBD for triangle shell cloth. Warp kernels add
-    shifted-Heaviside cut classification, enriched side displacement, cohesive
-    damage, online material/topology softening, knife friction, and table/glue
-    projection around that base solve. This keeps the X-FEM data path explicit
-    and extensible while preserving the material model expected by each mesh
-    type.
+    shifted-Heaviside cut classification, enriched side displacement, cut-cell
+    quadrature descriptors, cohesive damage, online material/topology softening,
+    knife friction, and table/glue projection around that base solve. This
+    keeps the X-FEM data path explicit and extensible while preserving the
+    material model expected by each mesh type.
     """
 
     def __init__(
@@ -96,8 +95,6 @@ class SolverXFEMCut(SolverBase):
         table_glue_depth: float = 0.0,
         table_glue_strength: float = 0.0,
         table_friction: float = 0.8,
-        seam_collision_thickness: float | None = None,
-        seam_collision_damping: float = 1.0,
     ):
         super().__init__(model=model)
 
@@ -118,15 +115,8 @@ class SolverXFEMCut(SolverBase):
         self.table_glue_depth = float(table_glue_depth)
         self.table_glue_strength = float(table_glue_strength)
         self.table_friction = float(table_friction)
-        self.seam_collision_damping = float(seam_collision_damping)
 
         self._uses_shell_cloth_solver = model.tet_count == 0 and model.tri_count > 0
-        if seam_collision_thickness is None:
-            self.seam_collision_thickness = (
-                min(0.004, 0.18 * self.max_visual_gap) if self._uses_shell_cloth_solver else 0.0
-            )
-        else:
-            self.seam_collision_thickness = max(0.0, float(seam_collision_thickness))
         if max_knife_velocity_delta is None:
             self.max_knife_velocity_delta = 0.12 if self._uses_shell_cloth_solver else 0.0
         else:
@@ -159,20 +149,20 @@ class SolverXFEMCut(SolverBase):
         self.base_tri_materials = (
             wp.clone(model.tri_materials) if model.tri_count and model.tri_materials is not None else None
         )
-        self.spring_cut_state = wp.zeros(model.spring_count, dtype=wp.int32, device=model.device)
         self.edge_cut_state = wp.zeros(model.edge_count, dtype=wp.int32, device=model.device)
-        self.base_spring_stiffness = (
-            wp.clone(model.spring_stiffness) if model.spring_count and model.spring_stiffness is not None else None
-        )
-        self.base_spring_damping = (
-            wp.clone(model.spring_damping) if model.spring_count and model.spring_damping is not None else None
-        )
         self.base_edge_bending_properties = (
             wp.clone(model.edge_bending_properties)
             if model.edge_count and model.edge_bending_properties is not None
             else None
         )
         self.cloth_cut_counts = wp.zeros(3, dtype=wp.int32, device=model.device)
+        self.shell_quad_triangle_indices = wp.zeros(0, dtype=wp.int32, device=model.device)
+        self.shell_quad_barycentric = wp.zeros(0, dtype=wp.vec3, device=model.device)
+        self.shell_quad_side = wp.zeros(0, dtype=wp.int32, device=model.device)
+        self.shell_quad_area = wp.zeros(0, dtype=float, device=model.device)
+        self.shell_quad_count = 0
+        self.shell_quad_cut_triangle_count = 0
+        self.shell_quad_total_area = 0.0
 
         self.force_accum = wp.zeros(6, dtype=float, device=model.device)
         self.knife_edge_points = wp.zeros(MAX_XFEM_KNIFE_EDGE_POINTS, dtype=wp.vec3, device=model.device)
@@ -180,6 +170,39 @@ class SolverXFEMCut(SolverBase):
 
         self.particle_area = self._estimate_particle_area()
         self.set_knife_state(front_x=-1.0, center_y=0.0, center_z=0.0)
+
+    def set_shell_quadrature(
+        self,
+        *,
+        triangle_indices: np.ndarray,
+        barycentric_coords: np.ndarray,
+        side: np.ndarray,
+        area: np.ndarray,
+        cut_triangle_count: int = 0,
+    ) -> None:
+        """Attach fixed side-aware cut-cell quadrature for shell X-FEM scenes."""
+
+        tri_np = np.asarray(triangle_indices, dtype=np.int32).reshape(-1)
+        bary_np = np.asarray(barycentric_coords, dtype=np.float32).reshape(-1, 3)
+        side_np = np.asarray(side, dtype=np.int32).reshape(-1)
+        area_np = np.asarray(area, dtype=np.float32).reshape(-1)
+        count = int(tri_np.shape[0])
+        if bary_np.shape[0] != count or side_np.shape[0] != count or area_np.shape[0] != count:
+            raise ValueError("shell quadrature arrays must have matching lengths")
+        if count and (np.any(tri_np < 0) or np.any(tri_np >= self.model.tri_count)):
+            raise ValueError("shell quadrature triangle indices are out of range")
+        if count and not np.all(np.isfinite(bary_np)):
+            raise ValueError("shell quadrature barycentric coordinates must be finite")
+        if count and not np.all(np.isfinite(area_np)):
+            raise ValueError("shell quadrature areas must be finite")
+
+        self.shell_quad_triangle_indices = wp.array(tri_np, dtype=wp.int32, device=self.model.device)
+        self.shell_quad_barycentric = wp.array(bary_np, dtype=wp.vec3, device=self.model.device)
+        self.shell_quad_side = wp.array(side_np, dtype=wp.int32, device=self.model.device)
+        self.shell_quad_area = wp.array(area_np, dtype=float, device=self.model.device)
+        self.shell_quad_count = count
+        self.shell_quad_cut_triangle_count = int(cut_triangle_count)
+        self.shell_quad_total_area = float(np.sum(area_np)) if count else 0.0
 
     def _estimate_particle_area(self) -> float:
         if self.model.particle_count == 0 or self.model.particle_q is None:
@@ -307,39 +330,6 @@ class SolverXFEMCut(SolverBase):
 
         self.cloth_cut_counts.zero_()
         if (
-            model.spring_count
-            and model.spring_indices is not None
-            and model.spring_stiffness is not None
-            and model.spring_damping is not None
-            and self.base_spring_stiffness is not None
-            and self.base_spring_damping is not None
-        ):
-            wp.launch(
-                cut_xfem_cloth_springs_kernel,
-                dim=model.spring_count,
-                inputs=[
-                    self.rest_particle_q,
-                    model.spring_indices,
-                    model.spring_stiffness,
-                    model.spring_damping,
-                    self.base_spring_stiffness,
-                    self.base_spring_damping,
-                    self.spring_cut_state,
-                    self.cloth_cut_counts,
-                    self.knife_front_x,
-                    self.knife_center_y,
-                    self.knife_center_z,
-                    self.knife_half_width_z,
-                    self.knife_process_width,
-                    self.cut_path_amplitude_y,
-                    self.cut_path_wavelength_x,
-                    self.cut_path_phase,
-                    self.cut_path_origin_x,
-                ],
-                device=model.device,
-            )
-
-        if (
             model.edge_count
             and model.edge_indices is not None
             and model.edge_bending_properties is not None
@@ -464,31 +454,27 @@ class SolverXFEMCut(SolverBase):
 
         if model.tet_count:
             self._classify_and_degrade(state_in.particle_q)
-        if model.tri_count or model.spring_count or model.edge_count:
+        if model.tri_count or model.edge_count:
             self._update_cloth_topology()
 
         self._base_solver.step(state_in, state_out, control, contacts, dt)
 
-        if (
-            self._uses_shell_cloth_solver
-            and self.rest_particle_q is not None
-            and self.seam_collision_thickness > 0.0
-            and model.spring_count
-            and model.spring_indices is not None
-        ):
+        if self._uses_shell_cloth_solver and model.particle_count and self.rest_particle_q is not None:
             wp.launch(
-                enforce_xfem_cloth_seam_collision_kernel,
-                dim=model.spring_count,
+                update_xfem_shell_enrichment_kernel,
+                dim=model.particle_count,
                 inputs=[
-                    state_out.particle_q,
-                    state_out.particle_qd,
-                    model.particle_inv_mass,
-                    model.particle_flags,
                     self.rest_particle_q,
-                    model.spring_indices,
-                    self.spring_cut_state,
-                    self.seam_collision_thickness,
-                    self.seam_collision_damping,
+                    model.particle_flags,
+                    self.particle_enrichment_q,
+                    self.particle_enrichment_qd,
+                    self.knife_front_x,
+                    self.knife_center_y,
+                    self.knife_center_z,
+                    self.knife_half_width_z,
+                    self.knife_process_width,
+                    dt,
+                    self.max_visual_gap,
                     self.cut_path_amplitude_y,
                     self.cut_path_wavelength_x,
                     self.cut_path_phase,

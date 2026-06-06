@@ -5,6 +5,7 @@
 
 import argparse
 import math
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
 import numpy as np
@@ -185,6 +186,17 @@ class XFEMScenario:
         return 0.5 * self.dim_y * self.cell_y
 
 
+@dataclass(frozen=True)
+class ShellCutQuadrature:
+    """Side-aware quadrature records for one 2D X-FEM shell cut."""
+
+    triangle_indices: np.ndarray
+    barycentric_coords: np.ndarray
+    side: np.ndarray
+    area: np.ndarray
+    cut_triangle_count: int
+
+
 SCENARIOS: dict[str, XFEMScenario] = {
     "cuboid_slice": XFEMScenario(
         name="cuboid_slice",
@@ -286,9 +298,9 @@ SCENARIOS: dict[str, XFEMScenario] = {
         cell_y=0.035,
         cell_z=0.0,
         density=0.045,
-        k_mu=2.8e2,
-        k_lambda=2.8e2,
-        k_damp=3.5e-2,
+        k_mu=4.8e2,
+        k_lambda=4.8e2,
+        k_damp=5.0e-2,
         gravity=(0.0, 0.0, -1.2),
         fix_left=True,
         knife_start_x=-0.58,
@@ -304,9 +316,9 @@ SCENARIOS: dict[str, XFEMScenario] = {
         fracture_energy=24.0,
         yield_stress=1.6e3,
         max_damage_rate=20.0,
-        separation_speed=0.075,
-        force_scale=0.16,
-        friction_mu=0.78,
+        separation_speed=0.028,
+        force_scale=0.040,
+        friction_mu=0.28,
         table_z=0.0,
         table_glue_depth=0.0,
         table_glue_strength=0.0,
@@ -499,133 +511,157 @@ def _scenario_cut_signed_y(cfg: XFEMScenario, point: np.ndarray) -> float:
     return float((point[1] - center_y) / math.sqrt(1.0 + slope * slope))
 
 
-def _build_virtual_node_cloth_grid(
-    cfg: XFEMScenario,
-) -> tuple[list[wp.vec3], list[int], list[tuple[int, int]]]:
-    """Build a cloth grid pre-split along the scenario cut path."""
-
-    base_vertices: list[np.ndarray] = []
+def _build_regular_cloth_grid(cfg: XFEMScenario) -> tuple[list[wp.vec3], list[int]]:
+    vertices: list[wp.vec3] = []
 
     def grid_index(x: int, y: int) -> int:
         return y * (cfg.dim_x + 1) + x
 
     for y in range(cfg.dim_y + 1):
         for x in range(cfg.dim_x + 1):
-            base_vertices.append(
-                np.asarray(
-                    (
-                        cfg.block_pos[0] + x * cfg.cell_x,
-                        cfg.block_pos[1] + y * cfg.cell_y,
-                        cfg.block_pos[2],
-                    ),
-                    dtype=np.float32,
+            vertices.append(
+                wp.vec3(
+                    cfg.block_pos[0] + x * cfg.cell_x,
+                    cfg.block_pos[1] + y * cfg.cell_y,
+                    cfg.block_pos[2],
                 )
             )
 
-    base_triangles: list[tuple[int, int, int]] = []
+    indices: list[int] = []
     for y in range(1, cfg.dim_y + 1):
         for x in range(1, cfg.dim_x + 1):
             v0 = grid_index(x - 1, y - 1)
             v1 = grid_index(x, y - 1)
             v2 = grid_index(x, y)
             v3 = grid_index(x - 1, y)
-            base_triangles.append((v0, v1, v3))
-            base_triangles.append((v1, v2, v3))
+            indices.extend((v0, v1, v3))
+            indices.extend((v1, v2, v3))
 
-    signed = np.asarray([_scenario_cut_signed_y(cfg, point) for point in base_vertices], dtype=np.float64)
-    snap_band = 0.10 * min(cfg.cell_x, cfg.cell_y)
-    signed[np.abs(signed) <= snap_band] = 0.0
-    vertices: list[np.ndarray] = []
-    indices: list[int] = []
-    seam_pairs: list[tuple[int, int]] = []
-    original_vertices: dict[tuple[int, int], int] = {}
-    intersections: dict[tuple[int, int], tuple[int, int]] = {}
-    eps = 1.0e-8
+    return vertices, indices
 
-    def append_vertex(point: np.ndarray) -> int:
-        vertices.append(np.asarray(point, dtype=np.float32))
-        return len(vertices) - 1
 
-    def side_key(side: int) -> int:
-        return 1 if side >= 0 else -1
+def _triangle_area_3d(points: np.ndarray) -> float:
+    return float(0.5 * np.linalg.norm(np.cross(points[1] - points[0], points[2] - points[0])))
 
-    def original_vertex(vertex_id: int, side: int) -> int:
-        key = (vertex_id, side_key(side))
-        if key not in original_vertices:
-            original_vertices[key] = append_vertex(base_vertices[vertex_id])
-            if abs(float(signed[vertex_id])) <= eps:
-                other_key = (vertex_id, -side_key(side))
-                if other_key in original_vertices:
-                    neg = original_vertices[(vertex_id, -1)]
-                    pos = original_vertices[(vertex_id, 1)]
-                    if neg != pos and (neg, pos) not in seam_pairs and (pos, neg) not in seam_pairs:
-                        seam_pairs.append((neg, pos))
-        return original_vertices[key]
 
-    def intersection_vertices(a: int, b: int) -> tuple[int, int]:
-        key = (min(a, b), max(a, b))
-        if key in intersections:
-            return intersections[key]
-        sa = float(signed[a])
-        sb = float(signed[b])
-        denom = sa - sb
-        alpha = 0.5 if abs(denom) <= eps else float(np.clip(sa / denom, 0.0, 1.0))
-        point = base_vertices[a] + alpha * (base_vertices[b] - base_vertices[a])
-        neg = append_vertex(point)
-        pos = append_vertex(point)
-        intersections[key] = (neg, pos)
-        seam_pairs.append((neg, pos))
-        return intersections[key]
+def _dedupe_barycentric_polygon(polygon: list[np.ndarray], eps: float) -> list[np.ndarray]:
+    deduped: list[np.ndarray] = []
+    for bary in polygon:
+        if not deduped or float(np.linalg.norm(bary - deduped[-1])) > eps:
+            deduped.append(np.asarray(bary, dtype=np.float32))
+    if len(deduped) >= 2 and float(np.linalg.norm(deduped[0] - deduped[-1])) <= eps:
+        deduped.pop()
+    return deduped
 
-    def vertex_for_side(vertex_id: int, side: int) -> int:
-        if abs(float(signed[vertex_id])) <= eps:
-            return original_vertex(vertex_id, side)
-        return original_vertex(vertex_id, 1 if signed[vertex_id] > 0.0 else -1)
 
-    def polygon_for_side(triangle: tuple[int, int, int], side: int) -> list[int]:
-        keep_positive = side > 0
-        polygon: list[int] = []
-        for edge in range(3):
-            current = triangle[edge]
-            nxt = triangle[(edge + 1) % 3]
-            s_current = float(signed[current])
-            s_next = float(signed[nxt])
-            current_inside = s_current >= -eps if keep_positive else s_current <= eps
-            next_inside = s_next >= -eps if keep_positive else s_next <= eps
-            if current_inside:
-                polygon.append(vertex_for_side(current, side))
-            if current_inside != next_inside:
-                neg, pos = intersection_vertices(current, nxt)
-                polygon.append(pos if keep_positive else neg)
-        deduped: list[int] = []
-        for vertex in polygon:
-            if not deduped or vertex != deduped[-1]:
-                deduped.append(vertex)
-        if len(deduped) >= 2 and deduped[0] == deduped[-1]:
-            deduped.pop()
-        return deduped
+def _clip_triangle_barycentric_by_side(
+    signed: np.ndarray,
+    keep_positive: bool,
+    eps: float = 1.0e-8,
+) -> list[np.ndarray]:
+    bary = [
+        np.asarray((1.0, 0.0, 0.0), dtype=np.float32),
+        np.asarray((0.0, 1.0, 0.0), dtype=np.float32),
+        np.asarray((0.0, 0.0, 1.0), dtype=np.float32),
+    ]
+    polygon: list[np.ndarray] = []
 
-    def append_polygon(polygon: list[int]) -> None:
-        if len(polygon) < 3:
+    def inside(value: float) -> bool:
+        return value >= -eps if keep_positive else value <= eps
+
+    prev_bary = bary[-1]
+    prev_value = float(signed[-1])
+    prev_inside = inside(prev_value)
+    for index in range(3):
+        curr_bary = bary[index]
+        curr_value = float(signed[index])
+        curr_inside = inside(curr_value)
+        if curr_inside != prev_inside:
+            denom = prev_value - curr_value
+            alpha = 0.5 if abs(denom) <= eps else float(np.clip(prev_value / denom, 0.0, 1.0))
+            polygon.append(((1.0 - alpha) * prev_bary + alpha * curr_bary).astype(np.float32))
+        if curr_inside:
+            polygon.append(curr_bary.astype(np.float32, copy=False))
+        prev_bary = curr_bary
+        prev_value = curr_value
+        prev_inside = curr_inside
+
+    return _dedupe_barycentric_polygon(polygon, eps)
+
+
+def _build_shell_cut_quadrature(
+    rest_points: np.ndarray,
+    triangles: np.ndarray,
+    signed_distance_fn: Callable[[np.ndarray], float],
+    area_eps: float = 1.0e-12,
+) -> ShellCutQuadrature:
+    """Clip shell triangles against a cut and emit side-aware area quadrature."""
+
+    points = np.asarray(rest_points, dtype=np.float32)
+    tri_indices = np.asarray(triangles, dtype=np.int32).reshape(-1, 3)
+    parent_records: list[int] = []
+    bary_records: list[np.ndarray] = []
+    side_records: list[int] = []
+    area_records: list[float] = []
+    cut_triangle_count = 0
+
+    def append_subcell(parent: int, rest_tri: np.ndarray, polygon_bary: list[np.ndarray], side: int) -> None:
+        if len(polygon_bary) < 3:
             return
-        for i in range(1, len(polygon) - 1):
-            tri = (polygon[0], polygon[i], polygon[i + 1])
-            a, b, c = (vertices[index] for index in tri)
-            if float(np.linalg.norm(np.cross(b - a, c - a))) <= 1.0e-12:
+        anchor = polygon_bary[0]
+        for index in range(1, len(polygon_bary) - 1):
+            sub_bary = np.asarray([anchor, polygon_bary[index], polygon_bary[index + 1]], dtype=np.float32)
+            sub_points = sub_bary @ rest_tri
+            area = _triangle_area_3d(sub_points)
+            if area <= area_eps:
                 continue
-            indices.extend(tri)
+            parent_records.append(parent)
+            bary_records.append(np.mean(sub_bary, axis=0).astype(np.float32))
+            side_records.append(side)
+            area_records.append(area)
 
-    for triangle in base_triangles:
-        tri_signed = signed[list(triangle)]
-        if np.all(tri_signed >= -eps):
-            append_polygon([original_vertex(vertex, 1) for vertex in triangle])
-        elif np.all(tri_signed <= eps):
-            append_polygon([original_vertex(vertex, -1) for vertex in triangle])
-        else:
-            append_polygon(polygon_for_side(triangle, -1))
-            append_polygon(polygon_for_side(triangle, 1))
+    for tri_id, tri in enumerate(tri_indices):
+        rest_tri = points[tri]
+        signed = np.asarray([signed_distance_fn(point) for point in rest_tri], dtype=np.float64)
+        min_signed = float(np.min(signed))
+        max_signed = float(np.max(signed))
+        if min_signed >= -1.0e-8:
+            area = _triangle_area_3d(rest_tri)
+            if area > area_eps:
+                parent_records.append(tri_id)
+                bary_records.append(np.asarray((1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0), dtype=np.float32))
+                side_records.append(1)
+                area_records.append(area)
+            continue
+        if max_signed <= 1.0e-8:
+            area = _triangle_area_3d(rest_tri)
+            if area > area_eps:
+                parent_records.append(tri_id)
+                bary_records.append(np.asarray((1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0), dtype=np.float32))
+                side_records.append(-1)
+                area_records.append(area)
+            continue
 
-    return [wp.vec3(float(v[0]), float(v[1]), float(v[2])) for v in vertices], indices, seam_pairs
+        cut_triangle_count += 1
+        append_subcell(tri_id, rest_tri, _clip_triangle_barycentric_by_side(signed, keep_positive=False), -1)
+        append_subcell(tri_id, rest_tri, _clip_triangle_barycentric_by_side(signed, keep_positive=True), 1)
+
+    if not parent_records:
+        return ShellCutQuadrature(
+            triangle_indices=np.zeros(0, dtype=np.int32),
+            barycentric_coords=np.zeros((0, 3), dtype=np.float32),
+            side=np.zeros(0, dtype=np.int32),
+            area=np.zeros(0, dtype=np.float32),
+            cut_triangle_count=0,
+        )
+
+    return ShellCutQuadrature(
+        triangle_indices=np.asarray(parent_records, dtype=np.int32),
+        barycentric_coords=np.asarray(bary_records, dtype=np.float32),
+        side=np.asarray(side_records, dtype=np.int32),
+        area=np.asarray(area_records, dtype=np.float32),
+        cut_triangle_count=int(cut_triangle_count),
+    )
 
 
 class Example:
@@ -695,7 +731,7 @@ class Example:
             )
         elif cfg.geometry == "cloth_grid":
             start_particle = len(builder.particle_q)
-            vertices, indices, seam_pairs = _build_virtual_node_cloth_grid(cfg)
+            vertices, indices = _build_regular_cloth_grid(cfg)
             total_area = cfg.cell_x * cfg.cell_y * cfg.dim_x * cfg.dim_y
             total_mass = max(cfg.density, 1.0e-5) * (cfg.dim_x + 1) * (cfg.dim_y + 1)
             builder.add_cloth_mesh(
@@ -715,10 +751,6 @@ class Example:
                 particle_radius=args.particle_radius,
                 label=f"xfem_{cfg.name}",
             )
-            cohesive_ke = max(18.0 * cfg.k_mu, 2.5e3)
-            cohesive_kd = max(6.0 * cfg.k_damp, 2.0e-2)
-            for a, b in seam_pairs:
-                builder.add_spring(start_particle + a, start_particle + b, cohesive_ke, cohesive_kd, control=0.0)
 
             x0 = float(cfg.block_pos[0])
             y0 = float(cfg.block_pos[1])
@@ -785,6 +817,20 @@ class Example:
             cut_path_phase=cfg.cut_path_phase,
             cut_path_origin_x=cfg.cut_path_origin_x,
         )
+        self.shell_cut_quadrature: ShellCutQuadrature | None = None
+        if cfg.geometry == "cloth_grid" and self.model.tri_indices is not None:
+            self.shell_cut_quadrature = _build_shell_cut_quadrature(
+                self.render_rest_particle_q_wp.numpy(),
+                self.model.tri_indices.numpy().reshape(-1, 3),
+                lambda point: _scenario_cut_signed_y(cfg, point),
+            )
+            self.solver.set_shell_quadrature(
+                triangle_indices=self.shell_cut_quadrature.triangle_indices,
+                barycentric_coords=self.shell_cut_quadrature.barycentric_coords,
+                side=self.shell_cut_quadrature.side,
+                area=self.shell_cut_quadrature.area,
+                cut_triangle_count=self.shell_cut_quadrature.cut_triangle_count,
+            )
         if args.render_split_mesh and cfg.geometry == "half_cylinder":
             if self.model.tet_indices is None or self.model.tri_indices is None:
                 raise ValueError("half-cylinder X-FEM scenes require tetrahedra and generated surface triangles")
@@ -956,7 +1002,7 @@ class Example:
                     wall_color=cfg.wall_color,
                     front_x=front_x,
                     center_z=center_z,
-                    enrichment_points=None,
+                    enrichment_points=self.solver.particle_enrichment_q,
                     triangle_cut_state=self.solver.tri_cut_state,
                 )
                 self.remesh_history.append({"time_s": self.sim_time, **asdict(stats)})

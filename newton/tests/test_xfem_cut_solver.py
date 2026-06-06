@@ -8,7 +8,7 @@ import warp as wp
 
 import newton
 from newton._src.geometry import ParticleFlags
-from newton._src.solvers.xfem_cut.kernels import apply_xfem_knife_kernel, enforce_xfem_cloth_seam_collision_kernel
+from newton._src.solvers.xfem_cut.kernels import apply_xfem_knife_kernel
 
 
 def _make_soft_block_model(device, *, dim_x=3, dim_y=2, dim_z=2):
@@ -271,86 +271,6 @@ class TestXFEMCutSolver(unittest.TestCase):
         q_after = state_1.particle_q.numpy()
         rest = solver.rest_particle_q.numpy()
         np.testing.assert_allclose(q_after[bottom, 2], rest[bottom, 2], atol=1.0e-5)
-
-    def test_released_cloth_seam_collision_resolves_crossed_twins(self):
-        device = wp.get_device()
-        rest_particle_q = wp.array(
-            np.array(
-                [
-                    [0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0],
-                    [0.1, -0.001, 0.0],
-                    [0.1, -0.001, 0.0],
-                ],
-                dtype=np.float32,
-            ),
-            dtype=wp.vec3,
-            device=device,
-        )
-        particle_q = wp.array(
-            np.array(
-                [
-                    [0.0, 0.010, 0.0],
-                    [0.0, -0.010, 0.0],
-                    [0.1, 0.012, 0.0],
-                    [0.1, -0.012, 0.0],
-                ],
-                dtype=np.float32,
-            ),
-            dtype=wp.vec3,
-            device=device,
-        )
-        particle_qd = wp.array(
-            np.array(
-                [
-                    [0.0, 0.5, 0.0],
-                    [0.0, -0.5, 0.0],
-                    [0.0, 0.5, 0.0],
-                    [0.0, -0.5, 0.0],
-                ],
-                dtype=np.float32,
-            ),
-            dtype=wp.vec3,
-            device=device,
-        )
-        spring_indices = wp.array(np.array([0, 1, 2, 3], dtype=np.int32), dtype=wp.int32, device=device)
-        spring_cut_state = wp.array(np.array([1, 1], dtype=np.int32), dtype=wp.int32, device=device)
-        particle_inv_mass = wp.array(np.array([1.0, 1.0, 0.0, 1.0], dtype=np.float32), dtype=float, device=device)
-        particle_flags = wp.array(
-            np.array([ParticleFlags.ACTIVE, ParticleFlags.ACTIVE, 0, ParticleFlags.ACTIVE], dtype=np.int32),
-            dtype=wp.int32,
-            device=device,
-        )
-
-        wp.launch(
-            enforce_xfem_cloth_seam_collision_kernel,
-            dim=2,
-            inputs=[
-                particle_q,
-                particle_qd,
-                particle_inv_mass,
-                particle_flags,
-                rest_particle_q,
-                spring_indices,
-                spring_cut_state,
-                0.004,
-                1.0,
-                0.0,
-                1.0,
-                0.0,
-                0.0,
-            ],
-            device=device,
-        )
-
-        q_after = particle_q.numpy()
-        qd_after = particle_qd.numpy()
-
-        self.assertGreaterEqual(float(q_after[1, 1] - q_after[0, 1]), 0.004 - 1.0e-6)
-        self.assertGreaterEqual(float(qd_after[1, 1] - qd_after[0, 1]), -1.0e-6)
-        np.testing.assert_allclose(q_after[2], np.array([0.1, 0.012, 0.0], dtype=np.float32), atol=1.0e-7)
-        self.assertGreaterEqual(float(q_after[3, 1] - q_after[2, 1]), 0.004 - 1.0e-6)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -2067,6 +2067,8 @@ class ShellCutSurfaceRenderer:
         current_np = self._current_points_np(current_points)
         if current_np.shape != self.rest_points.shape:
             raise ValueError("current_points must match rest point shape")
+        rest_signed = self.knife.signed_cut_y(self.rest_points)[:, None]
+        rest_side = np.where(rest_signed >= 0.0, 1.0, -1.0).astype(np.float32)
         cut_state_np = None
         if triangle_cut_state is not None:
             if isinstance(triangle_cut_state, wp.array):
@@ -2082,14 +2084,10 @@ class ShellCutSurfaceRenderer:
             enrichment_np = self._current_points_np(enrichment_points)
             if enrichment_np.shape != self.rest_points.shape:
                 raise ValueError("enrichment_points must match rest point shape")
-            side_gap = np.minimum(np.abs(enrichment_np[:, 1:2]), self.max_visual_gap)
-            side_gap = np.maximum(side_gap, np.linalg.norm(enrichment_np, axis=1, keepdims=True) * 0.25)
-            side_gap = np.minimum(side_gap, self.max_visual_gap)
-            y_axis = np.asarray((0.0, 1.0, 0.0), dtype=np.float32)
-            render_negative_np = current_np - side_gap * y_axis
-            render_positive_np = current_np + side_gap * y_axis
-        rest_signed = self.knife.signed_cut_y(self.rest_points)[:, None]
-        rest_side = np.where(rest_signed >= 0.0, 1.0, -1.0).astype(np.float32)
+            opening = np.minimum(np.linalg.norm(enrichment_np, axis=1, keepdims=True), self.max_visual_gap)
+            normals = np.asarray(self.knife.path_normal_at_x(self.rest_points[:, 0]), dtype=np.float32)
+            render_negative_np = current_np - opening * normals
+            render_positive_np = current_np + opening * normals
         render_np = np.where(rest_side > 0.0, render_positive_np, render_negative_np)
 
         hidden_anchor = np.mean(current_np, axis=0, dtype=np.float64).astype(np.float32)

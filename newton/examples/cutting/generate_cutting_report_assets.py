@@ -157,7 +157,29 @@ def _snapshot_render_geometry(example) -> tuple[dict[str, np.ndarray], dict[str,
             "wall_indices": np.zeros((0, 3), dtype=np.int32),
         }, {}
 
-    if isinstance(render_mesh, (TetMeshCutSurfaceRenderer, ShellCutSurfaceRenderer)):
+    if isinstance(render_mesh, TetMeshCutSurfaceRenderer):
+        front_x = None
+        center_z = None
+        if hasattr(example, "_knife_state"):
+            front_x, _center_y, center_z, _velocity = example._knife_state(example.sim_time)
+        enrichment_points = getattr(getattr(example, "solver", None), "particle_enrichment_q", None)
+        stats = render_mesh.update(
+            example.state_0.particle_q,
+            example.sim_time,
+            front_x=front_x,
+            center_z=center_z,
+            enrichment_points=enrichment_points,
+        )
+        surface_vertices = stats.surface_vertex_count
+        wall_vertices = stats.wall_vertex_count
+        return {
+            "surface_points": render_mesh.surface_points_np[:surface_vertices].copy(),
+            "surface_indices": np.arange(surface_vertices, dtype=np.int32).reshape(-1, 3),
+            "wall_points": render_mesh.wall_points_np[:wall_vertices].copy(),
+            "wall_indices": np.arange(wall_vertices, dtype=np.int32).reshape(-1, 3),
+        }, asdict(stats)
+
+    if isinstance(render_mesh, ShellCutSurfaceRenderer):
         front_x = None
         center_z = None
         if hasattr(example, "_knife_state"):
@@ -167,7 +189,7 @@ def _snapshot_render_geometry(example) -> tuple[dict[str, np.ndarray], dict[str,
             example.sim_time,
             front_x=front_x,
             center_z=center_z,
-            enrichment_points=None,
+            enrichment_points=getattr(getattr(example, "solver", None), "particle_enrichment_q", None),
             triangle_cut_state=getattr(getattr(example, "solver", None), "tri_cut_state", None),
         )
         surface_vertices = stats.surface_vertex_count
@@ -430,46 +452,44 @@ def _collect_cloth_quality_frame(example) -> dict[str, float | int | bool] | Non
         "p99_triangle_area_ratio": float(np.percentile(finite_ratio, 99.0)) if finite_ratio.size else 0.0,
         "min_triangle_area_m2": float(np.min(current_area)) if current_area.size else 0.0,
         "max_triangle_area_m2": float(np.max(current_area)) if current_area.size else 0.0,
-        "released_seam_count": 0,
-        "min_released_seam_gap_m": 0.0,
-        "p05_released_seam_gap_m": 0.0,
-        "mean_released_seam_gap_m": 0.0,
+        "enriched_cut_quadrature_count": 0,
+        "min_enriched_opening_m": 0.0,
+        "p05_enriched_opening_m": 0.0,
+        "mean_enriched_opening_m": 0.0,
+        "max_enriched_opening_m": 0.0,
     }
 
     solver = getattr(example, "solver", None)
-    if (
-        solver is None
-        or getattr(model, "spring_count", 0) == 0
-        or getattr(model, "spring_indices", None) is None
-        or getattr(solver, "spring_cut_state", None) is None
-    ):
+    if solver is None or getattr(solver, "particle_enrichment_q", None) is None:
         return frame
 
-    spring_indices = model.spring_indices.numpy().reshape(-1, 2).astype(np.int32, copy=False)
-    spring_cut = solver.spring_cut_state.numpy().astype(np.int32, copy=False)
-    rest_delta = rest_points[spring_indices[:, 0]] - rest_points[spring_indices[:, 1]]
-    released = (np.linalg.norm(rest_delta, axis=1) <= 1.0e-7) & (spring_cut != 0)
-    if not np.any(released):
+    quad_count = int(getattr(solver, "shell_quad_count", 0))
+    if quad_count <= 0:
         return frame
 
-    seam_pairs = spring_indices[released]
-    rest_mid = 0.5 * (rest_points[seam_pairs[:, 0]] + rest_points[seam_pairs[:, 1]])
-    knife = getattr(example, "knife_profile", None)
-    if knife is None:
-        normals = np.tile(np.array([[0.0, 1.0, 0.0]], dtype=np.float32), (seam_pairs.shape[0], 1))
+    quad_tri = solver.shell_quad_triangle_indices.numpy().astype(np.int32, copy=False)[:quad_count]
+    quad_bary = solver.shell_quad_barycentric.numpy().astype(np.float32, copy=False)[:quad_count]
+    quad_area = solver.shell_quad_area.numpy().astype(np.float32, copy=False)[:quad_count]
+    if getattr(solver, "tri_cut_state", None) is not None:
+        tri_cut_state = solver.tri_cut_state.numpy().astype(np.int32, copy=False)
+        active = (quad_tri >= 0) & (quad_tri < tri_cut_state.shape[0]) & (tri_cut_state[quad_tri] != 0)
     else:
-        normals = np.asarray(knife.path_normal_at_x(rest_mid[:, 0]), dtype=np.float32)
-    gaps = np.einsum(
-        "ij,ij->i",
-        current_points[seam_pairs[:, 1]] - current_points[seam_pairs[:, 0]],
-        normals,
-    )
-    finite_gaps = gaps[np.isfinite(gaps)]
-    if finite_gaps.size:
-        frame["released_seam_count"] = int(finite_gaps.size)
-        frame["min_released_seam_gap_m"] = float(np.min(finite_gaps))
-        frame["p05_released_seam_gap_m"] = float(np.percentile(finite_gaps, 5.0))
-        frame["mean_released_seam_gap_m"] = float(np.mean(finite_gaps))
+        active = np.ones(quad_tri.shape[0], dtype=bool)
+    active &= quad_area > 1.0e-12
+    if not np.any(active):
+        return frame
+
+    enrichment = solver.particle_enrichment_q.numpy().astype(np.float32, copy=False)
+    quad_vertices = tri_indices[quad_tri[active]]
+    quad_enrichment = np.einsum("ij,ijk->ik", quad_bary[active], enrichment[quad_vertices])
+    openings = 2.0 * np.linalg.norm(quad_enrichment, axis=1)
+    finite_openings = openings[np.isfinite(openings)]
+    if finite_openings.size:
+        frame["enriched_cut_quadrature_count"] = int(finite_openings.size)
+        frame["min_enriched_opening_m"] = float(np.min(finite_openings))
+        frame["p05_enriched_opening_m"] = float(np.percentile(finite_openings, 5.0))
+        frame["mean_enriched_opening_m"] = float(np.mean(finite_openings))
+        frame["max_enriched_opening_m"] = float(np.max(finite_openings))
     return frame
 
 
@@ -478,22 +498,29 @@ def _summarize_cloth_quality_history(
 ) -> dict[str, float | int | bool | None]:
     if not frames:
         return {}
-    released_frames = [frame for frame in frames if int(frame.get("released_seam_count", 0)) > 0]
+    enriched_frames = [frame for frame in frames if int(frame.get("enriched_cut_quadrature_count", 0)) > 0]
     return {
         "frame_count": int(len(frames)),
         "finite_geometry": bool(all(bool(frame.get("finite_geometry", False)) for frame in frames)),
         "max_total_area_ratio": float(max(float(frame["total_area_ratio"]) for frame in frames)),
         "max_triangle_area_ratio": float(max(float(frame["max_triangle_area_ratio"]) for frame in frames)),
         "max_p99_triangle_area_ratio": float(max(float(frame["p99_triangle_area_ratio"]) for frame in frames)),
-        "max_released_seam_count": int(max(int(frame.get("released_seam_count", 0)) for frame in frames)),
-        "min_released_seam_gap_m": (
-            float(min(float(frame["min_released_seam_gap_m"]) for frame in released_frames))
-            if released_frames
+        "max_enriched_cut_quadrature_count": int(
+            max(int(frame.get("enriched_cut_quadrature_count", 0)) for frame in frames)
+        ),
+        "min_enriched_opening_m": (
+            float(min(float(frame["min_enriched_opening_m"]) for frame in enriched_frames))
+            if enriched_frames
             else None
         ),
-        "min_p05_released_seam_gap_m": (
-            float(min(float(frame["p05_released_seam_gap_m"]) for frame in released_frames))
-            if released_frames
+        "min_p05_enriched_opening_m": (
+            float(min(float(frame["p05_enriched_opening_m"]) for frame in enriched_frames))
+            if enriched_frames
+            else None
+        ),
+        "max_enriched_opening_m": (
+            float(max(float(frame["max_enriched_opening_m"]) for frame in enriched_frames))
+            if enriched_frames
             else None
         ),
     }

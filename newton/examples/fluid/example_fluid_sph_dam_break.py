@@ -76,6 +76,7 @@ class Example:
         self.viewer.fluid_smoothing_radius = args.fluid_smoothing_radius
         self.viewer.fluid_reflection_strength = args.fluid_reflection_strength
         self.viewer.fluid_refraction_strength = args.fluid_refraction_strength
+        self.viewer.fluid_env_map_strength = args.fluid_env_map_strength
         self.viewer.fluid_caustic_strength = args.fluid_caustic_strength
         self.viewer.fluid_caustic_scale = args.fluid_caustic_scale
         self.viewer.set_camera(pos=wp.vec3(args.camera_pos), pitch=args.camera_pitch, yaw=args.camera_yaw)
@@ -206,16 +207,17 @@ class Example:
         parser.add_argument("--bounds-lower", type=float, nargs=3, default=(-0.75, -0.45, 0.0))
         parser.add_argument("--bounds-upper", type=float, nargs=3, default=(0.75, 0.45, 1.0))
 
-        parser.add_argument("--fluid-color", type=float, nargs=3, default=(0.35, 0.7, 0.95))
-        parser.add_argument("--fluid-opacity", type=float, default=0.75)
+        parser.add_argument("--fluid-color", type=float, nargs=3, default=(0.28, 0.88, 1.0))
+        parser.add_argument("--fluid-opacity", type=float, default=0.70)
         parser.add_argument("--fluid-radius-scale", type=float, default=1.35)
-        parser.add_argument("--fluid-thickness-scale", type=float, default=1.8)
-        parser.add_argument("--fluid-smoothing-iterations", type=int, default=4)
-        parser.add_argument("--fluid-smoothing-radius", type=float, default=1.4)
-        parser.add_argument("--fluid-reflection-strength", type=float, default=0.07)
-        parser.add_argument("--fluid-refraction-strength", type=float, default=0.022)
-        parser.add_argument("--fluid-caustic-strength", type=float, default=0.16)
-        parser.add_argument("--fluid-caustic-scale", type=float, default=70.0)
+        parser.add_argument("--fluid-thickness-scale", type=float, default=1.7)
+        parser.add_argument("--fluid-smoothing-iterations", type=int, default=6)
+        parser.add_argument("--fluid-smoothing-radius", type=float, default=1.8)
+        parser.add_argument("--fluid-reflection-strength", type=float, default=0.075)
+        parser.add_argument("--fluid-refraction-strength", type=float, default=0.030)
+        parser.add_argument("--fluid-env-map-strength", type=float, default=0.22)
+        parser.add_argument("--fluid-caustic-strength", type=float, default=0.42)
+        parser.add_argument("--fluid-caustic-scale", type=float, default=105.0)
 
         parser.add_argument("--camera-pos", type=float, nargs=3, default=(1.15, -1.35, 0.78))
         parser.add_argument("--camera-pitch", type=float, default=-20.0)

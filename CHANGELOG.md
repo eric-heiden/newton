@@ -4,7 +4,7 @@
 
 ### Added
 
-- Add `SolverSPH`, an experimental Warp-accelerated particle-fluid solver, and add ViewerGL screen-space fluid rendering with translucent smoothed water surfaces, tunable blur radius, refraction/reflection, and procedural caustic highlights for particle fluids.
+- Add `SolverSPH`, an experimental Warp-accelerated particle-fluid solver, and add ViewerGL screen-space fluid rendering with translucent smoothed water surfaces, tunable blur radius, refraction/reflection, Fresnel-weighted environment-map reflection, and procedural caustic highlights for particle fluids.
 - Add `newton.use_coord_layout_targets` opt-in flag exposing `Model.joint_target_q` / `Control.joint_target_q` shaped `(joint_coord_count,)` (matching `joint_q`) and `joint_target_qd` shaped `(joint_dof_count,)` (matching `joint_qd`); solvers, the actuator library, and `ModelBuilder.finalize()` honor the flag. Defaults to `False` for backwards compatibility; will flip in a future release.
 - Add opt-in `validate_mesh` parameter to `ModelBuilder.add_cloth_mesh()`, `ModelBuilder.add_soft_mesh()`, and `style3d.add_cloth_mesh()` that warns on degenerate geometry; add public `newton.utils.validate_triangle_mesh()` and `newton.utils.validate_tet_mesh()` utilities
 - Warn from `SolverMuJoCo` when a `JointType.FREE` joint has a non-world parent; MuJoCo requires free joints to attach directly to the world.

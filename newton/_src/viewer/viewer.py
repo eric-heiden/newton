@@ -147,16 +147,17 @@ class ViewerBase(ABC):
         self.show_inertia_boxes = False
         self.show_hydro_contact_surface = False
         self.sdf_margin_mode: ViewerBase.SDFMarginMode = ViewerBase.SDFMarginMode.OFF
-        self.fluid_color = (0.35, 0.65, 0.95)
-        self.fluid_opacity = 0.55
+        self.fluid_color = (0.28, 0.88, 1.0)
+        self.fluid_opacity = 0.62
         self.fluid_radius_scale = 1.35
-        self.fluid_thickness_scale = 1.0
-        self.fluid_smoothing_iterations = 2
-        self.fluid_smoothing_radius = 1.0
-        self.fluid_reflection_strength = 0.055
-        self.fluid_refraction_strength = 0.018
-        self.fluid_caustic_strength = 0.0
-        self.fluid_caustic_scale = 55.0
+        self.fluid_thickness_scale = 1.35
+        self.fluid_smoothing_iterations = 4
+        self.fluid_smoothing_radius = 1.4
+        self.fluid_reflection_strength = 0.065
+        self.fluid_refraction_strength = 0.026
+        self.fluid_env_map_strength = 0.18
+        self.fluid_caustic_strength = 0.22
+        self.fluid_caustic_scale = 95.0
 
         self.gaussians_max_points = 100_000  # Max number of points to visualize per gaussian
 
@@ -1206,16 +1207,17 @@ class ViewerBase(ABC):
         name: str,
         points: wp.array[wp.vec3] | None,
         radii: wp.array[wp.float32] | float | None = None,
-        color: tuple[float, float, float] = (0.35, 0.65, 0.95),
-        opacity: float = 0.55,
+        color: tuple[float, float, float] = (0.28, 0.88, 1.0),
+        opacity: float = 0.62,
         radius_scale: float = 1.0,
-        thickness_scale: float = 1.0,
-        smoothing_iterations: int = 2,
-        smoothing_radius: float = 1.0,
-        reflection_strength: float = 0.055,
-        refraction_strength: float = 0.018,
-        caustic_strength: float = 0.0,
-        caustic_scale: float = 55.0,
+        thickness_scale: float = 1.35,
+        smoothing_iterations: int = 4,
+        smoothing_radius: float = 1.4,
+        reflection_strength: float = 0.065,
+        refraction_strength: float = 0.026,
+        env_map_strength: float = 0.18,
+        caustic_strength: float = 0.22,
+        caustic_scale: float = 95.0,
         hidden: bool = False,
     ):
         """Log particle samples as a fluid surface.
@@ -1236,6 +1238,7 @@ class ViewerBase(ABC):
             smoothing_radius: Pixel-spacing multiplier for each bilateral blur tap.
             reflection_strength: Strength of the screen-color reflection sample.
             refraction_strength: Strength of the normal-based scene refraction offset.
+            env_map_strength: Strength of Fresnel-weighted environment-map reflection.
             caustic_strength: Strength of the procedural caustic highlight pattern.
             caustic_scale: Spatial frequency of the procedural caustic pattern.
             hidden: Whether the fluid batch should be hidden.
@@ -2387,6 +2390,7 @@ class ViewerBase(ABC):
                     smoothing_radius=self.fluid_smoothing_radius,
                     reflection_strength=self.fluid_reflection_strength,
                     refraction_strength=self.fluid_refraction_strength,
+                    env_map_strength=self.fluid_env_map_strength,
                     caustic_strength=self.fluid_caustic_strength,
                     caustic_scale=self.fluid_caustic_scale,
                     hidden=False,

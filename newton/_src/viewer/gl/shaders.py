@@ -602,15 +602,22 @@ out vec4 FragColor;
 uniform sampler2D scene_texture;
 uniform sampler2D fluid_depth_texture;
 uniform sampler2D thickness_texture;
+uniform sampler2D env_map;
 uniform mat4 inv_projection;
+uniform mat3 inv_view_rotation;
 uniform vec2 texel_size;
 uniform vec3 water_color;
 uniform float opacity;
 uniform float reflection_strength;
 uniform float refraction_strength;
+uniform float env_map_strength;
+uniform float env_intensity;
 uniform float caustic_strength;
 uniform float caustic_scale;
+uniform int up_axis;
 uniform vec3 sun_direction_view;
+
+const float PI = 3.14159265359;
 
 vec3 reconstruct_view_pos(vec2 uv, float linear_depth)
 {
@@ -638,6 +645,19 @@ vec3 fluid_normal(vec2 uv, float depth)
     return n;
 }
 
+vec3 sample_env_map(vec3 dir)
+{
+    vec3 dir_up = dir;
+    if (up_axis == 0) {
+        dir_up = vec3(-dir.y, dir.x, dir.z);
+    } else if (up_axis == 2) {
+        dir_up = vec3(dir.x, dir.z, -dir.y);
+    }
+    float u = atan(dir_up.z, dir_up.x) / (2.0 * PI) + 0.5;
+    float v = asin(clamp(dir_up.y, -1.0, 1.0)) / PI + 0.5;
+    return textureLod(env_map, vec2(u, v), 1.0).rgb;
+}
+
 float caustic_pattern(vec2 uv, vec3 n, float depth, float thickness)
 {
     vec2 p = (uv + n.xy * 0.045 + vec2(depth * 0.013, -depth * 0.009)) * caustic_scale;
@@ -663,20 +683,25 @@ void main()
 
     float alpha = clamp((1.0 - exp(-thickness * 3.0)) * opacity, 0.0, opacity);
     float fresnel = pow(clamp(1.0 - dot(n, v), 0.0, 1.0), 5.0);
+    float water_fresnel = 0.02 + 0.98 * fresnel;
 
     vec2 refract_uv = TexCoord + n.xy * refraction_strength * clamp(thickness, 0.0, 1.0);
     vec2 reflect_uv = TexCoord + reflect(-v, n).xy * reflection_strength;
     vec3 scene = texture(scene_texture, clamp(refract_uv, vec2(0.0), vec2(1.0))).rgb;
     vec3 reflected = texture(scene_texture, clamp(reflect_uv, vec2(0.0), vec2(1.0))).rgb;
+    vec3 env_dir = normalize(inv_view_rotation * reflect(-v, n));
+    vec3 env_reflected = sample_env_map(env_dir) * env_intensity;
 
     vec3 l = normalize(sun_direction_view);
     vec3 h = normalize(l + v);
-    float spec = pow(max(dot(n, h), 0.0), 120.0) * 0.7;
+    float spec = pow(max(dot(n, h), 0.0), 150.0) * 0.9;
 
-    vec3 water = mix(scene, water_color, 0.55);
-    water = mix(water, reflected, clamp(0.18 + 0.65 * fresnel, 0.0, 0.85));
+    vec3 water = mix(scene, water_color, 0.62);
+    water += water_color * 0.08 * smoothstep(0.02, 0.45, thickness);
+    water = mix(water, reflected, clamp(0.12 + 0.42 * fresnel, 0.0, 0.58));
+    water = mix(water, env_reflected, clamp(env_map_strength * (0.30 + 0.70 * water_fresnel), 0.0, 0.70));
     water += vec3(spec);
-    water += caustic_strength * caustic_pattern(TexCoord, n, depth, thickness) * vec3(0.65, 0.9, 1.0);
+    water += caustic_strength * caustic_pattern(TexCoord, n, depth, thickness) * (vec3(0.78, 1.0, 0.92) + water_color * 0.35);
 
     FragColor = vec4(mix(scene, water, alpha), 1.0);
 }
@@ -1000,14 +1025,19 @@ class FluidCompositeShader(ShaderGL):
             self.loc_scene_texture = self._get_uniform_location("scene_texture")
             self.loc_fluid_depth_texture = self._get_uniform_location("fluid_depth_texture")
             self.loc_thickness_texture = self._get_uniform_location("thickness_texture")
+            self.loc_env_map = self._get_uniform_location("env_map")
             self.loc_inv_projection = self._get_uniform_location("inv_projection")
+            self.loc_inv_view_rotation = self._get_uniform_location("inv_view_rotation")
             self.loc_texel_size = self._get_uniform_location("texel_size")
             self.loc_water_color = self._get_uniform_location("water_color")
             self.loc_opacity = self._get_uniform_location("opacity")
             self.loc_reflection_strength = self._get_uniform_location("reflection_strength")
             self.loc_refraction_strength = self._get_uniform_location("refraction_strength")
+            self.loc_env_map_strength = self._get_uniform_location("env_map_strength")
+            self.loc_env_intensity = self._get_uniform_location("env_intensity")
             self.loc_caustic_strength = self._get_uniform_location("caustic_strength")
             self.loc_caustic_scale = self._get_uniform_location("caustic_scale")
+            self.loc_up_axis = self._get_uniform_location("up_axis")
             self.loc_sun_direction_view = self._get_uniform_location("sun_direction_view")
 
     def update(
@@ -1015,28 +1045,40 @@ class FluidCompositeShader(ShaderGL):
         scene_unit: int,
         depth_unit: int,
         thickness_unit: int,
+        env_unit: int,
         inv_projection: np.ndarray,
+        inv_view_rotation: np.ndarray,
         texel_size: tuple[float, float],
         water_color: tuple[float, float, float],
         opacity: float,
         reflection_strength: float,
         refraction_strength: float,
+        env_map_strength: float,
+        env_intensity: float,
         caustic_strength: float,
         caustic_scale: float,
+        up_axis: int,
         sun_direction_view: tuple[float, float, float],
     ):
         with self:
             self._gl.glUniform1i(self.loc_scene_texture, scene_unit)
             self._gl.glUniform1i(self.loc_fluid_depth_texture, depth_unit)
             self._gl.glUniform1i(self.loc_thickness_texture, thickness_unit)
+            self._gl.glUniform1i(self.loc_env_map, env_unit)
             self._gl.glUniformMatrix4fv(self.loc_inv_projection, 1, self._gl.GL_FALSE, arr_pointer(inv_projection))
+            self._gl.glUniformMatrix3fv(
+                self.loc_inv_view_rotation, 1, self._gl.GL_FALSE, arr_pointer(inv_view_rotation)
+            )
             self._gl.glUniform2f(self.loc_texel_size, texel_size[0], texel_size[1])
             self._gl.glUniform3f(self.loc_water_color, *water_color)
             self._gl.glUniform1f(self.loc_opacity, float(opacity))
             self._gl.glUniform1f(self.loc_reflection_strength, float(reflection_strength))
             self._gl.glUniform1f(self.loc_refraction_strength, float(refraction_strength))
+            self._gl.glUniform1f(self.loc_env_map_strength, float(env_map_strength))
+            self._gl.glUniform1f(self.loc_env_intensity, float(env_intensity))
             self._gl.glUniform1f(self.loc_caustic_strength, float(caustic_strength))
             self._gl.glUniform1f(self.loc_caustic_scale, float(caustic_scale))
+            self._gl.glUniform1i(self.loc_up_axis, int(up_axis))
             self._gl.glUniform3f(self.loc_sun_direction_view, *sun_direction_view)
 
 

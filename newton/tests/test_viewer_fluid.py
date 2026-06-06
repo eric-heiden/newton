@@ -22,16 +22,17 @@ class _LogFluidProbe(ViewerNull):
         name,
         points,
         radii=None,
-        color=(0.35, 0.65, 0.95),
-        opacity=0.55,
+        color=(0.28, 0.88, 1.0),
+        opacity=0.62,
         radius_scale=1.0,
-        thickness_scale=1.0,
-        smoothing_iterations=2,
-        smoothing_radius=1.0,
-        reflection_strength=0.055,
-        refraction_strength=0.018,
-        caustic_strength=0.0,
-        caustic_scale=55.0,
+        thickness_scale=1.35,
+        smoothing_iterations=4,
+        smoothing_radius=1.4,
+        reflection_strength=0.065,
+        refraction_strength=0.026,
+        env_map_strength=0.18,
+        caustic_strength=0.22,
+        caustic_scale=95.0,
         hidden=False,
     ):
         self.logged_fluid = {
@@ -46,6 +47,7 @@ class _LogFluidProbe(ViewerNull):
             "smoothing_radius": smoothing_radius,
             "reflection_strength": reflection_strength,
             "refraction_strength": refraction_strength,
+            "env_map_strength": env_map_strength,
             "caustic_strength": caustic_strength,
             "caustic_scale": caustic_scale,
             "hidden": hidden,
@@ -85,6 +87,7 @@ class TestViewerFluid(unittest.TestCase):
         self.assertFalse(viewer.logged_fluid["hidden"])
         self.assertEqual(viewer.logged_fluid["radius_scale"], viewer.fluid_radius_scale)
         self.assertEqual(viewer.logged_fluid["smoothing_radius"], viewer.fluid_smoothing_radius)
+        self.assertEqual(viewer.logged_fluid["env_map_strength"], viewer.fluid_env_map_strength)
         self.assertEqual(viewer.logged_fluid["caustic_scale"], viewer.fluid_caustic_scale)
         np.testing.assert_allclose(viewer.logged_fluid["points"].numpy()[:, 0], [0.0, 2.0], atol=1.0e-6)
         self.assertIsNotNone(viewer.logged_points)

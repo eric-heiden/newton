@@ -14,6 +14,9 @@ from newton import Mesh
 from ...utils.mesh import compute_vertex_normals
 from ...utils.texture import normalize_texture
 from .shaders import (
+    FluidBlurShader,
+    FluidCompositeShader,
+    FluidParticleShader,
     FrameShader,
     ShaderArrow,
     ShaderEdge,
@@ -943,6 +946,97 @@ class MeshInstancerGL:
         gl.glBindVertexArray(0)
 
 
+class FluidGL:
+    """GPU buffer for screen-space fluid particle samples."""
+
+    def __init__(self, capacity: int):
+        gl = RendererGL.gl
+        self.capacity = max(int(capacity), 1)
+        self.active_particles = 0
+        self.hidden = False
+        self.color = (0.35, 0.65, 0.95)
+        self.opacity = 0.55
+        self.radius_scale = 1.0
+        self.thickness_scale = 1.0
+        self.smoothing_iterations = 2
+
+        self.vao = gl.GLuint()
+        self.vbo = gl.GLuint()
+        gl.glGenVertexArrays(1, self.vao)
+        gl.glGenBuffers(1, self.vbo)
+
+        gl.glBindVertexArray(self.vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, self.capacity * 4 * 4, None, gl.GL_DYNAMIC_DRAW)
+        gl.glVertexAttribPointer(0, 4, gl.GL_FLOAT, gl.GL_FALSE, 4 * 4, ctypes.c_void_p(0))
+        gl.glEnableVertexAttribArray(0)
+        gl.glBindVertexArray(0)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+
+    def destroy(self):
+        gl = RendererGL.gl
+        if getattr(self, "vao", None) is not None:
+            gl.glDeleteVertexArrays(1, self.vao)
+            gl.glDeleteBuffers(1, self.vbo)
+            self.vao = None
+            self.vbo = None
+
+    def _resize(self, capacity: int):
+        self.destroy()
+        self.__init__(capacity)
+
+    def update(
+        self,
+        points,
+        radii,
+        color: tuple[float, float, float],
+        opacity: float,
+        radius_scale: float,
+        thickness_scale: float,
+        smoothing_iterations: int,
+        hidden: bool,
+    ):
+        if points is None:
+            self.active_particles = 0
+            self.hidden = True
+            return
+
+        gl = RendererGL.gl
+        count = len(points)
+        if count > self.capacity:
+            self._resize(max(count, self.capacity * 2))
+
+        self.active_particles = count
+        self.hidden = hidden
+        self.color = tuple(float(c) for c in color)
+        self.opacity = float(np.clip(opacity, 0.0, 1.0))
+        self.radius_scale = float(max(radius_scale, 0.0))
+        self.thickness_scale = float(max(thickness_scale, 0.0))
+        self.smoothing_iterations = max(int(smoothing_iterations), 0)
+
+        particle_data = np.empty((count, 4), dtype=np.float32)
+        particle_data[:, :3] = points.numpy()
+        if radii is None:
+            particle_data[:, 3] = 0.1
+        elif isinstance(radii, (int, float, np.integer, np.floating)):
+            particle_data[:, 3] = float(radii)
+        else:
+            particle_data[:, 3] = radii.numpy().astype(np.float32, copy=False)
+        particle_data[:, 3] *= self.radius_scale
+
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+        gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, particle_data.nbytes, particle_data.ctypes.data)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+
+    def render(self):
+        if self.hidden or self.active_particles == 0:
+            return
+        gl = RendererGL.gl
+        gl.glBindVertexArray(self.vao)
+        gl.glDrawArrays(gl.GL_POINTS, 0, self.active_particles)
+        gl.glBindVertexArray(0)
+
+
 class RendererGL:
     gl = None  # Class-level variable to hold the imported module
     _fallback_texture = None  # 1x1 white texture bound when no albedo is set (suppresses macOS GL warning)
@@ -1118,6 +1212,12 @@ class RendererGL:
         self._frame_depth_texture = None
         self._frame_fbo = None
         self._frame_pbo = None
+        self._fluid_fbo = None
+        self._fluid_blur_fbo = None
+        self._fluid_depth_texture = None
+        self._fluid_depth_smooth_texture = None
+        self._fluid_thickness_texture = None
+        self._fluid_scene_texture = None
 
         self._sun_direction = None  # set on first render based on camera up_axis
 
@@ -1143,6 +1243,7 @@ class RendererGL:
         # create frame buffer for rendering to a texture
         self._setup_shadow_buffer()
         self._setup_frame_buffer()
+        self._setup_fluid_buffers()
         self._setup_sky_mesh()
         self._setup_frame_mesh()
 
@@ -1153,6 +1254,9 @@ class RendererGL:
         self._sky_shader = ShaderSky(gl)
         self._wireframe_shader = ShaderLine(gl)
         self._arrow_shader = ShaderArrow(gl)
+        self._fluid_particle_shader = FluidParticleShader(gl)
+        self._fluid_blur_shader = FluidBlurShader(gl)
+        self._fluid_composite_shader = FluidCompositeShader(gl)
 
         if not headless:
             self._setup_window_callbacks()
@@ -1214,7 +1318,7 @@ class RendererGL:
                 # This is a non-fatal error that can be safely ignored
                 pass
 
-    def render(self, camera, objects, lines=None, wireframe_shapes=None, arrows=None):
+    def render(self, camera, objects, lines=None, wireframe_shapes=None, arrows=None, fluids=None):
         gl = RendererGL.gl
         self._make_current()
 
@@ -1274,7 +1378,17 @@ class RendererGL:
 
         self._render_scene(objects)
 
-        # Render lines after main scene but before MSAA resolve
+        msaa_resolved = False
+        if getattr(self, "msaa_samples", 0) > 0 and self._frame_msaa_fbo is not None:
+            self._resolve_msaa_frame()
+            msaa_resolved = True
+            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._frame_fbo)
+            gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+
+        if fluids:
+            self._render_fluids(fluids)
+
+        # Render lines after main scene and fluid composition.
         if lines:
             self._render_lines(lines)
 
@@ -1287,25 +1401,8 @@ class RendererGL:
         # ------------------------------------------------------------------
         # If MSAA is enabled, resolve the multi-sample buffer into texture FBO
         # ------------------------------------------------------------------
-        if getattr(self, "msaa_samples", 0) > 0 and self._frame_msaa_fbo is not None:
-            gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, self._frame_msaa_fbo)
-            gl.glReadBuffer(gl.GL_COLOR_ATTACHMENT0)
-
-            gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, self._frame_fbo)
-            gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
-
-            gl.glBlitFramebuffer(
-                0,
-                0,
-                self._screen_width,
-                self._screen_height,
-                0,
-                0,
-                self._screen_width,
-                self._screen_height,
-                gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT,
-                gl.GL_NEAREST,
-            )
+        if not msaa_resolved and getattr(self, "msaa_samples", 0) > 0 and self._frame_msaa_fbo is not None:
+            self._resolve_msaa_frame()
 
         # ------------------------------------------------------------------
         # Draw resolved texture to the screen
@@ -1334,6 +1431,27 @@ class RendererGL:
         err = gl.glGetError()
         assert err == gl.GL_NO_ERROR, hex(err)
 
+    def _resolve_msaa_frame(self):
+        gl = RendererGL.gl
+        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, self._frame_msaa_fbo)
+        gl.glReadBuffer(gl.GL_COLOR_ATTACHMENT0)
+
+        gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, self._frame_fbo)
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+
+        gl.glBlitFramebuffer(
+            0,
+            0,
+            self._screen_width,
+            self._screen_height,
+            0,
+            0,
+            self._screen_width,
+            self._screen_height,
+            gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT,
+            gl.GL_NEAREST,
+        )
+
     def present(self):
         if not self.headless:
             if self._dwm_flush is not None and self.window._interval:
@@ -1343,6 +1461,7 @@ class RendererGL:
     def resize(self, width, height):
         self._screen_width, self._screen_height = self.window.get_framebuffer_size()
         self._setup_frame_buffer()
+        self._setup_fluid_buffers()
 
     def set_title(self, title):
         self.window.set_caption(title)
@@ -1700,6 +1819,87 @@ class RendererGL:
 
         check_gl_error()
 
+    def _setup_fluid_buffers(self):
+        gl = RendererGL.gl
+        self._make_current()
+
+        def ensure_texture(texture):
+            if texture is not None:
+                return texture
+            texture = gl.GLuint()
+            gl.glGenTextures(1, texture)
+            return texture
+
+        self._fluid_depth_texture = ensure_texture(self._fluid_depth_texture)
+        self._fluid_depth_smooth_texture = ensure_texture(self._fluid_depth_smooth_texture)
+        self._fluid_thickness_texture = ensure_texture(self._fluid_thickness_texture)
+        self._fluid_scene_texture = ensure_texture(self._fluid_scene_texture)
+
+        for texture in (self._fluid_depth_texture, self._fluid_depth_smooth_texture, self._fluid_thickness_texture):
+            gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+            gl.glTexImage2D(
+                gl.GL_TEXTURE_2D,
+                0,
+                gl.GL_R32F,
+                self._screen_width,
+                self._screen_height,
+                0,
+                gl.GL_RED,
+                gl.GL_FLOAT,
+                None,
+            )
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
+
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self._fluid_scene_texture)
+        gl.glTexImage2D(
+            gl.GL_TEXTURE_2D,
+            0,
+            gl.GL_RGB,
+            self._screen_width,
+            self._screen_height,
+            0,
+            gl.GL_RGB,
+            gl.GL_UNSIGNED_BYTE,
+            None,
+        )
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+
+        if self._fluid_fbo is None:
+            self._fluid_fbo = gl.GLuint()
+            gl.glGenFramebuffers(1, self._fluid_fbo)
+        if self._fluid_blur_fbo is None:
+            self._fluid_blur_fbo = gl.GLuint()
+            gl.glGenFramebuffers(1, self._fluid_blur_fbo)
+
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._fluid_fbo)
+        gl.glFramebufferTexture2D(
+            gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self._fluid_depth_texture, 0
+        )
+        gl.glFramebufferTexture2D(
+            gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, gl.GL_TEXTURE_2D, self._frame_depth_texture, 0
+        )
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+        if gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER) != gl.GL_FRAMEBUFFER_COMPLETE:
+            print("Warning: fluid framebuffer incomplete; fluid rendering will be skipped.")
+
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._fluid_blur_fbo)
+        gl.glFramebufferTexture2D(
+            gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self._fluid_depth_smooth_texture, 0
+        )
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+        if gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER) != gl.GL_FRAMEBUFFER_COMPLETE:
+            print("Warning: fluid blur framebuffer incomplete; smoothing will be skipped.")
+
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+        check_gl_error()
+
     def _setup_frame_mesh(self):
         gl = RendererGL.gl
 
@@ -1812,6 +2012,143 @@ class RendererGL:
 
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
 
+        check_gl_error()
+
+    def _draw_frame_quad(self):
+        gl = RendererGL.gl
+        gl.glBindVertexArray(self._frame_vao)
+        gl.glDrawElements(gl.GL_TRIANGLES, len(self._frame_indices), gl.GL_UNSIGNED_INT, None)
+        gl.glBindVertexArray(0)
+
+    def _blur_fluid_depth(self, source_texture, target_texture, direction: tuple[float, float]) -> None:
+        gl = RendererGL.gl
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._fluid_blur_fbo)
+        gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, target_texture, 0)
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glDisable(gl.GL_BLEND)
+        gl.glViewport(0, 0, self._screen_width, self._screen_height)
+
+        with self._fluid_blur_shader:
+            gl.glActiveTexture(gl.GL_TEXTURE0)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, source_texture)
+            self._fluid_blur_shader.update(
+                texture_unit=0,
+                texel_size=(1.0 / max(self._screen_width, 1), 1.0 / max(self._screen_height, 1)),
+                direction=direction,
+                max_depth_delta=0.25,
+            )
+            self._draw_frame_quad()
+
+    def _render_fluids(self, fluids):
+        gl = RendererGL.gl
+        active_fluids = [fluid for fluid in fluids.values() if not fluid.hidden and fluid.active_particles > 0]
+        if not active_fluids:
+            return
+
+        material_fluid = active_fluids[0]
+
+        # Keep a copy of opaque scene color because the composite pass writes
+        # back into the frame color texture.
+        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, self._frame_fbo)
+        gl.glReadBuffer(gl.GL_COLOR_ATTACHMENT0)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self._fluid_scene_texture)
+        gl.glCopyTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, 0, 0, self._screen_width, self._screen_height)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+
+        # Nearest fluid surface depth.
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._fluid_fbo)
+        gl.glFramebufferTexture2D(
+            gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self._fluid_depth_texture, 0
+        )
+        gl.glFramebufferTexture2D(
+            gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, gl.GL_TEXTURE_2D, self._frame_depth_texture, 0
+        )
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+        gl.glViewport(0, 0, self._screen_width, self._screen_height)
+        gl.glClearBufferfv(gl.GL_COLOR, 0, (gl.GLfloat * 4)(0.0, 0.0, 0.0, 0.0))
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDepthFunc(gl.GL_LEQUAL)
+        gl.glDepthMask(False)
+        gl.glDisable(gl.GL_BLEND)
+        if hasattr(gl, "GL_PROGRAM_POINT_SIZE"):
+            gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
+
+        with self._fluid_particle_shader:
+            self._fluid_particle_shader.update(
+                self._view_matrix,
+                self._projection_matrix,
+                output_thickness=False,
+                thickness_scale=1.0,
+            )
+            for fluid in active_fluids:
+                fluid.render()
+
+        # Optical thickness accumulated through all visible fluid particles.
+        gl.glFramebufferTexture2D(
+            gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self._fluid_thickness_texture, 0
+        )
+        gl.glClearBufferfv(gl.GL_COLOR, 0, (gl.GLfloat * 4)(0.0, 0.0, 0.0, 0.0))
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE)
+        with self._fluid_particle_shader:
+            self._fluid_particle_shader.update(
+                self._view_matrix,
+                self._projection_matrix,
+                output_thickness=True,
+                thickness_scale=material_fluid.thickness_scale,
+            )
+            for fluid in active_fluids:
+                fluid.render()
+        gl.glDisable(gl.GL_BLEND)
+        gl.glDepthMask(True)
+
+        depth_texture = self._fluid_depth_texture
+        scratch_texture = self._fluid_depth_smooth_texture
+        for _ in range(material_fluid.smoothing_iterations):
+            self._blur_fluid_depth(depth_texture, scratch_texture, (1.0, 0.0))
+            depth_texture, scratch_texture = scratch_texture, depth_texture
+            self._blur_fluid_depth(depth_texture, scratch_texture, (0.0, 1.0))
+            depth_texture, scratch_texture = scratch_texture, depth_texture
+
+        # Composite over the frame color.
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._frame_fbo)
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+        gl.glViewport(0, 0, self._screen_width, self._screen_height)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glDisable(gl.GL_BLEND)
+
+        view = np.asarray(self._view_matrix, dtype=np.float32).reshape(4, 4).transpose()
+        sun_view = view[:3, :3] @ np.asarray(self._sun_direction, dtype=np.float32)
+        norm = np.linalg.norm(sun_view)
+        if norm > 0.0:
+            sun_view = sun_view / norm
+        projection = np.asarray(self._projection_matrix, dtype=np.float32).reshape(4, 4).transpose()
+        inv_projection = np.linalg.inv(projection).transpose()
+
+        with self._fluid_composite_shader:
+            gl.glActiveTexture(gl.GL_TEXTURE0)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._fluid_scene_texture)
+            gl.glActiveTexture(gl.GL_TEXTURE1)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, depth_texture)
+            gl.glActiveTexture(gl.GL_TEXTURE2)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._fluid_thickness_texture)
+            self._fluid_composite_shader.update(
+                scene_unit=0,
+                depth_unit=1,
+                thickness_unit=2,
+                inv_projection=inv_projection,
+                texel_size=(1.0 / max(self._screen_width, 1), 1.0 / max(self._screen_height, 1)),
+                water_color=material_fluid.color,
+                opacity=material_fluid.opacity,
+                reflection_strength=0.055,
+                refraction_strength=0.018,
+                sun_direction_view=(float(sun_view[0]), float(sun_view[1]), float(sun_view[2])),
+            )
+            self._draw_frame_quad()
+
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDepthFunc(gl.GL_LESS)
         check_gl_error()
 
     def _render_scene(self, objects):

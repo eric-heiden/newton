@@ -136,6 +136,7 @@ class ViewerBase(ABC):
         self.show_joints = False
         self.show_com = False
         self.show_particles = False
+        self.show_fluid = False
         self.show_contacts = False
         self.show_springs = False
         self.show_triangles = True
@@ -146,6 +147,11 @@ class ViewerBase(ABC):
         self.show_inertia_boxes = False
         self.show_hydro_contact_surface = False
         self.sdf_margin_mode: ViewerBase.SDFMarginMode = ViewerBase.SDFMarginMode.OFF
+        self.fluid_color = (0.35, 0.65, 0.95)
+        self.fluid_opacity = 0.55
+        self.fluid_radius_scale = 1.35
+        self.fluid_thickness_scale = 1.0
+        self.fluid_smoothing_iterations = 2
 
         self.gaussians_max_points = 100_000  # Max number of points to visualize per gaussian
 
@@ -1189,6 +1195,37 @@ class ViewerBase(ABC):
             hidden: Whether the arrow batch should be hidden.
         """
         self.log_lines(name, starts, ends, colors, width=width, hidden=hidden)
+
+    def log_fluid(
+        self,
+        name: str,
+        points: wp.array[wp.vec3] | None,
+        radii: wp.array[wp.float32] | float | None = None,
+        color: tuple[float, float, float] = (0.35, 0.65, 0.95),
+        opacity: float = 0.55,
+        radius_scale: float = 1.0,
+        thickness_scale: float = 1.0,
+        smoothing_iterations: int = 2,
+        hidden: bool = False,
+    ):
+        """Log particle samples as a fluid surface.
+
+        Viewer backends that do not provide a fluid renderer fall back to
+        point-sphere rendering. :class:`~newton.viewer.ViewerGL` overrides this
+        method with a screen-space fluid pass.
+
+        Args:
+            name: Unique path/name for the fluid batch.
+            points: Particle centers [m].
+            radii: Particle support radii [m].
+            color: Water base color with RGB values in ``[0, 1]``.
+            opacity: Surface opacity in ``[0, 1]``.
+            radius_scale: Rendering-only multiplier applied to particle radii.
+            thickness_scale: Multiplier applied to accumulated optical thickness.
+            smoothing_iterations: Number of screen-space depth smoothing passes.
+            hidden: Whether the fluid batch should be hidden.
+        """
+        self.log_points(name, points, radii=radii, colors=color, hidden=hidden)
 
     def log_wireframe_shape(  # noqa: B027
         self,
@@ -2300,7 +2337,12 @@ class ViewerBase(ABC):
                 # Slice to transfer only the last element instead of the full array.
                 active_count = int(offsets[-1:].numpy()[0]) + int(mask[-1:].numpy()[0])
                 if active_count == 0:
-                    self.log_points(name="/model/particles", points=None, hidden=True)
+                    if self.show_fluid:
+                        self.log_points(name="/model/particles", points=None, hidden=True)
+                        self.log_fluid(name="/model/fluid", points=None, hidden=True)
+                    else:
+                        self.log_fluid(name="/model/fluid", points=None, hidden=True)
+                        self.log_points(name="/model/particles", points=None, hidden=True)
                     return
                 if active_count < n:
                     points_out = wp.empty(active_count, dtype=wp.vec3, device=self.device)
@@ -2316,13 +2358,28 @@ class ViewerBase(ABC):
             else:
                 colors = None
 
-            self.log_points(
-                name="/model/particles",
-                points=points,
-                radii=radii,
-                colors=colors,
-                hidden=not self.show_particles,
-            )
+            if self.show_fluid:
+                self.log_points(name="/model/particles", points=None, hidden=True)
+                self.log_fluid(
+                    name="/model/fluid",
+                    points=points,
+                    radii=radii,
+                    color=self.fluid_color,
+                    opacity=self.fluid_opacity,
+                    radius_scale=self.fluid_radius_scale,
+                    thickness_scale=self.fluid_thickness_scale,
+                    smoothing_iterations=self.fluid_smoothing_iterations,
+                    hidden=False,
+                )
+            else:
+                self.log_fluid(name="/model/fluid", points=None, hidden=True)
+                self.log_points(
+                    name="/model/particles",
+                    points=points,
+                    radii=radii,
+                    colors=colors,
+                    hidden=not self.show_particles,
+                )
 
     @staticmethod
     def _shape_color_map(i: int) -> list[float]:

@@ -474,6 +474,9 @@ class ViewerGL(ViewerBase):
             if hasattr(obj, "destroy"):
                 obj.destroy()
         self.objects = {}
+        for obj in getattr(self, "fluids", {}).values():
+            obj.destroy()
+        self.fluids = {}
         for obj in getattr(self, "lines", {}).values():
             obj.destroy()
         self.lines = {}
@@ -1185,6 +1188,39 @@ class ViewerGL(ViewerBase):
         self.objects[name].update_from_points(points, radii, colors)
         self.objects[name].hidden = hidden
 
+    @override
+    def log_fluid(
+        self,
+        name: str,
+        points: wp.array[wp.vec3] | None,
+        radii: wp.array[wp.float32] | float | None = None,
+        color: tuple[float, float, float] = (0.35, 0.65, 0.95),
+        opacity: float = 0.55,
+        radius_scale: float = 1.0,
+        thickness_scale: float = 1.0,
+        smoothing_iterations: int = 2,
+        hidden: bool = False,
+    ):
+        """Log particles for screen-space fluid rendering."""
+        from .gl.opengl import FluidGL  # noqa: PLC0415
+
+        if points is None:
+            if name in self.fluids:
+                self.fluids[name].update(
+                    None, None, color, opacity, radius_scale, thickness_scale, smoothing_iterations, True
+                )
+            return
+
+        count = len(points)
+        if name not in self.fluids:
+            self.fluids[name] = FluidGL(max(count, 256))
+        elif count > self.fluids[name].capacity:
+            self.fluids[name]._resize(max(count, self.fluids[name].capacity * 2))
+
+        self.fluids[name].update(
+            points, radii, color, opacity, radius_scale, thickness_scale, smoothing_iterations, hidden
+        )
+
     _SH_C0 = 0.28209479177387814
 
     def _create_gaussian_mesh(self):
@@ -1600,7 +1636,7 @@ class ViewerGL(ViewerBase):
             return
 
         # Render the scene and present it
-        self.renderer.render(self.camera, self.objects, self.lines, self.wireframe_shapes, self.arrows)
+        self.renderer.render(self.camera, self.objects, self.lines, self.wireframe_shapes, self.arrows, self.fluids)
 
         if self.gui:
             self.gui.render_frame(update_fps=True)
@@ -1626,6 +1662,7 @@ class ViewerGL(ViewerBase):
         """
 
         gl = RendererGL.gl
+        self.renderer._make_current()
         w, h = self.renderer._screen_width, self.renderer._screen_height
 
         # Lazy initialization of PBO (Pixel Buffer Object).

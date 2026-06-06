@@ -467,6 +467,205 @@ void main() {
 }
 """
 
+fluid_particle_vertex_shader = """
+#version 330 core
+layout (location = 0) in vec4 aParticle;
+
+uniform mat4 view;
+
+out vec3 CenterEye;
+out float Radius;
+
+void main()
+{
+    vec4 center_eye4 = view * vec4(aParticle.xyz, 1.0);
+    CenterEye = center_eye4.xyz;
+    Radius = max(aParticle.w, 1.0e-6);
+}
+"""
+
+fluid_particle_geometry_shader = """
+#version 330 core
+layout (points) in;
+layout (triangle_strip, max_vertices = 4) out;
+
+in vec3 CenterEye[];
+in float Radius[];
+
+uniform mat4 projection;
+
+flat out vec3 ParticleCenterEye;
+flat out float ParticleRadius;
+out vec2 LocalCoord;
+
+void emit_corner(vec2 local)
+{
+    vec3 eye_pos = CenterEye[0] + vec3(local * Radius[0], 0.0);
+    gl_Position = projection * vec4(eye_pos, 1.0);
+    ParticleCenterEye = CenterEye[0];
+    ParticleRadius = Radius[0];
+    LocalCoord = local;
+    EmitVertex();
+}
+
+void main()
+{
+    emit_corner(vec2(-1.0, -1.0));
+    emit_corner(vec2( 1.0, -1.0));
+    emit_corner(vec2(-1.0,  1.0));
+    emit_corner(vec2( 1.0,  1.0));
+    EndPrimitive();
+}
+"""
+
+fluid_particle_fragment_shader = """
+#version 330 core
+flat in vec3 ParticleCenterEye;
+flat in float ParticleRadius;
+in vec2 LocalCoord;
+
+out float FragValue;
+
+uniform mat4 projection;
+uniform int output_thickness;
+uniform float thickness_scale;
+
+void main()
+{
+    vec2 disk = LocalCoord;
+    float r2 = dot(disk, disk);
+    if (r2 > 1.0)
+        discard;
+
+    float z = sqrt(max(1.0 - r2, 0.0));
+    vec3 eye_pos = ParticleCenterEye + vec3(disk * ParticleRadius, z * ParticleRadius);
+    vec4 clip = projection * vec4(eye_pos, 1.0);
+    float ndc_depth = clip.z / clip.w;
+    gl_FragDepth = ndc_depth * 0.5 + 0.5;
+
+    if (output_thickness != 0)
+        FragValue = 2.0 * z * ParticleRadius * thickness_scale;
+    else
+        FragValue = -eye_pos.z;
+}
+"""
+
+fluid_blur_fragment_shader = """
+#version 330 core
+in vec2 TexCoord;
+
+out float FragValue;
+
+uniform sampler2D depth_texture;
+uniform vec2 texel_size;
+uniform vec2 direction;
+uniform float max_depth_delta;
+
+void main()
+{
+    float center = texture(depth_texture, TexCoord).r;
+    if (center <= 0.0) {
+        FragValue = 0.0;
+        return;
+    }
+
+    float weights[5] = float[](0.204164, 0.304005, 0.093913, 0.010381, 0.000873);
+    float sum = center * weights[0];
+    float weight_sum = weights[0];
+
+    for (int i = 1; i < 5; ++i) {
+        vec2 offset = direction * texel_size * float(i);
+        float d0 = texture(depth_texture, TexCoord + offset).r;
+        float d1 = texture(depth_texture, TexCoord - offset).r;
+        float w = weights[i];
+        if (d0 > 0.0 && abs(d0 - center) < max_depth_delta) {
+            sum += d0 * w;
+            weight_sum += w;
+        }
+        if (d1 > 0.0 && abs(d1 - center) < max_depth_delta) {
+            sum += d1 * w;
+            weight_sum += w;
+        }
+    }
+
+    FragValue = sum / max(weight_sum, 1.0e-6);
+}
+"""
+
+fluid_composite_fragment_shader = """
+#version 330 core
+in vec2 TexCoord;
+
+out vec4 FragColor;
+
+uniform sampler2D scene_texture;
+uniform sampler2D fluid_depth_texture;
+uniform sampler2D thickness_texture;
+uniform mat4 inv_projection;
+uniform vec2 texel_size;
+uniform vec3 water_color;
+uniform float opacity;
+uniform float reflection_strength;
+uniform float refraction_strength;
+uniform vec3 sun_direction_view;
+
+vec3 reconstruct_view_pos(vec2 uv, float linear_depth)
+{
+    vec4 clip = vec4(uv * 2.0 - vec2(1.0), 1.0, 1.0);
+    vec4 far_view = inv_projection * clip;
+    far_view /= far_view.w;
+    vec3 ray = normalize(far_view.xyz);
+    return ray * (linear_depth / max(-ray.z, 1.0e-5));
+}
+
+vec3 fluid_normal(vec2 uv, float depth)
+{
+    float depth_x = texture(fluid_depth_texture, uv + vec2(texel_size.x, 0.0)).r;
+    float depth_y = texture(fluid_depth_texture, uv + vec2(0.0, texel_size.y)).r;
+    if (depth_x <= 0.0) depth_x = depth;
+    if (depth_y <= 0.0) depth_y = depth;
+
+    vec3 p = reconstruct_view_pos(uv, depth);
+    vec3 px = reconstruct_view_pos(uv + vec2(texel_size.x, 0.0), depth_x);
+    vec3 py = reconstruct_view_pos(uv + vec2(0.0, texel_size.y), depth_y);
+    vec3 n = normalize(cross(px - p, py - p));
+    vec3 v = normalize(-p);
+    if (dot(n, v) < 0.0)
+        n = -n;
+    return n;
+}
+
+void main()
+{
+    float depth = texture(fluid_depth_texture, TexCoord).r;
+    if (depth <= 0.0)
+        discard;
+
+    vec3 p = reconstruct_view_pos(TexCoord, depth);
+    vec3 n = fluid_normal(TexCoord, depth);
+    vec3 v = normalize(-p);
+    float thickness = texture(thickness_texture, TexCoord).r;
+
+    float alpha = clamp((1.0 - exp(-thickness * 3.0)) * opacity, 0.0, opacity);
+    float fresnel = pow(clamp(1.0 - dot(n, v), 0.0, 1.0), 5.0);
+
+    vec2 refract_uv = TexCoord + n.xy * refraction_strength * clamp(thickness, 0.0, 1.0);
+    vec2 reflect_uv = TexCoord + reflect(-v, n).xy * reflection_strength;
+    vec3 scene = texture(scene_texture, clamp(refract_uv, vec2(0.0), vec2(1.0))).rgb;
+    vec3 reflected = texture(scene_texture, clamp(reflect_uv, vec2(0.0), vec2(1.0))).rgb;
+
+    vec3 l = normalize(sun_direction_view);
+    vec3 h = normalize(l + v);
+    float spec = pow(max(dot(n, h), 0.0), 120.0) * 0.7;
+
+    vec3 water = mix(scene, water_color, 0.55);
+    water = mix(water, reflected, clamp(0.18 + 0.65 * fresnel, 0.0, 0.85));
+    water += vec3(spec);
+
+    FragColor = vec4(mix(scene, water, alpha), 1.0);
+}
+"""
+
 
 def str_buffer(string: str):
     """Convert string to C-style char pointer for OpenGL."""
@@ -701,6 +900,119 @@ class FrameShader(ShaderGL):
         """Update texture uniform."""
         with self:
             self._gl.glUniform1i(self.loc_texture, texture_unit)
+
+
+class FluidParticleShader(ShaderGL):
+    """Shader that rasterizes fluid particles as sphere impostors."""
+
+    def __init__(self, gl):
+        super().__init__()
+        from pyglet.graphics.shader import Shader, ShaderProgram
+
+        self._gl = gl
+        self.shader_program = ShaderProgram(
+            Shader(fluid_particle_vertex_shader, "vertex"),
+            Shader(fluid_particle_fragment_shader, "fragment"),
+            Shader(fluid_particle_geometry_shader, "geometry"),
+        )
+        with self:
+            self.loc_view = self._get_uniform_location("view")
+            self.loc_projection = self._get_uniform_location("projection")
+            self.loc_output_thickness = self._get_uniform_location("output_thickness")
+            self.loc_thickness_scale = self._get_uniform_location("thickness_scale")
+
+    def update(
+        self,
+        view_matrix: np.ndarray,
+        projection_matrix: np.ndarray,
+        output_thickness: bool,
+        thickness_scale: float,
+    ):
+        with self:
+            self._gl.glUniformMatrix4fv(self.loc_view, 1, self._gl.GL_FALSE, arr_pointer(view_matrix))
+            self._gl.glUniformMatrix4fv(self.loc_projection, 1, self._gl.GL_FALSE, arr_pointer(projection_matrix))
+            self._gl.glUniform1i(self.loc_output_thickness, int(output_thickness))
+            self._gl.glUniform1f(self.loc_thickness_scale, float(thickness_scale))
+
+
+class FluidBlurShader(ShaderGL):
+    """Separable bilateral blur for the fluid linear-depth buffer."""
+
+    def __init__(self, gl):
+        super().__init__()
+        from pyglet.graphics.shader import Shader, ShaderProgram
+
+        self._gl = gl
+        self.shader_program = ShaderProgram(
+            Shader(frame_vertex_shader, "vertex"), Shader(fluid_blur_fragment_shader, "fragment")
+        )
+        with self:
+            self.loc_depth_texture = self._get_uniform_location("depth_texture")
+            self.loc_texel_size = self._get_uniform_location("texel_size")
+            self.loc_direction = self._get_uniform_location("direction")
+            self.loc_max_depth_delta = self._get_uniform_location("max_depth_delta")
+
+    def update(
+        self,
+        texture_unit: int,
+        texel_size: tuple[float, float],
+        direction: tuple[float, float],
+        max_depth_delta: float,
+    ):
+        with self:
+            self._gl.glUniform1i(self.loc_depth_texture, texture_unit)
+            self._gl.glUniform2f(self.loc_texel_size, texel_size[0], texel_size[1])
+            self._gl.glUniform2f(self.loc_direction, direction[0], direction[1])
+            self._gl.glUniform1f(self.loc_max_depth_delta, max_depth_delta)
+
+
+class FluidCompositeShader(ShaderGL):
+    """Composite smoothed fluid depth/thickness over the scene color."""
+
+    def __init__(self, gl):
+        super().__init__()
+        from pyglet.graphics.shader import Shader, ShaderProgram
+
+        self._gl = gl
+        self.shader_program = ShaderProgram(
+            Shader(frame_vertex_shader, "vertex"), Shader(fluid_composite_fragment_shader, "fragment")
+        )
+        with self:
+            self.loc_scene_texture = self._get_uniform_location("scene_texture")
+            self.loc_fluid_depth_texture = self._get_uniform_location("fluid_depth_texture")
+            self.loc_thickness_texture = self._get_uniform_location("thickness_texture")
+            self.loc_inv_projection = self._get_uniform_location("inv_projection")
+            self.loc_texel_size = self._get_uniform_location("texel_size")
+            self.loc_water_color = self._get_uniform_location("water_color")
+            self.loc_opacity = self._get_uniform_location("opacity")
+            self.loc_reflection_strength = self._get_uniform_location("reflection_strength")
+            self.loc_refraction_strength = self._get_uniform_location("refraction_strength")
+            self.loc_sun_direction_view = self._get_uniform_location("sun_direction_view")
+
+    def update(
+        self,
+        scene_unit: int,
+        depth_unit: int,
+        thickness_unit: int,
+        inv_projection: np.ndarray,
+        texel_size: tuple[float, float],
+        water_color: tuple[float, float, float],
+        opacity: float,
+        reflection_strength: float,
+        refraction_strength: float,
+        sun_direction_view: tuple[float, float, float],
+    ):
+        with self:
+            self._gl.glUniform1i(self.loc_scene_texture, scene_unit)
+            self._gl.glUniform1i(self.loc_fluid_depth_texture, depth_unit)
+            self._gl.glUniform1i(self.loc_thickness_texture, thickness_unit)
+            self._gl.glUniformMatrix4fv(self.loc_inv_projection, 1, self._gl.GL_FALSE, arr_pointer(inv_projection))
+            self._gl.glUniform2f(self.loc_texel_size, texel_size[0], texel_size[1])
+            self._gl.glUniform3f(self.loc_water_color, *water_color)
+            self._gl.glUniform1f(self.loc_opacity, float(opacity))
+            self._gl.glUniform1f(self.loc_reflection_strength, float(reflection_strength))
+            self._gl.glUniform1f(self.loc_refraction_strength, float(refraction_strength))
+            self._gl.glUniform3f(self.loc_sun_direction_view, *sun_direction_view)
 
 
 wireframe_vertex_shader = """

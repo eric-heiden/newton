@@ -148,6 +148,8 @@ class ViewerBase(ABC):
         self.show_hydro_contact_surface = False
         self.sdf_margin_mode: ViewerBase.SDFMarginMode = ViewerBase.SDFMarginMode.OFF
         self.fluid_color = (0.28, 0.88, 1.0)
+        self.fluid_deep_color = (0.02, 0.42, 0.82)
+        self.fluid_color_gradient_strength = 0.45
         self.fluid_opacity = 0.62
         self.fluid_radius_scale = 1.35
         self.fluid_thickness_scale = 1.35
@@ -1208,6 +1210,8 @@ class ViewerBase(ABC):
         points: wp.array[wp.vec3] | None,
         radii: wp.array[wp.float32] | float | None = None,
         color: tuple[float, float, float] = (0.28, 0.88, 1.0),
+        deep_color: tuple[float, float, float] = (0.02, 0.42, 0.82),
+        color_gradient_strength: float = 0.45,
         opacity: float = 0.62,
         radius_scale: float = 1.0,
         thickness_scale: float = 1.35,
@@ -1231,6 +1235,8 @@ class ViewerBase(ABC):
             points: Particle centers [m].
             radii: Particle support radii [m].
             color: Water base color with RGB values in ``[0, 1]``.
+            deep_color: Secondary/deep-water color for thickness-driven gradients.
+            color_gradient_strength: Blend strength for the shallow/deep color gradient.
             opacity: Surface opacity in ``[0, 1]``.
             radius_scale: Rendering-only multiplier applied to particle radii.
             thickness_scale: Multiplier applied to accumulated optical thickness.
@@ -2383,6 +2389,8 @@ class ViewerBase(ABC):
                     points=points,
                     radii=radii,
                     color=self.fluid_color,
+                    deep_color=self.fluid_deep_color,
+                    color_gradient_strength=self.fluid_color_gradient_strength,
                     opacity=self.fluid_opacity,
                     radius_scale=self.fluid_radius_scale,
                     thickness_scale=self.fluid_thickness_scale,

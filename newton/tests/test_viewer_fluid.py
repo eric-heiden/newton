@@ -23,6 +23,8 @@ class _LogFluidProbe(ViewerNull):
         points,
         radii=None,
         color=(0.28, 0.88, 1.0),
+        deep_color=(0.02, 0.42, 0.82),
+        color_gradient_strength=0.45,
         opacity=0.62,
         radius_scale=1.0,
         thickness_scale=1.35,
@@ -40,6 +42,8 @@ class _LogFluidProbe(ViewerNull):
             "points": points,
             "radii": radii,
             "color": color,
+            "deep_color": deep_color,
+            "color_gradient_strength": color_gradient_strength,
             "opacity": opacity,
             "radius_scale": radius_scale,
             "thickness_scale": thickness_scale,
@@ -87,6 +91,8 @@ class TestViewerFluid(unittest.TestCase):
         self.assertFalse(viewer.logged_fluid["hidden"])
         self.assertEqual(viewer.logged_fluid["radius_scale"], viewer.fluid_radius_scale)
         self.assertEqual(viewer.logged_fluid["smoothing_radius"], viewer.fluid_smoothing_radius)
+        self.assertEqual(viewer.logged_fluid["deep_color"], viewer.fluid_deep_color)
+        self.assertEqual(viewer.logged_fluid["color_gradient_strength"], viewer.fluid_color_gradient_strength)
         self.assertEqual(viewer.logged_fluid["env_map_strength"], viewer.fluid_env_map_strength)
         self.assertEqual(viewer.logged_fluid["caustic_scale"], viewer.fluid_caustic_scale)
         np.testing.assert_allclose(viewer.logged_fluid["points"].numpy()[:, 0], [0.0, 2.0], atol=1.0e-6)

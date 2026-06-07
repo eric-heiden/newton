@@ -955,6 +955,8 @@ class FluidGL:
         self.active_particles = 0
         self.hidden = False
         self.color = (0.28, 0.88, 1.0)
+        self.deep_color = (0.02, 0.42, 0.82)
+        self.color_gradient_strength = 0.45
         self.opacity = 0.62
         self.radius_scale = 1.0
         self.thickness_scale = 1.35
@@ -996,6 +998,8 @@ class FluidGL:
         points,
         radii,
         color: tuple[float, float, float],
+        deep_color: tuple[float, float, float],
+        color_gradient_strength: float,
         opacity: float,
         radius_scale: float,
         thickness_scale: float,
@@ -1021,6 +1025,8 @@ class FluidGL:
         self.active_particles = count
         self.hidden = hidden
         self.color = tuple(float(c) for c in color)
+        self.deep_color = tuple(float(c) for c in deep_color)
+        self.color_gradient_strength = float(np.clip(color_gradient_strength, 0.0, 1.0))
         self.opacity = float(np.clip(opacity, 0.0, 1.0))
         self.radius_scale = float(max(radius_scale, 0.0))
         self.thickness_scale = float(max(thickness_scale, 0.0))
@@ -2169,6 +2175,8 @@ class RendererGL:
                 inv_view_rotation=inv_view_rotation,
                 texel_size=(1.0 / max(self._screen_width, 1), 1.0 / max(self._screen_height, 1)),
                 water_color=material_fluid.color,
+                water_deep_color=material_fluid.deep_color,
+                color_gradient_strength=material_fluid.color_gradient_strength,
                 opacity=material_fluid.opacity,
                 reflection_strength=material_fluid.reflection_strength,
                 refraction_strength=material_fluid.refraction_strength,

@@ -69,6 +69,8 @@ class Example:
         self.viewer.show_particles = args.render_mode == "particles"
         self.viewer.show_fluid = args.render_mode == "fluid"
         self.viewer.fluid_color = tuple(args.fluid_color)
+        self.viewer.fluid_deep_color = tuple(args.fluid_deep_color)
+        self.viewer.fluid_color_gradient_strength = args.fluid_color_gradient_strength
         self.viewer.fluid_opacity = args.fluid_opacity
         self.viewer.fluid_radius_scale = args.fluid_radius_scale
         self.viewer.fluid_thickness_scale = args.fluid_thickness_scale
@@ -208,6 +210,8 @@ class Example:
         parser.add_argument("--bounds-upper", type=float, nargs=3, default=(0.75, 0.45, 1.0))
 
         parser.add_argument("--fluid-color", type=float, nargs=3, default=(0.28, 0.88, 1.0))
+        parser.add_argument("--fluid-deep-color", type=float, nargs=3, default=(0.02, 0.42, 0.82))
+        parser.add_argument("--fluid-color-gradient-strength", type=float, default=0.45)
         parser.add_argument("--fluid-opacity", type=float, default=0.70)
         parser.add_argument("--fluid-radius-scale", type=float, default=1.35)
         parser.add_argument("--fluid-thickness-scale", type=float, default=1.7)

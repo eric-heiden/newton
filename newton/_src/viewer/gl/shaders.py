@@ -607,6 +607,8 @@ uniform mat4 inv_projection;
 uniform mat3 inv_view_rotation;
 uniform vec2 texel_size;
 uniform vec3 water_color;
+uniform vec3 water_deep_color;
+uniform float color_gradient_strength;
 uniform float opacity;
 uniform float reflection_strength;
 uniform float refraction_strength;
@@ -670,6 +672,16 @@ float caustic_pattern(vec2 uv, vec3 n, float depth, float thickness)
     return lines * focus;
 }
 
+vec3 tropical_gradient(vec2 uv, vec3 n, float depth, float thickness)
+{
+    float depth_mix = smoothstep(0.05, 1.45, thickness);
+    float wave = 0.5 + 0.5 * sin((uv.x + n.x * 0.07 + depth * 0.012) * 22.0 + sin((uv.y - n.y * 0.05) * 31.0));
+    float gradient_mix = clamp(depth_mix * 0.82 + wave * 0.18, 0.0, 1.0);
+    vec3 shallow = mix(water_color, vec3(0.74, 1.0, 0.86), 0.28);
+    vec3 graded = mix(shallow, water_deep_color, gradient_mix);
+    return mix(water_color, graded, color_gradient_strength);
+}
+
 void main()
 {
     float depth = texture(fluid_depth_texture, TexCoord).r;
@@ -696,12 +708,13 @@ void main()
     vec3 h = normalize(l + v);
     float spec = pow(max(dot(n, h), 0.0), 150.0) * 0.9;
 
-    vec3 water = mix(scene, water_color, 0.62);
-    water += water_color * 0.08 * smoothstep(0.02, 0.45, thickness);
+    vec3 gradient_color = tropical_gradient(TexCoord, n, depth, thickness);
+    vec3 water = mix(scene, gradient_color, 0.62);
+    water += gradient_color * 0.08 * smoothstep(0.02, 0.45, thickness);
     water = mix(water, reflected, clamp(0.12 + 0.42 * fresnel, 0.0, 0.58));
     water = mix(water, env_reflected, clamp(env_map_strength * (0.30 + 0.70 * water_fresnel), 0.0, 0.70));
     water += vec3(spec);
-    water += caustic_strength * caustic_pattern(TexCoord, n, depth, thickness) * (vec3(0.78, 1.0, 0.92) + water_color * 0.35);
+    water += caustic_strength * caustic_pattern(TexCoord, n, depth, thickness) * (vec3(0.78, 1.0, 0.92) + gradient_color * 0.35);
 
     FragColor = vec4(mix(scene, water, alpha), 1.0);
 }
@@ -1030,6 +1043,8 @@ class FluidCompositeShader(ShaderGL):
             self.loc_inv_view_rotation = self._get_uniform_location("inv_view_rotation")
             self.loc_texel_size = self._get_uniform_location("texel_size")
             self.loc_water_color = self._get_uniform_location("water_color")
+            self.loc_water_deep_color = self._get_uniform_location("water_deep_color")
+            self.loc_color_gradient_strength = self._get_uniform_location("color_gradient_strength")
             self.loc_opacity = self._get_uniform_location("opacity")
             self.loc_reflection_strength = self._get_uniform_location("reflection_strength")
             self.loc_refraction_strength = self._get_uniform_location("refraction_strength")
@@ -1050,6 +1065,8 @@ class FluidCompositeShader(ShaderGL):
         inv_view_rotation: np.ndarray,
         texel_size: tuple[float, float],
         water_color: tuple[float, float, float],
+        water_deep_color: tuple[float, float, float],
+        color_gradient_strength: float,
         opacity: float,
         reflection_strength: float,
         refraction_strength: float,
@@ -1071,6 +1088,8 @@ class FluidCompositeShader(ShaderGL):
             )
             self._gl.glUniform2f(self.loc_texel_size, texel_size[0], texel_size[1])
             self._gl.glUniform3f(self.loc_water_color, *water_color)
+            self._gl.glUniform3f(self.loc_water_deep_color, *water_deep_color)
+            self._gl.glUniform1f(self.loc_color_gradient_strength, float(color_gradient_strength))
             self._gl.glUniform1f(self.loc_opacity, float(opacity))
             self._gl.glUniform1f(self.loc_reflection_strength, float(reflection_strength))
             self._gl.glUniform1f(self.loc_refraction_strength, float(refraction_strength))

@@ -4,6 +4,7 @@
 import unittest
 
 import numpy as np
+import warp as wp
 
 import newton
 from newton.viewer import ViewerNull
@@ -199,6 +200,34 @@ class TestViewerFluid(unittest.TestCase):
         self.assertLessEqual(args.fluid_env_reflection_lod, 0.5)
         self.assertGreater(args.fluid_floor_caustic_strength, 1.0)
         self.assertGreater(args.fluid_depth_visualization_strength, 0.5)
+
+    def test_interactive_tank_rollout_keeps_boxes_submerged_and_stable(self):
+        from newton.examples.fluid.example_fluid_sph_interactive_tank import Example
+
+        args = Example.create_parser().parse_args(["--viewer", "null", "--no-show-bounds", "--box-count", "3"])
+        viewer = ViewerNull(num_frames=1)
+        example = Example(viewer, args)
+
+        max_speed = 0.0
+        max_height = -np.inf
+        for _frame in range(45):
+            example.step()
+            wp.synchronize()
+            body_q = example.state_0.body_q.numpy()[example.box_body_ids]
+            body_qd = example.state_0.body_qd.numpy()[example.box_body_ids]
+            max_speed = max(max_speed, float(np.linalg.norm(body_qd[:, :3], axis=1).max()))
+            max_height = max(max_height, float(body_q[:, 2].max()))
+
+        particles = example.state_0.particle_q.numpy()
+        body_q = example.state_0.body_q.numpy()[example.box_body_ids]
+        targets = np.asarray(example.box_target_heights, dtype=np.float32)
+        half_z = np.asarray([float(h[2]) for h in example.box_half_extents], dtype=np.float32)
+
+        self.assertLess(max_speed, 4.0)
+        self.assertLess(max_height, args.bounds_upper[2] - 0.15)
+        self.assertLess(np.abs(body_q[:, 2] - targets).max(), 0.16)
+        self.assertGreater(particles[:, 2].max(), float((body_q[:, 2] + half_z).max()) + 0.05)
+        self.assertGreater(args.bounds_upper[2] - args.bounds_lower[2], 1.2)
 
 
 if __name__ == "__main__":

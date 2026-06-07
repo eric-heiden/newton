@@ -25,6 +25,31 @@ def _sign_nonzero(x: float) -> float:
 
 
 @wp.kernel
+def deactivate_particles_overlapping_boxes(
+    particle_q: wp.array[wp.vec3],
+    particle_flags: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    box_body_ids: wp.array[int],
+    box_half_extents: wp.array[wp.vec3],
+    clearance: float,
+):
+    tid = wp.tid()
+    x = particle_q[tid]
+    for box_idx in range(box_body_ids.shape[0]):
+        body = box_body_ids[box_idx]
+        X_bw = wp.transform_inverse(body_q[body])
+        local = wp.transform_point(X_bw, x)
+        half = box_half_extents[box_idx] + wp.vec3(clearance)
+        if (
+            wp.abs(local[0]) <= half[0]
+            and wp.abs(local[1]) <= half[1]
+            and wp.abs(local[2]) <= half[2]
+        ):
+            particle_flags[tid] = wp.int32(0)
+            return
+
+
+@wp.kernel
 def apply_body_suspension_forces(
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
@@ -214,6 +239,7 @@ class Example:
         self.box_body_ids_wp = wp.array(self.box_body_ids, dtype=int, device=self.model.device)
         self.box_half_extents_wp = wp.array(self.box_half_extents, dtype=wp.vec3, device=self.model.device)
         self.box_target_heights_wp = wp.array(self.box_target_heights, dtype=float, device=self.model.device)
+        self._carve_initial_box_volumes(args.fluid_carve_clearance)
 
         self.sph_solver = SolverSPH(
             self.model,
@@ -276,6 +302,23 @@ class Example:
             self.box_half_extents.append(wp.vec3(hx, hy, hz))
             self.box_target_heights.append(z)
             self.box_guide_colors.append(wp.vec3(colors[i % len(colors)]))
+
+    def _carve_initial_box_volumes(self, clearance: float):
+        if clearance < 0.0 or len(self.box_body_ids) == 0:
+            return
+        wp.launch(
+            kernel=deactivate_particles_overlapping_boxes,
+            dim=self.model.particle_count,
+            inputs=[
+                self.state_0.particle_q,
+                self.model.particle_flags,
+                self.state_0.body_q,
+                self.box_body_ids_wp,
+                self.box_half_extents_wp,
+                clearance,
+            ],
+            device=self.model.device,
+        )
 
     def _apply_fluid_args(self, args):
         self.viewer.fluid_color = tuple(args.fluid_color)
@@ -614,39 +657,40 @@ class Example:
             help="Draw colored guide outlines around the pickable rigid bodies.",
         )
 
-        parser.add_argument("--dim-x", type=int, default=28)
-        parser.add_argument("--dim-y", type=int, default=18)
-        parser.add_argument("--dim-z", type=int, default=14)
-        parser.add_argument("--spacing", type=float, default=0.043)
-        parser.add_argument("--radius", type=float, default=0.034)
+        parser.add_argument("--dim-x", type=int, default=36)
+        parser.add_argument("--dim-y", type=int, default=24)
+        parser.add_argument("--dim-z", type=int, default=24)
+        parser.add_argument("--spacing", type=float, default=0.040)
+        parser.add_argument("--radius", type=float, default=0.030)
         parser.add_argument("--jitter", type=float, default=0.0015)
-        parser.add_argument("--emit-lower", type=float, nargs=3, default=(-0.58, -0.34, 0.08))
+        parser.add_argument("--emit-lower", type=float, nargs=3, default=(-0.86, -0.52, 0.06))
         parser.add_argument("--initial-velocity", type=float, nargs=3, default=(0.0, 0.0, 0.0))
 
-        parser.add_argument("--smoothing-length", type=float, default=0.092)
+        parser.add_argument("--smoothing-length", type=float, default=0.086)
         parser.add_argument("--rest-density", type=float, default=460.0)
-        parser.add_argument("--gas-constant", type=float, default=70.0)
-        parser.add_argument("--viscosity", type=float, default=0.10)
-        parser.add_argument("--velocity-damping", type=float, default=0.015)
-        parser.add_argument("--boundary-damping", type=float, default=0.20)
-        parser.add_argument("--max-velocity", type=float, default=5.5)
-        parser.add_argument("--gravity", type=float, default=-3.5)
-        parser.add_argument("--bounds-lower", type=float, nargs=3, default=(-0.72, -0.48, 0.0))
-        parser.add_argument("--bounds-upper", type=float, nargs=3, default=(0.72, 0.48, 0.88))
+        parser.add_argument("--gas-constant", type=float, default=44.0)
+        parser.add_argument("--viscosity", type=float, default=0.18)
+        parser.add_argument("--velocity-damping", type=float, default=0.026)
+        parser.add_argument("--boundary-damping", type=float, default=0.16)
+        parser.add_argument("--max-velocity", type=float, default=3.8)
+        parser.add_argument("--gravity", type=float, default=-2.4)
+        parser.add_argument("--bounds-lower", type=float, nargs=3, default=(-1.10, -0.76, 0.0))
+        parser.add_argument("--bounds-upper", type=float, nargs=3, default=(1.25, 0.86, 1.48))
         parser.add_argument("--ground-color", type=float, nargs=3, default=(0.72, 0.63, 0.42))
 
         parser.add_argument("--box-count", type=int, default=5)
-        parser.add_argument("--box-half-extent", type=float, default=0.105)
+        parser.add_argument("--box-half-extent", type=float, default=0.115)
         parser.add_argument("--box-height", type=float, default=0.46)
-        parser.add_argument("--box-mass", type=float, default=1.4)
+        parser.add_argument("--box-mass", type=float, default=1.8)
         parser.add_argument("--box-density", type=float, default=65.0)
-        parser.add_argument("--pick-stiffness", type=float, default=120.0)
-        parser.add_argument("--pick-damping", type=float, default=18.0)
-        parser.add_argument("--coupling-stiffness", type=float, default=760.0)
-        parser.add_argument("--coupling-damping", type=float, default=28.0)
-        parser.add_argument("--splash-velocity-gain", type=float, default=1.45)
-        parser.add_argument("--suspension-stiffness", type=float, default=38.0)
-        parser.add_argument("--suspension-damping", type=float, default=9.5)
+        parser.add_argument("--fluid-carve-clearance", type=float, default=0.055)
+        parser.add_argument("--pick-stiffness", type=float, default=72.0)
+        parser.add_argument("--pick-damping", type=float, default=22.0)
+        parser.add_argument("--coupling-stiffness", type=float, default=260.0)
+        parser.add_argument("--coupling-damping", type=float, default=16.0)
+        parser.add_argument("--splash-velocity-gain", type=float, default=0.32)
+        parser.add_argument("--suspension-stiffness", type=float, default=42.0)
+        parser.add_argument("--suspension-damping", type=float, default=16.0)
 
         parser.add_argument("--fluid-color", type=float, nargs=3, default=(0.02, 0.96, 0.86))
         parser.add_argument("--fluid-deep-color", type=float, nargs=3, default=(0.0, 0.035, 0.36))

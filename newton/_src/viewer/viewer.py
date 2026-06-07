@@ -158,9 +158,13 @@ class ViewerBase(ABC):
         self.fluid_reflection_strength = 0.14
         self.fluid_refraction_strength = 0.055
         self.fluid_env_map_strength = 0.52
+        self.fluid_env_reflection_lod = 0.0
+        self.fluid_env_color_preserve = 0.85
         self.fluid_absorption_strength = 1.55
+        self.fluid_depth_visualization_strength = 0.55
         self.fluid_caustic_strength = 0.78
         self.fluid_caustic_scale = 155.0
+        self.fluid_floor_caustic_strength = 0.65
         self.fluid_foam_strength = 0.12
         self.fluid_foam_scale = 55.0
 
@@ -1223,9 +1227,13 @@ class ViewerBase(ABC):
         reflection_strength: float = 0.14,
         refraction_strength: float = 0.055,
         env_map_strength: float = 0.52,
+        env_reflection_lod: float = 0.0,
+        env_color_preserve: float = 0.85,
         absorption_strength: float = 1.55,
+        depth_visualization_strength: float = 0.55,
         caustic_strength: float = 0.78,
         caustic_scale: float = 155.0,
+        floor_caustic_strength: float = 0.65,
         foam_strength: float = 0.12,
         foam_scale: float = 55.0,
         hidden: bool = False,
@@ -1251,9 +1259,13 @@ class ViewerBase(ABC):
             reflection_strength: Strength of the screen-color reflection sample.
             refraction_strength: Strength of the normal-based scene refraction offset.
             env_map_strength: Strength of Fresnel-weighted environment-map reflection.
+            env_reflection_lod: Environment-map mip level for water reflection; lower values keep sharper cues.
+            env_color_preserve: Amount of original environment-map color retained after water filtering.
             absorption_strength: Strength of depth-based tropical absorption and shallow/deep color separation.
+            depth_visualization_strength: Strength of thickness/depth contrast cues on the water body.
             caustic_strength: Strength of the procedural caustic highlight pattern.
             caustic_scale: Spatial frequency of the procedural caustic pattern.
+            floor_caustic_strength: Strength of refracted caustics applied to opaque geometry below the water.
             foam_strength: Strength of the screen-space edge/crest foam overlay.
             foam_scale: Spatial frequency of the procedural foam breakup pattern.
             hidden: Whether the fluid batch should be hidden.
@@ -2408,9 +2420,13 @@ class ViewerBase(ABC):
                     reflection_strength=self.fluid_reflection_strength,
                     refraction_strength=self.fluid_refraction_strength,
                     env_map_strength=self.fluid_env_map_strength,
+                    env_reflection_lod=self.fluid_env_reflection_lod,
+                    env_color_preserve=self.fluid_env_color_preserve,
                     absorption_strength=self.fluid_absorption_strength,
+                    depth_visualization_strength=self.fluid_depth_visualization_strength,
                     caustic_strength=self.fluid_caustic_strength,
                     caustic_scale=self.fluid_caustic_scale,
+                    floor_caustic_strength=self.fluid_floor_caustic_strength,
                     foam_strength=self.fluid_foam_strength,
                     foam_scale=self.fluid_foam_scale,
                     hidden=False,

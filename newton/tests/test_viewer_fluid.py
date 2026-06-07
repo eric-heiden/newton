@@ -33,9 +33,13 @@ class _LogFluidProbe(ViewerNull):
         reflection_strength=0.14,
         refraction_strength=0.055,
         env_map_strength=0.52,
+        env_reflection_lod=0.0,
+        env_color_preserve=0.85,
         absorption_strength=1.55,
+        depth_visualization_strength=0.55,
         caustic_strength=0.78,
         caustic_scale=155.0,
+        floor_caustic_strength=0.65,
         foam_strength=0.12,
         foam_scale=55.0,
         hidden=False,
@@ -55,9 +59,13 @@ class _LogFluidProbe(ViewerNull):
             "reflection_strength": reflection_strength,
             "refraction_strength": refraction_strength,
             "env_map_strength": env_map_strength,
+            "env_reflection_lod": env_reflection_lod,
+            "env_color_preserve": env_color_preserve,
             "absorption_strength": absorption_strength,
+            "depth_visualization_strength": depth_visualization_strength,
             "caustic_strength": caustic_strength,
             "caustic_scale": caustic_scale,
+            "floor_caustic_strength": floor_caustic_strength,
             "foam_strength": foam_strength,
             "foam_scale": foam_scale,
             "hidden": hidden,
@@ -100,8 +108,14 @@ class TestViewerFluid(unittest.TestCase):
         self.assertEqual(viewer.logged_fluid["deep_color"], viewer.fluid_deep_color)
         self.assertEqual(viewer.logged_fluid["color_gradient_strength"], viewer.fluid_color_gradient_strength)
         self.assertEqual(viewer.logged_fluid["env_map_strength"], viewer.fluid_env_map_strength)
+        self.assertEqual(viewer.logged_fluid["env_reflection_lod"], viewer.fluid_env_reflection_lod)
+        self.assertEqual(viewer.logged_fluid["env_color_preserve"], viewer.fluid_env_color_preserve)
         self.assertEqual(viewer.logged_fluid["absorption_strength"], viewer.fluid_absorption_strength)
+        self.assertEqual(
+            viewer.logged_fluid["depth_visualization_strength"], viewer.fluid_depth_visualization_strength
+        )
         self.assertEqual(viewer.logged_fluid["caustic_scale"], viewer.fluid_caustic_scale)
+        self.assertEqual(viewer.logged_fluid["floor_caustic_strength"], viewer.fluid_floor_caustic_strength)
         self.assertEqual(viewer.logged_fluid["foam_strength"], viewer.fluid_foam_strength)
         self.assertEqual(viewer.logged_fluid["foam_scale"], viewer.fluid_foam_scale)
         np.testing.assert_allclose(viewer.logged_fluid["points"].numpy()[:, 0], [0.0, 2.0], atol=1.0e-6)
@@ -168,6 +182,23 @@ class TestViewerFluid(unittest.TestCase):
         self.assertGreaterEqual(viewer.fluid_refraction_strength, 0.04)
         self.assertGreaterEqual(viewer.fluid_reflection_strength, 0.10)
         self.assertGreaterEqual(viewer.fluid_absorption_strength, 1.20)
+        self.assertLessEqual(viewer.fluid_env_reflection_lod, 0.5)
+        self.assertGreaterEqual(viewer.fluid_env_color_preserve, 0.75)
+        self.assertGreaterEqual(viewer.fluid_depth_visualization_strength, 0.35)
+        self.assertGreaterEqual(viewer.fluid_floor_caustic_strength, 0.35)
+
+    def test_interactive_tank_parser_exposes_shader_and_picking_controls(self):
+        from newton.examples.fluid.example_fluid_sph_interactive_tank import Example
+
+        args = Example.create_parser().parse_args([])
+
+        self.assertEqual(args.render_mode, "fluid")
+        self.assertGreater(args.box_count, 0)
+        self.assertGreater(args.pick_stiffness, 0.0)
+        self.assertGreater(args.fluid_env_map_strength, 0.8)
+        self.assertLessEqual(args.fluid_env_reflection_lod, 0.5)
+        self.assertGreater(args.fluid_floor_caustic_strength, 1.0)
+        self.assertGreater(args.fluid_depth_visualization_strength, 0.5)
 
 
 if __name__ == "__main__":

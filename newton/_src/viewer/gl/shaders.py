@@ -603,6 +603,7 @@ uniform sampler2D scene_texture;
 uniform sampler2D fluid_depth_texture;
 uniform sampler2D thickness_texture;
 uniform sampler2D env_map;
+uniform sampler2D scene_depth_texture;
 uniform mat4 inv_projection;
 uniform mat3 inv_view_rotation;
 uniform vec2 texel_size;
@@ -613,10 +614,14 @@ uniform float opacity;
 uniform float reflection_strength;
 uniform float refraction_strength;
 uniform float env_map_strength;
+uniform float env_reflection_lod;
+uniform float env_color_preserve;
 uniform float env_intensity;
 uniform float absorption_strength;
+uniform float depth_visualization_strength;
 uniform float caustic_strength;
 uniform float caustic_scale;
+uniform float floor_caustic_strength;
 uniform float foam_strength;
 uniform float foam_scale;
 uniform int up_axis;
@@ -631,6 +636,14 @@ vec3 reconstruct_view_pos(vec2 uv, float linear_depth)
     far_view /= far_view.w;
     vec3 ray = normalize(far_view.xyz);
     return ray * (linear_depth / max(-ray.z, 1.0e-5));
+}
+
+vec3 reconstruct_device_depth_view_pos(vec2 uv, float depth)
+{
+    vec4 clip = vec4(uv * 2.0 - vec2(1.0), depth * 2.0 - 1.0, 1.0);
+    vec4 view = inv_projection * clip;
+    view /= max(view.w, 1.0e-6);
+    return view.xyz;
 }
 
 vec3 fluid_normal(vec2 uv, float depth)
@@ -698,8 +711,8 @@ vec3 water_env_tint(vec3 env_color, vec3 water_tint, float preserve_color)
 {
     float luma = dot(env_color, vec3(0.2126, 0.7152, 0.0722));
     vec3 filtered = mix(vec3(luma), env_color, preserve_color);
-    vec3 aqua_bias = vec3(0.72, 1.04, 1.12);
-    return filtered * aqua_bias + water_tint * luma * 0.12;
+    vec3 aqua_bias = mix(vec3(0.74, 1.03, 1.12), vec3(1.0), preserve_color);
+    return filtered * aqua_bias + water_tint * luma * mix(0.16, 0.04, preserve_color);
 }
 
 vec2 ripple_pattern(vec2 uv, float depth)
@@ -725,10 +738,24 @@ float caustic_pattern(vec2 uv, vec3 n, float depth, float thickness)
     return web * focus;
 }
 
+float floor_caustic_pattern(vec3 bottom_view, vec3 n, float water_depth)
+{
+    vec2 p = (bottom_view.xy * vec2(0.84, 1.16) + n.xy * 0.18 + vec2(water_depth * 0.12, -water_depth * 0.08))
+        * caustic_scale * 0.36;
+    float a = sin(p.x + 0.72 * sin(p.y * 1.43));
+    float b = sin(p.y * 1.21 + 0.60 * sin(p.x * 1.09));
+    float c = sin((p.x - p.y) * 1.67 + 0.42 * sin(p.x + p.y));
+    float d = sin((p.x + p.y) * 0.93 + 0.55 * sin(p.y));
+    float lines = smoothstep(-0.08, 0.78, (a + b + c + d) * 0.25);
+    float web = pow(lines, 2.25) + 0.62 * pow(max(lines - 0.12, 0.0), 3.5);
+    float focus = smoothstep(0.018, 0.16, water_depth) * (1.0 - smoothstep(1.95, 4.6, water_depth));
+    return web * focus;
+}
+
 vec3 tropical_gradient(vec2 uv, vec3 n, float depth, float thickness)
 {
     float optical_depth = thickness * max(absorption_strength, 0.0);
-    float depth_mix = 1.0 - exp(-optical_depth * 0.85);
+    float depth_mix = 1.0 - exp(-optical_depth * (0.85 + 0.25 * depth_visualization_strength));
     float wave = 0.5 + 0.5 * sin((uv.x + n.x * 0.10 + depth * 0.018) * 27.0 + sin((uv.y - n.y * 0.07) * 39.0));
     float shelf = smoothstep(0.05, 1.3, optical_depth);
     float gradient_mix = clamp(depth_mix * 0.82 + wave * 0.10 + shelf * 0.08, 0.0, 1.0);
@@ -785,31 +812,49 @@ void main()
     scene_refracted.b = texture(scene_texture, clamp(TexCoord + refract_offset * 0.88, vec2(0.0), vec2(1.0))).b;
     vec3 reflected = texture(scene_texture, clamp(reflect_uv, vec2(0.0), vec2(1.0))).rgb;
     vec3 env_dir = normalize(inv_view_rotation * reflect(-v, n));
-    vec3 env_reflected_raw = sample_env_map(env_dir, 0.0) * env_intensity;
+    vec3 env_reflected_raw = sample_env_map(env_dir, env_reflection_lod) * env_intensity;
     vec3 refracted_eye = refract(-v, n, 1.0 / 1.333);
     if (length(refracted_eye) < 0.001)
         refracted_eye = reflect(-v, n);
-    vec3 env_refracted_raw = sample_env_map(normalize(inv_view_rotation * refracted_eye), 2.3) * env_intensity;
+    vec3 env_refracted_raw = sample_env_map(normalize(inv_view_rotation * refracted_eye), max(env_reflection_lod + 2.0, 2.0)) * env_intensity;
 
     vec3 l = normalize(sun_direction_view);
     vec3 h = normalize(l + v);
     float spec = pow(max(dot(n, h), 0.0), 220.0) * (0.65 + env_map_strength * 1.15);
 
     vec3 gradient_color = tropical_gradient(TexCoord, n, depth, thickness);
-    vec3 env_reflected = water_env_tint(env_reflected_raw, gradient_color, 0.48);
-    vec3 env_refracted = water_env_tint(env_refracted_raw, gradient_color, 0.20);
+    vec3 env_reflected = water_env_tint(env_reflected_raw, gradient_color, env_color_preserve);
+    vec3 env_refracted = water_env_tint(env_refracted_raw, gradient_color, clamp(env_color_preserve * 0.45, 0.0, 1.0));
     vec3 absorption = exp(-vec3(1.95, 0.58, 0.12) * optical_depth);
     float env_transmission = clamp(env_map_strength * refraction_strength * 5.0 * (0.30 + 0.70 * (1.0 - depth_mix)), 0.0, 0.55);
     vec3 transmitted_scene = mix(scene_refracted, env_refracted, env_transmission);
-    vec3 transmitted = transmitted_scene * absorption * (1.0 - 0.34 * depth_mix) + gradient_color * (0.38 + 0.82 * depth_mix);
-    transmitted = mix(transmitted, gradient_color, clamp(0.16 + 0.28 * depth_mix, 0.0, 0.46));
+
+    float raw_bottom_depth = texture(scene_depth_texture, refract_uv).r;
+    float water_column_depth = 0.0;
+    vec3 bottom_view = p;
+    if (raw_bottom_depth < 0.9999) {
+        bottom_view = reconstruct_device_depth_view_pos(refract_uv, raw_bottom_depth);
+        water_column_depth = max(-bottom_view.z - depth, 0.0);
+    }
+    float bottom_caustic = floor_caustic_strength * floor_caustic_pattern(bottom_view, n, water_column_depth);
+    vec3 floor_caustic_color = vec3(1.0, 0.96, 0.72) + gradient_color * 0.55;
+    transmitted_scene += bottom_caustic * floor_caustic_color * (1.30 + 0.22 * depth_visualization_strength);
+
+    vec3 transmitted = transmitted_scene * absorption * (1.0 - 0.42 * depth_mix) + gradient_color * (0.54 + 0.96 * depth_mix);
+    transmitted = mix(transmitted, gradient_color, clamp(0.24 + 0.34 * depth_mix, 0.0, 0.58));
     vec3 reflection_color = mix(reflected, env_reflected, clamp(0.40 + env_map_strength * 0.85, 0.0, 1.0));
     float reflection_mix = clamp(
-        env_map_strength * (0.08 + 1.18 * water_fresnel) + reflection_strength * (0.22 + 0.78 * fresnel),
+        env_map_strength * (0.18 + 1.35 * water_fresnel + 0.10 * ripple_weight)
+            + reflection_strength * (0.35 + 0.65 * fresnel),
         0.0,
-        0.92
+        0.95
     );
     vec3 water = mix(transmitted, reflection_color, reflection_mix);
+    water += bottom_caustic * floor_caustic_color * (0.22 + 0.20 * (1.0 - reflection_mix));
+    float view_side = clamp(1.0 - abs(dot(n, v)), 0.0, 1.0);
+    float depth_shadow = depth_visualization_strength * clamp(depth_mix + smoothstep(0.02, 0.45, water_column_depth), 0.0, 1.0);
+    water *= mix(vec3(1.0), vec3(0.70, 0.84, 1.0), clamp(depth_shadow * 0.42, 0.0, 0.55));
+    water += gradient_color * (0.10 + 0.16 * view_side) * depth_visualization_strength;
     water += vec3(spec);
     float caustics = caustic_pattern(TexCoord, n, depth, thickness) * (1.0 - reflection_mix * 0.35);
     water += caustic_strength * caustics * (vec3(0.92, 1.0, 0.82) + gradient_color * 0.45) * 1.55;
@@ -1140,6 +1185,7 @@ class FluidCompositeShader(ShaderGL):
             self.loc_fluid_depth_texture = self._get_uniform_location("fluid_depth_texture")
             self.loc_thickness_texture = self._get_uniform_location("thickness_texture")
             self.loc_env_map = self._get_uniform_location("env_map")
+            self.loc_scene_depth_texture = self._get_uniform_location("scene_depth_texture")
             self.loc_inv_projection = self._get_uniform_location("inv_projection")
             self.loc_inv_view_rotation = self._get_uniform_location("inv_view_rotation")
             self.loc_texel_size = self._get_uniform_location("texel_size")
@@ -1150,10 +1196,14 @@ class FluidCompositeShader(ShaderGL):
             self.loc_reflection_strength = self._get_uniform_location("reflection_strength")
             self.loc_refraction_strength = self._get_uniform_location("refraction_strength")
             self.loc_env_map_strength = self._get_uniform_location("env_map_strength")
+            self.loc_env_reflection_lod = self._get_uniform_location("env_reflection_lod")
+            self.loc_env_color_preserve = self._get_uniform_location("env_color_preserve")
             self.loc_env_intensity = self._get_uniform_location("env_intensity")
             self.loc_absorption_strength = self._get_uniform_location("absorption_strength")
+            self.loc_depth_visualization_strength = self._get_uniform_location("depth_visualization_strength")
             self.loc_caustic_strength = self._get_uniform_location("caustic_strength")
             self.loc_caustic_scale = self._get_uniform_location("caustic_scale")
+            self.loc_floor_caustic_strength = self._get_uniform_location("floor_caustic_strength")
             self.loc_foam_strength = self._get_uniform_location("foam_strength")
             self.loc_foam_scale = self._get_uniform_location("foam_scale")
             self.loc_up_axis = self._get_uniform_location("up_axis")
@@ -1165,6 +1215,7 @@ class FluidCompositeShader(ShaderGL):
         depth_unit: int,
         thickness_unit: int,
         env_unit: int,
+        scene_depth_unit: int,
         inv_projection: np.ndarray,
         inv_view_rotation: np.ndarray,
         texel_size: tuple[float, float],
@@ -1175,10 +1226,14 @@ class FluidCompositeShader(ShaderGL):
         reflection_strength: float,
         refraction_strength: float,
         env_map_strength: float,
+        env_reflection_lod: float,
+        env_color_preserve: float,
         env_intensity: float,
         absorption_strength: float,
+        depth_visualization_strength: float,
         caustic_strength: float,
         caustic_scale: float,
+        floor_caustic_strength: float,
         foam_strength: float,
         foam_scale: float,
         up_axis: int,
@@ -1189,6 +1244,7 @@ class FluidCompositeShader(ShaderGL):
             self._gl.glUniform1i(self.loc_fluid_depth_texture, depth_unit)
             self._gl.glUniform1i(self.loc_thickness_texture, thickness_unit)
             self._gl.glUniform1i(self.loc_env_map, env_unit)
+            self._gl.glUniform1i(self.loc_scene_depth_texture, scene_depth_unit)
             self._gl.glUniformMatrix4fv(self.loc_inv_projection, 1, self._gl.GL_FALSE, arr_pointer(inv_projection))
             self._gl.glUniformMatrix3fv(
                 self.loc_inv_view_rotation, 1, self._gl.GL_FALSE, arr_pointer(inv_view_rotation)
@@ -1201,10 +1257,14 @@ class FluidCompositeShader(ShaderGL):
             self._gl.glUniform1f(self.loc_reflection_strength, float(reflection_strength))
             self._gl.glUniform1f(self.loc_refraction_strength, float(refraction_strength))
             self._gl.glUniform1f(self.loc_env_map_strength, float(env_map_strength))
+            self._gl.glUniform1f(self.loc_env_reflection_lod, float(env_reflection_lod))
+            self._gl.glUniform1f(self.loc_env_color_preserve, float(env_color_preserve))
             self._gl.glUniform1f(self.loc_env_intensity, float(env_intensity))
             self._gl.glUniform1f(self.loc_absorption_strength, float(absorption_strength))
+            self._gl.glUniform1f(self.loc_depth_visualization_strength, float(depth_visualization_strength))
             self._gl.glUniform1f(self.loc_caustic_strength, float(caustic_strength))
             self._gl.glUniform1f(self.loc_caustic_scale, float(caustic_scale))
+            self._gl.glUniform1f(self.loc_floor_caustic_strength, float(floor_caustic_strength))
             self._gl.glUniform1f(self.loc_foam_strength, float(foam_strength))
             self._gl.glUniform1f(self.loc_foam_scale, float(foam_scale))
             self._gl.glUniform1i(self.loc_up_axis, int(up_axis))

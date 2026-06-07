@@ -965,9 +965,13 @@ class FluidGL:
         self.reflection_strength = 0.14
         self.refraction_strength = 0.055
         self.env_map_strength = 0.52
+        self.env_reflection_lod = 0.0
+        self.env_color_preserve = 0.85
         self.absorption_strength = 1.55
+        self.depth_visualization_strength = 0.55
         self.caustic_strength = 0.78
         self.caustic_scale = 155.0
+        self.floor_caustic_strength = 0.65
         self.foam_strength = 0.12
         self.foam_scale = 55.0
 
@@ -1011,9 +1015,13 @@ class FluidGL:
         reflection_strength: float,
         refraction_strength: float,
         env_map_strength: float,
+        env_reflection_lod: float,
+        env_color_preserve: float,
         absorption_strength: float,
+        depth_visualization_strength: float,
         caustic_strength: float,
         caustic_scale: float,
+        floor_caustic_strength: float,
         foam_strength: float,
         foam_scale: float,
         hidden: bool,
@@ -1041,9 +1049,13 @@ class FluidGL:
         self.reflection_strength = float(max(reflection_strength, 0.0))
         self.refraction_strength = float(max(refraction_strength, 0.0))
         self.env_map_strength = float(max(env_map_strength, 0.0))
+        self.env_reflection_lod = float(np.clip(env_reflection_lod, 0.0, 8.0))
+        self.env_color_preserve = float(np.clip(env_color_preserve, 0.0, 1.0))
         self.absorption_strength = float(max(absorption_strength, 0.0))
+        self.depth_visualization_strength = float(max(depth_visualization_strength, 0.0))
         self.caustic_strength = float(max(caustic_strength, 0.0))
         self.caustic_scale = float(max(caustic_scale, 1.0))
+        self.floor_caustic_strength = float(max(floor_caustic_strength, 0.0))
         self.foam_strength = float(max(foam_strength, 0.0))
         self.foam_scale = float(max(foam_scale, 1.0))
 
@@ -2175,11 +2187,14 @@ class RendererGL:
                 gl.glBindTexture(gl.GL_TEXTURE_2D, self._env_texture)
             else:
                 gl.glBindTexture(gl.GL_TEXTURE_2D, RendererGL.get_fallback_texture())
+            gl.glActiveTexture(gl.GL_TEXTURE4)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._frame_depth_texture)
             self._fluid_composite_shader.update(
                 scene_unit=0,
                 depth_unit=1,
                 thickness_unit=2,
                 env_unit=3,
+                scene_depth_unit=4,
                 inv_projection=inv_projection,
                 inv_view_rotation=inv_view_rotation,
                 texel_size=(1.0 / max(self._screen_width, 1), 1.0 / max(self._screen_height, 1)),
@@ -2190,10 +2205,14 @@ class RendererGL:
                 reflection_strength=material_fluid.reflection_strength,
                 refraction_strength=material_fluid.refraction_strength,
                 env_map_strength=material_fluid.env_map_strength,
+                env_reflection_lod=material_fluid.env_reflection_lod,
+                env_color_preserve=material_fluid.env_color_preserve,
                 absorption_strength=material_fluid.absorption_strength,
+                depth_visualization_strength=material_fluid.depth_visualization_strength,
                 env_intensity=self._env_intensity,
                 caustic_strength=material_fluid.caustic_strength,
                 caustic_scale=material_fluid.caustic_scale,
+                floor_caustic_strength=material_fluid.floor_caustic_strength,
                 foam_strength=material_fluid.foam_strength,
                 foam_scale=material_fluid.foam_scale,
                 up_axis=self.camera.up_axis,

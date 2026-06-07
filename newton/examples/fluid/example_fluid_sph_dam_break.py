@@ -79,9 +79,13 @@ class Example:
         self.viewer.fluid_reflection_strength = args.fluid_reflection_strength
         self.viewer.fluid_refraction_strength = args.fluid_refraction_strength
         self.viewer.fluid_env_map_strength = args.fluid_env_map_strength
+        self.viewer.fluid_env_reflection_lod = args.fluid_env_reflection_lod
+        self.viewer.fluid_env_color_preserve = args.fluid_env_color_preserve
         self.viewer.fluid_absorption_strength = args.fluid_absorption_strength
+        self.viewer.fluid_depth_visualization_strength = args.fluid_depth_visualization_strength
         self.viewer.fluid_caustic_strength = args.fluid_caustic_strength
         self.viewer.fluid_caustic_scale = args.fluid_caustic_scale
+        self.viewer.fluid_floor_caustic_strength = args.fluid_floor_caustic_strength
         self.viewer.fluid_foam_strength = args.fluid_foam_strength
         self.viewer.fluid_foam_scale = args.fluid_foam_scale
         self.viewer.set_camera(pos=wp.vec3(args.camera_pos), pitch=args.camera_pitch, yaw=args.camera_yaw)
@@ -246,9 +250,13 @@ class Example:
         parser.add_argument("--fluid-reflection-strength", type=float, default=0.14)
         parser.add_argument("--fluid-refraction-strength", type=float, default=0.055)
         parser.add_argument("--fluid-env-map-strength", type=float, default=0.52)
+        parser.add_argument("--fluid-env-reflection-lod", type=float, default=0.0)
+        parser.add_argument("--fluid-env-color-preserve", type=float, default=0.85)
         parser.add_argument("--fluid-absorption-strength", type=float, default=1.55)
+        parser.add_argument("--fluid-depth-visualization-strength", type=float, default=0.55)
         parser.add_argument("--fluid-caustic-strength", type=float, default=0.78)
         parser.add_argument("--fluid-caustic-scale", type=float, default=155.0)
+        parser.add_argument("--fluid-floor-caustic-strength", type=float, default=0.65)
         parser.add_argument("--fluid-foam-strength", type=float, default=0.12)
         parser.add_argument("--fluid-foam-scale", type=float, default=55.0)
 

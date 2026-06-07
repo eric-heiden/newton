@@ -954,21 +954,22 @@ class FluidGL:
         self.capacity = max(int(capacity), 1)
         self.active_particles = 0
         self.hidden = False
-        self.color = (0.28, 0.88, 1.0)
-        self.deep_color = (0.02, 0.42, 0.82)
-        self.color_gradient_strength = 0.45
-        self.opacity = 0.62
+        self.color = (0.10, 0.98, 0.92)
+        self.deep_color = (0.0, 0.13, 0.58)
+        self.color_gradient_strength = 0.88
+        self.opacity = 0.64
         self.radius_scale = 1.0
-        self.thickness_scale = 1.35
-        self.smoothing_iterations = 4
-        self.smoothing_radius = 1.4
-        self.reflection_strength = 0.065
-        self.refraction_strength = 0.026
-        self.env_map_strength = 0.18
-        self.caustic_strength = 0.22
-        self.caustic_scale = 95.0
-        self.foam_strength = 0.0
-        self.foam_scale = 95.0
+        self.thickness_scale = 1.8
+        self.smoothing_iterations = 8
+        self.smoothing_radius = 2.0
+        self.reflection_strength = 0.14
+        self.refraction_strength = 0.055
+        self.env_map_strength = 0.52
+        self.absorption_strength = 1.55
+        self.caustic_strength = 0.78
+        self.caustic_scale = 155.0
+        self.foam_strength = 0.12
+        self.foam_scale = 55.0
 
         self.vao = gl.GLuint()
         self.vbo = gl.GLuint()
@@ -1010,6 +1011,7 @@ class FluidGL:
         reflection_strength: float,
         refraction_strength: float,
         env_map_strength: float,
+        absorption_strength: float,
         caustic_strength: float,
         caustic_scale: float,
         foam_strength: float,
@@ -1039,6 +1041,7 @@ class FluidGL:
         self.reflection_strength = float(max(reflection_strength, 0.0))
         self.refraction_strength = float(max(refraction_strength, 0.0))
         self.env_map_strength = float(max(env_map_strength, 0.0))
+        self.absorption_strength = float(max(absorption_strength, 0.0))
         self.caustic_strength = float(max(caustic_strength, 0.0))
         self.caustic_scale = float(max(caustic_scale, 1.0))
         self.foam_strength = float(max(foam_strength, 0.0))
@@ -2187,6 +2190,7 @@ class RendererGL:
                 reflection_strength=material_fluid.reflection_strength,
                 refraction_strength=material_fluid.refraction_strength,
                 env_map_strength=material_fluid.env_map_strength,
+                absorption_strength=material_fluid.absorption_strength,
                 env_intensity=self._env_intensity,
                 caustic_strength=material_fluid.caustic_strength,
                 caustic_scale=material_fluid.caustic_scale,

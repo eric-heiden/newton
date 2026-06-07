@@ -22,21 +22,22 @@ class _LogFluidProbe(ViewerNull):
         name,
         points,
         radii=None,
-        color=(0.28, 0.88, 1.0),
-        deep_color=(0.02, 0.42, 0.82),
-        color_gradient_strength=0.45,
-        opacity=0.62,
+        color=(0.10, 0.98, 0.92),
+        deep_color=(0.0, 0.13, 0.58),
+        color_gradient_strength=0.88,
+        opacity=0.64,
         radius_scale=1.0,
-        thickness_scale=1.35,
-        smoothing_iterations=4,
-        smoothing_radius=1.4,
-        reflection_strength=0.065,
-        refraction_strength=0.026,
-        env_map_strength=0.18,
-        caustic_strength=0.22,
-        caustic_scale=95.0,
-        foam_strength=0.0,
-        foam_scale=95.0,
+        thickness_scale=1.8,
+        smoothing_iterations=8,
+        smoothing_radius=2.0,
+        reflection_strength=0.14,
+        refraction_strength=0.055,
+        env_map_strength=0.52,
+        absorption_strength=1.55,
+        caustic_strength=0.78,
+        caustic_scale=155.0,
+        foam_strength=0.12,
+        foam_scale=55.0,
         hidden=False,
     ):
         self.logged_fluid = {
@@ -54,6 +55,7 @@ class _LogFluidProbe(ViewerNull):
             "reflection_strength": reflection_strength,
             "refraction_strength": refraction_strength,
             "env_map_strength": env_map_strength,
+            "absorption_strength": absorption_strength,
             "caustic_strength": caustic_strength,
             "caustic_scale": caustic_scale,
             "foam_strength": foam_strength,
@@ -98,6 +100,7 @@ class TestViewerFluid(unittest.TestCase):
         self.assertEqual(viewer.logged_fluid["deep_color"], viewer.fluid_deep_color)
         self.assertEqual(viewer.logged_fluid["color_gradient_strength"], viewer.fluid_color_gradient_strength)
         self.assertEqual(viewer.logged_fluid["env_map_strength"], viewer.fluid_env_map_strength)
+        self.assertEqual(viewer.logged_fluid["absorption_strength"], viewer.fluid_absorption_strength)
         self.assertEqual(viewer.logged_fluid["caustic_scale"], viewer.fluid_caustic_scale)
         self.assertEqual(viewer.logged_fluid["foam_strength"], viewer.fluid_foam_strength)
         self.assertEqual(viewer.logged_fluid["foam_scale"], viewer.fluid_foam_scale)
@@ -156,6 +159,15 @@ class TestViewerFluid(unittest.TestCase):
         self.assertIsNotNone(viewer.logged_points)
         self.assertEqual(viewer.logged_points["name"], "fallback")
         self.assertFalse(viewer.logged_points["hidden"])
+
+    def test_default_fluid_material_uses_visible_tropical_env_refraction(self):
+        viewer = _LogFluidProbe()
+
+        self.assertGreaterEqual(viewer.fluid_color_gradient_strength, 0.75)
+        self.assertGreaterEqual(viewer.fluid_env_map_strength, 0.40)
+        self.assertGreaterEqual(viewer.fluid_refraction_strength, 0.04)
+        self.assertGreaterEqual(viewer.fluid_reflection_strength, 0.10)
+        self.assertGreaterEqual(viewer.fluid_absorption_strength, 1.20)
 
 
 if __name__ == "__main__":

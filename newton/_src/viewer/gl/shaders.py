@@ -614,6 +614,7 @@ uniform float reflection_strength;
 uniform float refraction_strength;
 uniform float env_map_strength;
 uniform float env_intensity;
+uniform float absorption_strength;
 uniform float caustic_strength;
 uniform float caustic_scale;
 uniform float foam_strength;
@@ -649,7 +650,7 @@ vec3 fluid_normal(vec2 uv, float depth)
     return n;
 }
 
-vec3 sample_env_map(vec3 dir)
+vec3 sample_env_map(vec3 dir, float lod)
 {
     vec3 dir_up = dir;
     if (up_axis == 0) {
@@ -659,42 +660,96 @@ vec3 sample_env_map(vec3 dir)
     }
     float u = atan(dir_up.z, dir_up.x) / (2.0 * PI) + 0.5;
     float v = asin(clamp(dir_up.y, -1.0, 1.0)) / PI + 0.5;
-    return textureLod(env_map, vec2(u, v), 1.0).rgb;
+    return textureLod(env_map, vec2(u, v), lod).rgb;
+}
+
+float hash21(vec2 p)
+{
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+}
+
+float value_noise(vec2 p)
+{
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    float a = hash21(i);
+    float b = hash21(i + vec2(1.0, 0.0));
+    float c = hash21(i + vec2(0.0, 1.0));
+    float d = hash21(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+float fbm(vec2 p)
+{
+    float value = 0.0;
+    float amp = 0.5;
+    for (int i = 0; i < 4; ++i) {
+        value += amp * value_noise(p);
+        p = p * 2.03 + vec2(17.1, -9.2);
+        amp *= 0.5;
+    }
+    return value;
+}
+
+vec3 water_env_tint(vec3 env_color, vec3 water_tint, float preserve_color)
+{
+    float luma = dot(env_color, vec3(0.2126, 0.7152, 0.0722));
+    vec3 filtered = mix(vec3(luma), env_color, preserve_color);
+    vec3 aqua_bias = vec3(0.72, 1.04, 1.12);
+    return filtered * aqua_bias + water_tint * luma * 0.12;
+}
+
+vec2 ripple_pattern(vec2 uv, float depth)
+{
+    vec2 p = uv * vec2(78.0, 112.0) + vec2(depth * 0.13, -depth * 0.10);
+    float a = sin(p.x + 0.9 * sin(p.y * 0.72));
+    float b = sin(p.y * 1.13 + 0.7 * sin(p.x * 0.61));
+    float c = sin((p.x + p.y) * 0.57 + 1.2 * sin(p.x * 0.31 - p.y * 0.21));
+    return vec2(a + 0.45 * c, b - 0.35 * c);
 }
 
 float caustic_pattern(vec2 uv, vec3 n, float depth, float thickness)
 {
-    vec2 p = (uv + n.xy * 0.045 + vec2(depth * 0.013, -depth * 0.009)) * caustic_scale;
+    vec2 p = (uv + n.xy * 0.080 + vec2(depth * 0.018, -depth * 0.012)) * caustic_scale;
     float a = sin(p.x + 0.65 * sin(p.y * 1.31));
     float b = sin(0.73 * p.y + 0.55 * sin(p.x * 1.17));
     float c = sin(1.42 * (p.x + p.y) + 0.4 * sin(p.x - p.y));
-    float lines = (a + b + c) / 3.0;
-    lines = smoothstep(0.52, 0.96, lines);
-    float focus = smoothstep(0.02, 0.22, thickness) * (1.0 - smoothstep(1.8, 4.5, thickness));
-    return lines * focus;
+    float d = sin(1.91 * (p.x - p.y) + 0.35 * sin(p.y));
+    float lines = (a + b + c + d) * 0.25;
+    lines = smoothstep(0.34, 0.92, lines);
+    float web = pow(lines, 2.2) + 0.35 * pow(max(lines - 0.25, 0.0), 5.0);
+    float focus = smoothstep(0.004, 0.12, thickness) * (1.0 - smoothstep(2.1, 5.2, thickness));
+    return web * focus;
 }
 
 vec3 tropical_gradient(vec2 uv, vec3 n, float depth, float thickness)
 {
-    float depth_mix = smoothstep(0.05, 1.45, thickness);
-    float wave = 0.5 + 0.5 * sin((uv.x + n.x * 0.07 + depth * 0.012) * 22.0 + sin((uv.y - n.y * 0.05) * 31.0));
-    float gradient_mix = clamp(depth_mix * 0.82 + wave * 0.18, 0.0, 1.0);
-    vec3 shallow = mix(water_color, vec3(0.74, 1.0, 0.86), 0.28);
-    vec3 graded = mix(shallow, water_deep_color, gradient_mix);
+    float optical_depth = thickness * max(absorption_strength, 0.0);
+    float depth_mix = 1.0 - exp(-optical_depth * 0.85);
+    float wave = 0.5 + 0.5 * sin((uv.x + n.x * 0.10 + depth * 0.018) * 27.0 + sin((uv.y - n.y * 0.07) * 39.0));
+    float shelf = smoothstep(0.05, 1.3, optical_depth);
+    float gradient_mix = clamp(depth_mix * 0.82 + wave * 0.10 + shelf * 0.08, 0.0, 1.0);
+    vec3 shallow = mix(water_color, vec3(0.02, 1.0, 0.82), 0.32);
+    vec3 mid = mix(shallow, vec3(0.02, 0.72, 0.95), 0.52);
+    vec3 graded = mix(mid, water_deep_color, smoothstep(0.18, 0.95, gradient_mix));
     return mix(water_color, graded, color_gradient_strength);
 }
 
 float foam_pattern(vec2 uv, vec3 n, float depth, float thickness)
 {
     float curvature = length(dFdx(n)) + length(dFdy(n));
-    float edge = 1.0 - smoothstep(0.10, 0.55, thickness);
-    float crest = smoothstep(0.07, 0.22, curvature);
-    float free_surface = 1.0 - smoothstep(1.1, 2.6, thickness);
-    vec2 p = (uv + n.xy * 0.08 + vec2(depth * 0.010, -depth * 0.014)) * foam_scale;
-    float a = sin(p.x + 0.8 * sin(p.y * 1.7));
-    float b = sin(p.y * 1.23 + 0.5 * sin(p.x * 1.41));
-    float breakup = smoothstep(0.15, 0.88, (a + b) * 0.5);
-    return clamp((edge * 0.75 + crest * 0.65) * free_surface * breakup, 0.0, 1.0);
+    float optical_depth = thickness * max(absorption_strength, 0.0);
+    float edge = smoothstep(0.02, 0.18, optical_depth) * (1.0 - smoothstep(0.58, 1.65, optical_depth));
+    float crest = smoothstep(0.045, 0.18, curvature) * (1.0 - smoothstep(1.2, 3.0, optical_depth));
+    vec2 p = (uv + n.xy * 0.12 + vec2(depth * 0.012, -depth * 0.017)) * foam_scale * 0.055;
+    float patches = fbm(p * 1.55);
+    float veins = fbm(p * 5.5 + 5.0);
+    float breakup = mix(0.35, 1.0, smoothstep(0.22, 0.78, patches));
+    float lacing = smoothstep(0.46, 0.82, veins);
+    return clamp((edge * 0.82 + crest * 0.58) * breakup + crest * lacing * 0.18, 0.0, 1.0);
 }
 
 void main()
@@ -708,31 +763,59 @@ void main()
     vec3 v = normalize(-p);
     float thickness = texture(thickness_texture, TexCoord).r;
 
-    float alpha = clamp((1.0 - exp(-thickness * 3.0)) * opacity, 0.0, opacity);
+    float optical_depth = thickness * max(absorption_strength, 0.0);
+    float depth_mix = clamp(1.0 - exp(-optical_depth * 0.85), 0.0, 1.0);
+    vec2 ripple = ripple_pattern(TexCoord + n.xy * 0.035, depth);
+    float ripple_weight = smoothstep(0.01, 0.24, thickness) * (1.0 - smoothstep(4.0, 8.0, optical_depth));
+    n = normalize(n + vec3(ripple * (0.018 + 0.010 * caustic_strength) * ripple_weight, 0.0));
+    float alpha = clamp((1.0 - exp(-optical_depth * 1.35)) * opacity, 0.0, opacity);
+    alpha *= mix(0.55, 1.0, depth_mix);
     float fresnel = pow(clamp(1.0 - dot(n, v), 0.0, 1.0), 5.0);
     float water_fresnel = 0.02 + 0.98 * fresnel;
 
-    vec2 refract_uv = TexCoord + n.xy * refraction_strength * clamp(thickness, 0.0, 1.0);
-    vec2 reflect_uv = TexCoord + reflect(-v, n).xy * reflection_strength;
-    vec3 scene = texture(scene_texture, clamp(refract_uv, vec2(0.0), vec2(1.0))).rgb;
+    vec2 refract_offset = n.xy * refraction_strength * (0.35 + clamp(optical_depth, 0.0, 2.5));
+    refract_offset += ripple * refraction_strength * 0.055 * ripple_weight;
+    refract_offset += vec2(dFdx(depth), dFdy(depth)) * refraction_strength * 0.18;
+    vec2 refract_uv = clamp(TexCoord + refract_offset, vec2(0.0), vec2(1.0));
+    vec2 reflect_uv = clamp(TexCoord + reflect(-v, n).xy * reflection_strength * (0.35 + 0.65 * water_fresnel), vec2(0.0), vec2(1.0));
+    vec3 scene = texture(scene_texture, TexCoord).rgb;
+    vec3 scene_refracted;
+    scene_refracted.r = texture(scene_texture, clamp(TexCoord + refract_offset * 1.10, vec2(0.0), vec2(1.0))).r;
+    scene_refracted.g = texture(scene_texture, refract_uv).g;
+    scene_refracted.b = texture(scene_texture, clamp(TexCoord + refract_offset * 0.88, vec2(0.0), vec2(1.0))).b;
     vec3 reflected = texture(scene_texture, clamp(reflect_uv, vec2(0.0), vec2(1.0))).rgb;
     vec3 env_dir = normalize(inv_view_rotation * reflect(-v, n));
-    vec3 env_reflected = sample_env_map(env_dir) * env_intensity;
+    vec3 env_reflected_raw = sample_env_map(env_dir, 0.0) * env_intensity;
+    vec3 refracted_eye = refract(-v, n, 1.0 / 1.333);
+    if (length(refracted_eye) < 0.001)
+        refracted_eye = reflect(-v, n);
+    vec3 env_refracted_raw = sample_env_map(normalize(inv_view_rotation * refracted_eye), 2.3) * env_intensity;
 
     vec3 l = normalize(sun_direction_view);
     vec3 h = normalize(l + v);
-    float spec = pow(max(dot(n, h), 0.0), 150.0) * 0.9;
+    float spec = pow(max(dot(n, h), 0.0), 220.0) * (0.65 + env_map_strength * 1.15);
 
     vec3 gradient_color = tropical_gradient(TexCoord, n, depth, thickness);
-    vec3 water = mix(scene, gradient_color, 0.62);
-    water += gradient_color * 0.08 * smoothstep(0.02, 0.45, thickness);
-    water = mix(water, reflected, clamp(0.12 + 0.42 * fresnel, 0.0, 0.58));
-    water = mix(water, env_reflected, clamp(env_map_strength * (0.30 + 0.70 * water_fresnel), 0.0, 0.70));
+    vec3 env_reflected = water_env_tint(env_reflected_raw, gradient_color, 0.48);
+    vec3 env_refracted = water_env_tint(env_refracted_raw, gradient_color, 0.20);
+    vec3 absorption = exp(-vec3(1.95, 0.58, 0.12) * optical_depth);
+    float env_transmission = clamp(env_map_strength * refraction_strength * 5.0 * (0.30 + 0.70 * (1.0 - depth_mix)), 0.0, 0.55);
+    vec3 transmitted_scene = mix(scene_refracted, env_refracted, env_transmission);
+    vec3 transmitted = transmitted_scene * absorption * (1.0 - 0.34 * depth_mix) + gradient_color * (0.38 + 0.82 * depth_mix);
+    transmitted = mix(transmitted, gradient_color, clamp(0.16 + 0.28 * depth_mix, 0.0, 0.46));
+    vec3 reflection_color = mix(reflected, env_reflected, clamp(0.40 + env_map_strength * 0.85, 0.0, 1.0));
+    float reflection_mix = clamp(
+        env_map_strength * (0.08 + 1.18 * water_fresnel) + reflection_strength * (0.22 + 0.78 * fresnel),
+        0.0,
+        0.92
+    );
+    vec3 water = mix(transmitted, reflection_color, reflection_mix);
     water += vec3(spec);
-    water += caustic_strength * caustic_pattern(TexCoord, n, depth, thickness) * (vec3(0.78, 1.0, 0.92) + gradient_color * 0.35);
+    float caustics = caustic_pattern(TexCoord, n, depth, thickness) * (1.0 - reflection_mix * 0.35);
+    water += caustic_strength * caustics * (vec3(0.92, 1.0, 0.82) + gradient_color * 0.45) * 1.55;
     float foam = clamp(foam_strength * foam_pattern(TexCoord, n, depth, thickness), 0.0, 0.92);
-    water = mix(water, vec3(0.92, 1.0, 0.96), foam);
-    alpha = clamp(alpha + foam * 0.28, 0.0, 1.0);
+    water = mix(water, vec3(0.90, 1.0, 0.94), foam);
+    alpha = clamp(alpha + foam * 0.35, 0.0, 1.0);
 
     FragColor = vec4(mix(scene, water, alpha), 1.0);
 }
@@ -1068,6 +1151,7 @@ class FluidCompositeShader(ShaderGL):
             self.loc_refraction_strength = self._get_uniform_location("refraction_strength")
             self.loc_env_map_strength = self._get_uniform_location("env_map_strength")
             self.loc_env_intensity = self._get_uniform_location("env_intensity")
+            self.loc_absorption_strength = self._get_uniform_location("absorption_strength")
             self.loc_caustic_strength = self._get_uniform_location("caustic_strength")
             self.loc_caustic_scale = self._get_uniform_location("caustic_scale")
             self.loc_foam_strength = self._get_uniform_location("foam_strength")
@@ -1092,6 +1176,7 @@ class FluidCompositeShader(ShaderGL):
         refraction_strength: float,
         env_map_strength: float,
         env_intensity: float,
+        absorption_strength: float,
         caustic_strength: float,
         caustic_scale: float,
         foam_strength: float,
@@ -1117,6 +1202,7 @@ class FluidCompositeShader(ShaderGL):
             self._gl.glUniform1f(self.loc_refraction_strength, float(refraction_strength))
             self._gl.glUniform1f(self.loc_env_map_strength, float(env_map_strength))
             self._gl.glUniform1f(self.loc_env_intensity, float(env_intensity))
+            self._gl.glUniform1f(self.loc_absorption_strength, float(absorption_strength))
             self._gl.glUniform1f(self.loc_caustic_strength, float(caustic_strength))
             self._gl.glUniform1f(self.loc_caustic_scale, float(caustic_scale))
             self._gl.glUniform1f(self.loc_foam_strength, float(foam_strength))

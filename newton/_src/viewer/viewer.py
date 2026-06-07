@@ -147,21 +147,22 @@ class ViewerBase(ABC):
         self.show_inertia_boxes = False
         self.show_hydro_contact_surface = False
         self.sdf_margin_mode: ViewerBase.SDFMarginMode = ViewerBase.SDFMarginMode.OFF
-        self.fluid_color = (0.28, 0.88, 1.0)
-        self.fluid_deep_color = (0.02, 0.42, 0.82)
-        self.fluid_color_gradient_strength = 0.45
-        self.fluid_opacity = 0.62
-        self.fluid_radius_scale = 1.35
-        self.fluid_thickness_scale = 1.35
-        self.fluid_smoothing_iterations = 4
-        self.fluid_smoothing_radius = 1.4
-        self.fluid_reflection_strength = 0.065
-        self.fluid_refraction_strength = 0.026
-        self.fluid_env_map_strength = 0.18
-        self.fluid_caustic_strength = 0.22
-        self.fluid_caustic_scale = 95.0
-        self.fluid_foam_strength = 0.0
-        self.fluid_foam_scale = 95.0
+        self.fluid_color = (0.10, 0.98, 0.92)
+        self.fluid_deep_color = (0.0, 0.13, 0.58)
+        self.fluid_color_gradient_strength = 0.88
+        self.fluid_opacity = 0.64
+        self.fluid_radius_scale = 1.55
+        self.fluid_thickness_scale = 1.8
+        self.fluid_smoothing_iterations = 8
+        self.fluid_smoothing_radius = 2.0
+        self.fluid_reflection_strength = 0.14
+        self.fluid_refraction_strength = 0.055
+        self.fluid_env_map_strength = 0.52
+        self.fluid_absorption_strength = 1.55
+        self.fluid_caustic_strength = 0.78
+        self.fluid_caustic_scale = 155.0
+        self.fluid_foam_strength = 0.12
+        self.fluid_foam_scale = 55.0
 
         self.gaussians_max_points = 100_000  # Max number of points to visualize per gaussian
 
@@ -1211,21 +1212,22 @@ class ViewerBase(ABC):
         name: str,
         points: wp.array[wp.vec3] | None,
         radii: wp.array[wp.float32] | float | None = None,
-        color: tuple[float, float, float] = (0.28, 0.88, 1.0),
-        deep_color: tuple[float, float, float] = (0.02, 0.42, 0.82),
-        color_gradient_strength: float = 0.45,
-        opacity: float = 0.62,
+        color: tuple[float, float, float] = (0.10, 0.98, 0.92),
+        deep_color: tuple[float, float, float] = (0.0, 0.13, 0.58),
+        color_gradient_strength: float = 0.88,
+        opacity: float = 0.64,
         radius_scale: float = 1.0,
-        thickness_scale: float = 1.35,
-        smoothing_iterations: int = 4,
-        smoothing_radius: float = 1.4,
-        reflection_strength: float = 0.065,
-        refraction_strength: float = 0.026,
-        env_map_strength: float = 0.18,
-        caustic_strength: float = 0.22,
-        caustic_scale: float = 95.0,
-        foam_strength: float = 0.0,
-        foam_scale: float = 95.0,
+        thickness_scale: float = 1.8,
+        smoothing_iterations: int = 8,
+        smoothing_radius: float = 2.0,
+        reflection_strength: float = 0.14,
+        refraction_strength: float = 0.055,
+        env_map_strength: float = 0.52,
+        absorption_strength: float = 1.55,
+        caustic_strength: float = 0.78,
+        caustic_scale: float = 155.0,
+        foam_strength: float = 0.12,
+        foam_scale: float = 55.0,
         hidden: bool = False,
     ):
         """Log particle samples as a fluid surface.
@@ -1249,6 +1251,7 @@ class ViewerBase(ABC):
             reflection_strength: Strength of the screen-color reflection sample.
             refraction_strength: Strength of the normal-based scene refraction offset.
             env_map_strength: Strength of Fresnel-weighted environment-map reflection.
+            absorption_strength: Strength of depth-based tropical absorption and shallow/deep color separation.
             caustic_strength: Strength of the procedural caustic highlight pattern.
             caustic_scale: Spatial frequency of the procedural caustic pattern.
             foam_strength: Strength of the screen-space edge/crest foam overlay.
@@ -2405,6 +2408,7 @@ class ViewerBase(ABC):
                     reflection_strength=self.fluid_reflection_strength,
                     refraction_strength=self.fluid_refraction_strength,
                     env_map_strength=self.fluid_env_map_strength,
+                    absorption_strength=self.fluid_absorption_strength,
                     caustic_strength=self.fluid_caustic_strength,
                     caustic_scale=self.fluid_caustic_scale,
                     foam_strength=self.fluid_foam_strength,

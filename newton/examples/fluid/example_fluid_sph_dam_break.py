@@ -47,7 +47,7 @@ class Example:
             radius_mean=args.radius,
             radius_std=0.0,
         )
-        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.0))
+        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.0), color=tuple(args.ground_color))
 
         self.model = builder.finalize()
         self.state_0 = self.model.state()
@@ -79,11 +79,13 @@ class Example:
         self.viewer.fluid_reflection_strength = args.fluid_reflection_strength
         self.viewer.fluid_refraction_strength = args.fluid_refraction_strength
         self.viewer.fluid_env_map_strength = args.fluid_env_map_strength
+        self.viewer.fluid_absorption_strength = args.fluid_absorption_strength
         self.viewer.fluid_caustic_strength = args.fluid_caustic_strength
         self.viewer.fluid_caustic_scale = args.fluid_caustic_scale
         self.viewer.fluid_foam_strength = args.fluid_foam_strength
         self.viewer.fluid_foam_scale = args.fluid_foam_scale
         self.viewer.set_camera(pos=wp.vec3(args.camera_pos), pitch=args.camera_pitch, yaw=args.camera_yaw)
+        self._configure_render_environment(args)
 
         if hasattr(self.viewer, "register_ui_callback"):
             self.viewer.register_ui_callback(self.render_ui, position="side")
@@ -182,6 +184,25 @@ class Example:
         colors = wp.full(len(edges), value=wp.vec3(0.25, 0.55, 0.75), dtype=wp.vec3, device=self.model.device)
         self.viewer.log_lines("/fluid/bounds", starts, ends, colors)
 
+    def _configure_render_environment(self, args):
+        renderer = getattr(self.viewer, "renderer", None)
+        if renderer is None:
+            return
+
+        renderer._env_intensity = float(args.environment_intensity)
+        env_path = getattr(renderer, "_env_path", None)
+        if env_path is not None and hasattr(renderer, "set_environment_map"):
+            renderer.set_environment_map(env_path, intensity=args.environment_intensity)
+            renderer._env_path = None
+
+        if args.beach_lighting:
+            renderer.sky_upper = (0.48, 0.74, 1.0)
+            renderer.sky_lower = (0.68, 0.76, 0.78)
+            renderer.ambient_sky = (0.86, 0.92, 1.0)
+            renderer.ambient_ground = (0.56, 0.50, 0.36)
+            renderer.exposure = 1.12
+            renderer.specular_scale = 1.35
+
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
@@ -190,6 +211,7 @@ class Example:
         parser.add_argument("--render-mode", choices=["fluid", "particles"], default="fluid")
         parser.add_argument("--capture-graph", action="store_true", help="Capture the SPH substeps in a CUDA graph.")
         parser.add_argument("--show-bounds", action=argparse.BooleanOptionalAction, default=True)
+        parser.add_argument("--beach-lighting", action=argparse.BooleanOptionalAction, default=True)
 
         parser.add_argument("--dim-x", type=int, default=14)
         parser.add_argument("--dim-y", type=int, default=9)
@@ -210,22 +232,25 @@ class Example:
         parser.add_argument("--gravity", type=float, default=-9.81)
         parser.add_argument("--bounds-lower", type=float, nargs=3, default=(-0.75, -0.45, 0.0))
         parser.add_argument("--bounds-upper", type=float, nargs=3, default=(0.75, 0.45, 1.0))
+        parser.add_argument("--ground-color", type=float, nargs=3, default=(0.68, 0.61, 0.44))
+        parser.add_argument("--environment-intensity", type=float, default=1.35)
 
-        parser.add_argument("--fluid-color", type=float, nargs=3, default=(0.28, 0.88, 1.0))
-        parser.add_argument("--fluid-deep-color", type=float, nargs=3, default=(0.02, 0.42, 0.82))
-        parser.add_argument("--fluid-color-gradient-strength", type=float, default=0.45)
-        parser.add_argument("--fluid-opacity", type=float, default=0.70)
-        parser.add_argument("--fluid-radius-scale", type=float, default=1.35)
-        parser.add_argument("--fluid-thickness-scale", type=float, default=1.7)
-        parser.add_argument("--fluid-smoothing-iterations", type=int, default=6)
-        parser.add_argument("--fluid-smoothing-radius", type=float, default=1.8)
-        parser.add_argument("--fluid-reflection-strength", type=float, default=0.075)
-        parser.add_argument("--fluid-refraction-strength", type=float, default=0.030)
-        parser.add_argument("--fluid-env-map-strength", type=float, default=0.22)
-        parser.add_argument("--fluid-caustic-strength", type=float, default=0.42)
-        parser.add_argument("--fluid-caustic-scale", type=float, default=105.0)
-        parser.add_argument("--fluid-foam-strength", type=float, default=0.0)
-        parser.add_argument("--fluid-foam-scale", type=float, default=95.0)
+        parser.add_argument("--fluid-color", type=float, nargs=3, default=(0.10, 0.98, 0.92))
+        parser.add_argument("--fluid-deep-color", type=float, nargs=3, default=(0.0, 0.13, 0.58))
+        parser.add_argument("--fluid-color-gradient-strength", type=float, default=0.88)
+        parser.add_argument("--fluid-opacity", type=float, default=0.64)
+        parser.add_argument("--fluid-radius-scale", type=float, default=1.55)
+        parser.add_argument("--fluid-thickness-scale", type=float, default=1.8)
+        parser.add_argument("--fluid-smoothing-iterations", type=int, default=8)
+        parser.add_argument("--fluid-smoothing-radius", type=float, default=2.0)
+        parser.add_argument("--fluid-reflection-strength", type=float, default=0.14)
+        parser.add_argument("--fluid-refraction-strength", type=float, default=0.055)
+        parser.add_argument("--fluid-env-map-strength", type=float, default=0.52)
+        parser.add_argument("--fluid-absorption-strength", type=float, default=1.55)
+        parser.add_argument("--fluid-caustic-strength", type=float, default=0.78)
+        parser.add_argument("--fluid-caustic-scale", type=float, default=155.0)
+        parser.add_argument("--fluid-foam-strength", type=float, default=0.12)
+        parser.add_argument("--fluid-foam-scale", type=float, default=55.0)
 
         parser.add_argument("--camera-pos", type=float, nargs=3, default=(1.15, -1.35, 0.78))
         parser.add_argument("--camera-pitch", type=float, default=-20.0)

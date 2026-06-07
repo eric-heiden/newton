@@ -616,6 +616,8 @@ uniform float env_map_strength;
 uniform float env_intensity;
 uniform float caustic_strength;
 uniform float caustic_scale;
+uniform float foam_strength;
+uniform float foam_scale;
 uniform int up_axis;
 uniform vec3 sun_direction_view;
 
@@ -682,6 +684,19 @@ vec3 tropical_gradient(vec2 uv, vec3 n, float depth, float thickness)
     return mix(water_color, graded, color_gradient_strength);
 }
 
+float foam_pattern(vec2 uv, vec3 n, float depth, float thickness)
+{
+    float curvature = length(dFdx(n)) + length(dFdy(n));
+    float edge = 1.0 - smoothstep(0.10, 0.55, thickness);
+    float crest = smoothstep(0.07, 0.22, curvature);
+    float free_surface = 1.0 - smoothstep(1.1, 2.6, thickness);
+    vec2 p = (uv + n.xy * 0.08 + vec2(depth * 0.010, -depth * 0.014)) * foam_scale;
+    float a = sin(p.x + 0.8 * sin(p.y * 1.7));
+    float b = sin(p.y * 1.23 + 0.5 * sin(p.x * 1.41));
+    float breakup = smoothstep(0.15, 0.88, (a + b) * 0.5);
+    return clamp((edge * 0.75 + crest * 0.65) * free_surface * breakup, 0.0, 1.0);
+}
+
 void main()
 {
     float depth = texture(fluid_depth_texture, TexCoord).r;
@@ -715,6 +730,9 @@ void main()
     water = mix(water, env_reflected, clamp(env_map_strength * (0.30 + 0.70 * water_fresnel), 0.0, 0.70));
     water += vec3(spec);
     water += caustic_strength * caustic_pattern(TexCoord, n, depth, thickness) * (vec3(0.78, 1.0, 0.92) + gradient_color * 0.35);
+    float foam = clamp(foam_strength * foam_pattern(TexCoord, n, depth, thickness), 0.0, 0.92);
+    water = mix(water, vec3(0.92, 1.0, 0.96), foam);
+    alpha = clamp(alpha + foam * 0.28, 0.0, 1.0);
 
     FragColor = vec4(mix(scene, water, alpha), 1.0);
 }
@@ -1052,6 +1070,8 @@ class FluidCompositeShader(ShaderGL):
             self.loc_env_intensity = self._get_uniform_location("env_intensity")
             self.loc_caustic_strength = self._get_uniform_location("caustic_strength")
             self.loc_caustic_scale = self._get_uniform_location("caustic_scale")
+            self.loc_foam_strength = self._get_uniform_location("foam_strength")
+            self.loc_foam_scale = self._get_uniform_location("foam_scale")
             self.loc_up_axis = self._get_uniform_location("up_axis")
             self.loc_sun_direction_view = self._get_uniform_location("sun_direction_view")
 
@@ -1074,6 +1094,8 @@ class FluidCompositeShader(ShaderGL):
         env_intensity: float,
         caustic_strength: float,
         caustic_scale: float,
+        foam_strength: float,
+        foam_scale: float,
         up_axis: int,
         sun_direction_view: tuple[float, float, float],
     ):
@@ -1097,6 +1119,8 @@ class FluidCompositeShader(ShaderGL):
             self._gl.glUniform1f(self.loc_env_intensity, float(env_intensity))
             self._gl.glUniform1f(self.loc_caustic_strength, float(caustic_strength))
             self._gl.glUniform1f(self.loc_caustic_scale, float(caustic_scale))
+            self._gl.glUniform1f(self.loc_foam_strength, float(foam_strength))
+            self._gl.glUniform1f(self.loc_foam_scale, float(foam_scale))
             self._gl.glUniform1i(self.loc_up_axis, int(up_axis))
             self._gl.glUniform3f(self.loc_sun_direction_view, *sun_direction_view)
 

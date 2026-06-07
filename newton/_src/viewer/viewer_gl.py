@@ -1207,6 +1207,8 @@ class ViewerGL(ViewerBase):
         env_map_strength: float = 0.18,
         caustic_strength: float = 0.22,
         caustic_scale: float = 95.0,
+        foam_strength: float = 0.0,
+        foam_scale: float = 95.0,
         hidden: bool = False,
     ):
         """Log particles for screen-space fluid rendering."""
@@ -1230,6 +1232,8 @@ class ViewerGL(ViewerBase):
                     env_map_strength,
                     caustic_strength,
                     caustic_scale,
+                    foam_strength,
+                    foam_scale,
                     True,
                 )
             return
@@ -1256,6 +1260,8 @@ class ViewerGL(ViewerBase):
             env_map_strength,
             caustic_strength,
             caustic_scale,
+            foam_strength,
+            foam_scale,
             hidden,
         )
 

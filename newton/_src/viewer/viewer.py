@@ -160,6 +160,8 @@ class ViewerBase(ABC):
         self.fluid_env_map_strength = 0.18
         self.fluid_caustic_strength = 0.22
         self.fluid_caustic_scale = 95.0
+        self.fluid_foam_strength = 0.0
+        self.fluid_foam_scale = 95.0
 
         self.gaussians_max_points = 100_000  # Max number of points to visualize per gaussian
 
@@ -1222,6 +1224,8 @@ class ViewerBase(ABC):
         env_map_strength: float = 0.18,
         caustic_strength: float = 0.22,
         caustic_scale: float = 95.0,
+        foam_strength: float = 0.0,
+        foam_scale: float = 95.0,
         hidden: bool = False,
     ):
         """Log particle samples as a fluid surface.
@@ -1247,6 +1251,8 @@ class ViewerBase(ABC):
             env_map_strength: Strength of Fresnel-weighted environment-map reflection.
             caustic_strength: Strength of the procedural caustic highlight pattern.
             caustic_scale: Spatial frequency of the procedural caustic pattern.
+            foam_strength: Strength of the screen-space edge/crest foam overlay.
+            foam_scale: Spatial frequency of the procedural foam breakup pattern.
             hidden: Whether the fluid batch should be hidden.
         """
         self.log_points(name, points, radii=radii, colors=color, hidden=hidden)
@@ -2401,6 +2407,8 @@ class ViewerBase(ABC):
                     env_map_strength=self.fluid_env_map_strength,
                     caustic_strength=self.fluid_caustic_strength,
                     caustic_scale=self.fluid_caustic_scale,
+                    foam_strength=self.fluid_foam_strength,
+                    foam_scale=self.fluid_foam_scale,
                     hidden=False,
                 )
             else:

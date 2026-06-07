@@ -81,6 +81,8 @@ class Example:
         self.viewer.fluid_env_map_strength = args.fluid_env_map_strength
         self.viewer.fluid_caustic_strength = args.fluid_caustic_strength
         self.viewer.fluid_caustic_scale = args.fluid_caustic_scale
+        self.viewer.fluid_foam_strength = args.fluid_foam_strength
+        self.viewer.fluid_foam_scale = args.fluid_foam_scale
         self.viewer.set_camera(pos=wp.vec3(args.camera_pos), pitch=args.camera_pitch, yaw=args.camera_yaw)
 
         if hasattr(self.viewer, "register_ui_callback"):
@@ -222,6 +224,8 @@ class Example:
         parser.add_argument("--fluid-env-map-strength", type=float, default=0.22)
         parser.add_argument("--fluid-caustic-strength", type=float, default=0.42)
         parser.add_argument("--fluid-caustic-scale", type=float, default=105.0)
+        parser.add_argument("--fluid-foam-strength", type=float, default=0.0)
+        parser.add_argument("--fluid-foam-scale", type=float, default=95.0)
 
         parser.add_argument("--camera-pos", type=float, nargs=3, default=(1.15, -1.35, 0.78))
         parser.add_argument("--camera-pitch", type=float, default=-20.0)

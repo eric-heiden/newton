@@ -967,6 +967,8 @@ class FluidGL:
         self.env_map_strength = 0.18
         self.caustic_strength = 0.22
         self.caustic_scale = 95.0
+        self.foam_strength = 0.0
+        self.foam_scale = 95.0
 
         self.vao = gl.GLuint()
         self.vbo = gl.GLuint()
@@ -1010,6 +1012,8 @@ class FluidGL:
         env_map_strength: float,
         caustic_strength: float,
         caustic_scale: float,
+        foam_strength: float,
+        foam_scale: float,
         hidden: bool,
     ):
         if points is None:
@@ -1037,6 +1041,8 @@ class FluidGL:
         self.env_map_strength = float(max(env_map_strength, 0.0))
         self.caustic_strength = float(max(caustic_strength, 0.0))
         self.caustic_scale = float(max(caustic_scale, 1.0))
+        self.foam_strength = float(max(foam_strength, 0.0))
+        self.foam_scale = float(max(foam_scale, 1.0))
 
         particle_data = np.empty((count, 4), dtype=np.float32)
         particle_data[:, :3] = points.numpy()
@@ -2184,6 +2190,8 @@ class RendererGL:
                 env_intensity=self._env_intensity,
                 caustic_strength=material_fluid.caustic_strength,
                 caustic_scale=material_fluid.caustic_scale,
+                foam_strength=material_fluid.foam_strength,
+                foam_scale=material_fluid.foam_scale,
                 up_axis=self.camera.up_axis,
                 sun_direction_view=(float(sun_view[0]), float(sun_view[1]), float(sun_view[2])),
             )

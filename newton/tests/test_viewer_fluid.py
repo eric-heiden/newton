@@ -35,6 +35,8 @@ class _LogFluidProbe(ViewerNull):
         env_map_strength=0.18,
         caustic_strength=0.22,
         caustic_scale=95.0,
+        foam_strength=0.0,
+        foam_scale=95.0,
         hidden=False,
     ):
         self.logged_fluid = {
@@ -54,6 +56,8 @@ class _LogFluidProbe(ViewerNull):
             "env_map_strength": env_map_strength,
             "caustic_strength": caustic_strength,
             "caustic_scale": caustic_scale,
+            "foam_strength": foam_strength,
+            "foam_scale": foam_scale,
             "hidden": hidden,
         }
 
@@ -95,6 +99,8 @@ class TestViewerFluid(unittest.TestCase):
         self.assertEqual(viewer.logged_fluid["color_gradient_strength"], viewer.fluid_color_gradient_strength)
         self.assertEqual(viewer.logged_fluid["env_map_strength"], viewer.fluid_env_map_strength)
         self.assertEqual(viewer.logged_fluid["caustic_scale"], viewer.fluid_caustic_scale)
+        self.assertEqual(viewer.logged_fluid["foam_strength"], viewer.fluid_foam_strength)
+        self.assertEqual(viewer.logged_fluid["foam_scale"], viewer.fluid_foam_scale)
         np.testing.assert_allclose(viewer.logged_fluid["points"].numpy()[:, 0], [0.0, 2.0], atol=1.0e-6)
         self.assertIsNotNone(viewer.logged_points)
         self.assertEqual(viewer.logged_points["name"], "/model/particles")

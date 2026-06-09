@@ -16,7 +16,9 @@ from ...utils.texture import normalize_texture
 from .shaders import (
     FluidBlurShader,
     FluidCompositeShader,
+    FluidDiffuseShader,
     FluidParticleShader,
+    FluidShadowShader,
     FrameShader,
     ShaderArrow,
     ShaderEdge,
@@ -762,7 +764,7 @@ class MeshInstancerGL:
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.instance_transform_buffer)
         gl.glBufferData(gl.GL_ARRAY_BUFFER, self.instance_transform_buffer_size, None, gl.GL_DYNAMIC_DRAW)
 
-        # we can only send vec4s to the shader, so we need to split the instance transforms matrix into its column vectors
+        # Send transforms as vec4 columns because vertex attributes cannot carry a full mat4 directly.
         for i in range(4):
             gl.glVertexAttribPointer(
                 3 + i, 4, gl.GL_FLOAT, gl.GL_FALSE, self.transform_byte_size, ctypes.c_void_p(i * 16)
@@ -954,26 +956,38 @@ class FluidGL:
         self.capacity = max(int(capacity), 1)
         self.active_particles = 0
         self.hidden = False
-        self.color = (0.10, 0.98, 0.92)
-        self.deep_color = (0.0, 0.13, 0.58)
-        self.color_gradient_strength = 0.88
-        self.opacity = 0.64
-        self.radius_scale = 1.0
-        self.thickness_scale = 1.8
-        self.smoothing_iterations = 8
-        self.smoothing_radius = 2.0
-        self.reflection_strength = 0.14
-        self.refraction_strength = 0.055
-        self.env_map_strength = 0.52
-        self.env_reflection_lod = 0.0
-        self.env_color_preserve = 0.85
-        self.absorption_strength = 1.55
-        self.depth_visualization_strength = 0.55
-        self.caustic_strength = 0.78
-        self.caustic_scale = 155.0
-        self.floor_caustic_strength = 0.65
-        self.foam_strength = 0.12
-        self.foam_scale = 55.0
+        self.color = (0.10, 0.50, 0.80)
+        self.deep_color = (0.01, 0.09, 0.34)
+        self.color_gradient_strength = 0.20
+        self.opacity = 1.00
+        self.radius_scale = 1.34
+        self.thickness_scale = 2.39
+        self.smoothing_iterations = 7
+        self.smoothing_radius = 3.83
+        self.smoothing_depth_edge_falloff = 1.39
+        self.smoothing_max_samples = 4
+        self.reflection_strength = 0.528
+        self.refraction_strength = 0.038
+        self.env_map_strength = 1.02
+        self.env_reflection_lod = 0.42
+        self.env_color_preserve = 0.57
+        self.absorption_strength = 2.66
+        self.depth_visualization_strength = 2.13
+        self.caustic_strength = 3.03
+        self.caustic_scale = 37.1
+        self.floor_caustic_strength = 1.15
+        self.surface_shadow_strength = 0.03
+        self.foam_strength = 0.99
+        self.foam_scale = 5.0
+        self.bounds_valid = False
+        self.bounds_lower = np.zeros(3, dtype=np.float32)
+        self.bounds_upper = np.zeros(3, dtype=np.float32)
+        self.anisotropy_strength = 0.82
+        self.anisotropy_min = 0.1
+        self.anisotropy_max = 2.0
+        self.anisotropy_max_particles = 25000
+        self.render_smoothing = 0.45
+        self._particle_stride = 16 * 4
 
         self.vao = gl.GLuint()
         self.vbo = gl.GLuint()
@@ -982,9 +996,15 @@ class FluidGL:
 
         gl.glBindVertexArray(self.vao)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
-        gl.glBufferData(gl.GL_ARRAY_BUFFER, self.capacity * 4 * 4, None, gl.GL_DYNAMIC_DRAW)
-        gl.glVertexAttribPointer(0, 4, gl.GL_FLOAT, gl.GL_FALSE, 4 * 4, ctypes.c_void_p(0))
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, self.capacity * self._particle_stride, None, gl.GL_DYNAMIC_DRAW)
+        gl.glVertexAttribPointer(0, 4, gl.GL_FLOAT, gl.GL_FALSE, self._particle_stride, ctypes.c_void_p(0))
         gl.glEnableVertexAttribArray(0)
+        gl.glVertexAttribPointer(1, 4, gl.GL_FLOAT, gl.GL_FALSE, self._particle_stride, ctypes.c_void_p(4 * 4))
+        gl.glEnableVertexAttribArray(1)
+        gl.glVertexAttribPointer(2, 4, gl.GL_FLOAT, gl.GL_FALSE, self._particle_stride, ctypes.c_void_p(8 * 4))
+        gl.glEnableVertexAttribArray(2)
+        gl.glVertexAttribPointer(3, 4, gl.GL_FLOAT, gl.GL_FALSE, self._particle_stride, ctypes.c_void_p(12 * 4))
+        gl.glEnableVertexAttribArray(3)
         gl.glBindVertexArray(0)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
 
@@ -1012,6 +1032,8 @@ class FluidGL:
         thickness_scale: float,
         smoothing_iterations: int,
         smoothing_radius: float,
+        smoothing_depth_edge_falloff: float,
+        smoothing_max_samples: int,
         reflection_strength: float,
         refraction_strength: float,
         env_map_strength: float,
@@ -1022,21 +1044,21 @@ class FluidGL:
         caustic_strength: float,
         caustic_scale: float,
         floor_caustic_strength: float,
+        surface_shadow_strength: float,
         foam_strength: float,
         foam_scale: float,
         hidden: bool,
+        render_points=None,
+        anisotropy=None,
+        anisotropy_secondary=None,
+        anisotropy_tertiary=None,
     ):
         if points is None:
             self.active_particles = 0
             self.hidden = True
+            self.bounds_valid = False
             return
 
-        gl = RendererGL.gl
-        count = len(points)
-        if count > self.capacity:
-            self._resize(max(count, self.capacity * 2))
-
-        self.active_particles = count
         self.hidden = hidden
         self.color = tuple(float(c) for c in color)
         self.deep_color = tuple(float(c) for c in deep_color)
@@ -1046,6 +1068,8 @@ class FluidGL:
         self.thickness_scale = float(max(thickness_scale, 0.0))
         self.smoothing_iterations = max(int(smoothing_iterations), 0)
         self.smoothing_radius = float(max(smoothing_radius, 0.0))
+        self.smoothing_depth_edge_falloff = float(max(smoothing_depth_edge_falloff, 0.0))
+        self.smoothing_max_samples = max(min(int(smoothing_max_samples), 4), 0)
         self.reflection_strength = float(max(reflection_strength, 0.0))
         self.refraction_strength = float(max(refraction_strength, 0.0))
         self.env_map_strength = float(max(env_map_strength, 0.0))
@@ -1056,22 +1080,355 @@ class FluidGL:
         self.caustic_strength = float(max(caustic_strength, 0.0))
         self.caustic_scale = float(max(caustic_scale, 1.0))
         self.floor_caustic_strength = float(max(floor_caustic_strength, 0.0))
+        self.surface_shadow_strength = float(max(surface_shadow_strength, 0.0))
         self.foam_strength = float(max(foam_strength, 0.0))
         self.foam_scale = float(max(foam_scale, 1.0))
 
-        particle_data = np.empty((count, 4), dtype=np.float32)
-        particle_data[:, :3] = points.numpy()
+        host_points = points.numpy().astype(np.float32, copy=False)
+        source_count = host_points.shape[0]
         if radii is None:
-            particle_data[:, 3] = 0.1
+            radius_values = np.full(source_count, 0.1, dtype=np.float32)
         elif isinstance(radii, (int, float, np.integer, np.floating)):
-            particle_data[:, 3] = float(radii)
+            radius_values = np.full(source_count, float(radii), dtype=np.float32)
         else:
-            particle_data[:, 3] = radii.numpy().astype(np.float32, copy=False)
-        particle_data[:, 3] *= self.radius_scale
+            radius_values = radii.numpy().astype(np.float32, copy=False)
+        radius_values = np.asarray(radius_values * self.radius_scale, dtype=np.float32)
+
+        host_render_points = None
+        if render_points is not None:
+            host_render_points = render_points.numpy().astype(np.float32, copy=False)
+            if host_render_points.shape != host_points.shape:
+                raise ValueError("Fluid render_points must have the same shape as points.")
+
+        active = None
+        host_anisotropy = None
+        host_anisotropy_secondary = None
+        host_anisotropy_tertiary = None
+        if anisotropy is not None:
+            host_anisotropy = anisotropy.numpy().astype(np.float32, copy=False)
+            if host_anisotropy.shape != (source_count, 4):
+                raise ValueError("Fluid anisotropy must have shape [particle_count, 4].")
+            active = host_anisotropy[:, 3] > 0.0
+            if not np.all(active):
+                host_points = host_points[active]
+                radius_values = radius_values[active]
+                host_anisotropy = host_anisotropy[active]
+                if host_render_points is not None:
+                    host_render_points = host_render_points[active]
+
+        if anisotropy_secondary is not None:
+            host_anisotropy_secondary = anisotropy_secondary.numpy().astype(np.float32, copy=False)
+            if host_anisotropy_secondary.shape != (source_count, 4):
+                raise ValueError("Fluid anisotropy_secondary must have shape [particle_count, 4].")
+            if active is not None and not np.all(active):
+                host_anisotropy_secondary = host_anisotropy_secondary[active]
+
+        if anisotropy_tertiary is not None:
+            host_anisotropy_tertiary = anisotropy_tertiary.numpy().astype(np.float32, copy=False)
+            if host_anisotropy_tertiary.shape != (source_count, 4):
+                raise ValueError("Fluid anisotropy_tertiary must have shape [particle_count, 4].")
+            if active is not None and not np.all(active):
+                host_anisotropy_tertiary = host_anisotropy_tertiary[active]
+
+        count = host_points.shape[0]
+        if count > self.capacity:
+            self._resize(max(count, self.capacity * 2))
+
+        self.active_particles = count
+        if count > 0:
+            bounds_pad = float(np.max(radius_values)) if radius_values.size else 0.0
+            self.bounds_valid = True
+            self.bounds_lower = (np.min(host_points, axis=0) - bounds_pad).astype(np.float32, copy=False)
+            self.bounds_upper = (np.max(host_points, axis=0) + bounds_pad).astype(np.float32, copy=False)
+        else:
+            self.bounds_valid = False
+            return
+
+        if (
+            host_render_points is None
+            or host_anisotropy is None
+            or host_anisotropy_secondary is None
+            or host_anisotropy_tertiary is None
+        ):
+            (
+                fallback_render_points,
+                fallback_anisotropy,
+                fallback_anisotropy_secondary,
+                fallback_anisotropy_tertiary,
+            ) = self._compute_render_anisotropy(host_points, radius_values)
+            if host_render_points is None:
+                host_render_points = fallback_render_points
+            if host_anisotropy is None:
+                host_anisotropy = fallback_anisotropy
+            if host_anisotropy_secondary is None:
+                host_anisotropy_secondary = fallback_anisotropy_secondary
+            if host_anisotropy_tertiary is None:
+                host_anisotropy_tertiary = fallback_anisotropy_tertiary
+
+        particle_data = np.empty((count, 16), dtype=np.float32)
+        particle_data[:, :3] = host_render_points
+        particle_data[:, 3] = radius_values
+        particle_data[:, 4:8] = host_anisotropy
+        particle_data[:, 8:12] = host_anisotropy_secondary
+        particle_data[:, 12:16] = host_anisotropy_tertiary
 
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
         gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, particle_data.nbytes, particle_data.ctypes.data)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+
+    def _compute_render_anisotropy(
+        self, points: np.ndarray, radii: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        count = int(points.shape[0])
+        render_points = np.array(points, dtype=np.float32, copy=True)
+        anisotropy = np.zeros((count, 4), dtype=np.float32)
+        anisotropy_secondary = np.zeros((count, 4), dtype=np.float32)
+        anisotropy_tertiary = np.zeros((count, 4), dtype=np.float32)
+        if count == 0:
+            return render_points, anisotropy, anisotropy_secondary, anisotropy_tertiary
+
+        anisotropy[:, 0] = 1.0
+        anisotropy[:, 3] = 1.0
+        anisotropy_secondary[:, 1] = 1.0
+        anisotropy_secondary[:, 3] = 1.0
+        anisotropy_tertiary[:, 2] = 1.0
+        anisotropy_tertiary[:, 3] = 1.0
+        positive_radii = radii[radii > 0.0]
+        if positive_radii.size == 0 or count < 4 or count > self.anisotropy_max_particles:
+            return render_points, anisotropy, anisotropy_secondary, anisotropy_tertiary
+
+        base_radius = float(np.median(positive_radii))
+        support = max(base_radius * 2.6, 1.0e-5)
+        support_sq = support * support
+        cell_coords = np.floor(points / support).astype(np.int32, copy=False)
+        buckets: dict[tuple[int, int, int], list[int]] = {}
+        for particle_index, cell in enumerate(cell_coords):
+            buckets.setdefault((int(cell[0]), int(cell[1]), int(cell[2])), []).append(particle_index)
+
+        offsets = [(x, y, z) for x in (-1, 0, 1) for y in (-1, 0, 1) for z in (-1, 0, 1)]
+        identity_axis = np.array((1.0, 0.0, 0.0), dtype=np.float32)
+        secondary_fallback = np.array((0.0, 1.0, 0.0), dtype=np.float32)
+        tertiary_fallback = np.array((0.0, 0.0, 1.0), dtype=np.float32)
+        for particle_index, point in enumerate(points):
+            cell = cell_coords[particle_index]
+            candidates: list[int] = []
+            for dx, dy, dz in offsets:
+                candidates.extend(buckets.get((int(cell[0] + dx), int(cell[1] + dy), int(cell[2] + dz)), ()))
+            if len(candidates) < 4:
+                continue
+
+            neighbor_points = points[np.asarray(candidates, dtype=np.int32)]
+            delta = neighbor_points - point
+            dist_sq = np.einsum("ij,ij->i", delta, delta)
+            mask = dist_sq < support_sq
+            if int(np.count_nonzero(mask)) < 4:
+                continue
+
+            neighbor_points = neighbor_points[mask]
+            dist_sq = dist_sq[mask]
+            weights = np.square(np.maximum(1.0 - dist_sq / support_sq, 0.0)).astype(np.float32)
+            weight_sum = float(np.sum(weights))
+            if weight_sum <= 1.0e-8:
+                continue
+
+            center = np.sum(neighbor_points * weights[:, None], axis=0) / weight_sum
+            render_points[particle_index] = point * (1.0 - self.render_smoothing) + center * self.render_smoothing
+
+            if int(np.count_nonzero(dist_sq > 1.0e-10)) < 3:
+                continue
+
+            centered = neighbor_points - center
+            covariance = (centered * weights[:, None]).T @ centered / weight_sum
+            covariance += np.eye(3, dtype=np.float32) * (base_radius * base_radius * 0.025)
+            try:
+                values, vectors = np.linalg.eigh(covariance)
+            except np.linalg.LinAlgError:
+                continue
+
+            order = np.argsort(values)[::-1]
+            values = values[order]
+            major_axis = vectors[:, order[0]].astype(np.float32, copy=False)
+            if not np.all(np.isfinite(major_axis)) or float(np.dot(major_axis, major_axis)) < 1.0e-8:
+                major_axis = identity_axis
+            secondary_axis = vectors[:, order[1]].astype(np.float32, copy=False)
+            if not np.all(np.isfinite(secondary_axis)) or float(np.dot(secondary_axis, secondary_axis)) < 1.0e-8:
+                secondary_axis = secondary_fallback
+            secondary_axis = secondary_axis - major_axis * float(np.dot(secondary_axis, major_axis))
+            secondary_norm = float(np.linalg.norm(secondary_axis))
+            if secondary_norm <= 1.0e-8:
+                secondary_axis = secondary_fallback
+            else:
+                secondary_axis = secondary_axis / secondary_norm
+            tertiary_axis = vectors[:, order[2]].astype(np.float32, copy=False)
+            if not np.all(np.isfinite(tertiary_axis)) or float(np.dot(tertiary_axis, tertiary_axis)) < 1.0e-8:
+                tertiary_axis = np.cross(major_axis, secondary_axis).astype(np.float32, copy=False)
+            tertiary_axis = tertiary_axis - major_axis * float(np.dot(tertiary_axis, major_axis))
+            tertiary_axis = tertiary_axis - secondary_axis * float(np.dot(tertiary_axis, secondary_axis))
+            tertiary_norm = float(np.linalg.norm(tertiary_axis))
+            if tertiary_norm <= 1.0e-8:
+                tertiary_axis = np.cross(major_axis, secondary_axis).astype(np.float32, copy=False)
+                tertiary_norm = float(np.linalg.norm(tertiary_axis))
+            if tertiary_norm <= 1.0e-8:
+                tertiary_axis = tertiary_fallback
+            else:
+                tertiary_axis = tertiary_axis / tertiary_norm
+
+            spread_major = float(np.sqrt(max(values[0], 0.0)))
+            spread_minor = float(np.sqrt(max(values[-1], 0.0)))
+            eccentricity = max((spread_major - spread_minor) / max(base_radius, 1.0e-6), 0.0)
+            min_axis_scale = max(float(self.anisotropy_min), 0.01)
+            max_axis_scale = max(float(self.anisotropy_max), min_axis_scale)
+            major_min_scale = max(min_axis_scale, 1.0)
+            major_max_scale = max(max_axis_scale, major_min_scale)
+            stretch = 1.0 + self.anisotropy_strength * min(eccentricity, major_max_scale - 1.0)
+            stretch = float(np.clip(stretch, major_min_scale, major_max_scale))
+            stretch_strength = np.clip((stretch - 1.0) / max(major_max_scale - 1.0, 1.0e-6), 0.0, 1.0)
+            minor_min_scale = min(min_axis_scale, 1.0)
+            minor_span = 1.0 - minor_min_scale
+            anisotropy[particle_index, :3] = major_axis
+            anisotropy[particle_index, 3] = stretch
+            anisotropy_secondary[particle_index, :3] = secondary_axis
+            anisotropy_secondary[particle_index, 3] = float(
+                np.clip(1.0 - 0.70 * stretch_strength * minor_span, min_axis_scale, max_axis_scale)
+            )
+            anisotropy_tertiary[particle_index, :3] = tertiary_axis
+            anisotropy_tertiary[particle_index, 3] = float(
+                np.clip(1.0 - stretch_strength * minor_span, min_axis_scale, max_axis_scale)
+            )
+
+        return render_points, anisotropy, anisotropy_secondary, anisotropy_tertiary
+
+    def render(self):
+        if self.hidden or self.active_particles == 0:
+            return
+        gl = RendererGL.gl
+        gl.glBindVertexArray(self.vao)
+        gl.glDrawArrays(gl.GL_POINTS, 0, self.active_particles)
+        gl.glBindVertexArray(0)
+
+
+class FluidDiffuseGL:
+    """GPU buffer for secondary diffuse foam/spray particles."""
+
+    def __init__(self, capacity: int):
+        gl = RendererGL.gl
+        self.capacity = max(int(capacity), 1)
+        self.active_particles = 0
+        self.hidden = False
+        self.radius = 0.025
+        self.color = (1.0, 1.0, 1.0)
+        self.alpha = 0.75
+        self.motion_blur_scale = 1.0
+        self.expansion = 0.65
+        self.inscatter = 0.38
+        self.outscatter = 0.18
+        self.shadow_strength = 0.42
+        self._host_positions = np.zeros((0, 4), dtype=np.float32)
+        self._host_velocities = np.zeros((0, 4), dtype=np.float32)
+
+        self.vao = gl.GLuint()
+        self.position_vbo = gl.GLuint()
+        self.velocity_vbo = gl.GLuint()
+        gl.glGenVertexArrays(1, self.vao)
+        gl.glGenBuffers(1, self.position_vbo)
+        gl.glGenBuffers(1, self.velocity_vbo)
+
+        gl.glBindVertexArray(self.vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.position_vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, self.capacity * 4 * 4, None, gl.GL_DYNAMIC_DRAW)
+        gl.glVertexAttribPointer(0, 4, gl.GL_FLOAT, gl.GL_FALSE, 4 * 4, ctypes.c_void_p(0))
+        gl.glEnableVertexAttribArray(0)
+
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.velocity_vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, self.capacity * 4 * 4, None, gl.GL_DYNAMIC_DRAW)
+        gl.glVertexAttribPointer(1, 4, gl.GL_FLOAT, gl.GL_FALSE, 4 * 4, ctypes.c_void_p(0))
+        gl.glEnableVertexAttribArray(1)
+        gl.glBindVertexArray(0)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+
+    def destroy(self):
+        gl = RendererGL.gl
+        if getattr(self, "vao", None) is not None:
+            gl.glDeleteVertexArrays(1, self.vao)
+            gl.glDeleteBuffers(1, self.position_vbo)
+            gl.glDeleteBuffers(1, self.velocity_vbo)
+            self.vao = None
+            self.position_vbo = None
+            self.velocity_vbo = None
+
+    def _resize(self, capacity: int):
+        self.destroy()
+        self.__init__(capacity)
+
+    def update(
+        self,
+        positions,
+        velocities,
+        radius: float,
+        color: tuple[float, float, float],
+        alpha: float,
+        motion_blur_scale: float,
+        expansion: float,
+        inscatter: float,
+        outscatter: float,
+        shadow_strength: float,
+        hidden: bool,
+    ):
+        if positions is None:
+            self.active_particles = 0
+            self.hidden = True
+            return
+
+        self.hidden = hidden
+        self.radius = float(max(radius, 0.0))
+        self.color = tuple(float(c) for c in color)
+        self.alpha = float(np.clip(alpha, 0.0, 1.0))
+        self.motion_blur_scale = float(max(motion_blur_scale, 0.0))
+        self.expansion = float(max(expansion, 0.0))
+        self.inscatter = float(max(inscatter, 0.0))
+        self.outscatter = float(max(outscatter, 0.0))
+        self.shadow_strength = float(max(shadow_strength, 0.0))
+
+        host_positions = positions.numpy().astype(np.float32, copy=False)
+        if velocities is None:
+            host_velocities = np.zeros_like(host_positions)
+        else:
+            host_velocities = velocities.numpy().astype(np.float32, copy=False)
+
+        live = host_positions[:, 3] > 0.0
+        host_positions = np.ascontiguousarray(host_positions[live])
+        host_velocities = np.ascontiguousarray(host_velocities[live])
+        count = int(host_positions.shape[0])
+        if count > self.capacity:
+            self._resize(max(count, self.capacity * 2))
+
+        self.active_particles = count
+        self._host_positions = host_positions
+        self._host_velocities = host_velocities
+        self._upload_host_arrays()
+
+    def _upload_host_arrays(self):
+        if self.active_particles == 0:
+            return
+        gl = RendererGL.gl
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.position_vbo)
+        gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, self._host_positions.nbytes, self._host_positions.ctypes.data)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.velocity_vbo)
+        gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, self._host_velocities.nbytes, self._host_velocities.ctypes.data)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+
+    def sort_for_view(self, view_matrix):
+        if self.active_particles <= 1:
+            return
+
+        view = np.asarray(view_matrix, dtype=np.float32).reshape(4, 4).transpose()
+        homogeneous = np.ones((self.active_particles, 4), dtype=np.float32)
+        homogeneous[:, :3] = self._host_positions[:, :3]
+        view_positions = (view @ homogeneous.T).T
+        order = np.argsort(view_positions[:, 2], kind="mergesort")
+        self._host_positions = np.ascontiguousarray(self._host_positions[order])
+        self._host_velocities = np.ascontiguousarray(self._host_velocities[order])
+        self._upload_host_arrays()
 
     def render(self):
         if self.hidden or self.active_particles == 0:
@@ -1262,9 +1619,17 @@ class RendererGL:
         self._fluid_depth_texture = None
         self._fluid_depth_smooth_texture = None
         self._fluid_thickness_texture = None
+        self._fluid_thickness_smooth_texture = None
         self._fluid_scene_texture = None
+        self._fluid_scene_depth_texture = None
+        self._fluid_shadow_depth_texture = None
+        self._fluid_shadow_thickness_texture = None
+        self._fluid_shadow_depth_attachment = None
+        self._fluid_shadow_size = 2048
 
         self._sun_direction = None  # set on first render based on camera up_axis
+        self._light_view_matrix = np.eye(4, dtype=np.float32)
+        self._light_projection_matrix = np.eye(4, dtype=np.float32)
 
         self._light_color = (1.0, 1.0, 1.0)
 
@@ -1300,7 +1665,9 @@ class RendererGL:
         self._wireframe_shader = ShaderLine(gl)
         self._arrow_shader = ShaderArrow(gl)
         self._fluid_particle_shader = FluidParticleShader(gl)
+        self._fluid_diffuse_shader = FluidDiffuseShader(gl)
         self._fluid_blur_shader = FluidBlurShader(gl)
+        self._fluid_shadow_shader = FluidShadowShader(gl)
         self._fluid_composite_shader = FluidCompositeShader(gl)
 
         if not headless:
@@ -1313,6 +1680,20 @@ class RendererGL:
     @shadow_radius.setter
     def shadow_radius(self, value: float):
         self._shadow_radius = max(float(value), 0.0)
+
+    @property
+    def fluid_shadow_size(self) -> int:
+        return self._fluid_shadow_size
+
+    @fluid_shadow_size.setter
+    def fluid_shadow_size(self, value: int):
+        size = max(min(int(value), 4096), 256)
+        if size == self._fluid_shadow_size:
+            return
+
+        self._fluid_shadow_size = size
+        if getattr(self, "_fluid_shadow_depth_texture", None) is not None:
+            self._setup_fluid_buffers()
 
     @property
     def diffuse_scale(self) -> float:
@@ -1363,7 +1744,7 @@ class RendererGL:
                 # This is a non-fatal error that can be safely ignored
                 pass
 
-    def render(self, camera, objects, lines=None, wireframe_shapes=None, arrows=None, fluids=None):
+    def render(self, camera, objects, lines=None, wireframe_shapes=None, arrows=None, fluids=None, fluid_diffuse=None):
         gl = RendererGL.gl
         self._make_current()
 
@@ -1387,6 +1768,8 @@ class RendererGL:
         # Store matrices for other methods
         self._view_matrix = self.camera.get_view_matrix()
         self._projection_matrix = self.camera.get_projection_matrix()
+        if self.draw_shadows or fluids:
+            self._update_light_matrices()
 
         # Lazy-load environment map after a valid GL context is active
         if self._env_path is not None and self._env_texture is None:
@@ -1430,8 +1813,12 @@ class RendererGL:
             gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._frame_fbo)
             gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
 
+        rendered_fluid_surface = False
         if fluids:
-            self._render_fluids(fluids)
+            rendered_fluid_surface = self._render_fluids(fluids, fluid_diffuse)
+
+        if fluid_diffuse and not rendered_fluid_surface:
+            self._render_fluid_diffuse(fluid_diffuse)
 
         # Render lines after main scene and fluid composition.
         if lines:
@@ -1878,9 +2265,19 @@ class RendererGL:
         self._fluid_depth_texture = ensure_texture(self._fluid_depth_texture)
         self._fluid_depth_smooth_texture = ensure_texture(self._fluid_depth_smooth_texture)
         self._fluid_thickness_texture = ensure_texture(self._fluid_thickness_texture)
+        self._fluid_thickness_smooth_texture = ensure_texture(self._fluid_thickness_smooth_texture)
         self._fluid_scene_texture = ensure_texture(self._fluid_scene_texture)
+        self._fluid_scene_depth_texture = ensure_texture(self._fluid_scene_depth_texture)
+        self._fluid_shadow_depth_texture = ensure_texture(self._fluid_shadow_depth_texture)
+        self._fluid_shadow_thickness_texture = ensure_texture(self._fluid_shadow_thickness_texture)
+        self._fluid_shadow_depth_attachment = ensure_texture(self._fluid_shadow_depth_attachment)
 
-        for texture in (self._fluid_depth_texture, self._fluid_depth_smooth_texture, self._fluid_thickness_texture):
+        for texture in (
+            self._fluid_depth_texture,
+            self._fluid_depth_smooth_texture,
+            self._fluid_thickness_texture,
+            self._fluid_thickness_smooth_texture,
+        ):
             gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
             gl.glTexImage2D(
                 gl.GL_TEXTURE_2D,
@@ -1910,10 +2307,68 @@ class RendererGL:
             gl.GL_UNSIGNED_BYTE,
             None,
         )
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR_MIPMAP_LINEAR)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self._fluid_scene_depth_texture)
+        gl.glTexImage2D(
+            gl.GL_TEXTURE_2D,
+            0,
+            gl.GL_DEPTH_COMPONENT32,
+            self._screen_width,
+            self._screen_height,
+            0,
+            gl.GL_DEPTH_COMPONENT,
+            gl.GL_FLOAT,
+            None,
+        )
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+
+        for texture in (self._fluid_shadow_depth_texture, self._fluid_shadow_thickness_texture):
+            gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+            gl.glTexImage2D(
+                gl.GL_TEXTURE_2D,
+                0,
+                gl.GL_R32F,
+                self._fluid_shadow_size,
+                self._fluid_shadow_size,
+                0,
+                gl.GL_RED,
+                gl.GL_FLOAT,
+                None,
+            )
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_BORDER)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_BORDER)
+            border_color = [0.0, 0.0, 0.0, 0.0]
+            gl.glTexParameterfv(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_BORDER_COLOR, (gl.GLfloat * 4)(*border_color))
+
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self._fluid_shadow_depth_attachment)
+        gl.glTexImage2D(
+            gl.GL_TEXTURE_2D,
+            0,
+            gl.GL_DEPTH_COMPONENT32,
+            self._fluid_shadow_size,
+            self._fluid_shadow_size,
+            0,
+            gl.GL_DEPTH_COMPONENT,
+            gl.GL_FLOAT,
+            None,
+        )
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_BORDER)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_BORDER)
+        border_color = [1.0, 1.0, 1.0, 1.0]
+        gl.glTexParameterfv(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_BORDER_COLOR, (gl.GLfloat * 4)(*border_color))
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
 
         if self._fluid_fbo is None:
@@ -2033,20 +2488,8 @@ class RendererGL:
 
     def _render_shadow_map(self, objects):
         gl = RendererGL.gl
-        from pyglet.math import Mat4, Vec3
 
         self._make_current()
-
-        extents = self.shadow_extents
-
-        light_near = 1.0
-        light_far = 1000.0
-        camera_pos = np.array(self.camera.pos, dtype=np.float32)
-        light_pos = camera_pos + self._sun_direction * extents
-        light_proj = Mat4.orthogonal_projection(-extents, extents, -extents, extents, light_near, light_far)
-
-        light_view = Mat4.look_at(Vec3(*light_pos), Vec3(*camera_pos), Vec3(*self.camera.get_up()))
-        self._light_space_matrix = np.array(light_proj @ light_view, dtype=np.float32)
 
         self._shadow_shader.update(self._light_space_matrix)
 
@@ -2059,14 +2502,94 @@ class RendererGL:
 
         check_gl_error()
 
+    def _update_light_matrices(self):
+        from pyglet.math import Mat4, Vec3
+
+        extents = self.shadow_extents
+        light_near = 1.0
+        light_far = 1000.0
+        camera_pos = np.array(self.camera.pos, dtype=np.float32)
+        light_pos = camera_pos + self._sun_direction * extents
+        light_proj = Mat4.orthogonal_projection(-extents, extents, -extents, extents, light_near, light_far)
+        light_view = Mat4.look_at(Vec3(*light_pos), Vec3(*camera_pos), Vec3(*self._scene_up_vector()))
+
+        self._light_projection_matrix = np.array(light_proj, dtype=np.float32)
+        self._light_view_matrix = np.array(light_view, dtype=np.float32)
+        self._light_space_matrix = np.array(light_proj @ light_view, dtype=np.float32)
+
+    def _scene_up_vector(self) -> tuple[float, float, float]:
+        if self.camera.up_axis == 0:
+            return (1.0, 0.0, 0.0)
+        if self.camera.up_axis == 1:
+            return (0.0, 1.0, 0.0)
+        return (0.0, 0.0, 1.0)
+
+    def _update_fluid_light_matrices(self, active_fluids) -> None:
+        valid_bounds = [fluid for fluid in active_fluids if getattr(fluid, "bounds_valid", False)]
+        if not valid_bounds:
+            return
+
+        from pyglet.math import Mat4, Vec3
+
+        lower = np.min(np.stack([fluid.bounds_lower for fluid in valid_bounds]), axis=0).astype(np.float32)
+        upper = np.max(np.stack([fluid.bounds_upper for fluid in valid_bounds]), axis=0).astype(np.float32)
+        up_axis = int(self.camera.up_axis)
+        sun_direction = np.asarray(self._sun_direction, dtype=np.float32)
+        sun_up = float(sun_direction[up_axis])
+        receiver_up = min(float(lower[up_axis]), 0.0)
+        corners = np.array(
+            [(x, y, z) for x in (lower[0], upper[0]) for y in (lower[1], upper[1]) for z in (lower[2], upper[2])],
+            dtype=np.float32,
+        )
+        projected_corners = []
+        if sun_up > 1.0e-4:
+            for corner in corners:
+                travel = max((float(corner[up_axis]) - receiver_up) / sun_up, 0.0)
+                projected_corners.append(corner - sun_direction * travel)
+        if projected_corners:
+            shadow_points = np.concatenate((corners, np.asarray(projected_corners, dtype=np.float32)), axis=0)
+        else:
+            shadow_points = corners
+        shadow_lower = np.min(shadow_points, axis=0)
+        shadow_upper = np.max(shadow_points, axis=0)
+        center = (shadow_lower + shadow_upper) * 0.5
+        half_diagonal = float(np.linalg.norm((shadow_upper - shadow_lower) * 0.5))
+        ortho_extent = max(half_diagonal * 1.20, self.shadow_extents * 0.25, 1.0)
+        light_distance = max(ortho_extent * 3.0, 8.0)
+        light_near = 0.05
+        light_far = light_distance + max(ortho_extent * 4.0, 16.0)
+        light_pos = center + sun_direction * light_distance
+
+        light_proj = Mat4.orthogonal_projection(
+            -ortho_extent,
+            ortho_extent,
+            -ortho_extent,
+            ortho_extent,
+            light_near,
+            light_far,
+        )
+        light_view = Mat4.look_at(Vec3(*light_pos), Vec3(*center), Vec3(*self._scene_up_vector()))
+
+        self._light_projection_matrix = np.array(light_proj, dtype=np.float32)
+        self._light_view_matrix = np.array(light_view, dtype=np.float32)
+        self._light_space_matrix = np.array(light_proj @ light_view, dtype=np.float32)
+
     def _draw_frame_quad(self):
         gl = RendererGL.gl
         gl.glBindVertexArray(self._frame_vao)
         gl.glDrawElements(gl.GL_TRIANGLES, len(self._frame_indices), gl.GL_UNSIGNED_INT, None)
         gl.glBindVertexArray(0)
 
-    def _blur_fluid_depth(
-        self, source_texture, target_texture, direction: tuple[float, float], filter_radius: float
+    def _blur_fluid_scalar(
+        self,
+        source_texture,
+        target_texture,
+        direction: tuple[float, float],
+        filter_radius: float,
+        depth_edge_falloff: float,
+        max_radial_samples: int,
+        guide_texture=None,
+        max_depth_delta: float = 0.25,
     ) -> None:
         gl = RendererGL.gl
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._fluid_blur_fbo)
@@ -2079,30 +2602,229 @@ class RendererGL:
         with self._fluid_blur_shader:
             gl.glActiveTexture(gl.GL_TEXTURE0)
             gl.glBindTexture(gl.GL_TEXTURE_2D, source_texture)
+            gl.glActiveTexture(gl.GL_TEXTURE1)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, guide_texture if guide_texture is not None else source_texture)
             self._fluid_blur_shader.update(
                 texture_unit=0,
+                guide_unit=1,
                 texel_size=(1.0 / max(self._screen_width, 1), 1.0 / max(self._screen_height, 1)),
                 direction=direction,
                 filter_radius=filter_radius,
-                max_depth_delta=0.25,
+                max_depth_delta=max_depth_delta,
+                depth_edge_falloff=depth_edge_falloff,
+                max_radial_samples=max_radial_samples,
+                use_guide_texture=guide_texture is not None,
             )
             self._draw_frame_quad()
 
-    def _render_fluids(self, fluids):
+    def _blur_fluid_depth(
+        self,
+        source_texture,
+        target_texture,
+        direction: tuple[float, float],
+        filter_radius: float,
+        depth_edge_falloff: float,
+        max_radial_samples: int,
+    ) -> None:
+        self._blur_fluid_scalar(
+            source_texture,
+            target_texture,
+            direction,
+            filter_radius,
+            depth_edge_falloff,
+            max_radial_samples,
+            guide_texture=None,
+            max_depth_delta=0.25,
+        )
+
+    def _copy_frame_to_fluid_scene(self) -> None:
+        gl = RendererGL.gl
+        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, self._frame_fbo)
+        gl.glReadBuffer(gl.GL_COLOR_ATTACHMENT0)
+        gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, self._fluid_blur_fbo)
+        gl.glFramebufferTexture2D(
+            gl.GL_DRAW_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self._fluid_scene_texture, 0
+        )
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+        gl.glBlitFramebuffer(
+            0,
+            0,
+            self._screen_width,
+            self._screen_height,
+            0,
+            0,
+            self._screen_width,
+            self._screen_height,
+            gl.GL_COLOR_BUFFER_BIT,
+            gl.GL_NEAREST,
+        )
+
+    @staticmethod
+    def _fluid_smoothing_budget(requested_iterations: int) -> tuple[int, int, float]:
+        requested_iterations = max(int(requested_iterations), 0)
+        if requested_iterations == 0:
+            return 0, 0, 1.0
+
+        depth_iterations = min(requested_iterations, 4)
+        thickness_iterations = max(1, min(depth_iterations // 2, 2))
+        radius_scale = float(np.sqrt(requested_iterations / max(depth_iterations, 1)))
+        return depth_iterations, thickness_iterations, radius_scale
+
+    def _render_fluid_shadow_maps(self, active_fluids, material_fluid) -> None:
+        gl = RendererGL.gl
+        light_projection = np.asarray(self._light_projection_matrix, dtype=np.float32).reshape(4, 4).transpose()
+        light_inv_projection = np.linalg.inv(light_projection).transpose()
+        shadow_texel_size = (
+            1.0 / max(self._fluid_shadow_size, 1),
+            1.0 / max(self._fluid_shadow_size, 1),
+        )
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._fluid_fbo)
+        gl.glViewport(0, 0, self._fluid_shadow_size, self._fluid_shadow_size)
+        gl.glFramebufferTexture2D(
+            gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, gl.GL_TEXTURE_2D, self._fluid_shadow_depth_attachment, 0
+        )
+
+        gl.glFramebufferTexture2D(
+            gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self._fluid_shadow_depth_texture, 0
+        )
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+        gl.glClearBufferfv(gl.GL_COLOR, 0, (gl.GLfloat * 4)(0.0, 0.0, 0.0, 0.0))
+        gl.glClear(gl.GL_DEPTH_BUFFER_BIT)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDepthFunc(gl.GL_LEQUAL)
+        gl.glDepthMask(True)
+        gl.glDisable(gl.GL_BLEND)
+        if hasattr(gl, "GL_PROGRAM_POINT_SIZE"):
+            gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
+
+        with self._fluid_particle_shader:
+            self._fluid_particle_shader.update(
+                self._light_view_matrix,
+                self._light_projection_matrix,
+                light_inv_projection,
+                shadow_texel_size,
+                output_thickness=False,
+                thickness_scale=1.0,
+            )
+            for fluid in active_fluids:
+                fluid.render()
+
+        gl.glFramebufferTexture2D(
+            gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self._fluid_shadow_thickness_texture, 0
+        )
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+        gl.glClearBufferfv(gl.GL_COLOR, 0, (gl.GLfloat * 4)(0.0, 0.0, 0.0, 0.0))
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glDepthMask(False)
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE)
+        with self._fluid_particle_shader:
+            self._fluid_particle_shader.update(
+                self._light_view_matrix,
+                self._light_projection_matrix,
+                light_inv_projection,
+                shadow_texel_size,
+                output_thickness=True,
+                thickness_scale=material_fluid.thickness_scale,
+            )
+            for fluid in active_fluids:
+                fluid.render()
+        gl.glDisable(gl.GL_BLEND)
+        gl.glDepthMask(True)
+        gl.glViewport(0, 0, self._screen_width, self._screen_height)
+
+    def _apply_fluid_shadow_to_scene(
+        self,
+        inv_projection: np.ndarray,
+        inv_view: np.ndarray,
+        material_fluid,
+        fluid_bounds_lower: np.ndarray,
+        fluid_bounds_upper: np.ndarray,
+        scene_depth_texture=None,
+        copy_to_frame: bool = True,
+    ) -> None:
+        gl = RendererGL.gl
+        depth_texture = scene_depth_texture if scene_depth_texture is not None else self._frame_depth_texture
+
+        self._copy_frame_to_fluid_scene()
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._fluid_blur_fbo)
+        gl.glFramebufferTexture2D(
+            gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self._fluid_scene_texture, 0
+        )
+        gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, gl.GL_TEXTURE_2D, 0, 0)
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+        gl.glViewport(0, 0, self._screen_width, self._screen_height)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glDisable(gl.GL_BLEND)
+
+        with self._fluid_shadow_shader:
+            gl.glActiveTexture(gl.GL_TEXTURE0)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._frame_texture)
+            gl.glActiveTexture(gl.GL_TEXTURE1)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, depth_texture)
+            gl.glActiveTexture(gl.GL_TEXTURE2)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._fluid_shadow_depth_texture)
+            gl.glActiveTexture(gl.GL_TEXTURE3)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._fluid_shadow_thickness_texture)
+            self._fluid_shadow_shader.update(
+                scene_unit=0,
+                scene_depth_unit=1,
+                fluid_shadow_depth_unit=2,
+                fluid_shadow_thickness_unit=3,
+                inv_projection=inv_projection,
+                inv_view=inv_view,
+                light_projection=self._light_projection_matrix,
+                light_view=self._light_view_matrix,
+                light_space_matrix=self._light_space_matrix,
+                sun_direction_world=(
+                    float(self._sun_direction[0]),
+                    float(self._sun_direction[1]),
+                    float(self._sun_direction[2]),
+                ),
+                fluid_bounds_lower=fluid_bounds_lower,
+                fluid_bounds_upper=fluid_bounds_upper,
+                caustic_scale=material_fluid.caustic_scale,
+                floor_caustic_strength=material_fluid.floor_caustic_strength,
+                surface_shadow_strength=material_fluid.surface_shadow_strength,
+                up_axis=self.camera.up_axis,
+            )
+            self._draw_frame_quad()
+
+        if not copy_to_frame:
+            return
+
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._frame_fbo)
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+        with self._frame_shader:
+            gl.glActiveTexture(gl.GL_TEXTURE0)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._fluid_scene_texture)
+            self._frame_shader.update(0)
+            self._draw_frame_quad()
+
+    def _render_fluids(self, fluids, fluid_diffuse=None):
         gl = RendererGL.gl
         active_fluids = [fluid for fluid in fluids.values() if not fluid.hidden and fluid.active_particles > 0]
         if not active_fluids:
-            return
+            return False
 
         material_fluid = active_fluids[0]
+        valid_bounds = [fluid for fluid in active_fluids if fluid.bounds_valid]
+        if valid_bounds:
+            fluid_bounds_lower = np.min([fluid.bounds_lower for fluid in valid_bounds], axis=0).astype(np.float32)
+            fluid_bounds_upper = np.max([fluid.bounds_upper for fluid in valid_bounds], axis=0).astype(np.float32)
+        else:
+            fluid_bounds_lower = np.zeros(3, dtype=np.float32)
+            fluid_bounds_upper = np.zeros(3, dtype=np.float32)
 
-        # Keep a copy of opaque scene color because the composite pass writes
-        # back into the frame color texture.
-        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, self._frame_fbo)
-        gl.glReadBuffer(gl.GL_COLOR_ATTACHMENT0)
-        gl.glBindTexture(gl.GL_TEXTURE_2D, self._fluid_scene_texture)
-        gl.glCopyTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, 0, 0, self._screen_width, self._screen_height)
-        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+        view = np.asarray(self._view_matrix, dtype=np.float32).reshape(4, 4).transpose()
+        projection = np.asarray(self._projection_matrix, dtype=np.float32).reshape(4, 4).transpose()
+        inv_projection = np.linalg.inv(projection).transpose()
+        inv_view = np.linalg.inv(view).transpose()
+        inv_view_rotation = np.linalg.inv(view[:3, :3]).transpose()
+        screen_texel_size = (
+            1.0 / max(self._screen_width, 1),
+            1.0 / max(self._screen_height, 1),
+        )
 
         # Nearest fluid surface depth.
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._fluid_fbo)
@@ -2110,14 +2832,15 @@ class RendererGL:
             gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self._fluid_depth_texture, 0
         )
         gl.glFramebufferTexture2D(
-            gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, gl.GL_TEXTURE_2D, self._frame_depth_texture, 0
+            gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, gl.GL_TEXTURE_2D, self._fluid_scene_depth_texture, 0
         )
         gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
         gl.glViewport(0, 0, self._screen_width, self._screen_height)
         gl.glClearBufferfv(gl.GL_COLOR, 0, (gl.GLfloat * 4)(0.0, 0.0, 0.0, 0.0))
+        gl.glClear(gl.GL_DEPTH_BUFFER_BIT)
         gl.glEnable(gl.GL_DEPTH_TEST)
         gl.glDepthFunc(gl.GL_LEQUAL)
-        gl.glDepthMask(False)
+        gl.glDepthMask(True)
         gl.glDisable(gl.GL_BLEND)
         if hasattr(gl, "GL_PROGRAM_POINT_SIZE"):
             gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
@@ -2126,6 +2849,8 @@ class RendererGL:
             self._fluid_particle_shader.update(
                 self._view_matrix,
                 self._projection_matrix,
+                inv_projection,
+                screen_texel_size,
                 output_thickness=False,
                 thickness_scale=1.0,
             )
@@ -2137,12 +2862,16 @@ class RendererGL:
             gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self._fluid_thickness_texture, 0
         )
         gl.glClearBufferfv(gl.GL_COLOR, 0, (gl.GLfloat * 4)(0.0, 0.0, 0.0, 0.0))
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glDepthMask(False)
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE)
         with self._fluid_particle_shader:
             self._fluid_particle_shader.update(
                 self._view_matrix,
                 self._projection_matrix,
+                inv_projection,
+                screen_texel_size,
                 output_thickness=True,
                 thickness_scale=material_fluid.thickness_scale,
             )
@@ -2151,29 +2880,133 @@ class RendererGL:
         gl.glDisable(gl.GL_BLEND)
         gl.glDepthMask(True)
 
+        depth_iterations, thickness_iterations, smoothing_radius_scale = self._fluid_smoothing_budget(
+            material_fluid.smoothing_iterations
+        )
+        depth_filter_radius = material_fluid.smoothing_radius * smoothing_radius_scale
+
         depth_texture = self._fluid_depth_texture
         scratch_texture = self._fluid_depth_smooth_texture
-        for _ in range(material_fluid.smoothing_iterations):
-            self._blur_fluid_depth(depth_texture, scratch_texture, (1.0, 0.0), material_fluid.smoothing_radius)
+        for _ in range(depth_iterations):
+            self._blur_fluid_depth(
+                depth_texture,
+                scratch_texture,
+                (1.0, 0.0),
+                depth_filter_radius,
+                material_fluid.smoothing_depth_edge_falloff,
+                material_fluid.smoothing_max_samples,
+            )
             depth_texture, scratch_texture = scratch_texture, depth_texture
-            self._blur_fluid_depth(depth_texture, scratch_texture, (0.0, 1.0), material_fluid.smoothing_radius)
+            self._blur_fluid_depth(
+                depth_texture,
+                scratch_texture,
+                (0.0, 1.0),
+                depth_filter_radius,
+                material_fluid.smoothing_depth_edge_falloff,
+                material_fluid.smoothing_max_samples,
+            )
             depth_texture, scratch_texture = scratch_texture, depth_texture
+
+        thickness_texture = self._fluid_thickness_texture
+        thickness_scratch_texture = self._fluid_thickness_smooth_texture
+        thickness_radius = max(material_fluid.smoothing_radius * smoothing_radius_scale * 0.72, 0.2)
+        for _ in range(thickness_iterations):
+            self._blur_fluid_scalar(
+                thickness_texture,
+                thickness_scratch_texture,
+                (1.0, 0.0),
+                thickness_radius,
+                material_fluid.smoothing_depth_edge_falloff,
+                material_fluid.smoothing_max_samples,
+                guide_texture=depth_texture,
+                max_depth_delta=0.35,
+            )
+            thickness_texture, thickness_scratch_texture = thickness_scratch_texture, thickness_texture
+            self._blur_fluid_scalar(
+                thickness_texture,
+                thickness_scratch_texture,
+                (0.0, 1.0),
+                thickness_radius,
+                material_fluid.smoothing_depth_edge_falloff,
+                material_fluid.smoothing_max_samples,
+                guide_texture=depth_texture,
+                max_depth_delta=0.35,
+            )
+            thickness_texture, thickness_scratch_texture = thickness_scratch_texture, thickness_texture
+
+        fluid_shadows_enabled = self.draw_shadows and (
+            material_fluid.surface_shadow_strength > 0.0 or material_fluid.floor_caustic_strength > 0.0
+        )
+        scene_light_projection_matrix = np.array(self._light_projection_matrix, copy=True)
+        scene_light_view_matrix = np.array(self._light_view_matrix, copy=True)
+        scene_light_space_matrix = np.array(self._light_space_matrix, copy=True)
+        if fluid_shadows_enabled:
+            self._update_fluid_light_matrices(active_fluids)
+            self._render_fluid_shadow_maps(active_fluids, material_fluid)
+
+        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, self._frame_fbo)
+        gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, self._fluid_blur_fbo)
+        gl.glFramebufferTexture2D(
+            gl.GL_DRAW_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, gl.GL_TEXTURE_2D, self._fluid_scene_depth_texture, 0
+        )
+        gl.glBlitFramebuffer(
+            0,
+            0,
+            self._screen_width,
+            self._screen_height,
+            0,
+            0,
+            self._screen_width,
+            self._screen_height,
+            gl.GL_DEPTH_BUFFER_BIT,
+            gl.GL_NEAREST,
+        )
+
+        if fluid_shadows_enabled:
+            self._apply_fluid_shadow_to_scene(
+                inv_projection,
+                inv_view,
+                material_fluid,
+                fluid_bounds_lower,
+                fluid_bounds_upper,
+                scene_depth_texture=self._fluid_scene_depth_texture,
+                copy_to_frame=True,
+            )
+            self._light_projection_matrix = scene_light_projection_matrix
+            self._light_view_matrix = scene_light_view_matrix
+            self._light_space_matrix = scene_light_space_matrix
+        else:
+            self._copy_frame_to_fluid_scene()
+
+        if fluid_diffuse:
+            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._fluid_blur_fbo)
+            gl.glFramebufferTexture2D(
+                gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self._fluid_scene_texture, 0
+            )
+            self._render_fluid_diffuse(
+                fluid_diffuse,
+                fluid_depth_texture=depth_texture,
+                depth_mode=1,
+                target_fbo=self._fluid_blur_fbo,
+            )
+
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self._fluid_scene_texture)
+        gl.glGenerateMipmap(gl.GL_TEXTURE_2D)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
 
         # Composite over the frame color.
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._frame_fbo)
         gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
         gl.glViewport(0, 0, self._screen_width, self._screen_height)
-        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDepthFunc(gl.GL_ALWAYS)
+        gl.glDepthMask(True)
         gl.glDisable(gl.GL_BLEND)
 
-        view = np.asarray(self._view_matrix, dtype=np.float32).reshape(4, 4).transpose()
         sun_view = view[:3, :3] @ np.asarray(self._sun_direction, dtype=np.float32)
         norm = np.linalg.norm(sun_view)
         if norm > 0.0:
             sun_view = sun_view / norm
-        inv_view_rotation = np.linalg.inv(view[:3, :3]).transpose()
-        projection = np.asarray(self._projection_matrix, dtype=np.float32).reshape(4, 4).transpose()
-        inv_projection = np.linalg.inv(projection).transpose()
 
         with self._fluid_composite_shader:
             gl.glActiveTexture(gl.GL_TEXTURE0)
@@ -2181,22 +3014,30 @@ class RendererGL:
             gl.glActiveTexture(gl.GL_TEXTURE1)
             gl.glBindTexture(gl.GL_TEXTURE_2D, depth_texture)
             gl.glActiveTexture(gl.GL_TEXTURE2)
-            gl.glBindTexture(gl.GL_TEXTURE_2D, self._fluid_thickness_texture)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, thickness_texture)
             gl.glActiveTexture(gl.GL_TEXTURE3)
             if self._env_texture is not None:
                 gl.glBindTexture(gl.GL_TEXTURE_2D, self._env_texture)
             else:
                 gl.glBindTexture(gl.GL_TEXTURE_2D, RendererGL.get_fallback_texture())
             gl.glActiveTexture(gl.GL_TEXTURE4)
-            gl.glBindTexture(gl.GL_TEXTURE_2D, self._frame_depth_texture)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._fluid_scene_depth_texture)
+            gl.glActiveTexture(gl.GL_TEXTURE5)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._shadow_texture)
             self._fluid_composite_shader.update(
                 scene_unit=0,
                 depth_unit=1,
                 thickness_unit=2,
                 env_unit=3,
                 scene_depth_unit=4,
+                shadow_unit=5,
+                projection_matrix=self._projection_matrix,
                 inv_projection=inv_projection,
+                inv_view=inv_view,
+                light_space_matrix=self._light_space_matrix,
                 inv_view_rotation=inv_view_rotation,
+                fluid_bounds_lower=fluid_bounds_lower,
+                fluid_bounds_upper=fluid_bounds_upper,
                 texel_size=(1.0 / max(self._screen_width, 1), 1.0 / max(self._screen_height, 1)),
                 water_color=material_fluid.color,
                 water_deep_color=material_fluid.deep_color,
@@ -2210,9 +3051,14 @@ class RendererGL:
                 absorption_strength=material_fluid.absorption_strength,
                 depth_visualization_strength=material_fluid.depth_visualization_strength,
                 env_intensity=self._env_intensity,
+                env_map_available=self._env_texture is not None,
+                sky_reflection_color=self.sky_upper,
+                ground_reflection_color=self.ambient_ground,
                 caustic_strength=material_fluid.caustic_strength,
                 caustic_scale=material_fluid.caustic_scale,
-                floor_caustic_strength=material_fluid.floor_caustic_strength,
+                floor_caustic_strength=0.0,
+                surface_shadow_strength=0.0,
+                shadow_radius=self.shadow_radius,
                 foam_strength=material_fluid.foam_strength,
                 foam_scale=material_fluid.foam_scale,
                 up_axis=self.camera.up_axis,
@@ -2220,7 +3066,80 @@ class RendererGL:
             )
             self._draw_frame_quad()
 
+        gl.glDepthFunc(gl.GL_LESS)
+
+        if fluid_diffuse:
+            self._render_fluid_diffuse(fluid_diffuse, fluid_depth_texture=depth_texture, depth_mode=2)
+
         gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDepthFunc(gl.GL_LESS)
+        check_gl_error()
+        return True
+
+    def _render_fluid_diffuse(self, diffuse_batches, fluid_depth_texture=None, depth_mode: int = 0, target_fbo=None):
+        active_batches = [
+            batch for batch in diffuse_batches.values() if not batch.hidden and batch.active_particles > 0
+        ]
+        if not active_batches:
+            return
+
+        gl = RendererGL.gl
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._frame_fbo if target_fbo is None else target_fbo)
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+        gl.glViewport(0, 0, self._screen_width, self._screen_height)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glDepthMask(False)
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA)
+
+        with self._fluid_diffuse_shader:
+            gl.glActiveTexture(gl.GL_TEXTURE0)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._frame_depth_texture)
+            gl.glActiveTexture(gl.GL_TEXTURE1)
+            if fluid_depth_texture is not None:
+                gl.glBindTexture(gl.GL_TEXTURE_2D, fluid_depth_texture)
+            else:
+                gl.glBindTexture(gl.GL_TEXTURE_2D, RendererGL.get_fallback_texture())
+            gl.glActiveTexture(gl.GL_TEXTURE2)
+            gl.glBindTexture(
+                gl.GL_TEXTURE_2D,
+                self._shadow_texture if self._shadow_texture is not None else RendererGL.get_fallback_texture(),
+            )
+            sun = np.asarray(
+                self._sun_direction if self._sun_direction is not None else (0.2, -0.3, 0.8),
+                dtype=np.float32,
+            )
+            view_matrix = np.asarray(self._view_matrix, dtype=np.float32).reshape(4, 4).transpose()
+            projection_matrix = np.asarray(self._projection_matrix, dtype=np.float32).reshape(4, 4).transpose()
+            inv_projection_matrix = np.linalg.inv(projection_matrix).transpose()
+            sun_view = view_matrix[:3, :3] @ sun
+            for batch in active_batches:
+                batch.sort_for_view(self._view_matrix)
+                self._fluid_diffuse_shader.update(
+                    view_matrix=self._view_matrix,
+                    projection_matrix=self._projection_matrix,
+                    inv_projection_matrix=inv_projection_matrix,
+                    radius=batch.radius,
+                    motion_blur_scale=batch.motion_blur_scale,
+                    diffuse_expansion=batch.expansion,
+                    diffuse_color=batch.color,
+                    alpha=batch.alpha,
+                    scene_depth_unit=0,
+                    fluid_depth_unit=1,
+                    shadow_unit=2,
+                    light_space_matrix=self._light_space_matrix,
+                    sun_direction_view=(float(sun_view[0]), float(sun_view[1]), float(sun_view[2])),
+                    texel_size=(1.0 / max(self._screen_width, 1), 1.0 / max(self._screen_height, 1)),
+                    depth_mode=depth_mode,
+                    inscatter=batch.inscatter,
+                    outscatter=batch.outscatter,
+                    shadow_strength=batch.shadow_strength,
+                    shadow_enabled=self.draw_shadows and self._shadow_texture is not None,
+                )
+                batch.render()
+
+        gl.glDisable(gl.GL_BLEND)
+        gl.glDepthMask(True)
         gl.glDepthFunc(gl.GL_LESS)
         check_gl_error()
 

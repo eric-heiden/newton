@@ -40,27 +40,28 @@ def deactivate_particles_overlapping_boxes(
         X_bw = wp.transform_inverse(body_q[body])
         local = wp.transform_point(X_bw, x)
         half = box_half_extents[box_idx] + wp.vec3(clearance)
-        if (
-            wp.abs(local[0]) <= half[0]
-            and wp.abs(local[1]) <= half[1]
-            and wp.abs(local[2]) <= half[2]
-        ):
+        if wp.abs(local[0]) <= half[0] and wp.abs(local[1]) <= half[1] and wp.abs(local[2]) <= half[2]:
             particle_flags[tid] = wp.int32(0)
             return
 
 
 @wp.kernel
-def apply_body_suspension_forces(
+def apply_body_buoyancy_forces(
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_f: wp.array[wp.spatial_vector],
     body_mass: wp.array[float],
     body_ids: wp.array[int],
-    target_heights: wp.array[float],
+    box_half_extents: wp.array[wp.vec3],
     bounds_lower: wp.vec3,
     bounds_upper: wp.vec3,
-    stiffness: float,
+    gravity: wp.vec3,
+    water_level: float,
+    rest_density: float,
+    buoyancy_scale: float,
     damping: float,
+    fluid_drag: float,
+    angular_drag: float,
     wall_stiffness: float,
     wall_damping: float,
 ):
@@ -69,12 +70,33 @@ def apply_body_suspension_forces(
     if body < 0:
         return
 
-    x = wp.transform_get_translation(body_q[body])
+    X_wb = body_q[body]
+    x = wp.transform_get_translation(X_wb)
+    q = wp.transform_get_rotation(X_wb)
     v = wp.spatial_top(body_qd[body])
+    w = wp.spatial_bottom(body_qd[body])
     force = wp.vec3(0.0)
+    torque = wp.vec3(0.0)
     mass = body_mass[body]
+    half = box_half_extents[tid]
 
-    force[2] += mass * (stiffness * (target_heights[tid] - x[2]) - damping * v[2])
+    axis_x = wp.quat_rotate(q, wp.vec3(1.0, 0.0, 0.0))
+    axis_y = wp.quat_rotate(q, wp.vec3(0.0, 1.0, 0.0))
+    axis_z = wp.quat_rotate(q, wp.vec3(0.0, 0.0, 1.0))
+    vertical_extent = wp.abs(axis_x[2]) * half[0] + wp.abs(axis_y[2]) * half[1] + wp.abs(axis_z[2]) * half[2]
+    vertical_extent = wp.max(vertical_extent, 1.0e-4)
+    body_bottom = x[2] - vertical_extent
+    body_top = x[2] + vertical_extent
+    submerged_height = wp.min(wp.max(water_level - body_bottom, 0.0), body_top - body_bottom)
+    submerged_fraction = submerged_height / wp.max(body_top - body_bottom, 1.0e-4)
+
+    volume = 8.0 * half[0] * half[1] * half[2]
+    displaced_mass = rest_density * volume * submerged_fraction
+    buoyancy = -gravity * displaced_mass * buoyancy_scale
+    force += buoyancy
+    force -= v * (mass * fluid_drag * submerged_fraction)
+    force[2] -= mass * damping * submerged_fraction * v[2]
+    torque -= w * (mass * angular_drag * submerged_fraction)
 
     margin = float(0.18)
     if x[0] < bounds_lower[0] + margin:
@@ -92,7 +114,44 @@ def apply_body_suspension_forces(
     elif x[2] > bounds_upper[2] - margin:
         force[2] += wall_stiffness * (bounds_upper[2] - margin - x[2]) - wall_damping * v[2]
 
-    wp.atomic_add(body_f, body, wp.spatial_vector(force, wp.vec3(0.0)))
+    wp.atomic_add(body_f, body, wp.spatial_vector(force, torque))
+
+
+@wp.kernel
+def clamp_body_water_velocities(
+    body_qd: wp.array[wp.spatial_vector],
+    body_f: wp.array[wp.spatial_vector],
+    body_ids: wp.array[int],
+    max_linear_speed: float,
+    max_angular_speed: float,
+    max_torque: float,
+):
+    tid = wp.tid()
+    body = body_ids[tid]
+    if body < 0:
+        return
+
+    qd = body_qd[body]
+    v = wp.spatial_top(qd)
+    w = wp.spatial_bottom(qd)
+
+    speed = wp.length(v)
+    if max_linear_speed > 0.0 and speed > max_linear_speed:
+        v *= max_linear_speed / speed
+
+    angular_speed = wp.length(w)
+    if max_angular_speed > 0.0 and angular_speed > max_angular_speed:
+        w *= max_angular_speed / angular_speed
+
+    body_qd[body] = wp.spatial_vector(v, w)
+
+    wrench = body_f[body]
+    force = wp.spatial_top(wrench)
+    torque = wp.spatial_bottom(wrench)
+    torque_mag = wp.length(torque)
+    if max_torque > 0.0 and torque_mag > max_torque:
+        torque *= max_torque / torque_mag
+        body_f[body] = wp.spatial_vector(force, torque)
 
 
 @wp.kernel
@@ -100,12 +159,14 @@ def apply_particle_box_coupling(
     particle_q: wp.array[wp.vec3],
     particle_qd: wp.array[wp.vec3],
     particle_f: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
     particle_radius: wp.array[float],
     particle_flags: wp.array[wp.int32],
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_f: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
+    body_mass: wp.array[float],
     box_body_ids: wp.array[int],
     box_half_extents: wp.array[wp.vec3],
     contact_distance: float,
@@ -119,6 +180,7 @@ def apply_particle_box_coupling(
 
     x = particle_q[i]
     v = particle_qd[i]
+    mass = particle_mass[i]
     radius = particle_radius[i]
     particle_force = wp.vec3(0.0)
 
@@ -168,14 +230,16 @@ def apply_particle_box_coupling(
         if penetration > 0.0:
             normal = wp.quat_rotate(wp.transform_get_rotation(X_wb), normal_local)
             closest_world = wp.transform_point(X_wb, closest_local)
-            body_v = wp.spatial_top(body_qd[body])
+            r = closest_world - wp.transform_point(X_wb, body_com[body])
+            body_v = wp.spatial_top(body_qd[body]) + wp.cross(wp.spatial_bottom(body_qd[body]), r)
             rel_n = wp.dot(v - body_v, normal)
             magnitude = stiffness * penetration - damping * rel_n
             if magnitude > 0.0:
-                force = normal * magnitude
+                magnitude = wp.min(magnitude, 80.0)
+                force = normal * (magnitude * mass)
                 particle_force += force
-                body_force = -force * splash_velocity_gain
-                r = closest_world - wp.transform_point(X_wb, body_com[body])
+                body_feedback_scale = splash_velocity_gain * mass / wp.max(body_mass[body], 1.0e-6)
+                body_force = -force * body_feedback_scale
                 wp.atomic_add(body_f, body, wp.spatial_vector(body_force, wp.cross(r, body_force)))
 
     particle_f[i] = particle_f[i] + particle_force
@@ -192,16 +256,30 @@ class Example:
 
         self.bounds_lower = wp.vec3(args.bounds_lower)
         self.bounds_upper = wp.vec3(args.bounds_upper)
+        self.gravity = wp.vec3(0.0, 0.0, float(args.gravity))
+        if args.water_level is None:
+            self.water_level = float(args.emit_lower[2] + args.spacing * max(args.dim_z - 1, 0) + args.radius)
+        else:
+            self.water_level = float(args.water_level)
         self.show_bounds = args.show_bounds
         self.particle_radius = args.radius
+        self.rest_density = args.rest_density
         self.coupling_stiffness = args.coupling_stiffness
         self.coupling_damping = args.coupling_damping
         self.suspension_stiffness = args.suspension_stiffness
         self.suspension_damping = args.suspension_damping
+        self.box_fluid_drag = args.box_fluid_drag
+        self.box_angular_drag = args.box_angular_drag
+        self.box_max_linear_speed = args.box_max_linear_speed
+        self.box_max_angular_speed = args.box_max_angular_speed
+        self.box_max_torque = args.box_max_torque
         self.splash_velocity_gain = args.splash_velocity_gain
         self.pick_stiffness = args.pick_stiffness
         self.pick_damping = args.pick_damping
         self.show_box_guides = args.show_box_guides
+        self.diffuse_particle_radius = args.fluid_diffuse_radius
+        self.diffuse_alpha = args.fluid_diffuse_alpha
+        self.diffuse_motion_blur_scale = args.fluid_diffuse_motion_blur
 
         builder = newton.ModelBuilder(gravity=args.gravity)
         builder.default_particle_radius = args.radius
@@ -238,7 +316,6 @@ class Example:
 
         self.box_body_ids_wp = wp.array(self.box_body_ids, dtype=int, device=self.model.device)
         self.box_half_extents_wp = wp.array(self.box_half_extents, dtype=wp.vec3, device=self.model.device)
-        self.box_target_heights_wp = wp.array(self.box_target_heights, dtype=float, device=self.model.device)
         self._carve_initial_box_volumes(args.fluid_carve_clearance)
 
         self.sph_solver = SolverSPH(
@@ -247,11 +324,44 @@ class Example:
             rest_density=args.rest_density,
             gas_constant=args.gas_constant,
             viscosity=args.viscosity,
+            particle_friction=args.particle_friction,
+            particle_collision_margin=args.particle_collision_margin,
+            cohesion=args.cohesion,
+            surface_tension=args.surface_tension,
+            vorticity_confinement=args.vorticity_confinement,
+            solid_pressure=args.solid_pressure,
+            buoyancy=args.buoyancy,
+            xsph_strength=args.xsph_strength,
+            free_surface_drag=args.free_surface_drag,
+            dissipation=args.dissipation,
             velocity_damping=args.velocity_damping,
+            sleep_threshold=args.sleep_threshold,
             bounds_lower=self.bounds_lower,
             bounds_upper=self.bounds_upper,
             boundary_damping=args.boundary_damping,
+            shape_collision_distance=args.shape_collision_distance,
+            shape_collision_margin=args.shape_collision_margin,
+            shape_restitution=args.shape_restitution,
+            shape_friction=args.shape_friction,
+            shape_adhesion=args.shape_adhesion,
             max_velocity=args.max_velocity,
+            max_acceleration=args.max_acceleration,
+            pbf_iterations=args.pbf_iterations,
+            pbf_relaxation=args.pbf_relaxation,
+            pbf_artificial_pressure=args.pbf_artificial_pressure,
+            max_diffuse_particles=args.fluid_diffuse_max_particles,
+            diffuse_threshold=args.fluid_diffuse_threshold,
+            diffuse_lifetime=args.fluid_diffuse_lifetime,
+            diffuse_drag=args.fluid_diffuse_drag,
+            diffuse_buoyancy=args.fluid_diffuse_buoyancy,
+            diffuse_ballistic=args.fluid_diffuse_ballistic,
+            diffuse_spawn_probability=args.fluid_diffuse_spawn_probability,
+            render_smoothing=args.fluid_render_smoothing,
+            render_anisotropy_scale=args.fluid_render_anisotropy_scale,
+            render_anisotropy_min=args.fluid_render_anisotropy_min,
+            render_anisotropy_max=args.fluid_render_anisotropy_max,
+            render_update_interval=args.fluid_render_update_interval,
+            diffuse_update_interval=args.fluid_diffuse_update_interval,
         )
         self.rigid_integrator = newton.solvers.SolverSemiImplicit(self.model, angular_damping=args.angular_damping)
 
@@ -260,6 +370,7 @@ class Example:
         self._apply_picking_params()
         self.viewer.show_particles = args.render_mode == "particles"
         self.viewer.show_fluid = args.render_mode == "fluid"
+        self.viewer.show_fluid_diffuse = args.show_diffuse
         self._apply_fluid_args(args)
         self.viewer.set_camera(pos=wp.vec3(args.camera_pos), pitch=args.camera_pitch, yaw=args.camera_yaw)
         self._configure_render_environment(args)
@@ -289,7 +400,11 @@ class Example:
             hy = args.box_half_extent * (0.85 + 0.10 * ((i + 1) % 3))
             hz = args.box_half_extent * (0.95 + 0.10 * (i % 3))
             q = wp.quat_from_axis_angle(wp.vec3(0.2, 0.8, 0.1), 0.20 * float(i))
-            body = builder.add_body(xform=wp.transform(wp.vec3(x, y, z), q), mass=args.box_mass, label=f"water_cube_{i}")
+            body = builder.add_body(
+                xform=wp.transform(wp.vec3(x, y, z), q),
+                mass=args.box_mass,
+                label=f"water_cube_{i}",
+            )
             builder.add_shape_box(
                 body,
                 hx=hx,
@@ -329,6 +444,8 @@ class Example:
         self.viewer.fluid_thickness_scale = args.fluid_thickness_scale
         self.viewer.fluid_smoothing_iterations = args.fluid_smoothing_iterations
         self.viewer.fluid_smoothing_radius = args.fluid_smoothing_radius
+        self.viewer.fluid_smoothing_depth_edge_falloff = args.fluid_smoothing_depth_edge_falloff
+        self.viewer.fluid_smoothing_max_samples = args.fluid_smoothing_max_samples
         self.viewer.fluid_reflection_strength = args.fluid_reflection_strength
         self.viewer.fluid_refraction_strength = args.fluid_refraction_strength
         self.viewer.fluid_env_map_strength = args.fluid_env_map_strength
@@ -339,8 +456,13 @@ class Example:
         self.viewer.fluid_caustic_strength = args.fluid_caustic_strength
         self.viewer.fluid_caustic_scale = args.fluid_caustic_scale
         self.viewer.fluid_floor_caustic_strength = args.fluid_floor_caustic_strength
+        self.viewer.fluid_surface_shadow_strength = args.fluid_surface_shadow_strength
         self.viewer.fluid_foam_strength = args.fluid_foam_strength
         self.viewer.fluid_foam_scale = args.fluid_foam_scale
+        self.viewer.fluid_diffuse_expansion = args.fluid_diffuse_expansion
+        self.viewer.fluid_diffuse_inscatter = args.fluid_diffuse_inscatter
+        self.viewer.fluid_diffuse_outscatter = args.fluid_diffuse_outscatter
+        self.viewer.fluid_diffuse_shadow_strength = args.fluid_diffuse_shadow_strength
 
     def _configure_render_environment(self, args):
         renderer = getattr(self.viewer, "renderer", None)
@@ -353,13 +475,19 @@ class Example:
             renderer.set_environment_map(env_path, intensity=args.environment_intensity)
             renderer._env_path = None
 
+        sun = np.asarray(args.sun_direction, dtype=np.float32)
+        sun_norm = float(np.linalg.norm(sun))
+        if sun_norm > 1.0e-6:
+            renderer._sun_direction = sun / sun_norm
+
         renderer.sky_upper = (0.42, 0.74, 1.0)
         renderer.sky_lower = (0.72, 0.82, 0.78)
         renderer.ambient_sky = (0.92, 0.96, 1.0)
-        renderer.ambient_ground = (0.66, 0.58, 0.40)
+        renderer.ambient_ground = (0.48, 0.50, 0.52)
         renderer.exposure = args.exposure
         renderer.specular_scale = args.specular_scale
         renderer.diffuse_scale = args.diffuse_scale
+        renderer.fluid_shadow_size = args.fluid_shadow_size
 
     def _apply_picking_params(self):
         picking = getattr(self.viewer, "picking", None)
@@ -384,7 +512,10 @@ class Example:
                 self.simulate()
             self.graph = capture.graph
         except Exception as exc:
-            warnings.warn(f"Interactive SPH graph capture failed; falling back to uncaptured stepping: {exc}", stacklevel=2)
+            warnings.warn(
+                f"Interactive SPH graph capture failed; falling back to uncaptured stepping: {exc}",
+                stacklevel=2,
+            )
             self.graph = None
 
     def simulate(self):
@@ -392,7 +523,7 @@ class Example:
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
             wp.launch(
-                kernel=apply_body_suspension_forces,
+                kernel=apply_body_buoyancy_forces,
                 dim=len(self.box_body_ids),
                 inputs=[
                     self.state_0.body_q,
@@ -400,11 +531,16 @@ class Example:
                     self.state_0.body_f,
                     self.model.body_mass,
                     self.box_body_ids_wp,
-                    self.box_target_heights_wp,
+                    self.box_half_extents_wp,
                     self.bounds_lower,
                     self.bounds_upper,
-                    self.suspension_stiffness,
+                    self.gravity,
+                    self.water_level,
+                    self.rest_density,
+                    self.suspension_stiffness / 42.0,
                     self.suspension_damping,
+                    self.box_fluid_drag,
+                    self.box_angular_drag,
                     90.0,
                     9.0,
                 ],
@@ -417,12 +553,14 @@ class Example:
                     self.state_0.particle_q,
                     self.state_0.particle_qd,
                     self.state_0.particle_f,
+                    self.model.particle_mass,
                     self.model.particle_radius,
                     self.model.particle_flags,
                     self.state_0.body_q,
                     self.state_0.body_qd,
                     self.state_0.body_f,
                     self.model.body_com,
+                    self.model.body_mass,
                     self.box_body_ids_wp,
                     self.box_half_extents_wp,
                     self.particle_radius * 1.75,
@@ -432,8 +570,34 @@ class Example:
                 ],
                 device=self.model.device,
             )
+            wp.launch(
+                kernel=clamp_body_water_velocities,
+                dim=len(self.box_body_ids),
+                inputs=[
+                    self.state_0.body_qd,
+                    self.state_0.body_f,
+                    self.box_body_ids_wp,
+                    self.box_max_linear_speed,
+                    self.box_max_angular_speed,
+                    self.box_max_torque,
+                ],
+                device=self.model.device,
+            )
             self.sph_solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
             self.rigid_integrator.integrate_bodies(self.model, self.state_0, self.state_1, self.sim_dt, 0.03)
+            wp.launch(
+                kernel=clamp_body_water_velocities,
+                dim=len(self.box_body_ids),
+                inputs=[
+                    self.state_1.body_qd,
+                    self.state_1.body_f,
+                    self.box_body_ids_wp,
+                    self.box_max_linear_speed,
+                    self.box_max_angular_speed,
+                    0.0,
+                ],
+                device=self.model.device,
+            )
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
@@ -445,7 +609,15 @@ class Example:
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
-        self.viewer.log_state(self.state_0)
+        show_fluid = self.viewer.show_fluid
+        if show_fluid:
+            self.viewer.show_fluid = False
+        try:
+            self.viewer.log_state(self.state_0)
+        finally:
+            self.viewer.show_fluid = show_fluid
+        self._log_fluid_surface()
+        self._log_diffuse_particles()
         if self.show_box_guides:
             self._log_box_guides()
         if self.show_bounds:
@@ -453,6 +625,78 @@ class Example:
         else:
             self.viewer.log_lines("/fluid/bounds", None, None, None)
         self.viewer.end_frame()
+
+    def _log_fluid_surface(self):
+        if (
+            not self.viewer.show_fluid
+            or getattr(self.viewer, "fluids", None) is None
+            or not self.sph_solver.render_buffers_valid
+            or self.sph_solver.render_positions is None
+            or self.sph_solver.render_anisotropy is None
+            or self.sph_solver.render_anisotropy_secondary is None
+            or self.sph_solver.render_anisotropy_tertiary is None
+        ):
+            return
+
+        self.viewer.log_fluid(
+            "/model/fluid",
+            self.state_0.particle_q,
+            radii=self.model.particle_radius,
+            color=self.viewer.fluid_color,
+            deep_color=self.viewer.fluid_deep_color,
+            color_gradient_strength=self.viewer.fluid_color_gradient_strength,
+            opacity=self.viewer.fluid_opacity,
+            radius_scale=self.viewer.fluid_radius_scale,
+            thickness_scale=self.viewer.fluid_thickness_scale,
+            smoothing_iterations=self.viewer.fluid_smoothing_iterations,
+            smoothing_radius=self.viewer.fluid_smoothing_radius,
+            smoothing_depth_edge_falloff=self.viewer.fluid_smoothing_depth_edge_falloff,
+            smoothing_max_samples=self.viewer.fluid_smoothing_max_samples,
+            reflection_strength=self.viewer.fluid_reflection_strength,
+            refraction_strength=self.viewer.fluid_refraction_strength,
+            env_map_strength=self.viewer.fluid_env_map_strength,
+            env_reflection_lod=self.viewer.fluid_env_reflection_lod,
+            env_color_preserve=self.viewer.fluid_env_color_preserve,
+            absorption_strength=self.viewer.fluid_absorption_strength,
+            depth_visualization_strength=self.viewer.fluid_depth_visualization_strength,
+            caustic_strength=self.viewer.fluid_caustic_strength,
+            caustic_scale=self.viewer.fluid_caustic_scale,
+            floor_caustic_strength=self.viewer.fluid_floor_caustic_strength,
+            surface_shadow_strength=self.viewer.fluid_surface_shadow_strength,
+            foam_strength=self.viewer.fluid_foam_strength,
+            foam_scale=self.viewer.fluid_foam_scale,
+            hidden=False,
+            render_points=self.sph_solver.render_positions,
+            anisotropy=self.sph_solver.render_anisotropy,
+            anisotropy_secondary=self.sph_solver.render_anisotropy_secondary,
+            anisotropy_tertiary=self.sph_solver.render_anisotropy_tertiary,
+        )
+
+    def _log_diffuse_particles(self):
+        if (
+            not self.viewer.show_fluid
+            or not self.viewer.show_fluid_diffuse
+            or self.sph_solver.diffuse_positions is None
+        ):
+            self.viewer.log_fluid_diffuse("/model/fluid/diffuse", None, hidden=True)
+            return
+
+        foam_strength = max(self.viewer.fluid_foam_strength, 0.0)
+        foam_radius_scale = max(self.viewer.fluid_foam_scale, 1.0) / 111.1
+        self.viewer.log_fluid_diffuse(
+            "/model/fluid/diffuse",
+            self.sph_solver.diffuse_positions,
+            self.sph_solver.diffuse_velocities,
+            radius=self.diffuse_particle_radius * max(0.2, foam_radius_scale**0.5),
+            color=self.viewer.fluid_diffuse_color,
+            alpha=self.diffuse_alpha * foam_strength,
+            motion_blur_scale=self.diffuse_motion_blur_scale,
+            expansion=self.viewer.fluid_diffuse_expansion,
+            inscatter=self.viewer.fluid_diffuse_inscatter,
+            outscatter=self.viewer.fluid_diffuse_outscatter,
+            shadow_strength=self.viewer.fluid_diffuse_shadow_strength,
+            hidden=False,
+        )
 
     def _log_bounds(self):
         lower = self.bounds_lower
@@ -549,9 +793,72 @@ class Example:
         _changed, self.viewer.show_fluid = ui.checkbox("Fluid Surface", self.viewer.show_fluid)
         if self.viewer.show_fluid:
             self.viewer.show_particles = False
+        _changed, self.viewer.show_fluid_diffuse = ui.checkbox("Diffuse Spray", self.viewer.show_fluid_diffuse)
         _changed, self.viewer.show_particles = ui.checkbox("Raw Particles", self.viewer.show_particles)
         if self.viewer.show_particles:
             self.viewer.show_fluid = False
+
+        _, self.sph_solver.particle_friction = ui.slider_float(
+            "Particle Friction", self.sph_solver.particle_friction, 0.0, 8.0, "%.2f"
+        )
+        _, self.sph_solver.particle_collision_margin = ui.slider_float(
+            "Particle Margin", self.sph_solver.particle_collision_margin, 0.0, 0.05, "%.4f"
+        )
+        _, self.sph_solver.cohesion = ui.slider_float("Cohesion", self.sph_solver.cohesion, 0.0, 2.0, "%.3f")
+        _, self.sph_solver.surface_tension = ui.slider_float(
+            "Surface Tension", self.sph_solver.surface_tension, 0.0, 0.00002, "%.6f"
+        )
+        _, self.sph_solver.vorticity_confinement = ui.slider_float(
+            "Vorticity", self.sph_solver.vorticity_confinement, 0.0, 0.0004, "%.6f"
+        )
+        _, self.sph_solver.solid_pressure = ui.slider_float(
+            "Solid Pressure", self.sph_solver.solid_pressure, 0.0, 1.0, "%.2f"
+        )
+        _, self.sph_solver.buoyancy = ui.slider_float("Buoyancy", self.sph_solver.buoyancy, -1.0, 2.0, "%.2f")
+        _, self.sph_solver.xsph_strength = ui.slider_float("XSPH", self.sph_solver.xsph_strength, 0.0, 0.35, "%.3f")
+        self.sph_solver.xsph_enabled = self.sph_solver.xsph_strength > 0.0
+        _, self.sph_solver.free_surface_drag = ui.slider_float(
+            "Free Surface Drag", self.sph_solver.free_surface_drag, 0.0, 2.0, "%.2f"
+        )
+        _, self.sph_solver.dissipation = ui.slider_float("Dissipation", self.sph_solver.dissipation, 0.0, 8.0, "%.2f")
+        _, self.sph_solver.sleep_threshold = ui.slider_float(
+            "Sleep Threshold", self.sph_solver.sleep_threshold, 0.0, 1.0, "%.2f"
+        )
+        _, self.sph_solver.shape_friction = ui.slider_float(
+            "Shape Friction", self.sph_solver.shape_friction, 0.0, 4.0, "%.2f"
+        )
+        if self.sph_solver.shape_collision_distance is None:
+            self.sph_solver.shape_collision_distance = self.particle_radius
+        _, self.sph_solver.shape_collision_distance = ui.slider_float(
+            "Shape Distance", self.sph_solver.shape_collision_distance, 0.0, 0.10, "%.4f"
+        )
+        _, self.sph_solver.shape_collision_margin = ui.slider_float(
+            "Shape Margin", self.sph_solver.shape_collision_margin, 0.0, 0.05, "%.4f"
+        )
+        _, self.sph_solver.shape_restitution = ui.slider_float(
+            "Shape Restitution", self.sph_solver.shape_restitution or 0.0, 0.0, 1.0, "%.2f"
+        )
+        _, self.sph_solver.shape_adhesion = ui.slider_float(
+            "Shape Adhesion", self.sph_solver.shape_adhesion, 0.0, 4.0, "%.2f"
+        )
+        _, self.sph_solver.max_acceleration = ui.slider_float(
+            "Max Acceleration", self.sph_solver.max_acceleration, 1.0, 300.0, "%.1f"
+        )
+        _, self.sph_solver.render_smoothing = ui.slider_float(
+            "Render Smoothing", self.sph_solver.render_smoothing, 0.0, 1.0, "%.2f"
+        )
+        _, self.sph_solver.render_anisotropy_scale = ui.slider_float(
+            "Anisotropy Scale", self.sph_solver.render_anisotropy_scale, 0.0, 3.0, "%.2f"
+        )
+        _, self.sph_solver.render_anisotropy_min = ui.slider_float(
+            "Anisotropy Min", self.sph_solver.render_anisotropy_min, 0.01, 1.0, "%.2f"
+        )
+        _, self.sph_solver.render_anisotropy_max = ui.slider_float(
+            "Anisotropy Max", self.sph_solver.render_anisotropy_max, 1.0, 4.0, "%.2f"
+        )
+        self.sph_solver.render_anisotropy_max = max(
+            self.sph_solver.render_anisotropy_max, self.sph_solver.render_anisotropy_min
+        )
 
         ui.separator()
         ui.text("Water Shader")
@@ -561,7 +868,9 @@ class Example:
             "Color Gradient", self.viewer.fluid_color_gradient_strength, 0.0, 1.0, "%.2f"
         )
         _, self.viewer.fluid_opacity = ui.slider_float("Opacity", self.viewer.fluid_opacity, 0.05, 1.0, "%.2f")
-        _, self.viewer.fluid_radius_scale = ui.slider_float("Radius Scale", self.viewer.fluid_radius_scale, 0.2, 4.0, "%.2f")
+        _, self.viewer.fluid_radius_scale = ui.slider_float(
+            "Radius Scale", self.viewer.fluid_radius_scale, 0.2, 4.0, "%.2f"
+        )
         _, self.viewer.fluid_thickness_scale = ui.slider_float(
             "Thickness Scale", self.viewer.fluid_thickness_scale, 0.1, 6.0, "%.2f"
         )
@@ -571,6 +880,12 @@ class Example:
         _, self.viewer.fluid_smoothing_radius = ui.slider_float(
             "Smoothing Radius", self.viewer.fluid_smoothing_radius, 0.2, 6.0, "%.2f"
         )
+        _, self.viewer.fluid_smoothing_depth_edge_falloff = ui.slider_float(
+            "Depth Edge Falloff", self.viewer.fluid_smoothing_depth_edge_falloff, 0.0, 2.0, "%.2f"
+        )
+        _, self.viewer.fluid_smoothing_max_samples = ui.slider_int(
+            "Max Radial Samples", self.viewer.fluid_smoothing_max_samples, 0, 4
+        )
         _, self.viewer.fluid_absorption_strength = ui.slider_float(
             "Depth Absorption", self.viewer.fluid_absorption_strength, 0.0, 5.0, "%.2f"
         )
@@ -578,7 +893,7 @@ class Example:
             "Depth Cues", self.viewer.fluid_depth_visualization_strength, 0.0, 2.5, "%.2f"
         )
         _, self.viewer.fluid_reflection_strength = ui.slider_float(
-            "Screen Reflection", self.viewer.fluid_reflection_strength, 0.0, 0.6, "%.3f"
+            "Surface Reflection", self.viewer.fluid_reflection_strength, 0.0, 0.6, "%.3f"
         )
         _, self.viewer.fluid_refraction_strength = ui.slider_float(
             "Refraction", self.viewer.fluid_refraction_strength, 0.0, 0.18, "%.3f"
@@ -598,19 +913,47 @@ class Example:
         _, self.viewer.fluid_floor_caustic_strength = ui.slider_float(
             "Floor Caustics", self.viewer.fluid_floor_caustic_strength, 0.0, 5.0, "%.2f"
         )
+        _, self.viewer.fluid_surface_shadow_strength = ui.slider_float(
+            "Surface Shadows", self.viewer.fluid_surface_shadow_strength, 0.0, 1.2, "%.2f"
+        )
         _, self.viewer.fluid_caustic_scale = ui.slider_float(
             "Caustic Scale", self.viewer.fluid_caustic_scale, 20.0, 420.0, "%.1f"
         )
         _, self.viewer.fluid_foam_strength = ui.slider_float("Foam", self.viewer.fluid_foam_strength, 0.0, 1.2, "%.2f")
-        _, self.viewer.fluid_foam_scale = ui.slider_float("Foam Scale", self.viewer.fluid_foam_scale, 5.0, 160.0, "%.1f")
+        _, self.viewer.fluid_foam_scale = ui.slider_float(
+            "Foam Scale", self.viewer.fluid_foam_scale, 5.0, 160.0, "%.1f"
+        )
+        ui.separator()
+        ui.text("Diffuse Lighting")
+        _, self.viewer.fluid_diffuse_inscatter = ui.slider_float(
+            "Inscatter", self.viewer.fluid_diffuse_inscatter, 0.0, 1.5, "%.2f"
+        )
+        _, self.viewer.fluid_diffuse_outscatter = ui.slider_float(
+            "Outscatter", self.viewer.fluid_diffuse_outscatter, 0.0, 1.2, "%.2f"
+        )
+        _, self.viewer.fluid_diffuse_shadow_strength = ui.slider_float(
+            "Diffuse Shadows", self.viewer.fluid_diffuse_shadow_strength, 0.0, 1.2, "%.2f"
+        )
+        _, self.viewer.fluid_diffuse_expansion = ui.slider_float(
+            "Diffuse Expansion", self.viewer.fluid_diffuse_expansion, 0.0, 1.5, "%.2f"
+        )
 
         ui.separator()
         ui.text("Interaction")
-        _, self.coupling_stiffness = ui.slider_float("Water-Box Stiffness", self.coupling_stiffness, 0.0, 2200.0, "%.1f")
+        _, self.coupling_stiffness = ui.slider_float(
+            "Water-Box Stiffness", self.coupling_stiffness, 0.0, 2200.0, "%.1f"
+        )
         _, self.coupling_damping = ui.slider_float("Water-Box Damping", self.coupling_damping, 0.0, 80.0, "%.1f")
         _, self.splash_velocity_gain = ui.slider_float("Splash Gain", self.splash_velocity_gain, 0.0, 4.0, "%.2f")
-        _, self.suspension_stiffness = ui.slider_float("Suspension", self.suspension_stiffness, 0.0, 120.0, "%.1f")
-        _, self.suspension_damping = ui.slider_float("Suspension Damping", self.suspension_damping, 0.0, 35.0, "%.1f")
+        _, self.water_level = ui.slider_float("Water Level", self.water_level, 0.0, 1.8, "%.2f")
+        _, self.suspension_stiffness = ui.slider_float("Box Buoyancy", self.suspension_stiffness, 0.0, 120.0, "%.1f")
+        _, self.suspension_damping = ui.slider_float("Buoyancy Damping", self.suspension_damping, 0.0, 35.0, "%.1f")
+        _, self.box_fluid_drag = ui.slider_float("Box Fluid Drag", self.box_fluid_drag, 0.0, 12.0, "%.1f")
+        _, self.box_angular_drag = ui.slider_float("Box Angular Drag", self.box_angular_drag, 0.0, 8.0, "%.1f")
+        _, self.box_max_linear_speed = ui.slider_float("Box Max Speed", self.box_max_linear_speed, 0.5, 8.0, "%.1f")
+        _, self.box_max_angular_speed = ui.slider_float(
+            "Box Max Angular Speed", self.box_max_angular_speed, 1.0, 30.0, "%.1f"
+        )
         changed_stiff, self.pick_stiffness = ui.slider_float("Pick Stiffness", self.pick_stiffness, 0.0, 250.0, "%.1f")
         changed_damp, self.pick_damping = ui.slider_float("Pick Damping", self.pick_damping, 0.0, 60.0, "%.1f")
         if changed_stiff or changed_damp:
@@ -623,6 +966,7 @@ class Example:
             _, renderer._env_intensity = ui.slider_float("Env Intensity", renderer._env_intensity, 0.0, 4.0, "%.2f")
             _, renderer.exposure = ui.slider_float("Exposure", renderer.exposure, 0.2, 2.5, "%.2f")
             _, renderer.specular_scale = ui.slider_float("Specular Scale", renderer.specular_scale, 0.0, 4.0, "%.2f")
+            _, renderer.fluid_shadow_size = ui.slider_int("Fluid Shadow Size", renderer.fluid_shadow_size, 512, 4096)
 
     @staticmethod
     def _slider_color(ui, label: str, value: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -646,37 +990,72 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--fps", type=float, default=60.0)
-        parser.add_argument("--substeps", type=int, default=5)
+        parser.add_argument("--substeps", type=int, default=4)
         parser.add_argument("--render-mode", choices=["fluid", "particles"], default="fluid")
         parser.add_argument("--capture-graph", action="store_true", help="Capture fixed-parameter SPH substeps.")
-        parser.add_argument("--show-bounds", action=argparse.BooleanOptionalAction, default=True)
+        parser.add_argument("--show-bounds", action=argparse.BooleanOptionalAction, default=False)
+        parser.add_argument("--show-diffuse", action=argparse.BooleanOptionalAction, default=True)
         parser.add_argument(
             "--show-box-guides",
             action=argparse.BooleanOptionalAction,
-            default=True,
+            default=False,
             help="Draw colored guide outlines around the pickable rigid bodies.",
         )
 
-        parser.add_argument("--dim-x", type=int, default=36)
-        parser.add_argument("--dim-y", type=int, default=24)
-        parser.add_argument("--dim-z", type=int, default=24)
+        parser.add_argument("--dim-x", type=int, default=48)
+        parser.add_argument("--dim-y", type=int, default=30)
+        parser.add_argument("--dim-z", type=int, default=28)
         parser.add_argument("--spacing", type=float, default=0.040)
         parser.add_argument("--radius", type=float, default=0.030)
         parser.add_argument("--jitter", type=float, default=0.0015)
-        parser.add_argument("--emit-lower", type=float, nargs=3, default=(-0.86, -0.52, 0.06))
+        parser.add_argument("--emit-lower", type=float, nargs=3, default=(-1.04, -0.62, 0.06))
         parser.add_argument("--initial-velocity", type=float, nargs=3, default=(0.0, 0.0, 0.0))
 
         parser.add_argument("--smoothing-length", type=float, default=0.086)
         parser.add_argument("--rest-density", type=float, default=460.0)
         parser.add_argument("--gas-constant", type=float, default=44.0)
-        parser.add_argument("--viscosity", type=float, default=0.18)
-        parser.add_argument("--velocity-damping", type=float, default=0.026)
-        parser.add_argument("--boundary-damping", type=float, default=0.16)
-        parser.add_argument("--max-velocity", type=float, default=3.8)
-        parser.add_argument("--gravity", type=float, default=-2.4)
-        parser.add_argument("--bounds-lower", type=float, nargs=3, default=(-1.10, -0.76, 0.0))
-        parser.add_argument("--bounds-upper", type=float, nargs=3, default=(1.25, 0.86, 1.48))
-        parser.add_argument("--ground-color", type=float, nargs=3, default=(0.72, 0.63, 0.42))
+        parser.add_argument("--viscosity", type=float, default=0.06)
+        parser.add_argument("--particle-friction", type=float, default=0.10)
+        parser.add_argument("--particle-collision-margin", type=float, default=0.0015)
+        parser.add_argument("--cohesion", type=float, default=0.035)
+        parser.add_argument("--surface-tension", type=float, default=0.0000006)
+        parser.add_argument("--vorticity-confinement", type=float, default=0.00016)
+        parser.add_argument("--solid-pressure", type=float, default=0.28)
+        parser.add_argument("--buoyancy", type=float, default=1.0)
+        parser.add_argument("--xsph-strength", type=float, default=0.07)
+        parser.add_argument("--free-surface-drag", type=float, default=0.14)
+        parser.add_argument("--dissipation", type=float, default=0.22)
+        parser.add_argument("--velocity-damping", type=float, default=0.012)
+        parser.add_argument("--sleep-threshold", type=float, default=0.0)
+        parser.add_argument("--boundary-damping", type=float, default=0.10)
+        parser.add_argument("--shape-collision-distance", type=float, default=0.030)
+        parser.add_argument("--shape-collision-margin", type=float, default=0.0015)
+        parser.add_argument("--shape-restitution", type=float, default=0.0)
+        parser.add_argument("--shape-friction", type=float, default=0.12)
+        parser.add_argument("--shape-adhesion", type=float, default=0.10)
+        parser.add_argument("--max-velocity", type=float, default=5.0)
+        parser.add_argument("--max-acceleration", type=float, default=105.0)
+        parser.add_argument("--pbf-iterations", type=int, default=2)
+        parser.add_argument("--pbf-relaxation", type=float, default=0.72)
+        parser.add_argument("--pbf-artificial-pressure", type=float, default=0.014)
+        parser.add_argument("--fluid-diffuse-max-particles", type=int, default=8000)
+        parser.add_argument("--fluid-diffuse-threshold", type=float, default=0.92)
+        parser.add_argument("--fluid-diffuse-lifetime", type=float, default=2.2)
+        parser.add_argument("--fluid-diffuse-drag", type=float, default=0.92)
+        parser.add_argument("--fluid-diffuse-buoyancy", type=float, default=0.20)
+        parser.add_argument("--fluid-diffuse-ballistic", type=int, default=9)
+        parser.add_argument("--fluid-diffuse-spawn-probability", type=float, default=0.22)
+        parser.add_argument("--fluid-render-smoothing", type=float, default=0.45)
+        parser.add_argument("--fluid-render-anisotropy-scale", type=float, default=0.82)
+        parser.add_argument("--fluid-render-anisotropy-min", type=float, default=0.1)
+        parser.add_argument("--fluid-render-anisotropy-max", type=float, default=2.0)
+        parser.add_argument("--fluid-render-update-interval", type=int, default=2)
+        parser.add_argument("--fluid-diffuse-update-interval", type=int, default=2)
+        parser.add_argument("--gravity", type=float, default=-9.81)
+        parser.add_argument("--bounds-lower", type=float, nargs=3, default=(-1.35, -0.92, 0.0))
+        parser.add_argument("--bounds-upper", type=float, nargs=3, default=(1.55, 1.00, 1.72))
+        parser.add_argument("--ground-color", type=float, nargs=3, default=(0.54, 0.55, 0.53))
+        parser.add_argument("--water-level", type=float, default=None)
 
         parser.add_argument("--box-count", type=int, default=5)
         parser.add_argument("--box-half-extent", type=float, default=0.115)
@@ -691,32 +1070,49 @@ class Example:
         parser.add_argument("--splash-velocity-gain", type=float, default=0.32)
         parser.add_argument("--suspension-stiffness", type=float, default=42.0)
         parser.add_argument("--suspension-damping", type=float, default=16.0)
+        parser.add_argument("--box-fluid-drag", type=float, default=3.2)
+        parser.add_argument("--box-angular-drag", type=float, default=1.8)
+        parser.add_argument("--box-max-linear-speed", type=float, default=2.5)
+        parser.add_argument("--box-max-angular-speed", type=float, default=10.0)
+        parser.add_argument("--box-max-torque", type=float, default=1.6)
 
-        parser.add_argument("--fluid-color", type=float, nargs=3, default=(0.02, 0.96, 0.86))
-        parser.add_argument("--fluid-deep-color", type=float, nargs=3, default=(0.0, 0.035, 0.36))
-        parser.add_argument("--fluid-color-gradient-strength", type=float, default=0.96)
-        parser.add_argument("--fluid-opacity", type=float, default=0.56)
-        parser.add_argument("--fluid-radius-scale", type=float, default=2.35)
-        parser.add_argument("--fluid-thickness-scale", type=float, default=2.55)
-        parser.add_argument("--fluid-smoothing-iterations", type=int, default=18)
-        parser.add_argument("--fluid-smoothing-radius", type=float, default=3.25)
-        parser.add_argument("--fluid-reflection-strength", type=float, default=0.26)
-        parser.add_argument("--fluid-refraction-strength", type=float, default=0.082)
-        parser.add_argument("--fluid-env-map-strength", type=float, default=1.18)
-        parser.add_argument("--fluid-env-reflection-lod", type=float, default=0.0)
-        parser.add_argument("--fluid-env-color-preserve", type=float, default=0.92)
-        parser.add_argument("--fluid-absorption-strength", type=float, default=2.65)
-        parser.add_argument("--fluid-depth-visualization-strength", type=float, default=1.15)
-        parser.add_argument("--fluid-caustic-strength", type=float, default=1.75)
-        parser.add_argument("--fluid-caustic-scale", type=float, default=225.0)
-        parser.add_argument("--fluid-floor-caustic-strength", type=float, default=2.25)
-        parser.add_argument("--fluid-foam-strength", type=float, default=0.18)
-        parser.add_argument("--fluid-foam-scale", type=float, default=38.0)
+        parser.add_argument("--fluid-color", type=float, nargs=3, default=(0.10, 0.50, 0.80))
+        parser.add_argument("--fluid-deep-color", type=float, nargs=3, default=(0.01, 0.09, 0.34))
+        parser.add_argument("--fluid-color-gradient-strength", type=float, default=0.20)
+        parser.add_argument("--fluid-opacity", type=float, default=1.00)
+        parser.add_argument("--fluid-radius-scale", type=float, default=1.34)
+        parser.add_argument("--fluid-thickness-scale", type=float, default=2.39)
+        parser.add_argument("--fluid-smoothing-iterations", type=int, default=7)
+        parser.add_argument("--fluid-smoothing-radius", type=float, default=3.83)
+        parser.add_argument("--fluid-smoothing-depth-edge-falloff", type=float, default=1.39)
+        parser.add_argument("--fluid-smoothing-max-samples", type=int, default=4)
+        parser.add_argument("--fluid-reflection-strength", type=float, default=0.528)
+        parser.add_argument("--fluid-refraction-strength", type=float, default=0.038)
+        parser.add_argument("--fluid-env-map-strength", type=float, default=1.02)
+        parser.add_argument("--fluid-env-reflection-lod", type=float, default=0.42)
+        parser.add_argument("--fluid-env-color-preserve", type=float, default=0.57)
+        parser.add_argument("--fluid-absorption-strength", type=float, default=2.66)
+        parser.add_argument("--fluid-depth-visualization-strength", type=float, default=2.13)
+        parser.add_argument("--fluid-caustic-strength", type=float, default=3.03)
+        parser.add_argument("--fluid-caustic-scale", type=float, default=37.1)
+        parser.add_argument("--fluid-floor-caustic-strength", type=float, default=1.15)
+        parser.add_argument("--fluid-surface-shadow-strength", type=float, default=0.03)
+        parser.add_argument("--fluid-foam-strength", type=float, default=0.99)
+        parser.add_argument("--fluid-foam-scale", type=float, default=5.0)
+        parser.add_argument("--fluid-diffuse-radius", type=float, default=0.012)
+        parser.add_argument("--fluid-diffuse-alpha", type=float, default=0.34)
+        parser.add_argument("--fluid-diffuse-motion-blur", type=float, default=0.12)
+        parser.add_argument("--fluid-diffuse-expansion", type=float, default=1.23)
+        parser.add_argument("--fluid-diffuse-inscatter", type=float, default=0.60)
+        parser.add_argument("--fluid-diffuse-outscatter", type=float, default=0.70)
+        parser.add_argument("--fluid-diffuse-shadow-strength", type=float, default=0.62)
 
-        parser.add_argument("--environment-intensity", type=float, default=2.25)
-        parser.add_argument("--exposure", type=float, default=1.18)
+        parser.add_argument("--environment-intensity", type=float, default=3.15)
+        parser.add_argument("--exposure", type=float, default=1.08)
         parser.add_argument("--diffuse-scale", type=float, default=1.05)
-        parser.add_argument("--specular-scale", type=float, default=1.85)
+        parser.add_argument("--specular-scale", type=float, default=4.00)
+        parser.add_argument("--fluid-shadow-size", type=int, default=2048)
+        parser.add_argument("--sun-direction", type=float, nargs=3, default=(0.78, -0.56, 0.20))
         parser.add_argument("--angular-damping", type=float, default=0.04)
         parser.add_argument("--camera-pos", type=float, nargs=3, default=(1.18, -1.28, 0.74))
         parser.add_argument("--camera-pitch", type=float, default=-18.0)

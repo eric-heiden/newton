@@ -147,26 +147,38 @@ class ViewerBase(ABC):
         self.show_inertia_boxes = False
         self.show_hydro_contact_surface = False
         self.sdf_margin_mode: ViewerBase.SDFMarginMode = ViewerBase.SDFMarginMode.OFF
-        self.fluid_color = (0.10, 0.98, 0.92)
-        self.fluid_deep_color = (0.0, 0.13, 0.58)
-        self.fluid_color_gradient_strength = 0.88
-        self.fluid_opacity = 0.64
-        self.fluid_radius_scale = 1.55
-        self.fluid_thickness_scale = 1.8
-        self.fluid_smoothing_iterations = 8
-        self.fluid_smoothing_radius = 2.0
-        self.fluid_reflection_strength = 0.14
-        self.fluid_refraction_strength = 0.055
-        self.fluid_env_map_strength = 0.52
-        self.fluid_env_reflection_lod = 0.0
-        self.fluid_env_color_preserve = 0.85
-        self.fluid_absorption_strength = 1.55
-        self.fluid_depth_visualization_strength = 0.55
-        self.fluid_caustic_strength = 0.78
-        self.fluid_caustic_scale = 155.0
-        self.fluid_floor_caustic_strength = 0.65
-        self.fluid_foam_strength = 0.12
-        self.fluid_foam_scale = 55.0
+        self.fluid_color = (0.10, 0.50, 0.80)
+        self.fluid_deep_color = (0.01, 0.09, 0.34)
+        self.fluid_color_gradient_strength = 0.20
+        self.fluid_opacity = 1.00
+        self.fluid_radius_scale = 1.34
+        self.fluid_thickness_scale = 2.39
+        self.fluid_smoothing_iterations = 7
+        self.fluid_smoothing_radius = 3.83
+        self.fluid_smoothing_depth_edge_falloff = 1.39
+        self.fluid_smoothing_max_samples = 4
+        self.fluid_reflection_strength = 0.528
+        self.fluid_refraction_strength = 0.038
+        self.fluid_env_map_strength = 1.02
+        self.fluid_env_reflection_lod = 0.42
+        self.fluid_env_color_preserve = 0.57
+        self.fluid_absorption_strength = 2.66
+        self.fluid_depth_visualization_strength = 2.13
+        self.fluid_caustic_strength = 3.03
+        self.fluid_caustic_scale = 37.1
+        self.fluid_floor_caustic_strength = 1.15
+        self.fluid_surface_shadow_strength = 0.03
+        self.fluid_foam_strength = 0.99
+        self.fluid_foam_scale = 5.0
+        self.show_fluid_diffuse = True
+        self.fluid_diffuse_color = (1.0, 1.0, 1.0)
+        self.fluid_diffuse_alpha = 0.34
+        self.fluid_diffuse_radius = 0.012
+        self.fluid_diffuse_motion_blur_scale = 0.12
+        self.fluid_diffuse_expansion = 1.23
+        self.fluid_diffuse_inscatter = 0.60
+        self.fluid_diffuse_outscatter = 0.70
+        self.fluid_diffuse_shadow_strength = 0.62
 
         self.gaussians_max_points = 100_000  # Max number of points to visualize per gaussian
 
@@ -1216,27 +1228,34 @@ class ViewerBase(ABC):
         name: str,
         points: wp.array[wp.vec3] | None,
         radii: wp.array[wp.float32] | float | None = None,
-        color: tuple[float, float, float] = (0.10, 0.98, 0.92),
-        deep_color: tuple[float, float, float] = (0.0, 0.13, 0.58),
-        color_gradient_strength: float = 0.88,
-        opacity: float = 0.64,
-        radius_scale: float = 1.0,
-        thickness_scale: float = 1.8,
-        smoothing_iterations: int = 8,
-        smoothing_radius: float = 2.0,
-        reflection_strength: float = 0.14,
-        refraction_strength: float = 0.055,
-        env_map_strength: float = 0.52,
-        env_reflection_lod: float = 0.0,
-        env_color_preserve: float = 0.85,
-        absorption_strength: float = 1.55,
-        depth_visualization_strength: float = 0.55,
-        caustic_strength: float = 0.78,
-        caustic_scale: float = 155.0,
-        floor_caustic_strength: float = 0.65,
-        foam_strength: float = 0.12,
-        foam_scale: float = 55.0,
+        color: tuple[float, float, float] = (0.10, 0.50, 0.80),
+        deep_color: tuple[float, float, float] = (0.01, 0.09, 0.34),
+        color_gradient_strength: float = 0.20,
+        opacity: float = 1.00,
+        radius_scale: float = 1.34,
+        thickness_scale: float = 2.39,
+        smoothing_iterations: int = 7,
+        smoothing_radius: float = 3.83,
+        smoothing_depth_edge_falloff: float = 1.39,
+        smoothing_max_samples: int = 4,
+        reflection_strength: float = 0.528,
+        refraction_strength: float = 0.038,
+        env_map_strength: float = 1.02,
+        env_reflection_lod: float = 0.42,
+        env_color_preserve: float = 0.57,
+        absorption_strength: float = 2.66,
+        depth_visualization_strength: float = 2.13,
+        caustic_strength: float = 3.03,
+        caustic_scale: float = 37.1,
+        floor_caustic_strength: float = 1.15,
+        surface_shadow_strength: float = 0.03,
+        foam_strength: float = 0.99,
+        foam_scale: float = 5.0,
         hidden: bool = False,
+        render_points: wp.array[wp.vec3] | None = None,
+        anisotropy: wp.array[wp.vec4] | None = None,
+        anisotropy_secondary: wp.array[wp.vec4] | None = None,
+        anisotropy_tertiary: wp.array[wp.vec4] | None = None,
     ):
         """Log particle samples as a fluid surface.
 
@@ -1256,7 +1275,10 @@ class ViewerBase(ABC):
             thickness_scale: Multiplier applied to accumulated optical thickness.
             smoothing_iterations: Number of screen-space depth smoothing passes.
             smoothing_radius: Pixel-spacing multiplier for each bilateral blur tap.
-            reflection_strength: Strength of the screen-color reflection sample.
+            smoothing_depth_edge_falloff: Depth discontinuity falloff for
+                screen-space smoothing. ``0`` keeps only the center sample.
+            smoothing_max_samples: Maximum radial blur samples per direction.
+            reflection_strength: Strength of normal-driven surface reflection, with screen-space hits blended in.
             refraction_strength: Strength of the normal-based scene refraction offset.
             env_map_strength: Strength of Fresnel-weighted environment-map reflection.
             env_reflection_lod: Environment-map mip level for water reflection; lower values keep sharper cues.
@@ -1266,11 +1288,75 @@ class ViewerBase(ABC):
             caustic_strength: Strength of the procedural caustic highlight pattern.
             caustic_scale: Spatial frequency of the procedural caustic pattern.
             floor_caustic_strength: Strength of refracted caustics applied to opaque geometry below the water.
-            foam_strength: Strength of the screen-space edge/crest foam overlay.
-            foam_scale: Spatial frequency of the procedural foam breakup pattern.
+            surface_shadow_strength: Strength of water surface self-shadowing and projected blue floor shadow.
+            foam_strength: Foam/spray particle opacity multiplier used by SPH examples.
+            foam_scale: Foam/spray particle radius scale used by SPH examples.
             hidden: Whether the fluid batch should be hidden.
+            render_points: Optional pre-smoothed particle centers [m] for
+                surface rendering.
+            anisotropy: Optional render anisotropy, storing major axis in
+                ``xyz`` and stretch in ``w``.
+            anisotropy_secondary: Optional render anisotropy side axis in
+                ``xyz`` and minor radius scale in ``w``.
+            anisotropy_tertiary: Optional render anisotropy depth axis in
+                ``xyz`` and depth radius scale in ``w``.
         """
         self.log_points(name, points, radii=radii, colors=color, hidden=hidden)
+
+    def log_fluid_diffuse(
+        self,
+        name: str,
+        positions: wp.array[wp.vec4] | None,
+        velocities: wp.array[wp.vec4] | None = None,
+        radius: float = 0.025,
+        color: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        alpha: float = 0.75,
+        motion_blur_scale: float = 1.0,
+        expansion: float = 0.65,
+        inscatter: float = 0.38,
+        outscatter: float = 0.18,
+        shadow_strength: float = 0.42,
+        hidden: bool = False,
+    ):
+        """Log secondary foam/spray particles.
+
+        GL backends render these as soft screen-facing billboards. Other
+        backends fall back to point spheres using active particles whose
+        position ``w`` component is positive.
+
+        Args:
+            name: Unique path/name for the diffuse particle batch.
+            positions: Particle positions with normalized lifetime in ``w``.
+            velocities: Particle velocities with optional neighbor/debug value
+                in ``w``.
+            radius: Billboard/point radius [m].
+            color: Diffuse particle RGB color.
+            alpha: Opacity multiplier in ``[0, 1]``.
+            motion_blur_scale: Screen-space stretch scale for fast particles.
+            expansion: Flex-style sprite expansion as particles fade out.
+            inscatter: Strength of light scattered toward the viewer.
+            outscatter: Strength of edge/volume light attenuation.
+            shadow_strength: Strength of light-space shadow attenuation.
+            hidden: Whether the diffuse particle batch should be hidden.
+        """
+        if positions is None or hidden:
+            self.log_points(name, None, hidden=True)
+            return
+
+        host_positions = positions.numpy()
+        active = host_positions[:, 3] > 0.0
+        if not np.any(active):
+            self.log_points(name, None, hidden=True)
+            return
+
+        points = wp.array(host_positions[active, :3], dtype=wp.vec3, device=self.device)
+        self.log_points(
+            name,
+            points,
+            radii=float(radius),
+            colors=tuple(float(c) * float(alpha) for c in color),
+            hidden=False,
+        )
 
     def log_wireframe_shape(  # noqa: B027
         self,
@@ -2365,6 +2451,11 @@ class ViewerBase(ABC):
 
     def _log_particles(self, state: newton.State):
         if self.model.particle_count:
+            if not self.show_fluid and not self.show_particles:
+                self.log_fluid(name="/model/fluid", points=None, hidden=True)
+                self.log_points(name="/model/particles", points=None, hidden=True)
+                return
+
             points = state.particle_q
             radii = self.model.particle_radius
 
@@ -2417,6 +2508,8 @@ class ViewerBase(ABC):
                     thickness_scale=self.fluid_thickness_scale,
                     smoothing_iterations=self.fluid_smoothing_iterations,
                     smoothing_radius=self.fluid_smoothing_radius,
+                    smoothing_depth_edge_falloff=self.fluid_smoothing_depth_edge_falloff,
+                    smoothing_max_samples=self.fluid_smoothing_max_samples,
                     reflection_strength=self.fluid_reflection_strength,
                     refraction_strength=self.fluid_refraction_strength,
                     env_map_strength=self.fluid_env_map_strength,
@@ -2427,6 +2520,7 @@ class ViewerBase(ABC):
                     caustic_strength=self.fluid_caustic_strength,
                     caustic_scale=self.fluid_caustic_scale,
                     floor_caustic_strength=self.fluid_floor_caustic_strength,
+                    surface_shadow_strength=self.fluid_surface_shadow_strength,
                     foam_strength=self.fluid_foam_strength,
                     foam_scale=self.fluid_foam_scale,
                     hidden=False,

@@ -199,6 +199,7 @@ class ViewerGL(ViewerBase):
         vsync: bool = False,
         headless: bool = False,
         paused: bool = False,
+        num_frames: int | None = None,
         plot_history_size: int = 250,
     ):
         """
@@ -210,6 +211,7 @@ class ViewerGL(ViewerBase):
             vsync: Enable vertical sync.
             headless: Run in headless mode (no window).
             paused: Start the viewer in paused mode.
+            num_frames: Optional frame limit for automated/headless runs.
             plot_history_size: Maximum number of samples kept per
                 :meth:`log_scalar` signal for the live time-series plots.
         """
@@ -250,6 +252,8 @@ class ViewerGL(ViewerBase):
 
         self._paused = paused
         self._step_requested = False
+        self.num_frames = num_frames
+        self.frame_count = 0
         self._reset_callback: Callable[[], None] | None = None
 
         self.renderer.register_key_press(self.on_key_press)
@@ -477,6 +481,9 @@ class ViewerGL(ViewerBase):
         for obj in getattr(self, "fluids", {}).values():
             obj.destroy()
         self.fluids = {}
+        for obj in getattr(self, "fluid_diffuse", {}).values():
+            obj.destroy()
+        self.fluid_diffuse = {}
         for obj in getattr(self, "lines", {}).values():
             obj.destroy()
         self.lines = {}
@@ -1194,27 +1201,34 @@ class ViewerGL(ViewerBase):
         name: str,
         points: wp.array[wp.vec3] | None,
         radii: wp.array[wp.float32] | float | None = None,
-        color: tuple[float, float, float] = (0.10, 0.98, 0.92),
-        deep_color: tuple[float, float, float] = (0.0, 0.13, 0.58),
-        color_gradient_strength: float = 0.88,
-        opacity: float = 0.64,
-        radius_scale: float = 1.0,
-        thickness_scale: float = 1.8,
-        smoothing_iterations: int = 8,
-        smoothing_radius: float = 2.0,
-        reflection_strength: float = 0.14,
-        refraction_strength: float = 0.055,
-        env_map_strength: float = 0.52,
-        env_reflection_lod: float = 0.0,
-        env_color_preserve: float = 0.85,
-        absorption_strength: float = 1.55,
-        depth_visualization_strength: float = 0.55,
-        caustic_strength: float = 0.78,
-        caustic_scale: float = 155.0,
-        floor_caustic_strength: float = 0.65,
-        foam_strength: float = 0.12,
-        foam_scale: float = 55.0,
+        color: tuple[float, float, float] = (0.02, 0.96, 0.86),
+        deep_color: tuple[float, float, float] = (0.0, 0.04, 1.0),
+        color_gradient_strength: float = 0.39,
+        opacity: float = 0.85,
+        radius_scale: float = 2.53,
+        thickness_scale: float = 3.58,
+        smoothing_iterations: int = 30,
+        smoothing_radius: float = 2.26,
+        smoothing_depth_edge_falloff: float = 1.0,
+        smoothing_max_samples: int = 4,
+        reflection_strength: float = 0.516,
+        refraction_strength: float = 0.128,
+        env_map_strength: float = 0.45,
+        env_reflection_lod: float = 0.25,
+        env_color_preserve: float = 0.92,
+        absorption_strength: float = 0.38,
+        depth_visualization_strength: float = 2.40,
+        caustic_strength: float = 3.74,
+        caustic_scale: float = 175.6,
+        floor_caustic_strength: float = 3.96,
+        surface_shadow_strength: float = 0.55,
+        foam_strength: float = 1.20,
+        foam_scale: float = 111.1,
         hidden: bool = False,
+        render_points: wp.array[wp.vec3] | None = None,
+        anisotropy: wp.array[wp.vec4] | None = None,
+        anisotropy_secondary: wp.array[wp.vec4] | None = None,
+        anisotropy_tertiary: wp.array[wp.vec4] | None = None,
     ):
         """Log particles for screen-space fluid rendering."""
         from .gl.opengl import FluidGL  # noqa: PLC0415
@@ -1232,6 +1246,8 @@ class ViewerGL(ViewerBase):
                     thickness_scale,
                     smoothing_iterations,
                     smoothing_radius,
+                    smoothing_depth_edge_falloff,
+                    smoothing_max_samples,
                     reflection_strength,
                     refraction_strength,
                     env_map_strength,
@@ -1242,9 +1258,14 @@ class ViewerGL(ViewerBase):
                     caustic_strength,
                     caustic_scale,
                     floor_caustic_strength,
+                    surface_shadow_strength,
                     foam_strength,
                     foam_scale,
                     True,
+                    render_points=None,
+                    anisotropy=None,
+                    anisotropy_secondary=None,
+                    anisotropy_tertiary=None,
                 )
             return
 
@@ -1265,6 +1286,8 @@ class ViewerGL(ViewerBase):
             thickness_scale,
             smoothing_iterations,
             smoothing_radius,
+            smoothing_depth_edge_falloff,
+            smoothing_max_samples,
             reflection_strength,
             refraction_strength,
             env_map_strength,
@@ -1275,8 +1298,69 @@ class ViewerGL(ViewerBase):
             caustic_strength,
             caustic_scale,
             floor_caustic_strength,
+            surface_shadow_strength,
             foam_strength,
             foam_scale,
+            hidden,
+            render_points=render_points,
+            anisotropy=anisotropy,
+            anisotropy_secondary=anisotropy_secondary,
+            anisotropy_tertiary=anisotropy_tertiary,
+        )
+
+    @override
+    def log_fluid_diffuse(
+        self,
+        name: str,
+        positions: wp.array[wp.vec4] | None,
+        velocities: wp.array[wp.vec4] | None = None,
+        radius: float = 0.025,
+        color: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        alpha: float = 0.75,
+        motion_blur_scale: float = 1.0,
+        expansion: float = 0.65,
+        inscatter: float = 0.38,
+        outscatter: float = 0.18,
+        shadow_strength: float = 0.42,
+        hidden: bool = False,
+    ):
+        """Log Flex-style diffuse foam/spray particles."""
+        from .gl.opengl import FluidDiffuseGL  # noqa: PLC0415
+
+        if positions is None:
+            if name in self.fluid_diffuse:
+                self.fluid_diffuse[name].update(
+                    None,
+                    None,
+                    radius,
+                    color,
+                    alpha,
+                    motion_blur_scale,
+                    expansion,
+                    inscatter,
+                    outscatter,
+                    shadow_strength,
+                    True,
+                )
+            return
+
+        count = len(positions)
+        if name not in self.fluid_diffuse:
+            self.fluid_diffuse[name] = FluidDiffuseGL(max(count, 256))
+        elif count > self.fluid_diffuse[name].capacity:
+            self.fluid_diffuse[name]._resize(max(count, self.fluid_diffuse[name].capacity * 2))
+
+        self.fluid_diffuse[name].update(
+            positions,
+            velocities,
+            radius,
+            color,
+            alpha,
+            motion_blur_scale,
+            expansion,
+            inscatter,
+            outscatter,
+            shadow_strength,
             hidden,
         )
 
@@ -1660,6 +1744,7 @@ class ViewerGL(ViewerBase):
         whether an exit was requested and early-out before touching GL if so.
         """
         self._update()
+        self.frame_count += 1
 
     @override
     def apply_forces(self, state: nt.State):
@@ -1695,7 +1780,15 @@ class ViewerGL(ViewerBase):
             return
 
         # Render the scene and present it
-        self.renderer.render(self.camera, self.objects, self.lines, self.wireframe_shapes, self.arrows, self.fluids)
+        self.renderer.render(
+            self.camera,
+            self.objects,
+            self.lines,
+            self.wireframe_shapes,
+            self.arrows,
+            self.fluids,
+            self.fluid_diffuse,
+        )
 
         if self.gui:
             self.gui.render_frame(update_fps=True)
@@ -1793,6 +1886,8 @@ class ViewerGL(ViewerBase):
         Returns:
             bool: True if the window is open, False if closed.
         """
+        if self.num_frames is not None and self.frame_count >= self.num_frames:
+            return False
         return not self.renderer.has_exit()
 
     @override

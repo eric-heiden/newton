@@ -386,6 +386,13 @@ add_example_test(
 )
 add_example_test(
     TestRobotExamples,
+    name="robot.example_robot_tricycle_origin_offset",
+    devices=test_devices,
+    test_options={"num-frames": 20},
+    use_viewer=True,
+)
+add_example_test(
+    TestRobotExamples,
     name="robot.example_robot_anymal_c_walk",
     devices=cuda_test_devices,
     test_options={"usd_required": True, "num-frames": 500, "torch_required": True},

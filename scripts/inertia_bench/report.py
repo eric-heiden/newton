@@ -31,7 +31,7 @@ VARIANTS = ["v0", "v1", "v2", "v3"]
 VARIANT_LABELS = {
     "v0": "V0 main (atomic_add, f32)",
     "v1": "V1 f64 host-reduce (commit 23416f8b)",
-    "v2": "V2 Warp PR #1355 emulation (f32 det. reduce)",
+    "v2": "V2 Warp PR #1355 native (wp.config.deterministic=RUN_TO_RUN)",
     "v3": "V3 tile_sum in-kernel (commit 9b523cf1)",
 }
 VARIANT_SHORT = {
@@ -178,6 +178,9 @@ def render_summary_table(data: dict[str, dict]) -> str:
         if s["n_nondet"] == 0:
             det_cls = "c-good"
             det_txt = "deterministic"
+        elif s["n_nondet"] < 0.1 * s["n_meshes"]:
+            det_cls = "c-warn"
+            det_txt = f"{s['n_nondet']}/{s['n_meshes']} drift"
         else:
             det_cls = "c-bad"
             det_txt = f"{s['n_nondet']}/{s['n_meshes']} drift"
@@ -614,14 +617,22 @@ def main() -> None:
       Newton's mesh-inertia kernel on <code>main</code> uses <code>wp.atomic_add</code> into a
       single float32 accumulator. This is empirically <strong>non-deterministic on every single
       mesh tested</strong> (262/262 with run-to-run drift), with relative inertia drift up to
-      <strong>5&nbsp;×&nbsp;10⁻⁴</strong>. All three proposed fixes recover bit-exact run-to-run
-      reproducibility. The cheapest fix is V3 (<code>wp.tile_sum</code> in-kernel reduce): it adds
-      <strong>only ~2 % runtime</strong> and produces the most accurate result of the deterministic
-      variants. The Andrew Kaufman patch (V1, f64 host-reduce) is the slowest at ~+43 % per-call but
-      delivers the highest absolute accuracy; it is the ground-truth reference here. The Warp PR
-      #1355 path (V2) produces the same determinism guarantee with no source changes but, on
-      f32-typed kernels, gives the same f32-precision rounding as V0 (just deterministic), so it
-      doesn't fix the precision concern that motivated V1.
+      <strong>5&nbsp;×&nbsp;10⁻⁴</strong>. V1 (Andrew Kaufman's per-triangle device buffer + numpy
+      f64 host reduce) and V3 (<code>wp.tile_sum</code> in-kernel reduce) both recover bit-exact
+      reproducibility. The cheapest fix is <strong>V3</strong>: <strong>only ~2 % runtime
+      overhead</strong> and it is the most accurate of the deterministic variants vs the V1 f64
+      reference. V1 is +43 % per call but delivers the highest precision.
+    </p>
+    <p>
+      <strong>Unexpected:</strong> Warp PR&nbsp;#1355's automatic <code>deterministic = run_to_run</code>
+      lowering (V2) <em>does not</em> achieve full bit-exact reproducibility on these workloads:
+      <strong>10 / 262 meshes still drift</strong>, all on dense meshes (≥36 k triangles), with
+      sub-ULP rounding differences (~3 × 10⁻⁷ relative). The slowdown is also substantially worse
+      than expected: <strong>+551 %</strong> per-call (median 19 ms vs V0's 2.9 ms), because the
+      CUB scatter-sort-reduce machinery has fixed overhead that dominates these very small (single
+      accumulator slot) reductions. The simple per-thread-output + CUB-equivalent host reduce
+      emulation we ran earlier is fully deterministic and 60 % cheaper — suggesting PR #1355's
+      automatic path has further tuning headroom for atomic-into-scalar patterns.
     </p>
   </div>
 
@@ -684,29 +695,74 @@ def main() -> None:
     V0 isn't <em>wrong</em>, it's <em>variable</em>, and V1's f64 fold is just a deterministic
     realization of the same expectation with one extra digit of precision. V3 (<code>tile_sum</code>
     in float32) is consistently <strong>~1 order of magnitude more accurate</strong> than V0 or V2
-    against V1 across all robots, suggesting <code>tile_sum</code>'s tree reduction is numerically
-    better-conditioned than either GPU atomics or post-hoc CUB-style host reductions in f32.
+    against V1 across all robots, suggesting Warp's <code>tile_sum</code> tree reduction is
+    numerically better-conditioned than either GPU atomics or CUB scatter-sort-reduce in f32.
   </p>
 
   <h2>5 · Does f64 accumulation matter?</h2>
   <p>
-    This was the central question. Comparing V2 (deterministic f32 reduce) to V1 (deterministic
-    f64 reduce) isolates the precision question exactly: both have the same kernel structure and
-    are deterministic; the only difference is the host accumulator dtype.
+    This was the central question. We compare:
+  </p>
+  <ul>
+    <li><strong>V1</strong> — kernel still f32 per-triangle, but the final accumulation is
+        explicitly promoted to <code>numpy.float64</code> and summed.</li>
+    <li><strong>V3</strong> — entirely in f32, but reduced inside the kernel via
+        <code>wp.tile_sum</code> (tree reduction).</li>
+    <li><strong>V0</strong> — entirely in f32, GPU atomic add (non-deterministic, but the same
+        precision class as V2/V3 on average).</li>
+  </ul>
+  <p>
+    Worst-case relative inertia error V3 (f32 tile_sum) vs V1 (f64 host-reduce) across all 262
+    meshes is
+    <strong>{accuracy_vs_v1(data['v3']['rows'], per_mesh_index(data['v1']))['max_rel_I']:.2e}</strong>,
+    with p99 of
+    <strong>{accuracy_vs_v1(data['v3']['rows'], per_mesh_index(data['v1']))['p99_rel_I']:.2e}</strong>.
+    For comparison, V0's run-to-run drift alone is ~<strong>{accuracy_vs_v1(data['v0']['rows'], per_mesh_index(data['v1']))['max_rel_I']:.0e}</strong>
+    worst-case.
   </p>
   <p>
-    Worst-case relative inertia error V2 vs V1 across all 262 meshes is
-    <strong>{accuracy_vs_v1(data['v2']['rows'], per_mesh_index(data['v1']))['max_rel_I']:.2e}</strong>,
-    with p99 of
-    <strong>{accuracy_vs_v1(data['v2']['rows'], per_mesh_index(data['v1']))['p99_rel_I']:.2e}</strong>.
-    For most robotics use cases this is well below the integration-noise floor of physics steps and
-    well within the symmetry tolerance Newton already applies (1e-5 relative). For
-    <strong>certification-grade reproducibility</strong> or hash-based model snapshot regression,
-    bit-identity at the inertia level is what matters — and that is provided equally well by V1, V2,
-    or V3.
+    <strong>Bottom line:</strong> the precision gap between f64 host-reduce and f32 in-kernel
+    tile_sum is on the same order as V0's run-to-run drift. Both are well below Newton's existing
+    1e-5 relative symmetry tolerance and far below the integration-noise floor of physics steps.
+    For <strong>certification-grade reproducibility</strong> the deciding factor is determinism,
+    not f64 precision per se — and V3 delivers determinism at <em>no measurable runtime cost</em>.
   </p>
 
-  <h2>6 · Memory footprint</h2>
+  <h2>6 · Warp PR #1355 deep dive (V2)</h2>
+  <p>
+    The motivation for V2 was: <em>can we get determinism with no source changes, just by setting
+    <code>wp.config.deterministic = run_to_run</code>?</em> The answer on this workload is
+    <strong>almost yes, but not quite:</strong>
+  </p>
+  <ul>
+    <li><strong>Determinism:</strong>
+        {sum(1 for r in data['v2']['rows'] if is_nondeterministic(r))} of 262
+        meshes still drift across 5 reruns. All drifting meshes are large (≥36 k triangles), all
+        on G1 / H1 / Apollo, and the drift is sub-ULP — single-bit f32 rounding differences in the
+        scattered output. The PR docs do guarantee bit-exact run_to_run on the same architecture,
+        so this looks like a fitting subject for a Warp issue: the kernel under test is the simple
+        pattern <code>wp.atomic_add(accum, 0, value)</code>, all writes target slot 0, and the
+        scatter buffer is single-key (deterministically sorted by thread_id).</li>
+    <li><strong>Performance:</strong> median +551 % vs V0 (19 ms vs 2.9 ms per call). The CUB
+        scatter-sort-reduce path has fixed overhead per launch that dominates these very small
+        (single output slot) reductions. p90 is +2118 % (94 ms vs 4.2 ms) because the largest
+        meshes pay a worst-case sort cost.</li>
+    <li><strong>Accuracy:</strong> max relative ‖I‖ error vs V1 of
+        <strong>{accuracy_vs_v1(data['v2']['rows'], per_mesh_index(data['v1']))['max_rel_I']:.2e}</strong>,
+        same order as V0 (which makes sense: both do f32 reduction, V2 just in a deterministic
+        order).</li>
+  </ul>
+  <p>
+    For comparison, a stripped-down hand-rolled equivalent (each thread writes to its own buffer
+    slot, then host-side <code>numpy.sum</code> in f32) — which is essentially what PR #1355
+    <em>should</em> reduce to for an atomic-into-scalar pattern — gives <strong>bit-exact
+    determinism (0/262 drift)</strong> at only <strong>+30 % runtime</strong>. This is also
+    structurally similar to V1 except it stays in f32. The native CUB integration's overhead in
+    PR #1355 thus suggests there's room for the PR to add a fast-path for accumulate-into-single-
+    slot launches (which are extremely common in Warp code: every reduction kernel does this).
+  </p>
+
+  <h2>7 · Memory footprint</h2>
   {mem}
   <p>
     V0 / V3 keep a constant ~52 byte accumulator per launch; V1 / V2 allocate num_tris × 52 byte
@@ -716,10 +772,10 @@ def main() -> None:
     rewrite avoids.
   </p>
 
-  <h2>7 · Per-robot breakdown</h2>
+  <h2>8 · Per-robot breakdown</h2>
   {robot_table}
 
-  <h2>8 · Reproducibility</h2>
+  <h2>9 · Reproducibility</h2>
   <pre>Hardware: NVIDIA L40 (49 GiB, sm_89)
 Warp:     1.14.0 (V0/V1/V3); V2 = PR1355 emulation (see note below)
 Newton:   eric-heiden/deterministic-mesh-inertia-investigation@HEAD (off newton-physics/newton@main)
@@ -732,13 +788,13 @@ Commits:  V0 = newton@main (839284af)
 </pre>
 
   <div class="footnote">
-    <strong>Note on V2:</strong> The actual Warp PR #1355 build requires CUDA Toolkit 12.0+ for
-    its native <code>deterministic.cu</code> CUB integration. The host this report was generated on
-    only has CUDA Toolkit 11.5 from the apt repository, so V2 is run via an exact functional
-    emulation — same per-thread scatter buffer + deterministic in-order f32 reduce that PR #1355
-    produces for f32-typed atomic targets. The numerical outputs and runtime cost are
-    representative; the actual PR's native CUB reduction would be slightly faster on very large
-    meshes because the reduce stays on-device. Mode used: <code>{v2_mode}</code>.
+    <strong>Note on V2:</strong> Built NVIDIA/warp PR #1355 from source on this machine
+    (CUDA 12.4 toolkit installed to ~/cuda-12.4 specifically for this build) and ran V2 with
+    <code>wp.config.deterministic = DeterministicMode.RUN_TO_RUN</code> via a dedicated venv
+    pointing at the editable install of <code>/home/horde/repos/warp-determinism-pr1355</code>.
+    Warp build: <code>1.15.0.dev0</code>. Mode reported by harness: <code>{v2_mode}</code>.
+    All 4 variants use the same byte-identical inputs (extracted once with V0 active and persisted
+    to <code>meshes.npz</code>).
   </div>
 </main>
 </body>

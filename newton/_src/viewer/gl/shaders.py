@@ -1043,9 +1043,10 @@ float edge_weight(float sample_guide, float center_guide)
         return 0.0;
     }
 
-    float delta = abs(sample_guide - center_guide);
-    float edge_width = max(max_depth_delta * depth_edge_falloff, 1.0e-6);
-    return 1.0 - smoothstep(edge_width * 0.35, edge_width, delta);
+    // Gaussian range kernel on the depth difference (Flex bilateral blur);
+    // depth_edge_falloff plays the role of Flex's blurDepthFalloff (5.5).
+    float delta = (sample_guide - center_guide) * depth_edge_falloff;
+    return exp(-delta * delta);
 }
 
 void main()
@@ -1060,12 +1061,12 @@ void main()
         return;
     }
 
-    float weights[5] = float[](0.204164, 0.304005, 0.093913, 0.010381, 0.000873);
-    float sum = center * weights[0];
-    float weight_sum = weights[0];
-    int sample_count = clamp(max_radial_samples, 0, 4);
+    float sum = center;
+    float weight_sum = 1.0;
+    int sample_count = clamp(max_radial_samples, 0, 8);
+    float sigma = max(float(sample_count) * 0.48, 1.0);
 
-    for (int i = 1; i < 5; ++i) {
+    for (int i = 1; i < 9; ++i) {
         if (i > sample_count) {
             continue;
         }
@@ -1078,7 +1079,8 @@ void main()
             g0 = texture(guide_texture, TexCoord + offset).r;
             g1 = texture(guide_texture, TexCoord - offset).r;
         }
-        float w = weights[i];
+        float x = float(i);
+        float w = exp(-0.5 * (x * x) / (sigma * sigma));
         float e0 = edge_weight(g0, center_guide);
         float e1 = edge_weight(g1, center_guide);
         if (e0 > 0.0) {
@@ -1472,9 +1474,6 @@ uniform vec3 sky_reflection_color;
 uniform vec3 ground_reflection_color;
 uniform float absorption_strength;
 uniform float depth_visualization_strength;
-uniform float caustic_strength;
-uniform float caustic_scale;
-uniform float floor_caustic_strength;
 uniform float surface_shadow_strength;
 uniform float shadow_radius;
 uniform int up_axis;
@@ -1505,15 +1504,6 @@ vec3 view_to_world(vec3 view_pos)
     return world.xyz / max(abs(world.w), 1.0e-6);
 }
 
-vec2 world_floor_coord(vec3 world_pos)
-{
-    if (up_axis == 0)
-        return world_pos.yz;
-    if (up_axis == 1)
-        return world_pos.xz;
-    return world_pos.xy;
-}
-
 float world_up_coord(vec3 world_pos)
 {
     if (up_axis == 0)
@@ -1521,63 +1511,6 @@ float world_up_coord(vec3 world_pos)
     if (up_axis == 1)
         return world_pos.y;
     return world_pos.z;
-}
-
-vec3 world_up_vector()
-{
-    if (up_axis == 0)
-        return vec3(1.0, 0.0, 0.0);
-    if (up_axis == 1)
-        return vec3(0.0, 1.0, 0.0);
-    return vec3(0.0, 0.0, 1.0);
-}
-
-vec3 fluid_normal(vec2 uv, float depth)
-{
-    float center_thickness = texture(thickness_texture, uv).r;
-    vec2 safe_min = texel_size * 0.5;
-    vec2 safe_max = vec2(1.0) - safe_min;
-    float normal_radius = clamp(1.5 + center_thickness * 7.0, 1.5, 5.0);
-    vec2 dx = vec2(texel_size.x, 0.0) * normal_radius;
-    vec2 dy = vec2(0.0, texel_size.y) * normal_radius;
-    vec2 uv_l = clamp(uv - dx, safe_min, safe_max);
-    vec2 uv_r = clamp(uv + dx, safe_min, safe_max);
-    vec2 uv_d = clamp(uv - dy, safe_min, safe_max);
-    vec2 uv_u = clamp(uv + dy, safe_min, safe_max);
-
-    float depth_l = texture(fluid_depth_texture, uv_l).r;
-    float depth_r = texture(fluid_depth_texture, uv_r).r;
-    float depth_d = texture(fluid_depth_texture, uv_d).r;
-    float depth_u = texture(fluid_depth_texture, uv_u).r;
-    float thick_l = texture(thickness_texture, uv_l).r;
-    float thick_r = texture(thickness_texture, uv_r).r;
-    float thick_d = texture(thickness_texture, uv_d).r;
-    float thick_u = texture(thickness_texture, uv_u).r;
-    float min_neighbor_thickness = max(center_thickness * 0.035, 1.0e-5);
-    if (depth_l <= 0.0 || thick_l <= min_neighbor_thickness) depth_l = depth;
-    if (depth_r <= 0.0 || thick_r <= min_neighbor_thickness) depth_r = depth;
-    if (depth_d <= 0.0 || thick_d <= min_neighbor_thickness) depth_d = depth;
-    if (depth_u <= 0.0 || thick_u <= min_neighbor_thickness) depth_u = depth;
-
-    vec3 p = reconstruct_view_pos(uv, depth);
-    vec3 v = normalize(-p);
-    vec3 p_l = reconstruct_view_pos(uv_l, depth_l);
-    vec3 p_r = reconstruct_view_pos(uv_r, depth_r);
-    vec3 p_d = reconstruct_view_pos(uv_d, depth_d);
-    vec3 p_u = reconstruct_view_pos(uv_u, depth_u);
-    vec3 tangent_x = p_r - p_l;
-    vec3 tangent_y = p_u - p_d;
-    vec3 normal_cross = cross(tangent_x, tangent_y);
-    if (dot(normal_cross, normal_cross) < 1.0e-10) {
-        return v;
-    }
-
-    vec3 n = normalize(normal_cross);
-    if (dot(n, v) < 0.0)
-        n = -n;
-
-    float support = smoothstep(0.0025, 0.035, center_thickness);
-    return normalize(mix(v, n, support));
 }
 
 vec3 sample_env_map(vec3 dir, float lod)
@@ -1620,75 +1553,6 @@ vec3 water_parallax_env_dir(vec3 reflection_dir, vec3 surface_world)
     return normalize(hit - center);
 }
 
-vec3 sample_water_env_map(vec3 reflection_dir, vec3 surface_world, vec3 n_world, float lod)
-{
-    vec3 dir = normalize(reflection_dir);
-    vec3 boxed_dir = water_parallax_env_dir(dir, surface_world);
-    vec3 angular = sample_env_map(dir, lod);
-    vec3 boxed = sample_env_map(boxed_dir, lod);
-    float top_face = smoothstep(0.18, 0.76, abs(world_up_coord(normalize(n_world))));
-    float grazing = smoothstep(0.18, 0.92, 1.0 - abs(dot(normalize(n_world), dir)));
-    return mix(angular, boxed, clamp(0.62 + 0.22 * top_face + 0.10 * grazing, 0.0, 0.92));
-}
-
-float hash21(vec2 p)
-{
-    p = fract(p * vec2(123.34, 456.21));
-    p += dot(p, p + 45.32);
-    return fract(p.x * p.y);
-}
-
-float value_noise(vec2 p)
-{
-    vec2 i = floor(p);
-    vec2 f = fract(p);
-    vec2 u = f * f * (3.0 - 2.0 * f);
-    float a = hash21(i);
-    float b = hash21(i + vec2(1.0, 0.0));
-    float c = hash21(i + vec2(0.0, 1.0));
-    float d = hash21(i + vec2(1.0, 1.0));
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-}
-
-float fbm(vec2 p)
-{
-    float value = 0.0;
-    float amp = 0.5;
-    for (int i = 0; i < 4; ++i) {
-        value += amp * value_noise(p);
-        p = p * 2.03 + vec2(17.1, -9.2);
-        amp *= 0.5;
-    }
-    return value;
-}
-
-vec3 water_env_tint(vec3 env_color, vec3 water_tint, float preserve_color)
-{
-    float luma = dot(env_color, vec3(0.2126, 0.7152, 0.0722));
-    vec3 filtered = mix(vec3(luma), env_color, preserve_color);
-    vec3 aqua_bias = mix(vec3(0.74, 1.03, 1.12), vec3(1.0), preserve_color);
-    return filtered * aqua_bias + water_tint * luma * mix(0.16, 0.04, preserve_color);
-}
-
-vec3 water_env_limit(vec3 env_color, float luma_limit)
-{
-    float luma = max(dot(env_color, vec3(0.2126, 0.7152, 0.0722)), 0.0);
-    float safe_limit = max(luma_limit, 1.0e-4);
-    float compressed_luma = safe_limit * (1.0 - exp(-luma / safe_limit));
-    return env_color * (compressed_luma / max(luma, 1.0e-4));
-}
-
-vec3 water_sky_ground_reflection(vec3 reflection_dir, vec3 water_tint, float preserve_color)
-{
-    vec3 r = normalize(reflection_dir);
-    float up = world_up_coord(r);
-    float sky_blend = smoothstep(0.08, 0.38, up);
-    float lift = smoothstep(-0.18, 0.30, up);
-    vec3 horizon = mix(ground_reflection_color, sky_reflection_color, sky_blend);
-    vec3 limited = water_env_limit(horizon * (0.32 + 0.28 * lift), 0.42);
-    return water_env_tint(limited, water_tint, clamp(preserve_color, 0.35, 1.0));
-}
-
 vec3 water_analytic_environment(vec3 reflection_dir)
 {
     vec3 r = normalize(reflection_dir);
@@ -1698,71 +1562,6 @@ vec3 water_analytic_environment(vec3 reflection_dir)
     vec3 horizon_color = mix(ground_reflection_color, sky_reflection_color, 0.38);
     vec3 env = mix(ground_reflection_color, sky_reflection_color, sky_blend);
     return mix(env, horizon_color, horizon * 0.28);
-}
-
-vec3 water_directional_env_reflection(
-    vec3 reflection_dir,
-    vec3 surface_world,
-    vec3 n_world,
-    vec3 water_tint,
-    float preserve_color,
-    float lod,
-    float gain,
-    float fresnel_term,
-    float roughness
-)
-{
-    vec3 r = normalize(reflection_dir);
-    vec3 env_dir = water_parallax_env_dir(r, surface_world);
-    float reflected_up = clamp(world_up_coord(env_dir), -1.0, 1.0);
-    float horizon_surface = 1.0 - abs(reflected_up);
-    float sky_energy = smoothstep(-0.04, 0.58, reflected_up);
-
-    vec3 env = env_map_available != 0
-        ? sample_water_env_map(r, surface_world, n_world, lod)
-        : water_analytic_environment(env_dir);
-    env *= gain;
-
-    float luma_limit = mix(0.34, 0.95, max(sky_energy, fresnel_term));
-    luma_limit += horizon_surface * 0.16;
-    luma_limit *= mix(1.0, 0.70, roughness);
-    env = water_env_limit(env, luma_limit);
-    return water_env_tint(env, water_tint, preserve_color);
-}
-
-float scene_depth_gap(vec2 uv, float water_depth)
-{
-    float raw_depth = texture(scene_depth_texture, uv).r;
-    if (raw_depth >= 0.9999) {
-        return 999.0;
-    }
-
-    vec3 scene_view = reconstruct_device_depth_view_pos(uv, raw_depth);
-    return (-scene_view.z) - water_depth;
-}
-
-float refraction_visibility(vec2 uv, float water_depth)
-{
-    return smoothstep(0.010, 0.075, scene_depth_gap(uv, water_depth));
-}
-
-vec3 depth_aware_scene_sample(vec2 uv, float water_depth, vec3 fallback_scene)
-{
-    vec2 sample_uv = clamp(uv, vec2(0.0), vec2(1.0));
-    vec3 sample_scene = texture(scene_texture, sample_uv).rgb;
-    return mix(fallback_scene, sample_scene, refraction_visibility(sample_uv, water_depth));
-}
-
-vec2 ripple_pattern(vec3 surface_world, vec3 n_world)
-{
-    vec2 floor_p = world_floor_coord(surface_world);
-    vec2 normal_p = world_floor_coord(n_world);
-    float height = world_up_coord(surface_world);
-    vec2 p = (floor_p + normal_p * 0.060 + vec2(height * 0.10, -height * 0.075)) * vec2(48.0, 70.0);
-    float a = sin(p.x + 0.9 * sin(p.y * 0.72));
-    float b = sin(p.y * 1.13 + 0.7 * sin(p.x * 0.61));
-    float c = sin((p.x + p.y) * 0.57 + 1.2 * sin(p.x * 0.31 - p.y * 0.21));
-    return vec2(a + 0.45 * c, b - 0.35 * c);
 }
 
 float water_surface_shadow(vec3 surface_world, vec3 n_world)
@@ -1810,21 +1609,48 @@ float water_surface_shadow(vec3 surface_world, vec3 n_world)
     return shadow * 0.125 * fade;
 }
 
-vec3 tropical_gradient(vec3 surface_world, vec3 n_world, float thickness)
+// Surface normal from the smoothed linear-depth buffer using one-sided
+// finite differences (Flex): per axis, keep the neighbor with the smaller
+// depth jump so silhouettes against background/foreground stay crisp.
+vec3 fluid_normal(vec2 uv, float depth, vec3 p)
 {
-    float optical_depth = thickness * max(absorption_strength, 0.0);
-    float depth_mix = 1.0 - exp(-optical_depth * (0.85 + 0.25 * depth_visualization_strength));
-    vec2 floor_p = world_floor_coord(surface_world);
-    vec2 normal_p = world_floor_coord(n_world);
-    float height = world_up_coord(surface_world);
-    vec2 p = floor_p + normal_p * 0.085 + vec2(height * 0.075, -height * 0.055);
-    float wave = 0.5 + 0.5 * sin(p.x * 27.0 + sin(p.y * 39.0));
-    float shelf = smoothstep(0.05, 1.3, optical_depth);
-    float gradient_mix = clamp(depth_mix * 0.82 + wave * 0.10 + shelf * 0.08, 0.0, 1.0);
-    vec3 shallow = mix(water_color, vec3(0.42, 0.76, 1.0), 0.16);
-    vec3 mid = mix(shallow, vec3(0.10, 0.48, 0.88), 0.42);
-    vec3 graded = mix(mid, water_deep_color, smoothstep(0.18, 0.95, gradient_mix));
-    return mix(water_color, graded, color_gradient_strength);
+    vec2 safe_min = texel_size * 0.5;
+    vec2 safe_max = vec2(1.0) - safe_min;
+    vec2 dx_uv = vec2(texel_size.x, 0.0) * 1.5;
+    vec2 dy_uv = vec2(0.0, texel_size.y) * 1.5;
+    vec2 uv_l = clamp(uv - dx_uv, safe_min, safe_max);
+    vec2 uv_r = clamp(uv + dx_uv, safe_min, safe_max);
+    vec2 uv_d = clamp(uv - dy_uv, safe_min, safe_max);
+    vec2 uv_u = clamp(uv + dy_uv, safe_min, safe_max);
+
+    float depth_l = texture(fluid_depth_texture, uv_l).r;
+    float depth_r = texture(fluid_depth_texture, uv_r).r;
+    float depth_d = texture(fluid_depth_texture, uv_d).r;
+    float depth_u = texture(fluid_depth_texture, uv_u).r;
+    if (depth_l <= 0.0) depth_l = depth;
+    if (depth_r <= 0.0) depth_r = depth;
+    if (depth_d <= 0.0) depth_d = depth;
+    if (depth_u <= 0.0) depth_u = depth;
+
+    vec3 ddx = reconstruct_view_pos(uv_r, depth_r) - p;
+    vec3 ddx2 = p - reconstruct_view_pos(uv_l, depth_l);
+    if (abs(ddx2.z) < abs(ddx.z))
+        ddx = ddx2;
+
+    vec3 ddy = reconstruct_view_pos(uv_u, depth_u) - p;
+    vec3 ddy2 = p - reconstruct_view_pos(uv_d, depth_d);
+    if (abs(ddy2.z) < abs(ddy.z))
+        ddy = ddy2;
+
+    vec3 v = normalize(-p);
+    vec3 n = cross(ddx, ddy);
+    if (dot(n, n) < 1.0e-12)
+        return v;
+
+    n = normalize(n);
+    if (dot(n, v) < 0.0)
+        n = -n;
+    return n;
 }
 
 void main()
@@ -1834,223 +1660,115 @@ void main()
         discard;
 
     vec3 p = reconstruct_view_pos(TexCoord, depth);
-    vec3 n = fluid_normal(TexCoord, depth);
     vec3 v = normalize(-p);
-    float surface_thickness = texture(thickness_texture, TexCoord).r;
+    vec3 n = fluid_normal(TexCoord, depth, p);
+
     vec4 water_clip = projection * vec4(p, 1.0);
     float water_device_depth = clamp(water_clip.z / max(abs(water_clip.w), 1.0e-6) * 0.5 + 0.5, 0.0, 1.0);
 
-    vec3 surface_world = view_to_world(p);
-    vec3 n_world_base = normalize(inv_view_rotation * n);
-
-    float surface_optical_depth = surface_thickness * max(absorption_strength, 0.0);
-    vec2 ripple = ripple_pattern(surface_world, n_world_base);
-    float ripple_weight = smoothstep(0.01, 0.24, surface_thickness)
-        * (1.0 - smoothstep(4.0, 8.0, surface_optical_depth));
-    n = normalize(n + vec3(ripple * 0.012 * ripple_weight, 0.0));
-    float fresnel = pow(clamp(1.0 - dot(n, v), 0.0, 1.0), 5.0);
-    float water_fresnel = 0.08 + 0.92 * fresnel;
-    vec3 n_world = normalize(inv_view_rotation * n);
-    float normal_up = clamp(world_up_coord(n_world), -1.0, 1.0);
-    float top_surface = smoothstep(0.16, 0.72, normal_up);
-    float side_surface = 1.0 - top_surface;
-
-    float refraction_body = mix(0.28, 1.0, top_surface)
-        * mix(1.0, 0.42, smoothstep(1.2, 4.8, surface_optical_depth));
-    vec2 refract_offset = n.xy * refraction_strength * (0.22 + clamp(surface_optical_depth, 0.0, 1.35)) * refraction_body;
-    refract_offset += ripple * refraction_strength * 0.024 * ripple_weight * top_surface;
-    vec2 refract_uv = clamp(TexCoord + refract_offset, vec2(0.0), vec2(1.0));
-    float refracted_thickness = texture(thickness_texture, refract_uv).r;
-    float thickness = max(refracted_thickness, surface_thickness * 0.35);
-    float optical_depth = thickness * max(absorption_strength, 0.0);
-    float depth_mix = clamp(1.0 - exp(-optical_depth * 0.85), 0.0, 1.0);
-    float alpha = clamp((1.0 - exp(-optical_depth * 1.35)) * opacity, 0.0, opacity);
-    vec3 scene = texture(scene_texture, TexCoord).rgb;
-    vec3 refracted_r = depth_aware_scene_sample(TexCoord + refract_offset * 1.10, depth, scene);
-    vec3 refracted_g = depth_aware_scene_sample(refract_uv, depth, scene);
-    vec3 refracted_b = depth_aware_scene_sample(TexCoord + refract_offset * 0.88, depth, scene);
-    vec3 scene_refracted = vec3(refracted_r.r, refracted_g.g, refracted_b.b);
-    scene_refracted = mix(scene_refracted, scene, side_surface * 0.58);
-    vec3 reflection_ray = reflect(-v, n);
-    float reflection_slider = clamp(reflection_strength / 0.6, 0.0, 1.0);
-    float surface_roughness = clamp(
-        0.07 + ripple_weight * 0.26 + depth_mix * 0.14 + (1.0 - water_fresnel) * 0.08 + (1.0 - top_surface) * 0.10,
-        0.0,
-        1.0
-    );
-    float water_env_gain = env_intensity / (1.0 + 0.95 * max(env_intensity, 0.0));
-    vec3 reflection_world = normalize(inv_view_rotation * reflection_ray);
-    vec3 env_dir = water_parallax_env_dir(reflection_world, surface_world);
-    float env_reflection_lod_dynamic = clamp(env_reflection_lod + surface_roughness * 2.2 - water_fresnel * 0.34, 0.0, 8.0);
-    vec3 refracted_eye = refract(-v, n, 1.0 / 1.333);
-    if (length(refracted_eye) < 0.001)
-        refracted_eye = reflect(-v, n);
-    vec3 refracted_world = normalize(inv_view_rotation * refracted_eye);
-    vec3 env_refracted_raw = (env_map_available != 0
-            ? sample_env_map(refracted_world, max(env_reflection_lod + 2.0, 2.0))
-            : water_analytic_environment(refracted_world))
-        * water_env_gain;
-    env_refracted_raw = water_env_limit(env_refracted_raw, 0.24) * 0.36;
-
-    vec3 l = normalize(sun_direction_view);
-    vec3 h = normalize(l + v);
-    float spec = pow(max(dot(n, h), 0.0), 220.0) * (0.34 + env_map_strength * 0.42);
-    spec *= mix(0.10, 1.0, top_surface);
-
-    vec3 gradient_color = tropical_gradient(surface_world, n_world, thickness);
-    vec3 env_reflected = water_directional_env_reflection(
-        reflection_world,
-        surface_world,
-        n_world,
-        gradient_color,
-        env_color_preserve,
-        env_reflection_lod_dynamic,
-        water_env_gain,
-        water_fresnel,
-        surface_roughness
-    );
-    vec3 env_refracted = water_env_tint(env_refracted_raw, gradient_color, clamp(env_color_preserve * 0.45, 0.0, 1.0));
-
-    float raw_bottom_depth = texture(scene_depth_texture, TexCoord).r;
-    float water_column_depth = 0.0;
-    vec3 bottom_view = p;
-    vec3 bottom_world = surface_world;
-    float scene_gap = 999.0;
-    float bottom_visibility = 0.0;
+    // Scene geometry in front of the water surface occludes it.
+    float raw_scene_depth = texture(scene_depth_texture, TexCoord).r;
+    float scene_to_water_gap = 999.0;
     float foreground_occlusion = 0.0;
-    if (raw_bottom_depth < 0.9999) {
-        bottom_view = reconstruct_device_depth_view_pos(TexCoord, raw_bottom_depth);
-        bottom_world = view_to_world(bottom_view);
-        water_column_depth = max(world_up_coord(surface_world) - world_up_coord(bottom_world), 0.0);
-        float candidate_gap = (-bottom_view.z) - depth;
-        float scene_depth_ahead = water_device_depth - raw_bottom_depth;
-        if (candidate_gap > 0.0 || scene_depth_ahead <= 0.00035) {
-            scene_gap = max(candidate_gap, 0.0);
-            bottom_visibility = 1.0 - smoothstep(0.00015, 0.0015, scene_depth_ahead);
-        } else {
-            foreground_occlusion = smoothstep(0.00035, 0.0040, scene_depth_ahead);
+    if (raw_scene_depth < 0.9999) {
+        vec3 scene_view = reconstruct_device_depth_view_pos(TexCoord, raw_scene_depth);
+        scene_to_water_gap = (-scene_view.z) - depth;
+        foreground_occlusion = 1.0 - smoothstep(-0.018, -0.004, scene_to_water_gap);
+        if (foreground_occlusion > 0.995) {
+            discard;
         }
     }
 
-    float column_optical_depth = max(
-        optical_depth,
-        water_column_depth * max(absorption_strength, 0.0) * 0.72 * bottom_visibility
-    );
-    float column_depth_mix = clamp(1.0 - exp(-column_optical_depth * 0.85), 0.0, 1.0);
-    vec3 column_absorption = exp(-vec3(1.55, 0.46, 0.10) * column_optical_depth);
-    float column_alpha = clamp((1.0 - exp(-column_optical_depth * 1.05)) * opacity, 0.0, opacity);
-    alpha = max(alpha, column_alpha);
-    alpha *= mix(0.22, 0.58, max(depth_mix, column_depth_mix));
-    float env_transmission = clamp(
-        env_map_strength * refraction_strength * 2.6 * (0.28 + 0.72 * (1.0 - column_depth_mix)),
-        0.0,
-        0.22
-    );
-    vec3 transmitted_scene = mix(scene_refracted, env_refracted, env_transmission);
+    vec3 surface_world = view_to_world(p);
+    vec3 n_world = normalize(inv_view_rotation * n);
+    float thickness = texture(thickness_texture, TexCoord).r;
 
-    float floor_transmission = floor_caustic_strength * 0.35
-        * max(smoothstep(0.02, 0.42, water_column_depth), smoothstep(0.020, 0.26, scene_gap) * 0.72)
-        * (1.0 - smoothstep(2.8, 5.2, water_column_depth))
-        * smoothstep(0.02, 0.65, thickness);
-    vec3 floor_translucency = vec3(0.42, 0.82, 1.05) + gradient_color * 0.22;
-    float floor_receiver_depth = max(
-        smoothstep(0.015, 0.28, water_column_depth),
-        smoothstep(0.012, 0.22, scene_gap) * 0.86
-    );
-    float thickness_receiver = smoothstep(0.006, 0.18, thickness);
-    float water_volume_shadow = clamp(
-        surface_shadow_strength * thickness_receiver * (0.62 + 0.38 * (1.0 - top_surface)) * 1.85,
-        0.0,
-        0.82
-    );
-    float water_floor_shadow = clamp(
-        surface_shadow_strength * 1.35
-            * bottom_visibility
-            * floor_receiver_depth
-            * thickness_receiver,
-        0.0,
-        0.88
-    );
-    float water_shadow_amount = max(water_floor_shadow, water_volume_shadow);
-    vec3 water_shadow_filter = vec3(0.16, 0.32, 0.96);
-    transmitted_scene = mix(
-        transmitted_scene,
-        transmitted_scene * water_shadow_filter + gradient_color * 0.015,
-        water_shadow_amount
-    );
-    transmitted_scene = mix(
-        transmitted_scene,
-        transmitted_scene * vec3(0.72, 0.90, 1.06) + floor_translucency * 0.18,
-        clamp(floor_transmission * 0.16, 0.0, 0.42)
-    );
+    // View-ray distance from the water surface to the scene behind it.
+    float scene_gap = raw_scene_depth < 0.9999 ? max(scene_to_water_gap, 0.0) : 999.0;
 
-    vec3 transmitted = transmitted_scene * column_absorption * (1.0 - 0.34 * column_depth_mix)
-        + gradient_color * (0.30 + 0.54 * column_depth_mix);
-    transmitted = mix(transmitted, gradient_color, clamp(0.16 + 0.28 * column_depth_mix, 0.0, 0.46));
-    float reflection_volume = smoothstep(0.006, 0.12, thickness);
-    float column_reflection = mix(1.0, smoothstep(0.04, 0.75, water_column_depth), bottom_visibility);
-    float reflection_visibility = clamp(
-        mix(0.22, 1.0, reflection_volume * column_reflection) * (0.72 + 0.28 * water_fresnel),
-        0.12,
-        1.0
-    );
-    // View-dependent environment reflection only. Screen-space reflection was removed because
-    // its ray-march produced camera-following streaks on the surface; the env map gives a stable,
-    // Fresnel-weighted reflection instead.
-    vec3 reflection_color = env_reflected;
-    float env_shape_reflection = mix(0.18, 0.66, top_surface) * (0.30 + 0.70 * water_fresnel);
-    env_shape_reflection += side_surface * (0.08 + 0.22 * water_fresnel);
-    float reflection_mix_raw = env_map_strength * (0.10 + 0.46 * water_fresnel + 0.06 * top_surface)
-        + reflection_slider * env_shape_reflection;
-    float reflection_mix = clamp(reflection_mix_raw * mix(0.58, 1.08, reflection_visibility), 0.0, 0.82);
-    vec3 water = mix(transmitted, reflection_color, reflection_mix);
-    float reflected_up = clamp(world_up_coord(env_dir), -1.0, 1.0);
-    float reflected_sky = smoothstep(-0.02, 0.52, reflected_up);
-    float directional_reflection = clamp(
-        (reflection_slider * 0.22 + env_map_strength * 0.42) * (0.38 + 0.62 * water_fresnel),
-        0.0,
-        0.48
-    );
-    water = mix(water, env_reflected, directional_reflection * reflection_visibility);
-    water *= mix(vec3(0.72, 0.86, 1.04), vec3(1.06, 1.09, 1.04), top_surface * (0.55 + 0.45 * reflected_sky));
-    water *= mix(vec3(1.0), vec3(0.48, 0.64, 1.02), water_shadow_amount * 0.72);
-    water += floor_transmission * floor_translucency * (0.030 + 0.035 * (1.0 - reflection_mix));
-    vec3 side_body = mix(
-        gradient_color * vec3(0.60, 0.78, 1.05),
-        env_reflected,
-        clamp(0.16 + reflection_slider * 0.26 + env_map_strength * 0.58, 0.0, 0.58)
-    );
-    water = mix(water, side_body, clamp(side_surface * 0.86, 0.0, 0.90));
-    float view_side = clamp(1.0 - abs(dot(n, v)), 0.0, 1.0);
-    float depth_shadow = depth_visualization_strength
-        * clamp(max(depth_mix, column_depth_mix) + smoothstep(0.02, 0.45, water_column_depth), 0.0, 1.0);
-    water *= mix(vec3(1.0), vec3(0.70, 0.84, 1.0), clamp(depth_shadow * 0.42, 0.0, 0.55));
-    water += gradient_color * (0.065 + 0.11 * view_side) * depth_visualization_strength;
-    float final_env_reflection = clamp(
-        (env_map_strength * 0.38 + reflection_slider * 0.30)
-            * (0.32 + 0.68 * water_fresnel)
-            * reflection_visibility
-            + side_surface * (env_map_strength * 0.20 + reflection_slider * 0.14),
-        0.0,
-        0.54
-    );
-    water = mix(water, env_reflected, final_env_reflection);
-    float surface_shadow = water_surface_shadow(surface_world, n_world);
-    float shadow_amount = clamp(surface_shadow * surface_shadow_strength, 0.0, 0.82);
-    water += vec3(spec) * mix(1.0, 0.42, shadow_amount);
-    water *= mix(vec3(1.0), vec3(0.70, 0.84, 0.98), shadow_amount);
-    alpha = max(alpha, opacity * 0.08 * smoothstep(0.006, 0.080, surface_thickness));
-    alpha = max(alpha, opacity * 0.42 * side_surface * smoothstep(0.004, 0.060, surface_thickness));
-    alpha = max(
-        alpha,
-        opacity * 0.12 * reflection_visibility * clamp(reflection_mix + final_env_reflection, 0.0, 1.0)
-            * smoothstep(0.006, 0.080, surface_thickness)
-    );
-    alpha = min(alpha, opacity * mix(0.56, 0.62, clamp(reflection_mix + final_env_reflection, 0.0, 1.0)));
-    alpha *= (1.0 - foreground_occlusion);
+    // Fresnel (Schlick). F0 boosted slightly above physical water, Flex-style.
+    float ndotv = clamp(dot(n, v), 0.0, 1.0);
+    float fresnel = 0.08 + 0.92 * pow(1.0 - ndotv, 5.0);
 
-    gl_FragDepth = mix(water_device_depth, raw_bottom_depth, foreground_occlusion);
-    FragColor = vec4(mix(scene, water, alpha), 1.0);
+    // --- Refraction ---------------------------------------------------------
+    float refract_amount = refraction_strength * clamp(thickness * 4.0, 0.0, 1.0);
+    vec2 refract_uv = clamp(TexCoord + n.xy * refract_amount, texel_size, vec2(1.0) - texel_size);
+    // Reject refracted samples of geometry that sits in front of the surface.
+    float refract_scene_depth = texture(scene_depth_texture, refract_uv).r;
+    if (refract_scene_depth < 0.9999) {
+        float refract_gap = -reconstruct_device_depth_view_pos(refract_uv, refract_scene_depth).z - depth;
+        if (refract_gap < -0.01) {
+            refract_uv = TexCoord;
+        }
+    }
+    vec3 scene_refracted = texture(scene_texture, refract_uv).rgb;
+
+    // Beer-Lambert absorption along the optical path. The complement of the
+    // water color acts as the per-channel absorption coefficient so shallow
+    // water tints toward water_color and deep water toward water_deep_color.
+    float optical_path = max(thickness, min(scene_gap, 6.0) * 0.55);
+    vec3 transmission = exp(-(vec3(1.0) - water_color) * absorption_strength * optical_path);
+    float depth_mix = 1.0 - exp(-absorption_strength * 0.6 * optical_path);
+    vec3 body_color = mix(water_color, water_deep_color, depth_mix * clamp(0.35 + color_gradient_strength, 0.0, 1.0));
+
+    // Wrap-diffuse sun term on the scattered component plus shadowing.
+    vec3 l = normalize(sun_direction_view);
+    float wrap = clamp(dot(n, l) * 0.5 + 0.5, 0.0, 1.0);
+    float shadow = water_surface_shadow(surface_world, n_world);
+    float lit = 1.0 - clamp(shadow * surface_shadow_strength, 0.0, 0.85);
+
+    vec3 scatter = body_color * mix(0.55, 1.15, wrap) * mix(0.55, 1.0, lit);
+    float scatter_gain = clamp(depth_visualization_strength * 0.47, 0.0, 1.2);
+    vec3 refracted = scene_refracted * transmission + scatter * (1.0 - transmission) * scatter_gain;
+
+    // --- Reflection ---------------------------------------------------------
+    vec3 r = reflect(-v, n);
+    vec3 r_world = normalize(inv_view_rotation * r);
+
+    vec3 env_col;
+    if (env_map_available != 0) {
+        vec3 env_dir = water_parallax_env_dir(r_world, surface_world);
+        env_col = sample_env_map(env_dir, env_reflection_lod) * env_intensity;
+    } else {
+        env_col = water_analytic_environment(r_world);
+    }
+    env_col *= env_map_strength;
+    // Soft luma compression keeps bright env texels from blowing out.
+    float env_luma = max(dot(env_col, vec3(0.2126, 0.7152, 0.0722)), 1.0e-4);
+    float env_limit = 1.35;
+    env_col *= env_limit * (1.0 - exp(-env_luma / env_limit)) / env_luma;
+    env_col = mix(vec3(dot(env_col, vec3(0.2126, 0.7152, 0.0722))), env_col, clamp(env_color_preserve + 0.35, 0.0, 1.0));
+
+    // Flex-style single-tap screen-space reflection of the scene.
+    vec2 ss_uv = TexCoord + r.xy * vec2(0.75, 1.0) * (0.133 / max(depth, 0.05));
+    vec2 ss_edge = smoothstep(vec2(0.0), vec2(0.08), ss_uv) * smoothstep(vec2(0.0), vec2(0.08), vec2(1.0) - ss_uv);
+    float ss_fade = ss_edge.x * ss_edge.y;
+    ss_uv = clamp(ss_uv, texel_size, vec2(1.0) - texel_size);
+    // Only reflect actual geometry; the env map covers the sky.
+    ss_fade *= texture(scene_depth_texture, ss_uv).r < 0.9999 ? 1.0 : 0.0;
+    vec3 scene_reflect = texture(scene_texture, ss_uv).rgb;
+    vec3 reflect_col = mix(env_col, scene_reflect, ss_fade * 0.5);
+    reflect_col *= mix(0.55, 1.0, lit);
+
+    // --- Specular ------------------------------------------------------------
+    // Fresnel-scaled so camera-facing faces (e.g. the open tank sides) do not
+    // bloom into a saturated glint patch under a low sun.
+    vec3 h = normalize(l + v);
+    float spec = pow(max(dot(n, h), 0.0), 400.0) * 2.4 * fresnel * lit;
+
+    // --- Combine -------------------------------------------------------------
+    float reflect_gain = clamp(reflection_strength * 1.6, 0.0, 1.2);
+    float reflect_mix = clamp(fresnel * reflect_gain, 0.0, 1.0);
+    vec3 water = mix(refracted, reflect_col, reflect_mix) + vec3(spec);
+    water *= mix(vec3(0.52, 0.65, 0.88), vec3(1.0), lit);
+
+    // Fade out where the water film becomes vanishingly thin.
+    float coverage = smoothstep(0.0015, 0.014, thickness) * opacity;
+    coverage *= 1.0 - foreground_occlusion;
+    vec3 scene_center = texture(scene_texture, TexCoord).rgb;
+
+    gl_FragDepth = mix(water_device_depth, raw_scene_depth, foreground_occlusion);
+    FragColor = vec4(mix(scene_center, water, coverage), 1.0);
 }
 """
 

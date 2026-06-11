@@ -46,22 +46,83 @@ def deactivate_particles_overlapping_boxes(
 
 
 @wp.kernel
+def reset_box_water_heights(
+    box_water_height_raw: wp.array[float],
+    floor_height: float,
+):
+    tid = wp.tid()
+    box_water_height_raw[tid] = floor_height
+
+
+@wp.kernel
+def measure_box_water_heights(
+    particle_q: wp.array[wp.vec3],
+    particle_flags: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    box_body_ids: wp.array[int],
+    box_half_extents: wp.array[wp.vec3],
+    sample_clearance: float,
+    sample_margin: float,
+    box_water_height_raw: wp.array[float],
+):
+    tid = wp.tid()
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        return
+
+    x = particle_q[tid]
+    for box_idx in range(box_body_ids.shape[0]):
+        body = box_body_ids[box_idx]
+        c = wp.transform_get_translation(body_q[body])
+        half = box_half_extents[box_idx]
+        dx = wp.abs(x[0] - c[0])
+        dy = wp.abs(x[1] - c[1])
+        # Sample the free surface in a ring around the box footprint so
+        # particles splashed onto or climbing the box do not inflate the
+        # measured water level (which would levitate the box).
+        inside_outer = dx <= half[0] + sample_margin and dy <= half[1] + sample_margin
+        outside_inner = dx > half[0] + sample_clearance or dy > half[1] + sample_clearance
+        if inside_outer and outside_inner:
+            wp.atomic_max(box_water_height_raw, box_idx, x[2])
+
+
+@wp.kernel
+def smooth_box_water_heights(
+    box_water_height_raw: wp.array[float],
+    box_water_height: wp.array[float],
+    blend_up: float,
+    blend_down: float,
+):
+    tid = wp.tid()
+    raw = box_water_height_raw[tid]
+    smoothed = box_water_height[tid]
+    # Rise slowly so brief splashes in the sampling ring cannot inflate the
+    # perceived water level (and levitate the box), but fall quickly when the
+    # surface recedes.
+    blend = wp.where(raw > smoothed, blend_up, blend_down)
+    box_water_height[tid] = wp.lerp(smoothed, raw, blend)
+
+
+@wp.kernel
 def apply_body_buoyancy_forces(
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_f: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
     body_mass: wp.array[float],
     body_ids: wp.array[int],
     box_half_extents: wp.array[wp.vec3],
+    box_water_height: wp.array[float],
     bounds_lower: wp.vec3,
     bounds_upper: wp.vec3,
     gravity: wp.vec3,
-    water_level: float,
     rest_density: float,
     buoyancy_scale: float,
-    damping: float,
-    fluid_drag: float,
+    linear_drag: float,
+    quadratic_drag: float,
     angular_drag: float,
+    floor_stiffness: float,
+    floor_damping: float,
+    floor_friction: float,
     wall_stiffness: float,
     wall_damping: float,
 ):
@@ -71,50 +132,141 @@ def apply_body_buoyancy_forces(
         return
 
     X_wb = body_q[body]
-    x = wp.transform_get_translation(X_wb)
+    x = wp.transform_point(X_wb, body_com[body])
     q = wp.transform_get_rotation(X_wb)
     v = wp.spatial_top(body_qd[body])
     w = wp.spatial_bottom(body_qd[body])
-    force = wp.vec3(0.0)
-    torque = wp.vec3(0.0)
     mass = body_mass[body]
     half = box_half_extents[tid]
+    water_level = box_water_height[tid]
 
     axis_x = wp.quat_rotate(q, wp.vec3(1.0, 0.0, 0.0))
     axis_y = wp.quat_rotate(q, wp.vec3(0.0, 1.0, 0.0))
     axis_z = wp.quat_rotate(q, wp.vec3(0.0, 0.0, 1.0))
-    vertical_extent = wp.abs(axis_x[2]) * half[0] + wp.abs(axis_y[2]) * half[1] + wp.abs(axis_z[2]) * half[2]
-    vertical_extent = wp.max(vertical_extent, 1.0e-4)
-    body_bottom = x[2] - vertical_extent
-    body_top = x[2] + vertical_extent
-    submerged_height = wp.min(wp.max(water_level - body_bottom, 0.0), body_top - body_bottom)
-    submerged_fraction = submerged_height / wp.max(body_top - body_bottom, 1.0e-4)
 
-    volume = 8.0 * half[0] * half[1] * half[2]
-    displaced_mass = rest_density * volume * submerged_fraction
-    buoyancy = -gravity * displaced_mass * buoyancy_scale
-    force += buoyancy
-    force -= v * (mass * fluid_drag * submerged_fraction)
-    force[2] -= mass * damping * submerged_fraction * v[2]
-    torque -= w * (mass * angular_drag * submerged_fraction)
+    cell_volume = half[0] * half[1] * half[2]
+    cell_half_up = 0.5 * (wp.abs(axis_x[2]) * half[0] + wp.abs(axis_y[2]) * half[1] + wp.abs(axis_z[2]) * half[2])
+    cell_half_up = wp.max(cell_half_up, 1.0e-4)
+
+    force = wp.vec3(0.0)
+    torque = wp.vec3(0.0)
+    submerged = float(0.0)
+
+    # Archimedes per octant: each of the 8 cells contributes buoyancy and drag
+    # at its own center, which yields net lift plus a natural righting torque,
+    # and the locally measured water height couples the box to passing waves.
+    for corner in range(8):
+        sx = float(1.0)
+        sy = float(1.0)
+        sz = float(1.0)
+        if (corner & 1) == 0:
+            sx = -1.0
+        if (corner & 2) == 0:
+            sy = -1.0
+        if (corner & 4) == 0:
+            sz = -1.0
+
+        r = axis_x * (sx * half[0] * 0.5) + axis_y * (sy * half[1] * 0.5) + axis_z * (sz * half[2] * 0.5)
+        cell_center = x + r
+        depth_fraction = (water_level - cell_center[2] + cell_half_up) / (2.0 * cell_half_up)
+        depth_fraction = wp.min(wp.max(depth_fraction, 0.0), 1.0)
+        if depth_fraction > 0.0:
+            displaced_mass = rest_density * cell_volume * depth_fraction
+            cell_buoyancy = -gravity * (displaced_mass * buoyancy_scale)
+            force += cell_buoyancy
+            torque += wp.cross(r, cell_buoyancy)
+
+            point_v = v + wp.cross(w, r)
+            drag = -point_v * (displaced_mass * (linear_drag + quadratic_drag * wp.length(point_v)))
+            force += drag
+            torque += wp.cross(r, drag)
+            submerged += depth_fraction * 0.125
+
+    torque -= w * (mass * angular_drag * submerged)
+
+    # Sphere-approximated box-box repulsion so floating boxes do not raft into
+    # each other (the rigid integrator in this example resolves no contacts).
+    # Each box applies its own half of the symmetric pair force.
+    my_radius = 0.40 * (half[0] + half[1] + half[2])
+    for other_idx in range(box_half_extents.shape[0]):
+        if other_idx != tid:
+            other_body = body_ids[other_idx]
+            if other_body >= 0:
+                other_half = box_half_extents[other_idx]
+                other_center = wp.transform_point(body_q[other_body], body_com[other_body])
+                radius_sum = my_radius + 0.40 * (other_half[0] + other_half[1] + other_half[2])
+                delta = x - other_center
+                dist = wp.length(delta)
+                if dist > 1.0e-6 and dist < radius_sum:
+                    n = delta / dist
+                    rel_v = v - wp.spatial_top(body_qd[other_body])
+                    repulsion = mass * (220.0 * (radius_sum - dist) - 10.0 * wp.dot(rel_v, n))
+                    if repulsion > 0.0:
+                        force += n * repulsion
+
+    # Tank floor contact at the true corners. The rigid integrator in this
+    # example does not resolve contacts, so denser-than-water boxes need a
+    # floor reaction to rest on once they sink.
+    floor_z = bounds_lower[2]
+    for corner in range(8):
+        sx = float(1.0)
+        sy = float(1.0)
+        sz = float(1.0)
+        if (corner & 1) == 0:
+            sx = -1.0
+        if (corner & 2) == 0:
+            sy = -1.0
+        if (corner & 4) == 0:
+            sz = -1.0
+
+        r = axis_x * (sx * half[0]) + axis_y * (sy * half[1]) + axis_z * (sz * half[2])
+        corner_pos = x + r
+        penetration = floor_z - corner_pos[2]
+        if penetration > 0.0:
+            corner_v = v + wp.cross(w, r)
+            normal_force = (mass * 0.125) * (floor_stiffness * penetration - floor_damping * corner_v[2])
+            normal_force = wp.max(normal_force, 0.0)
+            contact_force = wp.vec3(0.0, 0.0, normal_force)
+            contact_force -= wp.vec3(corner_v[0], corner_v[1], 0.0) * (floor_friction * mass * 0.125)
+            force += contact_force
+            torque += wp.cross(r, contact_force)
 
     margin = float(0.18)
     if x[0] < bounds_lower[0] + margin:
-        force[0] += wall_stiffness * (bounds_lower[0] + margin - x[0]) - wall_damping * v[0]
+        force[0] += mass * (wall_stiffness * (bounds_lower[0] + margin - x[0]) - wall_damping * v[0])
     elif x[0] > bounds_upper[0] - margin:
-        force[0] += wall_stiffness * (bounds_upper[0] - margin - x[0]) - wall_damping * v[0]
+        force[0] += mass * (wall_stiffness * (bounds_upper[0] - margin - x[0]) - wall_damping * v[0])
 
     if x[1] < bounds_lower[1] + margin:
-        force[1] += wall_stiffness * (bounds_lower[1] + margin - x[1]) - wall_damping * v[1]
+        force[1] += mass * (wall_stiffness * (bounds_lower[1] + margin - x[1]) - wall_damping * v[1])
     elif x[1] > bounds_upper[1] - margin:
-        force[1] += wall_stiffness * (bounds_upper[1] - margin - x[1]) - wall_damping * v[1]
+        force[1] += mass * (wall_stiffness * (bounds_upper[1] - margin - x[1]) - wall_damping * v[1])
 
-    if x[2] < bounds_lower[2] + margin:
-        force[2] += wall_stiffness * (bounds_lower[2] + margin - x[2]) - wall_damping * v[2]
-    elif x[2] > bounds_upper[2] - margin:
-        force[2] += wall_stiffness * (bounds_upper[2] - margin - x[2]) - wall_damping * v[2]
+    if x[2] > bounds_upper[2] - margin:
+        force[2] += mass * (wall_stiffness * (bounds_upper[2] - margin - x[2]) - wall_damping * v[2])
 
     wp.atomic_add(body_f, body, wp.spatial_vector(force, torque))
+
+
+@wp.kernel
+def copy_body_kinematics(
+    src_body_q: wp.array[wp.transform],
+    src_body_qd: wp.array[wp.spatial_vector],
+    dst_body_q: wp.array[wp.transform],
+    dst_body_qd: wp.array[wp.spatial_vector],
+):
+    tid = wp.tid()
+    dst_body_q[tid] = src_body_q[tid]
+    dst_body_qd[tid] = src_body_qd[tid]
+
+
+@wp.kernel
+def add_body_wrenches(
+    dst_body_f: wp.array[wp.spatial_vector],
+    src_body_f: wp.array[wp.spatial_vector],
+):
+    tid = wp.tid()
+    dst_body_f[tid] = dst_body_f[tid] + src_body_f[tid]
 
 
 @wp.kernel
@@ -166,7 +318,6 @@ def apply_particle_box_coupling(
     body_qd: wp.array[wp.spatial_vector],
     body_f: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
-    body_mass: wp.array[float],
     box_body_ids: wp.array[int],
     box_half_extents: wp.array[wp.vec3],
     contact_distance: float,
@@ -238,7 +389,7 @@ def apply_particle_box_coupling(
                 magnitude = wp.min(magnitude, 80.0)
                 force = normal * (magnitude * mass)
                 particle_force += force
-                body_feedback_scale = splash_velocity_gain * mass / wp.max(body_mass[body], 1.0e-6)
+                body_feedback_scale = splash_velocity_gain
                 body_force = -force * body_feedback_scale
                 wp.atomic_add(body_f, body, wp.spatial_vector(body_force, wp.cross(r, body_force)))
 
@@ -266,10 +417,15 @@ class Example:
         self.rest_density = args.rest_density
         self.coupling_stiffness = args.coupling_stiffness
         self.coupling_damping = args.coupling_damping
-        self.suspension_stiffness = args.suspension_stiffness
-        self.suspension_damping = args.suspension_damping
-        self.box_fluid_drag = args.box_fluid_drag
+        self.buoyancy_scale = args.buoyancy_scale
+        self.box_linear_drag = args.box_linear_drag
+        self.box_quadratic_drag = args.box_quadratic_drag
         self.box_angular_drag = args.box_angular_drag
+        self.box_floor_stiffness = args.box_floor_stiffness
+        self.box_floor_damping = args.box_floor_damping
+        self.box_floor_friction = args.box_floor_friction
+        self.box_wall_stiffness = args.box_wall_stiffness
+        self.box_wall_damping = args.box_wall_damping
         self.box_max_linear_speed = args.box_max_linear_speed
         self.box_max_angular_speed = args.box_max_angular_speed
         self.box_max_torque = args.box_max_torque
@@ -305,7 +461,7 @@ class Example:
 
         self.box_body_ids: list[int] = []
         self.box_half_extents: list[wp.vec3] = []
-        self.box_target_heights: list[float] = []
+        self.box_densities: list[float] = []
         self.box_guide_colors: list[wp.vec3] = []
         self._add_boxes(builder, args)
 
@@ -316,6 +472,11 @@ class Example:
 
         self.box_body_ids_wp = wp.array(self.box_body_ids, dtype=int, device=self.model.device)
         self.box_half_extents_wp = wp.array(self.box_half_extents, dtype=wp.vec3, device=self.model.device)
+        # Per-box local water surface heights measured from the SPH particles;
+        # the smoothed array drives buoyancy so boxes ride passing waves.
+        box_count = max(len(self.box_body_ids), 1)
+        self.box_water_height_raw = wp.full(box_count, value=self.water_level, dtype=float, device=self.model.device)
+        self.box_water_height = wp.full(box_count, value=self.water_level, dtype=float, device=self.model.device)
         self._carve_initial_box_volumes(args.fluid_carve_clearance)
 
         self.sph_solver = SolverSPH(
@@ -349,6 +510,10 @@ class Example:
             pbf_iterations=args.pbf_iterations,
             pbf_relaxation=args.pbf_relaxation,
             pbf_artificial_pressure=args.pbf_artificial_pressure,
+            # The example applies its own displaced-volume buoyancy plus scaled
+            # splash feedback; full solver contact reactions would double-count
+            # buoyancy and let the coarse particle bed carry dense boxes.
+            shape_collision_body_feedback=args.sph_body_feedback,
             max_diffuse_particles=args.fluid_diffuse_max_particles,
             diffuse_threshold=args.fluid_diffuse_threshold,
             diffuse_lifetime=args.fluid_diffuse_lifetime,
@@ -390,6 +555,7 @@ class Example:
             (0.20, 0.50, 1.0),
             (0.82, 0.35, 1.0),
         )
+        density_fractions = tuple(args.box_density_fractions)
         for i in range(args.box_count):
             column = i % 3
             row = i // 3
@@ -400,9 +566,12 @@ class Example:
             hy = args.box_half_extent * (0.85 + 0.10 * ((i + 1) % 3))
             hz = args.box_half_extent * (0.95 + 0.10 * (i % 3))
             q = wp.quat_from_axis_angle(wp.vec3(0.2, 0.8, 0.1), 0.20 * float(i))
+            # The box mass comes purely from its shape density, expressed as a
+            # fraction of the fluid rest density: fractions below 1 float (the
+            # smaller, the higher they ride), fractions above 1 sink.
+            density = float(density_fractions[i % len(density_fractions)]) * args.rest_density
             body = builder.add_body(
                 xform=wp.transform(wp.vec3(x, y, z), q),
-                mass=args.box_mass,
                 label=f"water_cube_{i}",
             )
             builder.add_shape_box(
@@ -410,12 +579,12 @@ class Example:
                 hx=hx,
                 hy=hy,
                 hz=hz,
-                cfg=newton.ModelBuilder.ShapeConfig(density=args.box_density, mu=0.18),
+                cfg=newton.ModelBuilder.ShapeConfig(density=density, mu=0.18),
                 color=colors[i % len(colors)],
             )
             self.box_body_ids.append(body)
             self.box_half_extents.append(wp.vec3(hx, hy, hz))
-            self.box_target_heights.append(z)
+            self.box_densities.append(density)
             self.box_guide_colors.append(wp.vec3(colors[i % len(colors)]))
 
     def _carve_initial_box_volumes(self, clearance: float):
@@ -521,7 +690,43 @@ class Example:
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
+            self.state_1.clear_forces()
             self.viewer.apply_forces(self.state_0)
+            wp.launch(
+                kernel=reset_box_water_heights,
+                dim=len(self.box_body_ids),
+                inputs=[
+                    self.box_water_height_raw,
+                    float(self.bounds_lower[2]),
+                ],
+                device=self.model.device,
+            )
+            wp.launch(
+                kernel=measure_box_water_heights,
+                dim=self.model.particle_count,
+                inputs=[
+                    self.state_0.particle_q,
+                    self.model.particle_flags,
+                    self.state_0.body_q,
+                    self.box_body_ids_wp,
+                    self.box_half_extents_wp,
+                    self.particle_radius * 1.5,
+                    self.particle_radius * 6.0,
+                    self.box_water_height_raw,
+                ],
+                device=self.model.device,
+            )
+            wp.launch(
+                kernel=smooth_box_water_heights,
+                dim=len(self.box_body_ids),
+                inputs=[
+                    self.box_water_height_raw,
+                    self.box_water_height,
+                    0.04,
+                    0.30,
+                ],
+                device=self.model.device,
+            )
             wp.launch(
                 kernel=apply_body_buoyancy_forces,
                 dim=len(self.box_body_ids),
@@ -529,20 +734,24 @@ class Example:
                     self.state_0.body_q,
                     self.state_0.body_qd,
                     self.state_0.body_f,
+                    self.model.body_com,
                     self.model.body_mass,
                     self.box_body_ids_wp,
                     self.box_half_extents_wp,
+                    self.box_water_height,
                     self.bounds_lower,
                     self.bounds_upper,
                     self.gravity,
-                    self.water_level,
                     self.rest_density,
-                    self.suspension_stiffness / 42.0,
-                    self.suspension_damping,
-                    self.box_fluid_drag,
+                    self.buoyancy_scale,
+                    self.box_linear_drag,
+                    self.box_quadratic_drag,
                     self.box_angular_drag,
-                    90.0,
-                    9.0,
+                    self.box_floor_stiffness,
+                    self.box_floor_damping,
+                    self.box_floor_friction,
+                    self.box_wall_stiffness,
+                    self.box_wall_damping,
                 ],
                 device=self.model.device,
             )
@@ -560,7 +769,6 @@ class Example:
                     self.state_0.body_qd,
                     self.state_0.body_f,
                     self.model.body_com,
-                    self.model.body_mass,
                     self.box_body_ids_wp,
                     self.box_half_extents_wp,
                     self.particle_radius * 1.75,
@@ -583,7 +791,40 @@ class Example:
                 ],
                 device=self.model.device,
             )
+            wp.launch(
+                kernel=copy_body_kinematics,
+                dim=self.model.body_count,
+                inputs=[
+                    self.state_0.body_q,
+                    self.state_0.body_qd,
+                    self.state_1.body_q,
+                    self.state_1.body_qd,
+                ],
+                device=self.model.device,
+            )
             self.sph_solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
+            wp.launch(
+                kernel=add_body_wrenches,
+                dim=self.model.body_count,
+                inputs=[
+                    self.state_0.body_f,
+                    self.state_1.body_f,
+                ],
+                device=self.model.device,
+            )
+            wp.launch(
+                kernel=clamp_body_water_velocities,
+                dim=len(self.box_body_ids),
+                inputs=[
+                    self.state_0.body_qd,
+                    self.state_0.body_f,
+                    self.box_body_ids_wp,
+                    self.box_max_linear_speed,
+                    self.box_max_angular_speed,
+                    self.box_max_torque,
+                ],
+                device=self.model.device,
+            )
             self.rigid_integrator.integrate_bodies(self.model, self.state_0, self.state_1, self.sim_dt, 0.03)
             wp.launch(
                 kernel=clamp_body_water_velocities,
@@ -884,7 +1125,7 @@ class Example:
             "Depth Edge Falloff", self.viewer.fluid_smoothing_depth_edge_falloff, 0.0, 2.0, "%.2f"
         )
         _, self.viewer.fluid_smoothing_max_samples = ui.slider_int(
-            "Max Radial Samples", self.viewer.fluid_smoothing_max_samples, 0, 4
+            "Max Radial Samples", self.viewer.fluid_smoothing_max_samples, 0, 8
         )
         _, self.viewer.fluid_absorption_strength = ui.slider_float(
             "Depth Absorption", self.viewer.fluid_absorption_strength, 0.0, 5.0, "%.2f"
@@ -945,10 +1186,9 @@ class Example:
         )
         _, self.coupling_damping = ui.slider_float("Water-Box Damping", self.coupling_damping, 0.0, 80.0, "%.1f")
         _, self.splash_velocity_gain = ui.slider_float("Splash Gain", self.splash_velocity_gain, 0.0, 4.0, "%.2f")
-        _, self.water_level = ui.slider_float("Water Level", self.water_level, 0.0, 1.8, "%.2f")
-        _, self.suspension_stiffness = ui.slider_float("Box Buoyancy", self.suspension_stiffness, 0.0, 120.0, "%.1f")
-        _, self.suspension_damping = ui.slider_float("Buoyancy Damping", self.suspension_damping, 0.0, 35.0, "%.1f")
-        _, self.box_fluid_drag = ui.slider_float("Box Fluid Drag", self.box_fluid_drag, 0.0, 12.0, "%.1f")
+        _, self.buoyancy_scale = ui.slider_float("Buoyancy Scale", self.buoyancy_scale, 0.0, 2.0, "%.2f")
+        _, self.box_linear_drag = ui.slider_float("Box Linear Drag", self.box_linear_drag, 0.0, 10.0, "%.1f")
+        _, self.box_quadratic_drag = ui.slider_float("Box Quadratic Drag", self.box_quadratic_drag, 0.0, 25.0, "%.1f")
         _, self.box_angular_drag = ui.slider_float("Box Angular Drag", self.box_angular_drag, 0.0, 8.0, "%.1f")
         _, self.box_max_linear_speed = ui.slider_float("Box Max Speed", self.box_max_linear_speed, 0.5, 8.0, "%.1f")
         _, self.box_max_angular_speed = ui.slider_float(
@@ -986,6 +1226,15 @@ class Example:
         if not np.all(np.isfinite(body_q)):
             raise ValueError("Rigid bodies contain non-finite transforms")
 
+        box_q = body_q[self.box_body_ids]
+        margin = 0.35
+        if np.any(box_q[:, 0] < self.bounds_lower[0] - margin) or np.any(box_q[:, 0] > self.bounds_upper[0] + margin):
+            raise ValueError("Boxes escaped the tank bounds along x")
+        if np.any(box_q[:, 1] < self.bounds_lower[1] - margin) or np.any(box_q[:, 1] > self.bounds_upper[1] + margin):
+            raise ValueError("Boxes escaped the tank bounds along y")
+        if np.any(box_q[:, 2] < self.bounds_lower[2] - margin) or np.any(box_q[:, 2] > self.bounds_upper[2] + margin):
+            raise ValueError("Boxes escaped the tank bounds along z")
+
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
@@ -1002,49 +1251,55 @@ class Example:
             help="Draw colored guide outlines around the pickable rigid bodies.",
         )
 
-        parser.add_argument("--dim-x", type=int, default=48)
-        parser.add_argument("--dim-y", type=int, default=30)
-        parser.add_argument("--dim-z", type=int, default=28)
+        parser.add_argument("--dim-x", type=int, default=68)
+        parser.add_argument("--dim-y", type=int, default=44)
+        parser.add_argument("--dim-z", type=int, default=12)
         parser.add_argument("--spacing", type=float, default=0.040)
         parser.add_argument("--radius", type=float, default=0.030)
         parser.add_argument("--jitter", type=float, default=0.0015)
-        parser.add_argument("--emit-lower", type=float, nargs=3, default=(-1.04, -0.62, 0.06))
+        parser.add_argument("--emit-lower", type=float, nargs=3, default=(-1.24, -0.78, 0.06))
         parser.add_argument("--initial-velocity", type=float, nargs=3, default=(0.0, 0.0, 0.0))
 
         parser.add_argument("--smoothing-length", type=float, default=0.086)
         parser.add_argument("--rest-density", type=float, default=460.0)
         parser.add_argument("--gas-constant", type=float, default=44.0)
-        parser.add_argument("--viscosity", type=float, default=0.06)
+        parser.add_argument("--viscosity", type=float, default=0.035)
         parser.add_argument("--particle-friction", type=float, default=0.10)
         parser.add_argument("--particle-collision-margin", type=float, default=0.0015)
         parser.add_argument("--cohesion", type=float, default=0.035)
         parser.add_argument("--surface-tension", type=float, default=0.0000006)
-        parser.add_argument("--vorticity-confinement", type=float, default=0.00016)
-        parser.add_argument("--solid-pressure", type=float, default=0.28)
+        parser.add_argument("--vorticity-confinement", type=float, default=0.0)
+        parser.add_argument("--solid-pressure", type=float, default=0.08)
         parser.add_argument("--buoyancy", type=float, default=1.0)
-        parser.add_argument("--xsph-strength", type=float, default=0.07)
-        parser.add_argument("--free-surface-drag", type=float, default=0.14)
-        parser.add_argument("--dissipation", type=float, default=0.22)
-        parser.add_argument("--velocity-damping", type=float, default=0.012)
-        parser.add_argument("--sleep-threshold", type=float, default=0.0)
+        parser.add_argument("--xsph-strength", type=float, default=0.18)
+        parser.add_argument("--free-surface-drag", type=float, default=0.50)
+        parser.add_argument("--dissipation", type=float, default=0.85)
+        parser.add_argument("--velocity-damping", type=float, default=0.09)
+        parser.add_argument("--sleep-threshold", type=float, default=0.02)
         parser.add_argument("--boundary-damping", type=float, default=0.10)
         parser.add_argument("--shape-collision-distance", type=float, default=0.030)
         parser.add_argument("--shape-collision-margin", type=float, default=0.0015)
         parser.add_argument("--shape-restitution", type=float, default=0.0)
-        parser.add_argument("--shape-friction", type=float, default=0.12)
-        parser.add_argument("--shape-adhesion", type=float, default=0.10)
+        parser.add_argument("--shape-friction", type=float, default=0.25)
+        parser.add_argument("--shape-adhesion", type=float, default=0.18)
         parser.add_argument("--max-velocity", type=float, default=5.0)
-        parser.add_argument("--max-acceleration", type=float, default=105.0)
-        parser.add_argument("--pbf-iterations", type=int, default=2)
-        parser.add_argument("--pbf-relaxation", type=float, default=0.72)
-        parser.add_argument("--pbf-artificial-pressure", type=float, default=0.014)
-        parser.add_argument("--fluid-diffuse-max-particles", type=int, default=8000)
+        parser.add_argument("--max-acceleration", type=float, default=70.0)
+        parser.add_argument(
+            "--sph-body-feedback",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Apply full SPH shape-contact reactions to rigid bodies (in addition to the example's buoyancy model).",
+        )
+        parser.add_argument("--pbf-iterations", type=int, default=4)
+        parser.add_argument("--pbf-relaxation", type=float, default=0.60)
+        parser.add_argument("--pbf-artificial-pressure", type=float, default=0.002)
+        parser.add_argument("--fluid-diffuse-max-particles", type=int, default=16000)
         parser.add_argument("--fluid-diffuse-threshold", type=float, default=0.92)
-        parser.add_argument("--fluid-diffuse-lifetime", type=float, default=2.2)
+        parser.add_argument("--fluid-diffuse-lifetime", type=float, default=2.8)
         parser.add_argument("--fluid-diffuse-drag", type=float, default=0.92)
         parser.add_argument("--fluid-diffuse-buoyancy", type=float, default=0.20)
         parser.add_argument("--fluid-diffuse-ballistic", type=int, default=9)
-        parser.add_argument("--fluid-diffuse-spawn-probability", type=float, default=0.22)
+        parser.add_argument("--fluid-diffuse-spawn-probability", type=float, default=0.30)
         parser.add_argument("--fluid-render-smoothing", type=float, default=0.45)
         parser.add_argument("--fluid-render-anisotropy-scale", type=float, default=0.82)
         parser.add_argument("--fluid-render-anisotropy-min", type=float, default=0.1)
@@ -1059,44 +1314,54 @@ class Example:
 
         parser.add_argument("--box-count", type=int, default=5)
         parser.add_argument("--box-half-extent", type=float, default=0.115)
-        parser.add_argument("--box-height", type=float, default=0.46)
-        parser.add_argument("--box-mass", type=float, default=1.8)
-        parser.add_argument("--box-density", type=float, default=65.0)
+        parser.add_argument("--box-height", type=float, default=0.70)
+        parser.add_argument(
+            "--box-density-fractions",
+            type=float,
+            nargs="+",
+            default=(0.30, 0.55, 0.85, 0.42, 1.60),
+            help="Box densities as fractions of the fluid rest density; values above 1 sink.",
+        )
         parser.add_argument("--fluid-carve-clearance", type=float, default=0.055)
         parser.add_argument("--pick-stiffness", type=float, default=72.0)
         parser.add_argument("--pick-damping", type=float, default=22.0)
-        parser.add_argument("--coupling-stiffness", type=float, default=260.0)
-        parser.add_argument("--coupling-damping", type=float, default=16.0)
-        parser.add_argument("--splash-velocity-gain", type=float, default=0.32)
-        parser.add_argument("--suspension-stiffness", type=float, default=42.0)
-        parser.add_argument("--suspension-damping", type=float, default=16.0)
-        parser.add_argument("--box-fluid-drag", type=float, default=3.2)
-        parser.add_argument("--box-angular-drag", type=float, default=1.8)
-        parser.add_argument("--box-max-linear-speed", type=float, default=2.5)
-        parser.add_argument("--box-max-angular-speed", type=float, default=10.0)
-        parser.add_argument("--box-max-torque", type=float, default=1.6)
+        parser.add_argument("--coupling-stiffness", type=float, default=90.0)
+        parser.add_argument("--coupling-damping", type=float, default=30.0)
+        parser.add_argument("--splash-velocity-gain", type=float, default=0.15)
+        parser.add_argument("--buoyancy-scale", type=float, default=1.0)
+        parser.add_argument("--box-linear-drag", type=float, default=2.0)
+        parser.add_argument("--box-quadratic-drag", type=float, default=8.0)
+        parser.add_argument("--box-angular-drag", type=float, default=3.0)
+        parser.add_argument("--box-floor-stiffness", type=float, default=600.0)
+        parser.add_argument("--box-floor-damping", type=float, default=20.0)
+        parser.add_argument("--box-floor-friction", type=float, default=8.0)
+        parser.add_argument("--box-wall-stiffness", type=float, default=60.0)
+        parser.add_argument("--box-wall-damping", type=float, default=5.0)
+        parser.add_argument("--box-max-linear-speed", type=float, default=4.0)
+        parser.add_argument("--box-max-angular-speed", type=float, default=14.0)
+        parser.add_argument("--box-max-torque", type=float, default=0.0)
 
         parser.add_argument("--fluid-color", type=float, nargs=3, default=(0.10, 0.50, 0.80))
         parser.add_argument("--fluid-deep-color", type=float, nargs=3, default=(0.01, 0.09, 0.34))
         parser.add_argument("--fluid-color-gradient-strength", type=float, default=0.20)
         parser.add_argument("--fluid-opacity", type=float, default=1.00)
         parser.add_argument("--fluid-radius-scale", type=float, default=1.34)
-        parser.add_argument("--fluid-thickness-scale", type=float, default=2.39)
+        parser.add_argument("--fluid-thickness-scale", type=float, default=0.55)
         parser.add_argument("--fluid-smoothing-iterations", type=int, default=7)
         parser.add_argument("--fluid-smoothing-radius", type=float, default=3.83)
-        parser.add_argument("--fluid-smoothing-depth-edge-falloff", type=float, default=1.39)
+        parser.add_argument("--fluid-smoothing-depth-edge-falloff", type=float, default=5.5)
         parser.add_argument("--fluid-smoothing-max-samples", type=int, default=4)
         parser.add_argument("--fluid-reflection-strength", type=float, default=0.528)
         parser.add_argument("--fluid-refraction-strength", type=float, default=0.038)
         parser.add_argument("--fluid-env-map-strength", type=float, default=1.02)
-        parser.add_argument("--fluid-env-reflection-lod", type=float, default=0.42)
+        parser.add_argument("--fluid-env-reflection-lod", type=float, default=1.8)
         parser.add_argument("--fluid-env-color-preserve", type=float, default=0.57)
-        parser.add_argument("--fluid-absorption-strength", type=float, default=2.66)
+        parser.add_argument("--fluid-absorption-strength", type=float, default=1.2)
         parser.add_argument("--fluid-depth-visualization-strength", type=float, default=2.13)
         parser.add_argument("--fluid-caustic-strength", type=float, default=3.03)
         parser.add_argument("--fluid-caustic-scale", type=float, default=37.1)
         parser.add_argument("--fluid-floor-caustic-strength", type=float, default=1.15)
-        parser.add_argument("--fluid-surface-shadow-strength", type=float, default=0.03)
+        parser.add_argument("--fluid-surface-shadow-strength", type=float, default=0.35)
         parser.add_argument("--fluid-foam-strength", type=float, default=0.99)
         parser.add_argument("--fluid-foam-scale", type=float, default=5.0)
         parser.add_argument("--fluid-diffuse-radius", type=float, default=0.012)
@@ -1114,8 +1379,8 @@ class Example:
         parser.add_argument("--fluid-shadow-size", type=int, default=2048)
         parser.add_argument("--sun-direction", type=float, nargs=3, default=(0.78, -0.56, 0.20))
         parser.add_argument("--angular-damping", type=float, default=0.04)
-        parser.add_argument("--camera-pos", type=float, nargs=3, default=(1.18, -1.28, 0.74))
-        parser.add_argument("--camera-pitch", type=float, default=-18.0)
+        parser.add_argument("--camera-pos", type=float, nargs=3, default=(1.45, -1.55, 1.30))
+        parser.add_argument("--camera-pitch", type=float, default=-27.0)
         parser.add_argument("--camera-yaw", type=float, default=132.0)
         return parser
 

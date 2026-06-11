@@ -948,8 +948,94 @@ class MeshInstancerGL:
         gl.glBindVertexArray(0)
 
 
+@wp.kernel
+def _pack_fluid_particle_data(
+    points: wp.array[wp.vec3],
+    radii: wp.array[float],
+    use_radii: int,
+    uniform_radius: float,
+    radius_scale: float,
+    anisotropy: wp.array[wp.vec4],
+    anisotropy_secondary: wp.array[wp.vec4],
+    anisotropy_tertiary: wp.array[wp.vec4],
+    dest: wp.array[float],
+    bounds: wp.array[float],
+):
+    tid = wp.tid()
+    p = points[tid]
+    a = anisotropy[tid]
+    a2 = anisotropy_secondary[tid]
+    a3 = anisotropy_tertiary[tid]
+    r = uniform_radius
+    if use_radii != 0:
+        r = radii[tid]
+    r *= radius_scale
+    if a[3] <= 0.0:
+        # Inactive particles collapse to zero-radius splats the shaders skip.
+        r = 0.0
+
+    base = tid * 16
+    dest[base + 0] = p[0]
+    dest[base + 1] = p[1]
+    dest[base + 2] = p[2]
+    dest[base + 3] = r
+    dest[base + 4] = a[0]
+    dest[base + 5] = a[1]
+    dest[base + 6] = a[2]
+    dest[base + 7] = a[3]
+    dest[base + 8] = a2[0]
+    dest[base + 9] = a2[1]
+    dest[base + 10] = a2[2]
+    dest[base + 11] = a2[3]
+    dest[base + 12] = a3[0]
+    dest[base + 13] = a3[1]
+    dest[base + 14] = a3[2]
+    dest[base + 15] = a3[3]
+
+    if r > 0.0:
+        wp.atomic_min(bounds, 0, p[0] - r)
+        wp.atomic_min(bounds, 1, p[1] - r)
+        wp.atomic_min(bounds, 2, p[2] - r)
+        wp.atomic_max(bounds, 3, p[0] + r)
+        wp.atomic_max(bounds, 4, p[1] + r)
+        wp.atomic_max(bounds, 5, p[2] + r)
+
+
 class FluidGL:
     """GPU buffer for screen-space fluid particle samples."""
+
+    # Material/tuning fields preserved across capacity resizes.
+    _MATERIAL_FIELDS = (
+        "hidden",
+        "color",
+        "deep_color",
+        "color_gradient_strength",
+        "opacity",
+        "radius_scale",
+        "thickness_scale",
+        "smoothing_iterations",
+        "smoothing_radius",
+        "smoothing_depth_edge_falloff",
+        "smoothing_max_samples",
+        "reflection_strength",
+        "refraction_strength",
+        "env_map_strength",
+        "env_reflection_lod",
+        "env_color_preserve",
+        "absorption_strength",
+        "depth_visualization_strength",
+        "caustic_strength",
+        "caustic_scale",
+        "floor_caustic_strength",
+        "surface_shadow_strength",
+        "foam_strength",
+        "foam_scale",
+        "anisotropy_strength",
+        "anisotropy_min",
+        "anisotropy_max",
+        "anisotropy_max_particles",
+        "render_smoothing",
+    )
 
     def __init__(self, capacity: int):
         gl = RendererGL.gl
@@ -961,22 +1047,22 @@ class FluidGL:
         self.color_gradient_strength = 0.20
         self.opacity = 1.00
         self.radius_scale = 1.34
-        self.thickness_scale = 2.39
+        self.thickness_scale = 0.55
         self.smoothing_iterations = 7
         self.smoothing_radius = 3.83
-        self.smoothing_depth_edge_falloff = 1.39
+        self.smoothing_depth_edge_falloff = 5.5
         self.smoothing_max_samples = 4
         self.reflection_strength = 0.528
         self.refraction_strength = 0.038
         self.env_map_strength = 1.02
-        self.env_reflection_lod = 0.42
+        self.env_reflection_lod = 1.8
         self.env_color_preserve = 0.57
-        self.absorption_strength = 2.66
+        self.absorption_strength = 1.2
         self.depth_visualization_strength = 2.13
         self.caustic_strength = 3.03
         self.caustic_scale = 37.1
         self.floor_caustic_strength = 1.15
-        self.surface_shadow_strength = 0.03
+        self.surface_shadow_strength = 0.35
         self.foam_strength = 0.99
         self.foam_scale = 5.0
         self.bounds_valid = False
@@ -988,6 +1074,11 @@ class FluidGL:
         self.anisotropy_max_particles = 25000
         self.render_smoothing = 0.45
         self._particle_stride = 16 * 4
+        self._packed_gpu = None
+        self._bounds_gpu = None
+        self._dummy_radii_gpu = None
+        self.vertex_cuda_buffer = None
+        self._bounds_reset = np.array([1.0e9, 1.0e9, 1.0e9, -1.0e9, -1.0e9, -1.0e9], dtype=np.float32)
 
         self.vao = gl.GLuint()
         self.vbo = gl.GLuint()
@@ -1010,6 +1101,10 @@ class FluidGL:
 
     def destroy(self):
         gl = RendererGL.gl
+        self.vertex_cuda_buffer = None
+        self._packed_gpu = None
+        self._bounds_gpu = None
+        self._dummy_radii_gpu = None
         if getattr(self, "vao", None) is not None:
             gl.glDeleteVertexArrays(1, self.vao)
             gl.glDeleteBuffers(1, self.vbo)
@@ -1017,8 +1112,11 @@ class FluidGL:
             self.vbo = None
 
     def _resize(self, capacity: int):
+        preserved = {name: getattr(self, name) for name in self._MATERIAL_FIELDS}
         self.destroy()
         self.__init__(capacity)
+        for name, value in preserved.items():
+            setattr(self, name, value)
 
     def update(
         self,
@@ -1059,6 +1157,7 @@ class FluidGL:
             self.bounds_valid = False
             return
 
+        gl = RendererGL.gl
         self.hidden = hidden
         self.color = tuple(float(c) for c in color)
         self.deep_color = tuple(float(c) for c in deep_color)
@@ -1069,7 +1168,7 @@ class FluidGL:
         self.smoothing_iterations = max(int(smoothing_iterations), 0)
         self.smoothing_radius = float(max(smoothing_radius, 0.0))
         self.smoothing_depth_edge_falloff = float(max(smoothing_depth_edge_falloff, 0.0))
-        self.smoothing_max_samples = max(min(int(smoothing_max_samples), 4), 0)
+        self.smoothing_max_samples = max(min(int(smoothing_max_samples), 8), 0)
         self.reflection_strength = float(max(reflection_strength, 0.0))
         self.refraction_strength = float(max(refraction_strength, 0.0))
         self.env_map_strength = float(max(env_map_strength, 0.0))
@@ -1083,6 +1182,22 @@ class FluidGL:
         self.surface_shadow_strength = float(max(surface_shadow_strength, 0.0))
         self.foam_strength = float(max(foam_strength, 0.0))
         self.foam_scale = float(max(foam_scale, 1.0))
+
+        # Fast path: when the solver provides device-side render buffers, pack
+        # the interleaved vertex data and bounds on the GPU. This avoids four
+        # separate device-to-host copies plus numpy filtering per frame.
+        scalar_radius = radii is None or isinstance(radii, (int, float, np.integer, np.floating))
+        if (
+            render_points is not None
+            and anisotropy is not None
+            and anisotropy_secondary is not None
+            and anisotropy_tertiary is not None
+            and isinstance(render_points, wp.array)
+            and render_points.device.is_cuda
+            and (scalar_radius or (isinstance(radii, wp.array) and radii.device == render_points.device))
+        ):
+            self._update_from_device(render_points, radii, anisotropy, anisotropy_secondary, anisotropy_tertiary)
+            return
 
         host_points = points.numpy().astype(np.float32, copy=False)
         source_count = host_points.shape[0]
@@ -1175,6 +1290,78 @@ class FluidGL:
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
         gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, particle_data.nbytes, particle_data.ctypes.data)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+
+    def _update_from_device(self, render_points, radii, anisotropy, anisotropy_secondary, anisotropy_tertiary):
+        gl = RendererGL.gl
+        count = int(len(render_points))
+        if count == 0:
+            self.active_particles = 0
+            self.bounds_valid = False
+            return
+        if count > self.capacity:
+            self._resize(max(count, self.capacity * 2))
+
+        device = render_points.device
+        if self._packed_gpu is None or len(self._packed_gpu) < self.capacity * 16 or self._packed_gpu.device != device:
+            self._packed_gpu = wp.empty(self.capacity * 16, dtype=float, device=device)
+            self._bounds_gpu = wp.empty(6, dtype=float, device=device)
+            self._dummy_radii_gpu = wp.zeros(1, dtype=float, device=device)
+        self._bounds_gpu.assign(self._bounds_reset)
+
+        if isinstance(radii, wp.array):
+            radii_array = radii
+            use_radii = 1
+            uniform_radius = 0.0
+        else:
+            radii_array = self._dummy_radii_gpu
+            use_radii = 0
+            uniform_radius = 0.1 if radii is None else float(radii)
+
+        use_interop = ENABLE_CUDA_INTEROP
+        dest = None
+        if use_interop:
+            if self.vertex_cuda_buffer is None:
+                self.vertex_cuda_buffer = wp.RegisteredGLBuffer(
+                    int(self.vbo.value), device, flags=wp.RegisteredGLBuffer.WRITE_DISCARD
+                )
+            dest = self.vertex_cuda_buffer.map(dtype=wp.float32, shape=(self.capacity * 16,))
+        else:
+            dest = self._packed_gpu
+
+        wp.launch(
+            _pack_fluid_particle_data,
+            dim=count,
+            inputs=[
+                render_points,
+                radii_array,
+                use_radii,
+                uniform_radius,
+                self.radius_scale,
+                anisotropy,
+                anisotropy_secondary,
+                anisotropy_tertiary,
+                dest,
+                self._bounds_gpu,
+            ],
+            device=device,
+        )
+
+        if use_interop:
+            self.vertex_cuda_buffer.unmap()
+        else:
+            packed_host = self._packed_gpu[: count * 16].numpy()
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+            gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, packed_host.nbytes, packed_host.ctypes.data)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+
+        bounds_host = self._bounds_gpu.numpy()
+        self.active_particles = count
+        if bounds_host[0] <= bounds_host[3]:
+            self.bounds_valid = True
+            self.bounds_lower = bounds_host[:3].copy()
+            self.bounds_upper = bounds_host[3:].copy()
+        else:
+            self.bounds_valid = False
 
     def _compute_render_anisotropy(
         self, points: np.ndarray, radii: np.ndarray
@@ -2634,7 +2821,7 @@ class RendererGL:
             depth_edge_falloff,
             max_radial_samples,
             guide_texture=None,
-            max_depth_delta=0.25,
+            max_depth_delta=0.55,
         )
 
     def _copy_frame_to_fluid_scene(self) -> None:
@@ -2665,8 +2852,8 @@ class RendererGL:
         if requested_iterations == 0:
             return 0, 0, 1.0
 
-        depth_iterations = min(requested_iterations, 4)
-        thickness_iterations = max(1, min(depth_iterations // 2, 2))
+        depth_iterations = min(requested_iterations, 6)
+        thickness_iterations = max(1, min(depth_iterations // 2, 3))
         radius_scale = float(np.sqrt(requested_iterations / max(depth_iterations, 1)))
         return depth_iterations, thickness_iterations, radius_scale
 

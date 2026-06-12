@@ -104,7 +104,7 @@ class SolverSPH(SolverBase):
             velocity points out of the fluid (breaking crests, splashes).
         diffuse_lifetime: Diffuse particle lifetime [s].
         diffuse_drag: Blend rate toward neighboring fluid velocity [1/s].
-        diffuse_buoyancy: Acceleration scale opposing gravity when a diffuse
+        diffuse_buoyancy: Fraction of gravity canceled while a diffuse
             particle is inside the fluid neighborhood.
         diffuse_ballistic: Neighbor count below which a diffuse particle falls
             ballistically instead of advecting with the fluid.

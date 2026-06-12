@@ -742,7 +742,11 @@ def test_sph_diffuse_particles_spawn_inside_bounds(test, device):
 def test_sph_diffuse_spawn_prefers_free_slots(test, device):
     builder = newton.ModelBuilder(gravity=0.0)
     builder.default_particle_radius = 0.04
-    builder.add_particle(pos=(0.0, 0.0, 0.2), vel=(4.0, 0.0, 0.0), mass=0.1, radius=0.04)
+    # Two particles separating fast: the trapped-air/wave-crest potential
+    # requires separating relative motion with outward-pointing velocity, so an
+    # isolated fast particle alone does not spawn foam.
+    builder.add_particle(pos=(0.0, 0.0, 0.2), vel=(2.0, 0.0, 0.0), mass=0.1, radius=0.04)
+    builder.add_particle(pos=(-0.05, 0.0, 0.2), vel=(-2.0, 0.0, 0.0), mass=0.1, radius=0.04)
     model = builder.finalize(device=device)
     state_0 = model.state()
     state_1 = model.state()

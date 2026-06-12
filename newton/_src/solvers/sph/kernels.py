@@ -1304,7 +1304,10 @@ def update_sph_diffuse_particles(
         target_v = weighted_v / weight_sum
         blend = wp.min(wp.max(diffuse_drag * dt, 0.0), 1.0)
         v = v * (1.0 - blend) + target_v * blend
-        v -= g * (diffuse_buoyancy * dt)
+        # Buoyancy cancels a fraction of gravity (1 = neutrally buoyant); it
+        # must not become a net upward thrust or foam launches out of the
+        # water and hovers above the surface.
+        v += g * ((1.0 - diffuse_buoyancy) * dt)
     else:
         v += g * dt
 

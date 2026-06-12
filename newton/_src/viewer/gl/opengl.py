@@ -3302,6 +3302,9 @@ class RendererGL:
             projection_matrix = np.asarray(self._projection_matrix, dtype=np.float32).reshape(4, 4).transpose()
             inv_projection_matrix = np.linalg.inv(projection_matrix).transpose()
             sun_view = view_matrix[:3, :3] @ sun
+            up_world = np.zeros(3, dtype=np.float32)
+            up_world[int(self.camera.up_axis)] = 1.0
+            up_view = view_matrix[:3, :3] @ up_world
             for batch in active_batches:
                 batch.sort_for_view(self._view_matrix)
                 self._fluid_diffuse_shader.update(
@@ -3311,6 +3314,7 @@ class RendererGL:
                     radius=batch.radius,
                     motion_blur_scale=batch.motion_blur_scale,
                     diffuse_expansion=batch.expansion,
+                    up_axis_view=(float(up_view[0]), float(up_view[1]), float(up_view[2])),
                     diffuse_color=batch.color,
                     alpha=batch.alpha,
                     scene_depth_unit=0,

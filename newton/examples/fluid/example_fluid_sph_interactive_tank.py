@@ -1351,7 +1351,7 @@ class Example:
         parser.add_argument("--fluid-diffuse-threshold", type=float, default=0.55)
         parser.add_argument("--fluid-diffuse-lifetime", type=float, default=2.8)
         parser.add_argument("--fluid-diffuse-drag", type=float, default=0.92)
-        parser.add_argument("--fluid-diffuse-buoyancy", type=float, default=0.20)
+        parser.add_argument("--fluid-diffuse-buoyancy", type=float, default=0.9)
         parser.add_argument("--fluid-diffuse-ballistic", type=int, default=9)
         parser.add_argument("--fluid-diffuse-spawn-probability", type=float, default=0.45)
         parser.add_argument("--fluid-render-smoothing", type=float, default=0.45)

@@ -743,6 +743,7 @@ uniform mat4 projection;
 uniform float radius;
 uniform float motion_blur_scale;
 uniform float diffuse_expansion;
+uniform vec3 up_axis_view;
 
 out vec2 TexCoord;
 out float ParticleAlpha;
@@ -788,6 +789,19 @@ void main()
     vec3 up = vec3(0.0, base_radius * expansion, 0.0);
     vec3 right = vec3(base_radius * expansion, 0.0, 0.0);
     float stretch_fade = 1.0 / max(death_expansion * death_expansion, 1.0);
+
+    // Surface foam patches lie flat on the water: squash the sprite along the
+    // screen projection of world-up so foam reads as pancakes at grazing
+    // angles while staying round when seen from above.
+    vec2 up_screen = up_axis_view.xy;
+    float up_screen_len = length(up_screen);
+    float flatten = foam_density * clamp(up_screen_len * 1.4, 0.0, 1.0);
+    if (flatten > 1.0e-3 && up_screen_len > 1.0e-4) {
+        vec2 minor_dir = up_screen / up_screen_len;
+        float r = base_radius * expansion;
+        up = vec3(minor_dir, 0.0) * (r * (1.0 - 0.55 * flatten));
+        right = vec3(-minor_dir.y, minor_dir.x, 0.0) * (r * (1.0 + 0.45 * flatten));
+    }
 
     // Flex stretches diffuse sprites along their velocity, which makes foam
     // read as elongated streaks that follow the flow instead of round dots.
@@ -2005,6 +2019,7 @@ class FluidDiffuseShader(ShaderGL):
             self.loc_radius = self._get_uniform_location("radius")
             self.loc_motion_blur_scale = self._get_uniform_location("motion_blur_scale")
             self.loc_diffuse_expansion = self._get_uniform_location("diffuse_expansion")
+            self.loc_up_axis_view = self._get_uniform_location("up_axis_view")
             self.loc_diffuse_color = self._get_uniform_location("diffuse_color")
             self.loc_alpha = self._get_uniform_location("alpha")
             self.loc_scene_depth_texture = self._get_uniform_location("scene_depth_texture")
@@ -2028,6 +2043,7 @@ class FluidDiffuseShader(ShaderGL):
         radius: float,
         motion_blur_scale: float,
         diffuse_expansion: float,
+        up_axis_view: tuple[float, float, float],
         diffuse_color: tuple[float, float, float],
         alpha: float,
         scene_depth_unit: int,
@@ -2048,6 +2064,7 @@ class FluidDiffuseShader(ShaderGL):
             self._gl.glUniform1f(self.loc_radius, float(radius))
             self._gl.glUniform1f(self.loc_motion_blur_scale, float(motion_blur_scale))
             self._gl.glUniform1f(self.loc_diffuse_expansion, float(diffuse_expansion))
+            self._gl.glUniform3f(self.loc_up_axis_view, *up_axis_view)
             self._gl.glUniform3f(self.loc_diffuse_color, *diffuse_color)
             self._gl.glUniform1f(self.loc_alpha, float(alpha))
             self._gl.glUniform1i(self.loc_scene_depth_texture, scene_depth_unit)

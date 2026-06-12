@@ -1391,7 +1391,7 @@ def spawn_sph_diffuse_particles(
     separation_len = wp.length(separation)
     if separation_len > EPS and speed > EPS:
         crest = wp.max(wp.dot(separation / separation_len, vi / speed), 0.0)
-    potential = divergence * (0.3 + 0.7 * crest) + 0.5 * speed_sq * crest
+    potential = divergence * (0.3 + 0.7 * crest) + 0.5 * speed_sq * crest * crest
     threshold = wp.max(diffuse_threshold, EPS)
     if potential <= threshold:
         return

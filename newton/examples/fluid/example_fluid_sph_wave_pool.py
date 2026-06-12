@@ -416,7 +416,7 @@ class Example:
         parser.add_argument("--paddle-x", type=float, default=-2.20)
         parser.add_argument("--paddle-height", type=float, default=0.55)
         parser.add_argument("--paddle-amplitude", type=float, default=0.26)
-        parser.add_argument("--paddle-period", type=float, default=2.0)
+        parser.add_argument("--paddle-period", type=float, default=0.8)
         parser.add_argument("--beach-start", type=float, default=0.20)
         parser.add_argument("--beach-length", type=float, default=2.6)
         parser.add_argument("--beach-angle-deg", type=float, default=13.0)

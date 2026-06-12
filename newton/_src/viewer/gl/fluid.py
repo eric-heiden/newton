@@ -1169,7 +1169,7 @@ class FluidRenderer:
         gl.glEnableVertexAttribArray(0)
         gl.glBindVertexArray(0)
 
-    def _make_texture(self, internal_format, fmt, dtype, width=None, height=None):
+    def _make_texture(self, internal_format, fmt, dtype, width=None, height=None, filter_mode=None):
         gl = self._gl
         tex = gl.GLuint()
         gl.glGenTextures(1, tex)
@@ -1185,8 +1185,10 @@ class FluidRenderer:
             dtype,
             None,
         )
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        if filter_mode is None:
+            filter_mode = gl.GL_LINEAR
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, filter_mode)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, filter_mode)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
@@ -1215,8 +1217,13 @@ class FluidRenderer:
         self._buf_width = max(int(width * self.RESOLUTION_SCALE), 1)
         self._buf_height = max(int(height * self.RESOLUTION_SCALE), 1)
         bw, bh = self._buf_width, self._buf_height
-        self._depth_tex = self._make_texture(gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT, bw, bh)
-        self._depth_smooth_tex = self._make_texture(gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT, bw, bh)
+        # NEAREST filtering: bilinear at the silhouette blends valid depths
+        # with the invalid 0 background, creating a bright rim of phantom
+        # surface pixels around the water.
+        self._depth_tex = self._make_texture(gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT, bw, bh, filter_mode=gl.GL_NEAREST)
+        self._depth_smooth_tex = self._make_texture(
+            gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT, bw, bh, filter_mode=gl.GL_NEAREST
+        )
         self._thickness_tex = self._make_texture(gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT, bw, bh)
         self._scene_tex = self._make_texture(gl.GL_RGBA8, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE)
         self._scene_depth_half = self._make_texture(

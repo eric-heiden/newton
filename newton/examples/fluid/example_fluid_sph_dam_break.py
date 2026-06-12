@@ -395,8 +395,8 @@ class Example:
         parser.add_argument("--fluid-ior", type=float, default=1.0)
         parser.add_argument("--fluid-radius-scale", type=float, default=1.8)
         parser.add_argument("--fluid-blur-radius", type=float, default=0.11)
-        parser.add_argument("--foam-color", type=float, nargs=4, default=(0.9, 0.95, 1.0, 0.8))
-        parser.add_argument("--foam-radius", type=float, default=0.02)
+        parser.add_argument("--foam-color", type=float, nargs=4, default=(0.9, 0.95, 1.0, 1.6))
+        parser.add_argument("--foam-radius", type=float, default=0.024)
         parser.add_argument("--foam-motion-blur", type=float, default=1.0)
 
         parser.add_argument("--sun-direction", type=float, nargs=3, default=(0.78, -0.56, 0.20))

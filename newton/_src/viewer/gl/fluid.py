@@ -287,7 +287,11 @@ void main()
     float minT;
     float maxT;
     if (solveQuadratic(a, 2.0 * b, c, minT, maxT)) {
-        vec3 eyePos = viewDir.xyz * minT;
+        // inside the ellipsoid the entry point lies behind the camera; use
+        // the exit point so submerged views see a closed surface
+        float t = minT > 0.0 ? minT : maxT;
+        if (t <= 0.0) discard;
+        vec3 eyePos = viewDir.xyz * t;
         vec4 clipPos = projection * vec4(eyePos, 1.0);
         clipPos.z /= clipPos.w;
         FragEyeZ = eyePos.z;
@@ -472,6 +476,7 @@ uniform float ior;
 uniform vec3 sky_color;
 uniform vec3 ground_color;
 uniform vec3 up_vec;
+uniform float underwater_radius;
 
 float sqr(float x) { return x * x; }
 float cube(float x) { return x * x * x; }
@@ -578,7 +583,15 @@ void main()
         * (1.0 - color.w);
     vec3 specular = vec3(1.2 * pow(max(dot(h, n), 0.0), 400.0));
 
-    FragColor.xyz = diffuse + (mix(refractCol, reflectCol, fresnel) + specular) * color.w;
+    vec3 surfaceCol = diffuse + (mix(refractCol, reflectCol, fresnel) + specular) * color.w;
+
+    // When the surface sits at the near plane the camera is inside the
+    // water: shade the pixel as looking through the volume (absorbed scene,
+    // no surface lighting) instead of showing the splats in front of the eye.
+    float submerged = 1.0 - smoothstep(2.0 * underwater_radius, 5.0 * underwater_radius, -eyeZ);
+    vec3 throughCol = texture(scene_tex, TexCoord).xyz * transmission
+        + color.xyz * (1.0 - color.w) * 0.15;
+    FragColor.xyz = mix(surfaceCol, throughCol, submerged);
     FragColor.w = 1.0;
 
     vec4 clipPos = projection * vec4(0.0, 0.0, eyeZ, 1.0);
@@ -853,7 +866,7 @@ class FluidBatch:
         self.color = (0.113, 0.425, 0.55, 0.8)
         self.ior = 1.0
         self.blur_radius_world = 0.06
-        self.max_blur_radius = 14.0
+        self.max_blur_radius = 8.0
         self.shadow_opacity = 0.5
         self.thickness_scale = 4.0
         self.thickness_gain = 0.0015
@@ -1117,10 +1130,17 @@ class DiffuseBatch:
 class FluidRenderer:
     """Owns the fluid render targets and programs; driven by RendererGL."""
 
+    # Fluid depth/thickness/blur run at reduced resolution: the bilateral
+    # blur cost scales with covered pixels times taps squared, and half
+    # resolution also doubles the filter's effective world-space reach.
+    RESOLUTION_SCALE = 0.5
+
     def __init__(self, gl):
         self._gl = gl
         self._width = 0
         self._height = 0
+        self._buf_width = 0
+        self._buf_height = 0
 
         self._depth_tex = None
         self._depth_smooth_tex = None
@@ -1149,12 +1169,22 @@ class FluidRenderer:
         gl.glEnableVertexAttribArray(0)
         gl.glBindVertexArray(0)
 
-    def _make_texture(self, internal_format, fmt, dtype):
+    def _make_texture(self, internal_format, fmt, dtype, width=None, height=None):
         gl = self._gl
         tex = gl.GLuint()
         gl.glGenTextures(1, tex)
         gl.glBindTexture(gl.GL_TEXTURE_2D, tex)
-        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, internal_format, self._width, self._height, 0, fmt, dtype, None)
+        gl.glTexImage2D(
+            gl.GL_TEXTURE_2D,
+            0,
+            internal_format,
+            width if width is not None else self._width,
+            height if height is not None else self._height,
+            0,
+            fmt,
+            dtype,
+            None,
+        )
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
@@ -1166,7 +1196,13 @@ class FluidRenderer:
         gl = self._gl
         if width == self._width and height == self._height and self._fbo is not None:
             return
-        for tex in (self._depth_tex, self._depth_smooth_tex, self._thickness_tex, self._scene_tex):
+        for tex in (
+            self._depth_tex,
+            self._depth_smooth_tex,
+            self._thickness_tex,
+            self._scene_tex,
+            getattr(self, "_scene_depth_half", None),
+        ):
             if tex is not None:
                 gl.glDeleteTextures(1, tex)
         if self._depth_buffer is not None:
@@ -1176,15 +1212,21 @@ class FluidRenderer:
 
         self._width = width
         self._height = height
-        self._depth_tex = self._make_texture(gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT)
-        self._depth_smooth_tex = self._make_texture(gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT)
-        self._thickness_tex = self._make_texture(gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT)
+        self._buf_width = max(int(width * self.RESOLUTION_SCALE), 1)
+        self._buf_height = max(int(height * self.RESOLUTION_SCALE), 1)
+        bw, bh = self._buf_width, self._buf_height
+        self._depth_tex = self._make_texture(gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT, bw, bh)
+        self._depth_smooth_tex = self._make_texture(gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT, bw, bh)
+        self._thickness_tex = self._make_texture(gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT, bw, bh)
         self._scene_tex = self._make_texture(gl.GL_RGBA8, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE)
+        self._scene_depth_half = self._make_texture(
+            gl.GL_DEPTH_COMPONENT24, gl.GL_DEPTH_COMPONENT, gl.GL_UNSIGNED_INT, bw, bh
+        )
 
         self._depth_buffer = gl.GLuint()
         gl.glGenRenderbuffers(1, self._depth_buffer)
         gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, self._depth_buffer)
-        gl.glRenderbufferStorage(gl.GL_RENDERBUFFER, gl.GL_DEPTH_COMPONENT24, width, height)
+        gl.glRenderbufferStorage(gl.GL_RENDERBUFFER, gl.GL_DEPTH_COMPONENT24, bw, bh)
         gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, 0)
 
         self._fbo = gl.GLuint()
@@ -1248,11 +1290,12 @@ class FluidRenderer:
         inv_projection = np.linalg.inv(projection)
         light_transform = np.asarray(host._light_space_matrix, dtype=np.float32).reshape(4, 4).T
 
+        bw, bh = self._buf_width, self._buf_height
         tan_half_fov = 1.0 / projection[1, 1]
         aspect = projection[1, 1] / projection[0, 0]
-        point_scale = height / (2.0 * tan_half_fov)  # Flex: pixels = r * point_scale / w (diameter)
+        blur_point_scale = bh / (2.0 * tan_half_fov)  # projected size in fluid-buffer pixels
         clip_pos_to_eye = (tan_half_fov * aspect, tan_half_fov)
-        inv_viewport = (1.0 / width, 1.0 / height)
+        inv_buf_viewport = (1.0 / bw, 1.0 / bh)
 
         sun = np.asarray(host._sun_direction, dtype=np.float32)
         light_dir = -sun / max(np.linalg.norm(sun), 1.0e-6)
@@ -1270,9 +1313,9 @@ class FluidRenderer:
             gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, host._frame_fbo)
             gl.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, gl.GL_COLOR_BUFFER_BIT, gl.GL_NEAREST)
 
-            # 2. ellipsoid depth
+            # 2. ellipsoid depth (reduced resolution)
             self._attach(self._depth_tex, with_depth_buffer=True)
-            gl.glViewport(0, 0, width, height)
+            gl.glViewport(0, 0, bw, bh)
             gl.glClearBufferfv(gl.GL_COLOR, 0, (gl.GLfloat * 4)(0.0, 0.0, 0.0, 0.0))
             gl.glClear(gl.GL_DEPTH_BUFFER_BIT)
             gl.glEnable(gl.GL_DEPTH_TEST)
@@ -1284,12 +1327,16 @@ class FluidRenderer:
                 prog.set_mat4("projection", projection)
                 prog.set_mat4("inv_view", inv_view)
                 prog.set_mat4("inv_projection", inv_projection)
-                prog.set_vec2("inv_viewport", inv_viewport)
+                prog.set_vec2("inv_viewport", inv_buf_viewport)
                 for batch in batches:
                     batch.draw()
 
-            # 3. thickness (additive point sprites, depth-tested against the scene)
-            self._attach(self._thickness_tex, with_depth_buffer=False, depth_tex=host._frame_depth_texture)
+            # 3. thickness billboards, depth-tested against a downsampled
+            # copy of the scene depth
+            gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, host._frame_fbo)
+            self._attach(self._thickness_tex, with_depth_buffer=False, depth_tex=self._scene_depth_half)
+            gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, host._frame_fbo)
+            gl.glBlitFramebuffer(0, 0, width, height, 0, 0, bw, bh, gl.GL_DEPTH_BUFFER_BIT, gl.GL_NEAREST)
             gl.glClearBufferfv(gl.GL_COLOR, 0, (gl.GLfloat * 4)(0.0, 0.0, 0.0, 0.0))
             gl.glEnable(gl.GL_DEPTH_TEST)
             gl.glDepthMask(False)
@@ -1313,7 +1360,7 @@ class FluidRenderer:
                 gl.glBindTexture(gl.GL_TEXTURE_2D, self._depth_tex)
                 prog.set_int("depth_tex", 0)
                 prog.set_float("blur_radius_world", material.blur_radius_world)
-                prog.set_float("blur_scale", point_scale)
+                prog.set_float("blur_scale", blur_point_scale)
                 prog.set_float("max_blur_radius", material.max_blur_radius)
                 self._draw_quad()
 
@@ -1347,11 +1394,12 @@ class FluidRenderer:
                 prog.set_mat4("inv_view", inv_view)
                 prog.set_mat4("light_transform", light_transform)
                 prog.set_vec3("light_dir", light_dir)
-                prog.set_vec2("inv_tex_scale", inv_viewport)
+                prog.set_vec2("inv_tex_scale", inv_buf_viewport)
                 prog.set_vec2("clip_pos_to_eye", clip_pos_to_eye)
                 prog.set_vec2("tex_scale", (1.0 / aspect, 1.0))
                 prog.set_vec4("color", material.color)
                 prog.set_float("ior", material.ior)
+                prog.set_float("underwater_radius", material.blur_radius_world)
                 prog.set_vec3("sky_color", host.sky_upper)
                 prog.set_vec3("ground_color", host.ambient_ground)
                 prog.set_vec3("up_vec", up_vec)

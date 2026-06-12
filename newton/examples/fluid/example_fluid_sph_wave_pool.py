@@ -82,6 +82,7 @@ class Example:
         self.foam_color = tuple(args.foam_color)
         self.foam_radius = args.foam_radius
         self.foam_motion_blur = args.foam_motion_blur
+        self.foam_lifetime = args.fluid_diffuse_lifetime
 
         builder = newton.ModelBuilder(gravity=args.gravity)
         builder.default_particle_radius = args.radius
@@ -338,6 +339,7 @@ class Example:
             radius=self.foam_radius,
             color=self.foam_color,
             motion_blur_scale=self.foam_motion_blur,
+            lifetime=self.foam_lifetime,
             hidden=False,
         )
 

@@ -440,6 +440,7 @@ class Example:
         self.foam_color = tuple(args.foam_color)
         self.foam_radius = args.foam_radius
         self.foam_motion_blur = args.foam_motion_blur
+        self.foam_lifetime = args.fluid_diffuse_lifetime
 
         builder = newton.ModelBuilder(gravity=args.gravity)
         builder.default_particle_radius = args.radius
@@ -929,6 +930,7 @@ class Example:
             radius=self.foam_radius,
             color=self.foam_color,
             motion_blur_scale=self.foam_motion_blur,
+            lifetime=self.foam_lifetime,
             hidden=False,
         )
 
@@ -1189,25 +1191,25 @@ class Example:
         parser.add_argument("--smoothing-length", type=float, default=0.0731)
         parser.add_argument("--rest-density", type=float, default=460.0)
         parser.add_argument("--gas-constant", type=float, default=44.0)
-        parser.add_argument("--viscosity", type=float, default=0.010)
-        parser.add_argument("--particle-friction", type=float, default=0.10)
+        parser.add_argument("--viscosity", type=float, default=0.005)
+        parser.add_argument("--particle-friction", type=float, default=0.03)
         parser.add_argument("--particle-collision-margin", type=float, default=0.0015)
-        parser.add_argument("--cohesion", type=float, default=0.035)
+        parser.add_argument("--cohesion", type=float, default=0.020)
         parser.add_argument("--surface-tension", type=float, default=0.0000006)
         parser.add_argument("--vorticity-confinement", type=float, default=0.0)
         parser.add_argument("--solid-pressure", type=float, default=0.08)
         parser.add_argument("--buoyancy", type=float, default=1.0)
-        parser.add_argument("--xsph-strength", type=float, default=0.06)
-        parser.add_argument("--free-surface-drag", type=float, default=0.12)
-        parser.add_argument("--dissipation", type=float, default=0.25)
-        parser.add_argument("--velocity-damping", type=float, default=0.02)
-        parser.add_argument("--sleep-threshold", type=float, default=0.01)
-        parser.add_argument("--boundary-damping", type=float, default=0.10)
+        parser.add_argument("--xsph-strength", type=float, default=0.04)
+        parser.add_argument("--free-surface-drag", type=float, default=0.05)
+        parser.add_argument("--dissipation", type=float, default=0.10)
+        parser.add_argument("--velocity-damping", type=float, default=0.01)
+        parser.add_argument("--sleep-threshold", type=float, default=0.0)
+        parser.add_argument("--boundary-damping", type=float, default=0.05)
         parser.add_argument("--shape-collision-distance", type=float, default=0.0255)
         parser.add_argument("--shape-collision-margin", type=float, default=0.0015)
         parser.add_argument("--shape-restitution", type=float, default=0.0)
         parser.add_argument("--shape-friction", type=float, default=0.25)
-        parser.add_argument("--shape-adhesion", type=float, default=0.18)
+        parser.add_argument("--shape-adhesion", type=float, default=0.05)
         parser.add_argument("--max-velocity", type=float, default=6.0)
         parser.add_argument("--max-acceleration", type=float, default=70.0)
         parser.add_argument(
@@ -1221,7 +1223,7 @@ class Example:
         parser.add_argument("--pbf-artificial-pressure", type=float, default=0.002)
         parser.add_argument("--fluid-diffuse-max-particles", type=int, default=16000)
         parser.add_argument("--fluid-diffuse-threshold", type=float, default=0.55)
-        parser.add_argument("--fluid-diffuse-lifetime", type=float, default=2.8)
+        parser.add_argument("--fluid-diffuse-lifetime", type=float, default=2.0)
         parser.add_argument("--fluid-diffuse-drag", type=float, default=0.92)
         parser.add_argument("--fluid-diffuse-buoyancy", type=float, default=0.9)
         parser.add_argument("--fluid-diffuse-ballistic", type=int, default=9)

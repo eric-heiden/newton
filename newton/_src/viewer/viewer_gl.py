@@ -1612,6 +1612,7 @@ class ViewerGL(ViewerBase):
         color: tuple[float, float, float, float] = (0.113, 0.425, 0.55, 0.8),
         ior: float = 1.0,
         blur_radius_world: float | None = None,
+        shadow_opacity: float = 0.5,
         anisotropy: wp.array[wp.vec4] | None = None,
         anisotropy_secondary: wp.array[wp.vec4] | None = None,
         anisotropy_tertiary: wp.array[wp.vec4] | None = None,
@@ -1640,6 +1641,7 @@ class ViewerGL(ViewerBase):
             batch.blur_radius_world = float(blur_radius_world)
         elif isinstance(radii, (int, float)):
             batch.blur_radius_world = float(radii) * 2.0
+        batch.shadow_opacity = float(shadow_opacity)
         batch.update(points, radii, radius_scale, anisotropy, anisotropy_secondary, anisotropy_tertiary)
 
     @override
@@ -1652,6 +1654,7 @@ class ViewerGL(ViewerBase):
         color: tuple[float, float, float, float] = (0.9, 0.95, 1.0, 0.8),
         motion_blur_scale: float = 1.0,
         diffusion: float = 1.0,
+        lifetime: float = 2.0,
         hidden: bool = False,
     ):
         """Log Flex-style diffuse spray/foam particles."""
@@ -1674,6 +1677,7 @@ class ViewerGL(ViewerBase):
         batch.color = tuple(float(c) for c in color)
         batch.motion_blur_scale = float(motion_blur_scale)
         batch.diffusion = float(diffusion)
+        batch.lifetime = float(max(lifetime, 1.0e-3))
         batch.update(positions, velocities)
 
     @override

@@ -3319,6 +3319,7 @@ class ViewerBase(ABC):
         color=(0.113, 0.425, 0.55, 0.8),
         ior: float = 1.0,
         blur_radius_world: float | None = None,
+        shadow_opacity: float = 0.5,
         anisotropy=None,
         anisotropy_secondary=None,
         anisotropy_tertiary=None,
@@ -3338,6 +3339,8 @@ class ViewerBase(ABC):
             ior: Index of refraction controlling refraction/reflection offsets.
             blur_radius_world: World-space radius of the surface smoothing
                 filter [m]. Defaults to twice the particle radius.
+            shadow_opacity: Dither density of the fluid shadow-map splats;
+                lower values cast a more translucent shadow.
             anisotropy: Primary ellipsoid axis (xyz) and scale (w) per particle.
             anisotropy_secondary: Secondary ellipsoid axis and scale.
             anisotropy_tertiary: Tertiary ellipsoid axis and scale.
@@ -3354,6 +3357,7 @@ class ViewerBase(ABC):
         color=(0.9, 0.95, 1.0, 0.8),
         motion_blur_scale: float = 1.0,
         diffusion: float = 1.0,
+        lifetime: float = 2.0,
         hidden: bool = False,
     ):
         """Log diffuse spray/foam particles (no-op for non-fluid backends).
@@ -3367,9 +3371,10 @@ class ViewerBase(ABC):
             color: Sprite color and alpha multiplier.
             motion_blur_scale: Velocity stretch factor for the sprites.
             diffusion: Sprite growth factor over the particle lifetime.
+            lifetime: Particle lifetime [s] used to scale the Flex life fades.
             hidden: Whether the diffuse batch should be hidden.
         """
-        del name, positions, velocities, radius, color, motion_blur_scale, diffusion, hidden
+        del name, positions, velocities, radius, color, motion_blur_scale, diffusion, lifetime, hidden
 
     def _log_particles(self, state: newton.State):
         if self.model.particle_count:

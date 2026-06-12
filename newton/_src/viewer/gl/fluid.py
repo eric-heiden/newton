@@ -589,6 +589,7 @@ uniform mat4 projection;
 uniform float point_scale;
 uniform float motion_blur_scale;
 uniform float diffusion;
+uniform float lifetime;
 
 out vec2 TexCoord;
 flat out float LifeFade;
@@ -611,8 +612,12 @@ void main()
     vec3 u = vec3(0.0, point_scale, 0.0);
     vec3 l = vec3(point_scale, 0.0, 0.0);
 
-    // sprites grow as they age (life counts down from 1)
-    float sizeFade = mix(1.0 + diffusion, 1.0, min(1.0, life * 4.0));
+    // Flex fades: life is normalized (1 -> 0), so convert back to seconds.
+    // Sprites grow as they age and the alpha ramps down over the whole life,
+    // peaking at only 0.25 -- Flex foam is faint per sprite and reads as
+    // whitewater through accumulation, not through bright individual dots.
+    float lifeSeconds = life * lifetime;
+    float sizeFade = mix(1.0 + diffusion, 1.0, min(1.0, lifeSeconds * 0.25));
     u *= sizeFade;
     l *= sizeFade;
 
@@ -627,7 +632,7 @@ void main()
         l = normalize(cross(u, vec3(0.0, 0.0, -1.0))) * point_scale;
     }
 
-    LifeFade = min(1.0, life * 2.0);
+    LifeFade = min(1.0, lifeSeconds * 0.125);
     VelocityFade = fade;
 
     TexCoord = vec2(0.0, 1.0);
@@ -689,10 +694,24 @@ void main()
 
 SHADOW_SPLAT_FS = """
 #version 330 core
+uniform float shadow_opacity;
+
 void main()
 {
     vec2 d = gl_PointCoord.xy * 2.0 - vec2(1.0);
     if (dot(d, d) > 1.0) discard;
+
+    // Ordered dithering: the PCF taps of the scene shadow lookup average the
+    // stipple into a partial shadow, so water casts a translucent shadow
+    // instead of an opaque one.
+    float bayer[16] = float[](
+        0.0, 8.0, 2.0, 10.0,
+        12.0, 4.0, 14.0, 6.0,
+        3.0, 11.0, 1.0, 9.0,
+        15.0, 7.0, 13.0, 5.0
+    );
+    ivec2 p = ivec2(gl_FragCoord.xy) % 4;
+    if ((bayer[p.y * 4 + p.x] + 0.5) / 16.0 > shadow_opacity) discard;
 }
 """
 
@@ -760,6 +779,7 @@ class FluidBatch:
         self.ior = 1.0
         self.blur_radius_world = 0.06
         self.max_blur_radius = 14.0
+        self.shadow_opacity = 0.5
         self.thickness_scale = 4.0
         self.thickness_gain = 0.005
 
@@ -801,6 +821,7 @@ class FluidBatch:
             self.max_blur_radius,
             self.thickness_scale,
             self.thickness_gain,
+            self.shadow_opacity,
         )
         self.destroy()
         self.__init__(self._gl, max(count, self.capacity * 2))
@@ -811,6 +832,7 @@ class FluidBatch:
             self.max_blur_radius,
             self.thickness_scale,
             self.thickness_gain,
+            self.shadow_opacity,
         ) = material
 
     def update(
@@ -925,6 +947,7 @@ class DiffuseBatch:
         self.color = (0.9, 0.95, 1.0, 0.8)
         self.motion_blur_scale = 1.0
         self.diffusion = 1.0
+        self.lifetime = 2.0
 
         self._host_positions = np.zeros((0, 4), dtype=np.float32)
         self._host_velocities = np.zeros((0, 4), dtype=np.float32)
@@ -959,10 +982,10 @@ class DiffuseBatch:
     def _ensure_capacity(self, count: int):
         if count <= self.capacity:
             return
-        material = (self.radius, self.color, self.motion_blur_scale, self.diffusion)
+        material = (self.radius, self.color, self.motion_blur_scale, self.diffusion, self.lifetime)
         self.destroy()
         self.__init__(self._gl, max(count, self.capacity * 2))
-        self.radius, self.color, self.motion_blur_scale, self.diffusion = material
+        self.radius, self.color, self.motion_blur_scale, self.diffusion, self.lifetime = material
 
     def update(self, positions, velocities):
         if positions is None:
@@ -1135,6 +1158,7 @@ class FluidRenderer:
             prog.set_mat4("light_projection", light_proj)
             prog.set_float("point_scale", point_scale)
             for batch in batches:
+                prog.set_float("shadow_opacity", batch.shadow_opacity)
                 batch.draw()
 
     def render(self, host, fluids, diffuse):
@@ -1284,6 +1308,7 @@ class FluidRenderer:
                     prog.set_float("point_scale", batch.radius)
                     prog.set_float("motion_blur_scale", batch.motion_blur_scale)
                     prog.set_float("diffusion", batch.diffusion)
+                    prog.set_float("lifetime", batch.lifetime)
                     prog.set_vec4("color", batch.color)
                     batch.draw()
             gl.glDisable(gl.GL_BLEND)

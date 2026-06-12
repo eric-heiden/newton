@@ -107,6 +107,7 @@ class Example:
         self.foam_color = tuple(args.foam_color)
         self.foam_radius = args.foam_radius
         self.foam_motion_blur = args.foam_motion_blur
+        self.foam_lifetime = args.fluid_diffuse_lifetime
         self.viewer.set_camera(pos=wp.vec3(args.camera_pos), pitch=args.camera_pitch, yaw=args.camera_yaw)
         self._configure_render_environment(args)
 
@@ -266,6 +267,7 @@ class Example:
             radius=self.foam_radius,
             color=self.foam_color,
             motion_blur_scale=self.foam_motion_blur,
+            lifetime=self.foam_lifetime,
             hidden=False,
         )
 

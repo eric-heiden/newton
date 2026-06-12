@@ -57,14 +57,16 @@ class Example:
             flags=newton.ParticleFlags.ACTIVE | newton.ParticleFlags.FLUID,
         )
 
-        # static pillar the wave splashes against
-        builder.add_shape_box(
-            body=-1,
+        # heavy pillar the wave splashes against (dynamic so it can be picked)
+        self.pillar_body = builder.add_body(
             xform=wp.transform(wp.vec3(0.5, 0.0, 0.25), wp.quat_identity()),
+        )
+        builder.add_shape_box(
+            body=self.pillar_body,
             hx=0.1,
             hy=0.1,
             hz=0.25,
-            cfg=newton.ModelBuilder.ShapeConfig(mu=0.2),
+            cfg=newton.ModelBuilder.ShapeConfig(density=2000.0, mu=0.4),
         )
 
         # light dynamic box that floats on the wave
@@ -108,6 +110,7 @@ class Example:
         self.render_anisotropy_scale = args.render_anisotropy_scale
 
         self.viewer.set_model(self.model)
+        self.viewer.picking_enabled = True
         use_fluid_surface = args.render_mode == "fluid" and getattr(self.viewer, "fluids", None) is not None
         self.viewer.show_particles = not use_fluid_surface
         if hasattr(self.viewer, "show_fluid"):
@@ -118,6 +121,7 @@ class Example:
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.model.collide(self.state_0, self.contacts)
+            self.viewer.apply_forces(self.state_0)
             self.solver.step(self.state_0, self.state_1, None, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 

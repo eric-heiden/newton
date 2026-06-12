@@ -1323,6 +1323,13 @@ def update_sph_diffuse_particles(
 
 
 @wp.kernel
+def advance_sph_diffuse_seed(frame_seed: wp.array[wp.int32]):
+    # Device-side spawn seed so the randomness keeps advancing inside a
+    # captured CUDA graph, where Python-side counters are frozen.
+    frame_seed[0] = frame_seed[0] + 1
+
+
+@wp.kernel
 def spawn_sph_diffuse_particles(
     grid: wp.uint64,
     fluid_q: wp.array[wp.vec3],
@@ -1340,7 +1347,7 @@ def spawn_sph_diffuse_particles(
     bounds_lower: wp.vec3,
     bounds_upper: wp.vec3,
     boundary_damping: float,
-    frame_seed: int,
+    frame_seed: wp.array[wp.int32],
     diffuse_spawn_counter: wp.array[wp.int32],
     diffuse_q: wp.array[wp.vec4],
     diffuse_qd: wp.array[wp.vec4],
@@ -1374,17 +1381,29 @@ def spawn_sph_diffuse_particles(
             neighbors += 1
 
     is_surface = density[i] < rest_density * diffuse_surface_density_ratio or neighbors < diffuse_ballistic
-    potential = 0.5 * speed_sq + divergence
+
+    # Wave-crest weighting: `separation` approximates the outward surface
+    # normal, so velocity aligned with it marks breaking crests, plunging
+    # sheets, and beach run-up fronts. Fast laminar bulk flow has little
+    # separating motion and no crest alignment, so it stays foam-free.
+    speed = wp.sqrt(speed_sq)
+    crest = float(0.0)
+    separation_len = wp.length(separation)
+    if separation_len > EPS and speed > EPS:
+        crest = wp.max(wp.dot(separation / separation_len, vi / speed), 0.0)
+    potential = divergence * (0.3 + 0.7 * crest) + 0.5 * speed_sq * crest
     threshold = wp.max(diffuse_threshold, EPS)
     if potential <= threshold:
         return
 
     surface_scale = float(1.0)
     if not is_surface:
-        surface_scale = 0.35
+        # Keep only a trickle of submerged bubbles; whitewater belongs to the
+        # free surface.
+        surface_scale = 0.06
 
     probability = wp.min(diffuse_spawn_probability * surface_scale * (potential / threshold - 1.0), 1.0)
-    seed = float((i + 1) * 928371 + (frame_seed + 17) * 68917)
+    seed = float((i + 1) * 928371 + (frame_seed[0] + 17) * 68917)
     if _hash01(seed) > probability:
         return
 

@@ -777,7 +777,7 @@ void main()
     float bubble_density = smoothstep(13.0, 26.0, neighbors);
     float type_radius = (0.72 * spray_weight + 1.10 * foam_weight + 0.82 * bubble_weight) / type_weight;
     type_radius *= mix(0.92, 1.20, foam_density) * mix(1.0, 0.88, bubble_density);
-    float motion_blur_gain = (1.08 * spray_weight + 0.28 * foam_weight + 0.10 * bubble_weight) / type_weight;
+    float motion_blur_gain = (1.15 * spray_weight + 0.75 * foam_weight + 0.18 * bubble_weight) / type_weight;
 
     float base_radius = max(radius * type_radius, 0.0001);
     float age = 1.0 - life;
@@ -789,10 +789,12 @@ void main()
     vec3 right = vec3(base_radius * expansion, 0.0, 0.0);
     float stretch_fade = 1.0 / max(death_expansion * death_expansion, 1.0);
 
+    // Flex stretches diffuse sprites along their velocity, which makes foam
+    // read as elongated streaks that follow the flow instead of round dots.
     float speed = length(v) * motion_blur_scale * motion_blur_gain;
-    if (speed > 0.8) {
-        float max_stretch = base_radius * mix(2.15, 1.12, foam_density) * mix(1.0, 0.72, bubble_density);
-        float stretch = clamp(max(base_radius, speed * 0.0045), base_radius, max_stretch);
+    if (speed > 0.25) {
+        float max_stretch = base_radius * mix(3.2, 2.0, foam_density) * mix(1.0, 0.72, bubble_density);
+        float stretch = clamp(base_radius * (1.0 + speed * 2.4), base_radius, max_stretch);
         up = normalize(v) * stretch;
         vec3 side = cross(up, vec3(0.0, 0.0, -1.0));
         if (length(side) < 1.0e-5) {
@@ -928,9 +930,11 @@ float diffuse_breakup(vec2 disk, vec3 world_pos, float neighbors)
 
 float scene_view_depth(vec2 uv, float device_depth)
 {
+    // inv_projection arrives transposed (row-vector convention, matching the
+    // composite shader), so multiply with the vector on the left.
     vec4 clip = vec4(uv * 2.0 - vec2(1.0), device_depth * 2.0 - 1.0, 1.0);
-    vec4 view = inv_projection * clip;
-    view /= max(view.w, 1.0e-6);
+    vec4 view = clip * inv_projection;
+    view /= max(abs(view.w), 1.0e-6);
     return -view.z;
 }
 
@@ -958,20 +962,23 @@ void main()
 
     float fluid_depth = texture(fluid_depth_texture, uv).r;
     float fluid_surface_fade = 1.0;
+    // The smoothed water surface bulges roughly a splat radius in front of the
+    // particle centers, so foam spawned at fluid positions sits "behind" it.
+    // Use a generous surface band so near-surface foam renders in the bright
+    // front pass instead of being relegated to the dim submerged-bubble pass.
+    float surface_band = max(ParticleViewRadius * 1.5, 0.045);
     if (depth_mode == 1) {
         if (fluid_depth <= 0.0) {
             discard;
         }
         float fluid_gap = diffuse_view_depth - fluid_depth;
-        float fluid_fade_width = max(ParticleViewRadius * 1.4, 0.018);
-        fluid_surface_fade = smoothstep(-ParticleViewRadius * 0.25, fluid_fade_width, fluid_gap);
+        fluid_surface_fade = smoothstep(surface_band * 0.6, surface_band * 1.8, fluid_gap);
         if (fluid_surface_fade <= 0.001)
             discard;
     } else if (depth_mode == 2) {
         if (fluid_depth > 0.0) {
             float fluid_gap = diffuse_view_depth - fluid_depth;
-            float fluid_fade_width = max(ParticleViewRadius * 1.4, 0.018);
-            fluid_surface_fade = 1.0 - smoothstep(-ParticleViewRadius * 0.25, fluid_fade_width, fluid_gap);
+            fluid_surface_fade = 1.0 - smoothstep(surface_band, surface_band * 2.4, fluid_gap);
             if (fluid_surface_fade <= 0.001)
                 discard;
         }
@@ -997,8 +1004,8 @@ void main()
     vec3 color = (spray_color * spray + foam_color * foam + bubble_color * bubble) / type_sum;
 
     float core = pow(z, mix(3.0, 1.35, foam_density));
-    color += foam_color * core * (0.10 + 0.16 * max(spray, foam));
-    color += foam_color * foam_density * core * 0.18;
+    color += foam_color * core * (0.20 + 0.30 * max(spray, foam));
+    color += foam_color * foam_density * core * 0.30;
     color *= mix(vec3(1.0), vec3(0.86, 0.94, 1.0), clamp((1.0 - breakup) * spray, 0.0, 0.35));
     float scatter = inscatter * (0.24 + 0.76 * ndotl) * (0.45 + 0.55 * core);
     scatter += inscatter * backscatter * (0.10 + 0.18 * spray);
@@ -1007,7 +1014,7 @@ void main()
     float shadow_amount = diffuse_particle_shadow(ParticleWorldPos) * clamp(shadow_strength, 0.0, 1.0);
     color *= mix(vec3(1.0), vec3(0.60, 0.74, 0.92), shadow_amount);
 
-    float type_alpha = (0.78 * spray + 1.04 * foam + 0.44 * bubble) / type_sum;
+    float type_alpha = (0.80 * spray + 1.15 * foam + 0.44 * bubble) / type_sum;
     type_alpha *= mix(0.80, 1.28, foam_density) * mix(1.0, 0.78, bubble);
     if (depth_mode == 1) {
         type_alpha *= mix(0.18, 0.36, bubble);
@@ -1115,6 +1122,8 @@ uniform mat4 light_space_matrix;
 uniform vec3 sun_direction_world;
 uniform vec3 fluid_bounds_lower;
 uniform vec3 fluid_bounds_upper;
+uniform vec3 water_color;
+uniform float absorption_strength;
 uniform float caustic_scale;
 uniform float floor_caustic_strength;
 uniform float surface_shadow_strength;
@@ -1150,48 +1159,6 @@ float world_up_coord(vec3 world_pos)
     if (up_axis == 1)
         return world_pos.y;
     return world_pos.z;
-}
-
-float fluid_bounds_floor_density(vec3 receiver_world, out float bounds_depth)
-{
-    vec2 receiver_floor = world_floor_coord(receiver_world);
-    vec2 floor_min = min(world_floor_coord(fluid_bounds_lower), world_floor_coord(fluid_bounds_upper));
-    vec2 floor_max = max(world_floor_coord(fluid_bounds_lower), world_floor_coord(fluid_bounds_upper));
-    vec2 extent = max(floor_max - floor_min, vec2(1.0e-4));
-    float feather = clamp(max(extent.x, extent.y) * 0.045, 0.035, 0.18);
-
-    float mask_x = smoothstep(floor_min.x - feather, floor_min.x + feather, receiver_floor.x)
-        * (1.0 - smoothstep(floor_max.x - feather, floor_max.x + feather, receiver_floor.x));
-    float mask_y = smoothstep(floor_min.y - feather, floor_min.y + feather, receiver_floor.y)
-        * (1.0 - smoothstep(floor_max.y - feather, floor_max.y + feather, receiver_floor.y));
-
-    float water_top = max(world_up_coord(fluid_bounds_lower), world_up_coord(fluid_bounds_upper));
-    float water_bottom = min(world_up_coord(fluid_bounds_lower), world_up_coord(fluid_bounds_upper));
-    bounds_depth = max(water_top - max(world_up_coord(receiver_world), water_bottom), 0.0);
-    float vertical_mask = smoothstep(0.015, 0.18, bounds_depth);
-    return mask_x * mask_y * vertical_mask;
-}
-
-float fluid_projected_bounds_density(vec3 receiver_world, out float bounds_depth)
-{
-    vec3 lower = min(fluid_bounds_lower, fluid_bounds_upper);
-    vec3 upper = max(fluid_bounds_lower, fluid_bounds_upper);
-    vec3 dir = normalize(sun_direction_world);
-    vec3 inv_dir = vec3(
-        abs(dir.x) > 1.0e-5 ? 1.0 / dir.x : 1.0e5,
-        abs(dir.y) > 1.0e-5 ? 1.0 / dir.y : 1.0e5,
-        abs(dir.z) > 1.0e-5 ? 1.0 / dir.z : 1.0e5
-    );
-    vec3 t0 = (lower - receiver_world) * inv_dir;
-    vec3 t1 = (upper - receiver_world) * inv_dir;
-    vec3 t_min = min(t0, t1);
-    vec3 t_max = max(t0, t1);
-    float t_enter = max(max(t_min.x, t_min.y), t_min.z);
-    float t_exit = min(min(t_max.x, t_max.y), t_max.z);
-    float entry = max(t_enter, 0.0);
-    bounds_depth = max(t_exit - entry, 0.0);
-    float hit = step(entry, t_exit) * step(0.0, t_exit);
-    return hit * smoothstep(0.015, 0.30, bounds_depth);
 }
 
 float stable_floor_caustics(vec2 floor_pos, float water_depth, float water_thickness)
@@ -1346,96 +1313,63 @@ void main()
     vec3 world_pos = view_to_world(view_pos);
 
     vec4 light_clip = light_space_matrix * vec4(world_pos, 1.0);
-    float valid_light_projection = step(1.0e-6, light_clip.w);
-    vec3 light_ndc = light_clip.xyz / max(light_clip.w, 1.0e-6);
-    vec2 shadow_uv = light_ndc.xy * 0.5 + vec2(0.5);
-    valid_light_projection *= step(0.0, shadow_uv.x) * step(shadow_uv.x, 1.0);
-    valid_light_projection *= step(0.0, shadow_uv.y) * step(shadow_uv.y, 1.0);
-
-    float fluid_light_depth = 0.0;
-    float fluid_thickness = 0.0;
-    float fluid_coverage = 0.0;
-    if (valid_light_projection > 0.0) {
-        sample_fluid_volume(shadow_uv, fluid_light_depth, fluid_thickness, fluid_coverage);
+    if (light_clip.w <= 1.0e-6) {
+        FragColor = vec4(scene, 1.0);
+        return;
     }
-
-    float projected_bounds_depth = 0.0;
-    float projected_bounds_density = fluid_projected_bounds_density(world_pos, projected_bounds_depth);
-    float coverage_density = smoothstep(0.06, 0.55, fluid_coverage);
-    float has_light_volume = valid_light_projection * projected_bounds_density
-        * step(0.035, fluid_coverage) * step(1.0e-4, fluid_thickness);
-    vec4 light_view_pos = light_view * vec4(world_pos, 1.0);
-    float receiver_light_depth = -light_view_pos.z;
-    // Light-space water column between the fluid front and this floor point. The fluid-front
-    // depth can be missing where the light-space splats are sparse, so clamp it to zero rather
-    // than culling on it: the shadow is driven by optical density (thickness/coverage), and the
-    // old `fluid_light_depth <= 0` / `water_depth <= 0.015` gates rejected nearly all of the floor.
-    float water_depth = max(receiver_light_depth - fluid_light_depth, 0.0);
-
-    float bounds_depth = 0.0;
-    float bounds_density = fluid_bounds_floor_density(world_pos, bounds_depth);
-    float receiver_light_separation = abs(receiver_light_depth - fluid_light_depth);
-    float receiver_behind_fluid = max(
-        smoothstep(0.010, 0.12, receiver_light_separation) * has_light_volume,
-        projected_bounds_density
-    );
-
-    if (projected_bounds_density <= 0.0 || receiver_behind_fluid <= 0.0) {
+    vec3 light_ndc = light_clip.xyz / light_clip.w;
+    vec2 shadow_uv = light_ndc.xy * 0.5 + vec2(0.5);
+    if (any(lessThan(shadow_uv, vec2(0.0))) || any(greaterThan(shadow_uv, vec2(1.0)))) {
         FragColor = vec4(scene, 1.0);
         return;
     }
 
-    // Optical density of the water column between the light and this receiver.
-    float effective_thickness = max(
-        fluid_thickness * has_light_volume,
-        max(bounds_depth * bounds_density, projected_bounds_depth * projected_bounds_density) * 0.18
-    );
-    float density = max(
-        smoothstep(0.0015, 0.060, fluid_thickness) * coverage_density,
-        max(
-            bounds_density * smoothstep(0.03, 0.36, bounds_depth) * 0.28,
-            projected_bounds_density * smoothstep(0.04, 0.72, projected_bounds_depth) * 0.56
-        )
-    ) * receiver_behind_fluid;
-    // Caustics are a near-floor refractive effect, so keep them depth-windowed (but relaxed).
-    float caustic_depth = max(water_depth, 0.05);
-    caustic_depth = max(caustic_depth, max(bounds_depth, projected_bounds_depth));
-    float caustic_volume = density
-        * smoothstep(0.02, 0.30, caustic_depth)
-        * (1.0 - smoothstep(6.0, 13.0, caustic_depth));
-
-    float light_focus = 0.0;
-    vec2 refracted_floor_coord = world_floor_coord(world_pos);
-    if (has_light_volume > 0.0) {
-        light_focus = light_space_caustic_focus(shadow_uv, fluid_light_depth, fluid_thickness, fluid_coverage);
-        refracted_floor_coord = refracted_floor_caustic_coord(
-            world_pos,
-            shadow_uv,
-            fluid_light_depth,
-            fluid_thickness,
-            water_depth
-        );
+    float fluid_light_depth = 0.0;
+    float fluid_thickness = 0.0;
+    float fluid_coverage = 0.0;
+    sample_fluid_volume(shadow_uv, fluid_light_depth, fluid_thickness, fluid_coverage);
+    if (fluid_coverage <= 0.02 || fluid_thickness <= 1.0e-4) {
+        FragColor = vec4(scene, 1.0);
+        return;
     }
-    refracted_floor_coord = mix(world_floor_coord(world_pos), refracted_floor_coord, has_light_volume);
-    float caustic = stable_floor_caustics(refracted_floor_coord, max(water_depth, 0.05), effective_thickness);
-    caustic = clamp(caustic * (0.70 + 0.34 * light_focus) + light_focus * 0.055, 0.0, 1.0);
 
-    // Transparent blue shadow cast by the water: a soft multiply tinted blue and deepened
-    // by fluid density (a thicker column absorbs more red/green, leaving a bluer shadow).
-    float shadow_opacity = clamp(
-        surface_shadow_strength * density * (0.70 + 0.30 * max(coverage_density, bounds_density)) * 1.65,
-        0.0,
-        0.48
+    // Receivers in front of the fluid (from the light) stay fully lit.
+    vec4 light_view_pos = light_view * vec4(world_pos, 1.0);
+    float receiver_light_depth = -light_view_pos.z;
+    float water_depth = receiver_light_depth - fluid_light_depth;
+    float behind = smoothstep(0.0, 0.06, water_depth) * smoothstep(0.02, 0.30, fluid_coverage);
+    if (behind <= 0.001) {
+        FragColor = vec4(scene, 1.0);
+        return;
+    }
+
+    // The water shadow is the same Beer-Lambert color filter the surface
+    // composite applies, evaluated along the light path, so the shadow always
+    // matches the rendered water's effective color and opacity.
+    vec3 transmission = exp(-(vec3(1.0) - water_color) * absorption_strength * fluid_thickness);
+    // In-scattered ambient light keeps long underwater light paths from going
+    // black (real water shadows stay luminous, e.g. at pool edges).
+    transmission = mix(vec3(0.26), vec3(1.0), transmission);
+
+    float light_focus = light_space_caustic_focus(shadow_uv, fluid_light_depth, fluid_thickness, fluid_coverage);
+    vec2 refracted_floor_coord = refracted_floor_caustic_coord(
+        world_pos,
+        shadow_uv,
+        fluid_light_depth,
+        fluid_thickness,
+        max(water_depth, 0.0)
     );
-    vec3 absorption_tint = exp(-vec3(1.08, 0.52, 0.10) * clamp(effective_thickness * 2.2 + caustic_depth * 0.030, 0.0, 2.4));
-    vec3 transmitted_shadow = scene * vec3(0.55, 0.74, 1.06) * absorption_tint + vec3(0.00, 0.10, 0.26) * density;
-    vec3 shadowed = mix(scene, transmitted_shadow, shadow_opacity);
+    float caustic = stable_floor_caustics(refracted_floor_coord, max(water_depth, 0.05), fluid_thickness);
+    caustic = clamp(caustic * (0.70 + 0.34 * light_focus) + light_focus * 0.055, 0.0, 1.0);
+    float caustic_volume = smoothstep(0.02, 0.30, max(water_depth, 0.05))
+        * (1.0 - smoothstep(6.0, 13.0, water_depth));
 
-    vec3 caustic_color = vec3(0.22, 0.76, 1.12);
-    shadowed += caustic_color * caustic * clamp(floor_caustic_strength * 0.13, 0.0, 0.36)
-        * caustic_volume * (0.54 + 0.20 * coverage_density);
+    float shadow_amount = clamp(surface_shadow_strength * 1.4, 0.0, 1.0) * behind;
+    vec3 filtered = scene * transmission;
+    vec3 caustic_color = mix(vec3(0.22, 0.76, 1.12), water_color + vec3(0.25), 0.35);
+    filtered += caustic_color * caustic * clamp(floor_caustic_strength * 0.16, 0.0, 0.40) * caustic_volume;
 
-    FragColor = vec4(clamp(shadowed, 0.0, 1.0), 1.0);
+    FragColor = vec4(clamp(mix(scene, filtered, shadow_amount), 0.0, 1.0), 1.0);
 }
 """
 
@@ -1706,7 +1640,7 @@ void main()
     // Beer-Lambert absorption along the optical path. The complement of the
     // water color acts as the per-channel absorption coefficient so shallow
     // water tints toward water_color and deep water toward water_deep_color.
-    float optical_path = max(thickness, min(scene_gap, 6.0) * 0.55);
+    float optical_path = min(max(thickness, min(scene_gap, 6.0) * 0.55), 3.0);
     vec3 transmission = exp(-(vec3(1.0) - water_color) * absorption_strength * optical_path);
     float depth_mix = 1.0 - exp(-absorption_strength * 0.6 * optical_path);
     vec3 body_color = mix(water_color, water_deep_color, depth_mix * clamp(0.35 + color_gradient_strength, 0.0, 1.0));
@@ -1758,12 +1692,15 @@ void main()
 
     // --- Combine -------------------------------------------------------------
     float reflect_gain = clamp(reflection_strength * 1.6, 0.0, 1.2);
+    // Spray and thin sheets should not mirror the environment; otherwise the
+    // sparse splats above a churning surface read as a gray haze.
+    reflect_gain *= 0.15 + 0.85 * smoothstep(0.010, 0.080, thickness);
     float reflect_mix = clamp(fresnel * reflect_gain, 0.0, 1.0);
     vec3 water = mix(refracted, reflect_col, reflect_mix) + vec3(spec);
     water *= mix(vec3(0.52, 0.65, 0.88), vec3(1.0), lit);
 
     // Fade out where the water film becomes vanishingly thin.
-    float coverage = smoothstep(0.0015, 0.014, thickness) * opacity;
+    float coverage = smoothstep(0.004, 0.022, thickness) * opacity;
     coverage *= 1.0 - foreground_occlusion;
     vec3 scene_center = texture(scene_texture, TexCoord).rgb;
 
@@ -2204,6 +2141,8 @@ class FluidShadowShader(ShaderGL):
             self.loc_caustic_scale = self._get_uniform_location("caustic_scale")
             self.loc_floor_caustic_strength = self._get_uniform_location("floor_caustic_strength")
             self.loc_surface_shadow_strength = self._get_uniform_location("surface_shadow_strength")
+            self.loc_water_color = self._get_uniform_location("water_color")
+            self.loc_absorption_strength = self._get_uniform_location("absorption_strength")
             self.loc_up_axis = self._get_uniform_location("up_axis")
 
     def update(
@@ -2220,6 +2159,8 @@ class FluidShadowShader(ShaderGL):
         sun_direction_world: tuple[float, float, float],
         fluid_bounds_lower: np.ndarray,
         fluid_bounds_upper: np.ndarray,
+        water_color: tuple[float, float, float],
+        absorption_strength: float,
         caustic_scale: float,
         floor_caustic_strength: float,
         surface_shadow_strength: float,
@@ -2250,6 +2191,8 @@ class FluidShadowShader(ShaderGL):
                 float(fluid_bounds_upper[1]),
                 float(fluid_bounds_upper[2]),
             )
+            self._gl.glUniform3f(self.loc_water_color, *water_color)
+            self._gl.glUniform1f(self.loc_absorption_strength, float(absorption_strength))
             self._gl.glUniform1f(self.loc_caustic_scale, float(caustic_scale))
             self._gl.glUniform1f(self.loc_floor_caustic_strength, float(floor_caustic_strength))
             self._gl.glUniform1f(self.loc_surface_shadow_strength, float(surface_shadow_strength))

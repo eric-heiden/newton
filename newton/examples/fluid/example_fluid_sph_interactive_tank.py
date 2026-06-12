@@ -671,21 +671,69 @@ class Example:
 
     def capture(self):
         self.graph = None
+        self._captured_params = None
         if not self.capture_graph:
             return
         if not wp.get_device().is_cuda:
+            self.capture_graph = False
             warnings.warn("SPH interactive graph capture is only available on CUDA devices.", stacklevel=2)
             return
         try:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
+            self._captured_params = self._graph_params()
         except Exception as exc:
+            self.capture_graph = False
             warnings.warn(
                 f"Interactive SPH graph capture failed; falling back to uncaptured stepping: {exc}",
                 stacklevel=2,
             )
             self.graph = None
+
+    def _graph_params(self):
+        # Every Python-side value baked into the captured launch sequence;
+        # changing any of them (e.g. via a GUI slider) requires a re-capture.
+        solver = self.sph_solver
+        return (
+            self.coupling_stiffness,
+            self.coupling_damping,
+            self.splash_velocity_gain,
+            self.buoyancy_scale,
+            self.box_linear_drag,
+            self.box_quadratic_drag,
+            self.box_angular_drag,
+            self.box_floor_stiffness,
+            self.box_floor_damping,
+            self.box_floor_friction,
+            self.box_wall_stiffness,
+            self.box_wall_damping,
+            self.box_max_linear_speed,
+            self.box_max_angular_speed,
+            self.box_max_torque,
+            solver.particle_friction,
+            solver.particle_collision_margin,
+            solver.cohesion,
+            solver.surface_tension,
+            solver.vorticity_confinement,
+            solver.solid_pressure,
+            solver.buoyancy,
+            solver.xsph_strength,
+            solver.xsph_enabled,
+            solver.free_surface_drag,
+            solver.dissipation,
+            solver.sleep_threshold,
+            solver.shape_friction,
+            solver.shape_collision_distance,
+            solver.shape_collision_margin,
+            solver.shape_restitution,
+            solver.shape_adhesion,
+            solver.max_acceleration,
+            solver.render_smoothing,
+            solver.render_anisotropy_scale,
+            solver.render_anisotropy_min,
+            solver.render_anisotropy_max,
+        )
 
     def simulate(self):
         for _ in range(self.sim_substeps):
@@ -842,6 +890,8 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
+        if self.capture_graph and (self.graph is None or self._graph_params() != self._captured_params):
+            self.capture()
         if self.graph is not None:
             wp.capture_launch(self.graph)
         else:
@@ -923,12 +973,11 @@ class Example:
             return
 
         foam_strength = max(self.viewer.fluid_foam_strength, 0.0)
-        foam_radius_scale = max(self.viewer.fluid_foam_scale, 1.0) / 111.1
         self.viewer.log_fluid_diffuse(
             "/model/fluid/diffuse",
             self.sph_solver.diffuse_positions,
             self.sph_solver.diffuse_velocities,
-            radius=self.diffuse_particle_radius * max(0.2, foam_radius_scale**0.5),
+            radius=self.diffuse_particle_radius,
             color=self.viewer.fluid_diffuse_color,
             alpha=self.diffuse_alpha * foam_strength,
             motion_blur_scale=self.diffuse_motion_blur_scale,
@@ -1239,9 +1288,14 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--fps", type=float, default=60.0)
-        parser.add_argument("--substeps", type=int, default=4)
+        parser.add_argument("--substeps", type=int, default=3)
         parser.add_argument("--render-mode", choices=["fluid", "particles"], default="fluid")
-        parser.add_argument("--capture-graph", action="store_true", help="Capture fixed-parameter SPH substeps.")
+        parser.add_argument(
+            "--capture-graph",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Capture the SPH substeps in a CUDA graph (re-captured automatically when sliders change).",
+        )
         parser.add_argument("--show-bounds", action=argparse.BooleanOptionalAction, default=False)
         parser.add_argument("--show-diffuse", action=argparse.BooleanOptionalAction, default=True)
         parser.add_argument(
@@ -1251,19 +1305,19 @@ class Example:
             help="Draw colored guide outlines around the pickable rigid bodies.",
         )
 
-        parser.add_argument("--dim-x", type=int, default=68)
-        parser.add_argument("--dim-y", type=int, default=44)
-        parser.add_argument("--dim-z", type=int, default=12)
-        parser.add_argument("--spacing", type=float, default=0.040)
-        parser.add_argument("--radius", type=float, default=0.030)
+        parser.add_argument("--dim-x", type=int, default=80)
+        parser.add_argument("--dim-y", type=int, default=50)
+        parser.add_argument("--dim-z", type=int, default=14)
+        parser.add_argument("--spacing", type=float, default=0.034)
+        parser.add_argument("--radius", type=float, default=0.0255)
         parser.add_argument("--jitter", type=float, default=0.0015)
         parser.add_argument("--emit-lower", type=float, nargs=3, default=(-1.24, -0.78, 0.06))
         parser.add_argument("--initial-velocity", type=float, nargs=3, default=(0.0, 0.0, 0.0))
 
-        parser.add_argument("--smoothing-length", type=float, default=0.086)
+        parser.add_argument("--smoothing-length", type=float, default=0.0731)
         parser.add_argument("--rest-density", type=float, default=460.0)
         parser.add_argument("--gas-constant", type=float, default=44.0)
-        parser.add_argument("--viscosity", type=float, default=0.035)
+        parser.add_argument("--viscosity", type=float, default=0.010)
         parser.add_argument("--particle-friction", type=float, default=0.10)
         parser.add_argument("--particle-collision-margin", type=float, default=0.0015)
         parser.add_argument("--cohesion", type=float, default=0.035)
@@ -1271,18 +1325,18 @@ class Example:
         parser.add_argument("--vorticity-confinement", type=float, default=0.0)
         parser.add_argument("--solid-pressure", type=float, default=0.08)
         parser.add_argument("--buoyancy", type=float, default=1.0)
-        parser.add_argument("--xsph-strength", type=float, default=0.18)
-        parser.add_argument("--free-surface-drag", type=float, default=0.50)
-        parser.add_argument("--dissipation", type=float, default=0.85)
-        parser.add_argument("--velocity-damping", type=float, default=0.09)
-        parser.add_argument("--sleep-threshold", type=float, default=0.02)
+        parser.add_argument("--xsph-strength", type=float, default=0.06)
+        parser.add_argument("--free-surface-drag", type=float, default=0.12)
+        parser.add_argument("--dissipation", type=float, default=0.25)
+        parser.add_argument("--velocity-damping", type=float, default=0.02)
+        parser.add_argument("--sleep-threshold", type=float, default=0.01)
         parser.add_argument("--boundary-damping", type=float, default=0.10)
-        parser.add_argument("--shape-collision-distance", type=float, default=0.030)
+        parser.add_argument("--shape-collision-distance", type=float, default=0.0255)
         parser.add_argument("--shape-collision-margin", type=float, default=0.0015)
         parser.add_argument("--shape-restitution", type=float, default=0.0)
         parser.add_argument("--shape-friction", type=float, default=0.25)
         parser.add_argument("--shape-adhesion", type=float, default=0.18)
-        parser.add_argument("--max-velocity", type=float, default=5.0)
+        parser.add_argument("--max-velocity", type=float, default=6.0)
         parser.add_argument("--max-acceleration", type=float, default=70.0)
         parser.add_argument(
             "--sph-body-feedback",
@@ -1290,16 +1344,16 @@ class Example:
             default=False,
             help="Apply full SPH shape-contact reactions to rigid bodies (in addition to the example's buoyancy model).",
         )
-        parser.add_argument("--pbf-iterations", type=int, default=4)
+        parser.add_argument("--pbf-iterations", type=int, default=3)
         parser.add_argument("--pbf-relaxation", type=float, default=0.60)
         parser.add_argument("--pbf-artificial-pressure", type=float, default=0.002)
         parser.add_argument("--fluid-diffuse-max-particles", type=int, default=16000)
-        parser.add_argument("--fluid-diffuse-threshold", type=float, default=0.92)
+        parser.add_argument("--fluid-diffuse-threshold", type=float, default=0.55)
         parser.add_argument("--fluid-diffuse-lifetime", type=float, default=2.8)
         parser.add_argument("--fluid-diffuse-drag", type=float, default=0.92)
         parser.add_argument("--fluid-diffuse-buoyancy", type=float, default=0.20)
         parser.add_argument("--fluid-diffuse-ballistic", type=int, default=9)
-        parser.add_argument("--fluid-diffuse-spawn-probability", type=float, default=0.30)
+        parser.add_argument("--fluid-diffuse-spawn-probability", type=float, default=0.45)
         parser.add_argument("--fluid-render-smoothing", type=float, default=0.45)
         parser.add_argument("--fluid-render-anisotropy-scale", type=float, default=0.82)
         parser.add_argument("--fluid-render-anisotropy-min", type=float, default=0.1)
@@ -1364,13 +1418,13 @@ class Example:
         parser.add_argument("--fluid-surface-shadow-strength", type=float, default=0.35)
         parser.add_argument("--fluid-foam-strength", type=float, default=0.99)
         parser.add_argument("--fluid-foam-scale", type=float, default=5.0)
-        parser.add_argument("--fluid-diffuse-radius", type=float, default=0.012)
-        parser.add_argument("--fluid-diffuse-alpha", type=float, default=0.34)
-        parser.add_argument("--fluid-diffuse-motion-blur", type=float, default=0.12)
-        parser.add_argument("--fluid-diffuse-expansion", type=float, default=1.23)
-        parser.add_argument("--fluid-diffuse-inscatter", type=float, default=0.60)
-        parser.add_argument("--fluid-diffuse-outscatter", type=float, default=0.70)
-        parser.add_argument("--fluid-diffuse-shadow-strength", type=float, default=0.62)
+        parser.add_argument("--fluid-diffuse-radius", type=float, default=0.014)
+        parser.add_argument("--fluid-diffuse-alpha", type=float, default=0.40)
+        parser.add_argument("--fluid-diffuse-motion-blur", type=float, default=0.35)
+        parser.add_argument("--fluid-diffuse-expansion", type=float, default=0.55)
+        parser.add_argument("--fluid-diffuse-inscatter", type=float, default=0.80)
+        parser.add_argument("--fluid-diffuse-outscatter", type=float, default=0.30)
+        parser.add_argument("--fluid-diffuse-shadow-strength", type=float, default=0.35)
 
         parser.add_argument("--environment-intensity", type=float, default=3.15)
         parser.add_argument("--exposure", type=float, default=1.08)

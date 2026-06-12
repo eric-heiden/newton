@@ -424,6 +424,37 @@ If you run the examples from a source checkout with uv, use
     </td>
   </tr>
   <tr>
+    <td colspan="3"><h3>Fluid Examples</h3></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_sph_dam_break.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_sph_dam_break.jpg" alt="SPH Dam Break">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_sph_interactive_tank.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_sph_interactive_tank.jpg" alt="SPH Interactive Tank">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_sph_wave_pool.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_sph_wave_pool.jpg" alt="SPH Wave Pool">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_sph_dam_break</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_sph_interactive_tank</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_sph_wave_pool</code>
+    </td>
+  </tr>
+  <tr>
     <td colspan="3"><h3>MPM Examples</h3></td>
   </tr>
   <tr>

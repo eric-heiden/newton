@@ -730,6 +730,57 @@ add_example_test(
 )
 
 
+class TestFluidExamples(unittest.TestCase):
+    pass
+
+
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_sph_dam_break",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 30},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_sph_interactive_tank",
+    devices=cuda_test_devices,
+    test_options={
+        "num-frames": 30,
+        "dim-x": 34,
+        "dim-y": 22,
+        "dim-z": 6,
+        "spacing": 0.08,
+        "radius": 0.06,
+        "smoothing-length": 0.172,
+        "shape-collision-distance": 0.06,
+        "fluid-carve-clearance": 0.08,
+        "fluid-diffuse-max-particles": 2000,
+    },
+    use_viewer=True,
+)
+
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_sph_wave_pool",
+    devices=cuda_test_devices,
+    test_options={
+        "num-frames": 90,
+        "dim-x": 48,
+        "dim-y": 20,
+        "dim-z": 8,
+        "spacing": 0.06,
+        "radius": 0.045,
+        "smoothing-length": 0.129,
+        "paddle-period": 1.2,
+        "fluid-diffuse-threshold": 0.4,
+        "fluid-diffuse-max-particles": 4000,
+    },
+    use_viewer=True,
+)
+
+
 class TestContactsExamples(unittest.TestCase):
     pass
 

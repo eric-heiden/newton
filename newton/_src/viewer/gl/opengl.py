@@ -2970,6 +2970,8 @@ class RendererGL:
                 ),
                 fluid_bounds_lower=fluid_bounds_lower,
                 fluid_bounds_upper=fluid_bounds_upper,
+                water_color=material_fluid.color,
+                absorption_strength=material_fluid.absorption_strength,
                 caustic_scale=material_fluid.caustic_scale,
                 floor_caustic_strength=material_fluid.floor_caustic_strength,
                 surface_shadow_strength=material_fluid.surface_shadow_strength,

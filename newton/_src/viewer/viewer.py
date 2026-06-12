@@ -173,12 +173,12 @@ class ViewerBase(ABC):
         self.show_fluid_diffuse = True
         self.fluid_diffuse_color = (1.0, 1.0, 1.0)
         self.fluid_diffuse_alpha = 0.34
-        self.fluid_diffuse_radius = 0.012
+        self.fluid_diffuse_radius = 0.016
         self.fluid_diffuse_motion_blur_scale = 0.12
-        self.fluid_diffuse_expansion = 1.23
-        self.fluid_diffuse_inscatter = 0.60
-        self.fluid_diffuse_outscatter = 0.70
-        self.fluid_diffuse_shadow_strength = 0.62
+        self.fluid_diffuse_expansion = 0.55
+        self.fluid_diffuse_inscatter = 0.80
+        self.fluid_diffuse_outscatter = 0.30
+        self.fluid_diffuse_shadow_strength = 0.35
 
         self.gaussians_max_points = 100_000  # Max number of points to visualize per gaussian
 

@@ -11,6 +11,7 @@ from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelFlags, State
 from ..solver import SolverBase
 from .kernels import (
+    advance_sph_diffuse_seed,
     apply_pbf_deltas,
     collide_sph_diffuse_particles_with_shapes,
     collide_sph_particles_with_shapes,
@@ -98,8 +99,9 @@ class SolverSPH(SolverBase):
             ``None``, ``0.5 * smoothing_length`` is used.
         max_diffuse_particles: Maximum secondary foam/spray particles. Set to
             ``0`` to disable the diffuse particle layer.
-        diffuse_threshold: Kinetic/divergence potential needed to emit a
-            diffuse particle.
+        diffuse_threshold: Trapped-air/wave-crest potential needed to emit a
+            diffuse particle. The potential favors surface particles whose
+            velocity points out of the fluid (breaking crests, splashes).
         diffuse_lifetime: Diffuse particle lifetime [s].
         diffuse_drag: Blend rate toward neighboring fluid velocity [1/s].
         diffuse_buoyancy: Acceleration scale opposing gravity when a diffuse
@@ -286,6 +288,7 @@ class SolverSPH(SolverBase):
         self.diffuse_worlds: wp.array[wp.int32] | None = None
         self.diffuse_slot_states: wp.array[wp.int32] | None = None
         self.diffuse_spawn_counter: wp.array[wp.int32] | None = None
+        self.diffuse_frame_seed: wp.array[wp.int32] | None = None
         self._ensure_particle_storage()
         self._ensure_diffuse_storage()
 
@@ -336,6 +339,7 @@ class SolverSPH(SolverBase):
             self.diffuse_worlds = None
             self.diffuse_slot_states = None
             self.diffuse_spawn_counter = None
+            self.diffuse_frame_seed = None
             return
 
         model = self.model
@@ -352,6 +356,7 @@ class SolverSPH(SolverBase):
         self.diffuse_worlds = wp.zeros(self.max_diffuse_particles, dtype=wp.int32, device=model.device)
         self.diffuse_slot_states = wp.zeros(self.max_diffuse_particles, dtype=wp.int32, device=model.device)
         self.diffuse_spawn_counter = wp.zeros(1, dtype=wp.int32, device=model.device)
+        self.diffuse_frame_seed = wp.zeros(1, dtype=wp.int32, device=model.device)
 
     def clear_diffuse_particles(self) -> None:
         """Deactivate all secondary foam/spray particles."""
@@ -904,6 +909,12 @@ class SolverSPH(SolverBase):
         )
 
         wp.launch(
+            kernel=advance_sph_diffuse_seed,
+            dim=1,
+            inputs=[self.diffuse_frame_seed],
+            device=model.device,
+        )
+        wp.launch(
             kernel=spawn_sph_diffuse_particles,
             dim=model.particle_count,
             inputs=[
@@ -923,7 +934,7 @@ class SolverSPH(SolverBase):
                 self.bounds_lower,
                 self.bounds_upper,
                 self.boundary_damping,
-                self._step_index,
+                self.diffuse_frame_seed,
                 self.diffuse_spawn_counter,
                 self.diffuse_positions,
                 self.diffuse_velocities,

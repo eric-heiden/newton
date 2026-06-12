@@ -642,6 +642,7 @@ uniform float point_scale;
 uniform float motion_blur_scale;
 uniform float diffusion;
 uniform float lifetime;
+uniform float surface_bias;
 
 out vec2 TexCoord;
 flat out float LifeFade;
@@ -659,6 +660,14 @@ void main()
 
     vec3 v = EyeVel[0];
     vec3 p = EyePos[0].xyz;
+
+    // Foam rides at fluid-particle level, roughly one splat radius below the
+    // rendered water skin; pull sprites toward the camera so surface foam
+    // passes the depth test while deeper bubbles stay hidden.
+    float dist = length(p);
+    if (dist > 1.0e-4) {
+        p *= max(1.0 - surface_bias / dist, 0.0);
+    }
 
     // billboard in eye space
     vec3 u = vec3(0.0, point_scale, 0.0);
@@ -888,9 +897,12 @@ class FluidBatch:
 
         self._packed_gpu = None
         self._dummy_radii = None
+        self._cuda_vbo = None
+        self._interop_failed = False
 
     def destroy(self):
         gl = self._gl
+        self._cuda_vbo = None
         if getattr(self, "vao", None) is not None:
             gl.glDeleteVertexArrays(1, self.vao)
             gl.glDeleteBuffers(1, self.vbo)
@@ -943,8 +955,7 @@ class FluidBatch:
 
         if isinstance(points, wp.array) and points.device.is_cuda:
             device = points.device
-            if self._packed_gpu is None or len(self._packed_gpu) < self.capacity * 16:
-                self._packed_gpu = wp.empty(self.capacity * 16, dtype=float, device=device)
+            if self._dummy_radii is None:
                 self._dummy_radii = wp.zeros(1, dtype=float, device=device)
             if scalar_radius:
                 radii_array = self._dummy_radii
@@ -955,6 +966,27 @@ class FluidBatch:
                 uniform_radius = 0.0
                 use_radii = 1
             dummy4 = anisotropy if use_aniso else wp.zeros(1, dtype=wp.vec4, device=device)
+
+            # CUDA-GL interop: pack straight into the mapped vertex buffer.
+            # This avoids a per-frame device-to-host copy of the packed data
+            # and, more importantly, the full GPU sync that copy implies.
+            dest = None
+            if not self._interop_failed:
+                try:
+                    if self._cuda_vbo is None:
+                        self._cuda_vbo = wp.RegisteredGLBuffer(
+                            int(self.vbo.value), device, flags=wp.RegisteredGLBuffer.WRITE_DISCARD
+                        )
+                    dest = self._cuda_vbo.map(dtype=wp.float32, shape=(self.capacity * 16,))
+                except Exception:
+                    self._interop_failed = True
+                    self._cuda_vbo = None
+                    dest = None
+            if dest is None:
+                if self._packed_gpu is None or len(self._packed_gpu) < self.capacity * 16:
+                    self._packed_gpu = wp.empty(self.capacity * 16, dtype=float, device=device)
+                dest = self._packed_gpu
+
             wp.launch(
                 _pack_fluid_vertices,
                 dim=count,
@@ -968,10 +1000,14 @@ class FluidBatch:
                     anisotropy_secondary if use_aniso else dummy4,
                     anisotropy_tertiary if use_aniso else dummy4,
                     1 if use_aniso else 0,
-                    self._packed_gpu,
+                    dest,
                 ],
                 device=device,
             )
+            if self._cuda_vbo is not None and not self._interop_failed:
+                self._cuda_vbo.unmap()
+                self.count = count
+                return
             host = self._packed_gpu[: count * 16].numpy()
         else:
             host_points = points.numpy() if isinstance(points, wp.array) else np.asarray(points)
@@ -1036,6 +1072,7 @@ class DiffuseBatch:
         self.motion_blur_scale = 1.0
         self.diffusion = 1.0
         self.lifetime = 2.0
+        self.surface_bias = 0.05
 
         self._host_positions = np.zeros((0, 4), dtype=np.float32)
         self._host_velocities = np.zeros((0, 4), dtype=np.float32)
@@ -1070,10 +1107,10 @@ class DiffuseBatch:
     def _ensure_capacity(self, count: int):
         if count <= self.capacity:
             return
-        material = (self.radius, self.color, self.motion_blur_scale, self.diffusion, self.lifetime)
+        material = (self.radius, self.color, self.motion_blur_scale, self.diffusion, self.lifetime, self.surface_bias)
         self.destroy()
         self.__init__(self._gl, max(count, self.capacity * 2))
-        self.radius, self.color, self.motion_blur_scale, self.diffusion, self.lifetime = material
+        self.radius, self.color, self.motion_blur_scale, self.diffusion, self.lifetime, self.surface_bias = material
 
     def update(self, positions, velocities):
         if positions is None:
@@ -1431,6 +1468,7 @@ class FluidRenderer:
                     prog.set_float("motion_blur_scale", batch.motion_blur_scale)
                     prog.set_float("diffusion", batch.diffusion)
                     prog.set_float("lifetime", batch.lifetime)
+                    prog.set_float("surface_bias", batch.surface_bias)
                     prog.set_vec4("color", batch.color)
                     batch.draw()
             gl.glDisable(gl.GL_BLEND)

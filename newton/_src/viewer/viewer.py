@@ -3358,6 +3358,7 @@ class ViewerBase(ABC):
         motion_blur_scale: float = 1.0,
         diffusion: float = 1.0,
         lifetime: float = 2.0,
+        surface_bias: float = 0.05,
         hidden: bool = False,
     ):
         """Log diffuse spray/foam particles (no-op for non-fluid backends).
@@ -3372,9 +3373,11 @@ class ViewerBase(ABC):
             motion_blur_scale: Velocity stretch factor for the sprites.
             diffusion: Sprite growth factor over the particle lifetime.
             lifetime: Particle lifetime [s] used to scale the Flex life fades.
+            surface_bias: Camera-ward offset [m] so surface-riding foam passes
+                the depth test against the rendered water skin.
             hidden: Whether the diffuse batch should be hidden.
         """
-        del name, positions, velocities, radius, color, motion_blur_scale, diffusion, lifetime, hidden
+        del name, positions, velocities, radius, color, motion_blur_scale, diffusion, lifetime, surface_bias, hidden
 
     def _log_particles(self, state: newton.State):
         if self.model.particle_count:

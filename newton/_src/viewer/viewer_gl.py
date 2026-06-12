@@ -593,6 +593,8 @@ class ViewerGL(ViewerBase):
         self.objects = _filter_destroy(getattr(self, "objects", {}))
         self.lines = _filter_destroy(getattr(self, "lines", {}))
         self.arrows = _filter_destroy(getattr(self, "arrows", {}))
+        self.fluids = _filter_destroy(getattr(self, "fluids", {}))
+        self.fluid_diffuse = _filter_destroy(getattr(self, "fluid_diffuse", {}))
 
         # Wireframe shapes are keyed on layer-qualified names; filter by ownership.
         # VBO owners are shared across layers by ``id(vertex_data)``; after
@@ -1568,7 +1570,7 @@ class ViewerGL(ViewerBase):
                 destroy_once(obj)
         objects.clear()
 
-        for collection_name in ("lines", "arrows"):
+        for collection_name in ("lines", "arrows", "fluids", "fluid_diffuse"):
             collection = getattr(self, collection_name, {})
             for obj in collection.values():
                 destroy_once(obj)
@@ -1599,6 +1601,80 @@ class ViewerGL(ViewerBase):
             self.log_points(self._qualify("/model/particles"), points=None, hidden=True)
             return
         super()._log_particles(state)
+
+    @override
+    def log_fluid(
+        self,
+        name: str,
+        points: wp.array[wp.vec3] | None,
+        radii: wp.array[wp.float32] | float | None = None,
+        radius_scale: float = 1.0,
+        color: tuple[float, float, float, float] = (0.113, 0.425, 0.55, 0.8),
+        ior: float = 1.0,
+        blur_radius_world: float | None = None,
+        anisotropy: wp.array[wp.vec4] | None = None,
+        anisotropy_secondary: wp.array[wp.vec4] | None = None,
+        anisotropy_tertiary: wp.array[wp.vec4] | None = None,
+        hidden: bool = False,
+    ):
+        """Log particles for Flex-style screen-space fluid rendering."""
+        from .gl.fluid import FluidBatch  # noqa: PLC0415
+
+        name = self._qualify(name)
+        hidden = hidden or self._layer_force_hidden()
+
+        if points is None:
+            if name in self.fluids:
+                self.fluids[name].count = 0
+                self.fluids[name].hidden = True
+            return
+
+        count = len(points)
+        if name not in self.fluids:
+            self.fluids[name] = FluidBatch(self.renderer.gl, max(count, 256))
+        batch = self.fluids[name]
+        batch.hidden = hidden
+        batch.color = tuple(float(c) for c in color)
+        batch.ior = float(ior)
+        if blur_radius_world is not None:
+            batch.blur_radius_world = float(blur_radius_world)
+        elif isinstance(radii, (int, float)):
+            batch.blur_radius_world = float(radii) * 2.0
+        batch.update(points, radii, radius_scale, anisotropy, anisotropy_secondary, anisotropy_tertiary)
+
+    @override
+    def log_fluid_diffuse(
+        self,
+        name: str,
+        positions: wp.array[wp.vec4] | None,
+        velocities: wp.array[wp.vec4] | None = None,
+        radius: float = 0.02,
+        color: tuple[float, float, float, float] = (0.9, 0.95, 1.0, 0.8),
+        motion_blur_scale: float = 1.0,
+        diffusion: float = 1.0,
+        hidden: bool = False,
+    ):
+        """Log Flex-style diffuse spray/foam particles."""
+        from .gl.fluid import DiffuseBatch  # noqa: PLC0415
+
+        name = self._qualify(name)
+        hidden = hidden or self._layer_force_hidden()
+
+        if positions is None:
+            if name in self.fluid_diffuse:
+                self.fluid_diffuse[name].count = 0
+                self.fluid_diffuse[name].hidden = True
+            return
+
+        if name not in self.fluid_diffuse:
+            self.fluid_diffuse[name] = DiffuseBatch(self.renderer.gl, max(len(positions), 256))
+        batch = self.fluid_diffuse[name]
+        batch.hidden = hidden
+        batch.radius = float(radius)
+        batch.color = tuple(float(c) for c in color)
+        batch.motion_blur_scale = float(motion_blur_scale)
+        batch.diffusion = float(diffusion)
+        batch.update(positions, velocities)
 
     @override
     def log_points(
@@ -2165,7 +2241,15 @@ class ViewerGL(ViewerBase):
                 else:
                     self.renderer.render_texture(*texture)
             else:
-                self.renderer.render(self.camera, self.objects, self.lines, self.wireframe_shapes, self.arrows)
+                self.renderer.render(
+                    self.camera,
+                    self.objects,
+                    self.lines,
+                    self.wireframe_shapes,
+                    self.arrows,
+                    fluids=self.fluids,
+                    fluid_diffuse=self.fluid_diffuse,
+                )
 
             if self.gui:
                 self.gui.render_frame(update_fps=True)

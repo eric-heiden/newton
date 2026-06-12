@@ -599,6 +599,14 @@ class ViewerBase(ABC):
         layer.show_joints = False
         layer.show_com = False
         layer.show_particles = False
+        layer.show_fluid = False
+        layer.show_fluid_diffuse = True
+        # Flex-style water material (rgb + opacity term used by the composite)
+        layer.fluid_color = (0.113, 0.425, 0.55, 0.8)
+        layer.fluid_ior = 1.0
+        layer.fluid_diffuse_color = (0.9, 0.95, 1.0, 0.8)
+        layer.fluid_diffuse_radius = 0.02
+        layer.fluid_diffuse_motion_blur = 1.0
         layer.show_contacts = False
         layer.show_contact_normals = True
         layer.show_contact_disks = True  # Note: requires the ``"force"`` extended contact attribute.
@@ -3302,6 +3310,67 @@ class ViewerBase(ABC):
                         opacity=opacity,
                     )
 
+    def log_fluid(
+        self,
+        name: str,
+        points,
+        radii=None,
+        radius_scale: float = 1.0,
+        color=(0.113, 0.425, 0.55, 0.8),
+        ior: float = 1.0,
+        blur_radius_world: float | None = None,
+        anisotropy=None,
+        anisotropy_secondary=None,
+        anisotropy_tertiary=None,
+        hidden: bool = False,
+    ):
+        """Log particle samples as a fluid surface.
+
+        Viewer backends without a screen-space fluid renderer fall back to
+        rendering the samples as plain points. :class:`ViewerGL` overrides this
+        with the Flex-style fluid pipeline.
+
+        Args:
+            name: Unique path/name for the fluid batch.
+            points: Particle positions [m], shape [particle_count, 3].
+            radii: Particle radii [m] (array, scalar, or ``None``).
+            color: Water color and opacity term used by the composite shader.
+            ior: Index of refraction controlling refraction/reflection offsets.
+            blur_radius_world: World-space radius of the surface smoothing
+                filter [m]. Defaults to twice the particle radius.
+            anisotropy: Primary ellipsoid axis (xyz) and scale (w) per particle.
+            anisotropy_secondary: Secondary ellipsoid axis and scale.
+            anisotropy_tertiary: Tertiary ellipsoid axis and scale.
+            hidden: Whether the fluid batch should be hidden.
+        """
+        self.log_points(name=name, points=points, radii=radii, hidden=hidden)
+
+    def log_fluid_diffuse(
+        self,
+        name: str,
+        positions,
+        velocities=None,
+        radius: float = 0.02,
+        color=(0.9, 0.95, 1.0, 0.8),
+        motion_blur_scale: float = 1.0,
+        diffusion: float = 1.0,
+        hidden: bool = False,
+    ):
+        """Log diffuse spray/foam particles (no-op for non-fluid backends).
+
+        Args:
+            name: Unique path/name for the diffuse batch.
+            positions: Particle positions and normalized life, shape
+                [particle_count, 4].
+            velocities: Particle velocities [m/s], shape [particle_count, 4].
+            radius: Sprite radius [m].
+            color: Sprite color and alpha multiplier.
+            motion_blur_scale: Velocity stretch factor for the sprites.
+            diffusion: Sprite growth factor over the particle lifetime.
+            hidden: Whether the diffuse batch should be hidden.
+        """
+        del name, positions, velocities, radius, color, motion_blur_scale, diffusion, hidden
+
     def _log_particles(self, state: newton.State):
         if self.model.particle_count:
             points = state.particle_q
@@ -3341,6 +3410,19 @@ class ViewerBase(ABC):
             else:
                 colors = None
 
+            if self.show_fluid:
+                self.log_fluid(
+                    name="/model/fluid",
+                    points=points,
+                    radii=radii,
+                    color=self.fluid_color,
+                    ior=self.fluid_ior,
+                    hidden=False,
+                )
+                self.log_points(name="/model/particles", points=None, hidden=True)
+                return
+
+            self.log_fluid(name="/model/fluid", points=None, hidden=True)
             self.log_points(
                 name=self._qualify("/model/particles"),
                 points=points,

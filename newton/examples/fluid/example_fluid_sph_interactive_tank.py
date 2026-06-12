@@ -1281,7 +1281,7 @@ class Example:
         parser.add_argument("--exposure", type=float, default=1.08)
         parser.add_argument("--diffuse-scale", type=float, default=1.05)
         parser.add_argument("--specular-scale", type=float, default=4.00)
-        parser.add_argument("--sun-direction", type=float, nargs=3, default=(0.78, -0.56, 0.20))
+        parser.add_argument("--sun-direction", type=float, nargs=3, default=(0.66, -0.48, 0.45))
         parser.add_argument("--angular-damping", type=float, default=0.04)
         parser.add_argument("--camera-pos", type=float, nargs=3, default=(1.45, -1.55, 1.30))
         parser.add_argument("--camera-pitch", type=float, default=-27.0)

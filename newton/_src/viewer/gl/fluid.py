@@ -306,27 +306,64 @@ THICKNESS_VS = """
 layout (location = 0) in vec4 aPositionRadius;
 
 uniform mat4 view;
-uniform mat4 projection;
 uniform float thickness_scale;
-uniform float point_scale;
+
+out vec4 EyePosRadius;
 
 void main()
 {
     vec4 eyePos = view * vec4(aPositionRadius.xyz, 1.0);
-    gl_Position = projection * eyePos;
-    gl_PointSize = aPositionRadius.w * thickness_scale * (point_scale / max(gl_Position.w, 1.0e-6));
+    EyePosRadius = vec4(eyePos.xyz, aPositionRadius.w * thickness_scale);
+    gl_Position = eyePos;
+}
+"""
+
+# Billboards are expanded in a geometry shader instead of point sprites:
+# point-sprite rasterization (gl_PointSize/gl_PointCoord) is unreliable
+# across GL profiles and silently produced no fragments on some contexts.
+THICKNESS_GS = """
+#version 330 core
+layout (points) in;
+layout (triangle_strip, max_vertices = 4) out;
+
+in vec4 EyePosRadius[];
+
+uniform mat4 projection;
+
+out vec2 TexCoord;
+
+void main()
+{
+    vec3 p = EyePosRadius[0].xyz;
+    float r = EyePosRadius[0].w;
+    if (r <= 0.0) return;
+
+    TexCoord = vec2(0.0, 1.0);
+    gl_Position = projection * vec4(p + vec3(-r, r, 0.0), 1.0);
+    EmitVertex();
+    TexCoord = vec2(0.0, 0.0);
+    gl_Position = projection * vec4(p + vec3(-r, -r, 0.0), 1.0);
+    EmitVertex();
+    TexCoord = vec2(1.0, 1.0);
+    gl_Position = projection * vec4(p + vec3(r, r, 0.0), 1.0);
+    EmitVertex();
+    TexCoord = vec2(1.0, 0.0);
+    gl_Position = projection * vec4(p + vec3(r, -r, 0.0), 1.0);
+    EmitVertex();
+    EndPrimitive();
 }
 """
 
 THICKNESS_FS = """
 #version 330 core
+in vec2 TexCoord;
 out float FragThickness;
 
 uniform float thickness_gain;
 
 void main()
 {
-    vec2 d = gl_PointCoord.xy * 2.0 - vec2(1.0);
+    vec2 d = TexCoord * 2.0 - vec2(1.0);
     float mag = dot(d, d);
     if (mag > 1.0) discard;
     FragThickness = sqrt(1.0 - mag) * thickness_gain;
@@ -525,7 +562,9 @@ void main()
 
     // read thickness from the refracted coordinate to avoid halos
     float thickness = max(texture(thickness_tex, refractCoord).x, 0.3);
-    vec3 transmission = (1.0 - (1.0 - color.xyz) * thickness * 0.8) * color.w;
+    // Beer-Lambert variant of the Flex transmission: the shipped linear form
+    // goes negative once the accumulated thickness exceeds ~1.4
+    vec3 transmission = exp(-(vec3(1.0) - color.xyz) * thickness) * color.w;
     vec3 refractCol = texture(scene_tex, refractCoord).xyz * transmission;
 
     vec2 sceneReflectCoord = TexCoord - rEye.xy * tex_scale * reflectScale / eyeZ;
@@ -682,23 +721,59 @@ SHADOW_SPLAT_VS = """
 layout (location = 0) in vec4 aPositionRadius;
 
 uniform mat4 light_view;
-uniform mat4 light_projection;
-uniform float point_scale;
+
+out vec4 EyePosRadius;
 
 void main()
 {
-    gl_Position = light_projection * light_view * vec4(aPositionRadius.xyz, 1.0);
-    gl_PointSize = aPositionRadius.w * 2.0 * point_scale;
+    vec4 eyePos = light_view * vec4(aPositionRadius.xyz, 1.0);
+    EyePosRadius = vec4(eyePos.xyz, aPositionRadius.w);
+    gl_Position = eyePos;
+}
+"""
+
+SHADOW_SPLAT_GS = """
+#version 330 core
+layout (points) in;
+layout (triangle_strip, max_vertices = 4) out;
+
+in vec4 EyePosRadius[];
+
+uniform mat4 light_projection;
+
+out vec2 TexCoord;
+
+void main()
+{
+    vec3 p = EyePosRadius[0].xyz;
+    float r = EyePosRadius[0].w;
+    if (r <= 0.0) return;
+
+    TexCoord = vec2(0.0, 1.0);
+    gl_Position = light_projection * vec4(p + vec3(-r, r, 0.0), 1.0);
+    EmitVertex();
+    TexCoord = vec2(0.0, 0.0);
+    gl_Position = light_projection * vec4(p + vec3(-r, -r, 0.0), 1.0);
+    EmitVertex();
+    TexCoord = vec2(1.0, 1.0);
+    gl_Position = light_projection * vec4(p + vec3(r, r, 0.0), 1.0);
+    EmitVertex();
+    TexCoord = vec2(1.0, 0.0);
+    gl_Position = light_projection * vec4(p + vec3(r, -r, 0.0), 1.0);
+    EmitVertex();
+    EndPrimitive();
 }
 """
 
 SHADOW_SPLAT_FS = """
 #version 330 core
+in vec2 TexCoord;
+
 uniform float shadow_opacity;
 
 void main()
 {
-    vec2 d = gl_PointCoord.xy * 2.0 - vec2(1.0);
+    vec2 d = TexCoord * 2.0 - vec2(1.0);
     if (dot(d, d) > 1.0) discard;
 
     // Ordered dithering: the PCF taps of the scene shadow lookup average the
@@ -781,7 +856,7 @@ class FluidBatch:
         self.max_blur_radius = 14.0
         self.shadow_opacity = 0.5
         self.thickness_scale = 4.0
-        self.thickness_gain = 0.005
+        self.thickness_gain = 0.0015
 
         self.vao = gl.GLuint()
         self.vbo = gl.GLuint()
@@ -1055,11 +1130,11 @@ class FluidRenderer:
         self._fbo = None
 
         self._ellipsoid_prog = _Program(gl, ELLIPSOID_DEPTH_VS, ELLIPSOID_DEPTH_FS, ELLIPSOID_DEPTH_GS)
-        self._thickness_prog = _Program(gl, THICKNESS_VS, THICKNESS_FS)
+        self._thickness_prog = _Program(gl, THICKNESS_VS, THICKNESS_FS, THICKNESS_GS)
         self._blur_prog = _Program(gl, BLUR_VS, BLUR_FS)
         self._composite_prog = _Program(gl, BLUR_VS, COMPOSITE_FS)
         self._diffuse_prog = _Program(gl, DIFFUSE_VS, DIFFUSE_FS, DIFFUSE_GS)
-        self._shadow_prog = _Program(gl, SHADOW_SPLAT_VS, SHADOW_SPLAT_FS)
+        self._shadow_prog = _Program(gl, SHADOW_SPLAT_VS, SHADOW_SPLAT_FS, SHADOW_SPLAT_GS)
 
         # fullscreen triangle-strip quad
         self._quad_vao = gl.GLuint()
@@ -1146,17 +1221,12 @@ class FluidRenderer:
         gl = self._gl
         light_view = _std_mat(getattr(host, "_light_view_matrix", np.eye(4, dtype=np.float32).flatten()))
         light_proj = _std_mat(getattr(host, "_light_projection_matrix", np.eye(4, dtype=np.float32).flatten()))
-        # orthographic projection: pixels per world unit
-        point_scale = 0.5 * host._shadow_width * light_proj[0, 0]
 
-        if hasattr(gl, "GL_PROGRAM_POINT_SIZE"):
-            gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
         gl.glEnable(gl.GL_DEPTH_TEST)
         gl.glDepthMask(True)
         with self._shadow_prog as prog:
             prog.set_mat4("light_view", light_view)
             prog.set_mat4("light_projection", light_proj)
-            prog.set_float("point_scale", point_scale)
             for batch in batches:
                 prog.set_float("shadow_opacity", batch.shadow_opacity)
                 batch.draw()
@@ -1225,12 +1295,9 @@ class FluidRenderer:
             gl.glDepthMask(False)
             gl.glEnable(gl.GL_BLEND)
             gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE)
-            if hasattr(gl, "GL_PROGRAM_POINT_SIZE"):
-                gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
             with self._thickness_prog as prog:
                 prog.set_mat4("view", view)
                 prog.set_mat4("projection", projection)
-                prog.set_float("point_scale", point_scale)
                 for batch in batches:
                     prog.set_float("thickness_scale", batch.thickness_scale)
                     prog.set_float("thickness_gain", batch.thickness_gain)

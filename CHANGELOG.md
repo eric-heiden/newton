@@ -410,6 +410,13 @@
 - Add `newton.use_coord_layout_targets` opt-in flag exposing `Model.joint_target_q` / `Control.joint_target_q` shaped `(joint_coord_count,)` (matching `joint_q`) and `joint_target_qd` shaped `(joint_dof_count,)` (matching `joint_qd`); solvers, the actuator library, and `ModelBuilder.finalize()` honor the flag. Defaults to `False` for backwards compatibility; will flip in a future release.
 - Add opt-in `validate_mesh` parameter to `ModelBuilder.add_cloth_mesh()`, `ModelBuilder.add_soft_mesh()`, and `style3d.add_cloth_mesh()` that warns on degenerate geometry; add public `newton.utils.validate_triangle_mesh()` and `newton.utils.validate_tet_mesh()` utilities
 - Add edge-simplification options to `Mesh.build_sdf()` that drop near-coplanar internal edges from the mesh-edge set used by SDF-mesh contact generation: `edge_lower_angle_threshold_rad` (default 0.1°; pass a negative value to opt out and keep the full edge set), `edge_upper_angle_threshold_rad`, opt-in `edge_box_absorption`, and box half-extent controls `edge_box_half_{normal,lateral}` / `edge_box_half_{normal,lateral}_rel`. (#2894)
+- Warn from `SolverMuJoCo` when a `JointType.FREE` joint has a non-world parent; MuJoCo requires free joints to attach directly to the world.
+- Document loop closure in the articulations concept page, covering the omit-from-`add_articulation` pattern and USD `excludeFromArticulation` with per-solver caveats
+- Add position-based fluid (PBF) support to `SolverXPBD`: particles flagged with the new `ParticleFlags.FLUID` generate SPH density constraints solved alongside all other XPBD constraints, with controls for rest spacing, cohesion (splash coagulation), XSPH viscosity, and vorticity confinement, plus `SolverXPBD.update_render_particles()` for Flex-style smoothed/anisotropic fluid surface rendering
+- Add `ViewerGL.show_loading_splash()` / `ViewerGL.hide_loading_splash()` displaying a stylized Newton's-cradle overlay while the GL viewer waits on Warp kernel compilation; raised automatically by `newton.examples.init()` for visible GL viewers
+- Add edge-simplification options to `Mesh.build_sdf()` that drop near-coplanar internal edges from the mesh-edge set used by SDF-mesh contact generation: `edge_lower_angle_threshold_rad` (default 0.1°; pass a negative value to opt out and keep the full edge set), `edge_upper_angle_threshold_rad`, opt-in `edge_box_absorption`, and box half-extent controls `edge_box_half_{normal,lateral}` / `edge_box_half_{normal,lateral}_rel`
+- Add `cable_cross_slide_table` example demonstrating a cable-driven XY table
+- Parse `NewtonSDFCollisionAPI` attributes from USD in `ModelBuilder.add_usd()`, including the `newton:hydroelasticEnabled` toggle, absolute narrow band / margin, texture format, hydroelastic stiffness (`newton:hydroelasticStiffness`), and applied-API schema defaults. Hydroelastic configuration is folded into `NewtonSDFCollisionAPI` and opted into via `newton:hydroelasticEnabled` (default `false`). SDF generation is opt-in by applying the API; for primitive shapes the SDF is only built when hydroelastic is also enabled.
 - Add `ModelBuilder.ShapeConfig.sdf_padding` and `ModelBuilder.shape_sdf_padding` for setting the per-shape SDF AABB padding [m] used when building primitive texture SDFs and deferred mesh SDFs
 - Add `contact_reduction_hashtable_size_factor` to `CollisionPipeline`, `NarrowPhase`, and `HydroelasticSDF.Config` for increasing contact reduction hashtable capacity when fill/failure warnings appear. (#2978)
 - Add `Model.bvh_build_shapes()`, `Model.bvh_refit_shapes()`, `Model.bvh_build_particles()`, and `Model.bvh_refit_particles()` for managing model BVHs, with optional `bvh_constructor` selection on the build methods. (#3039)
@@ -428,6 +435,14 @@
 - Add an optional `kernel_block_dim` argument to `SensorTiledCamera.update()` for tuning the Warp ray-tracer's `render_megakernel` launch shape
 - Add `rec_id` parameter to `ViewerRerun` for specifying the recording ID, enabling multiple processes to share a single Rerun recording
 - Add `ViewerRTX`, a real-time ray-traced viewer powered by NVIDIA OVRTX. (#1861)
+- Add `fluid_xpbd_dam_break` example: a water column collapses across an unbounded ground plane, splashes against a pillar, and carries a floating box, demonstrating two-way coupled XPBD fluids
+- Add USD parsing for `NewtonSiteAPI` to mark shapes as sites.
+- Add `joint_damping` model attribute and `JointDofConfig.damping` for velocity-proportional damping that is always active
+- Add `ViewerRTX`, a real-time ray-traced viewer powered by NVIDIA OVRTX.
+- Add `SolverBase.reset()` method for in-place solver state resets with optional `world_mask` and `StateFlags`; default implementation is a no-op
+- Implement `SolverMuJoCo.reset()` to reset selected worlds: it resets `State.joint_q` / `State.joint_qd` to the model defaults (gated by `StateFlags`) and clears the per-world MuJoCo buffers that persist between steps (`qacc_warmstart`, `qfrc_applied`, `xfrc_applied`, `act`, `ctrl`), so a world recovers cleanly on the next step after a divergence (e.g. NaNs); accepts an optional `world_mask`
+- Add `StateFlags` enum to control which state attributes are reset
+- Add `ModelFlags` as the canonical name for model-change notification flags
 - Add edge overlay toggle (`renderer.draw_edges`) for wireframe visualization on top of solid geometry
 - Add `newton.utils.ColorSpace`, `color_srgb_to_linear()`, `color_linear_to_srgb()`, and `SensorTiledCamera.RenderConfig.output_color_space` for color-space boundaries. (#2411)
 - Add `cable_cross_slide_table` example demonstrating a cable-driven XY table

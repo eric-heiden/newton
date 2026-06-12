@@ -7,10 +7,12 @@ import warnings
 import warp as wp
 
 from ...core.types import override
+from ...geometry import ParticleFlags
 from ...sim import Contacts, Control, Model, ModelFlags, State
 from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
 from . import kernels, restitution_kernels
+from ..sph.kernels import compute_sph_render_particles
 from .kernels import (
     accumulate_weighted_contact_impulse,
     apply_body_delta_velocities,
@@ -19,11 +21,15 @@ from .kernels import (
     apply_particle_deltas,
     apply_particle_shape_restitution,
     bending_constraint,
+    compute_fluid_lambdas,
+    compute_fluid_vorticity,
     convert_contact_impulse_to_force,
     convert_joint_impulse_to_parent_f,
     copy_kinematic_body_state_kernel,
     solve_body_contact_positions,
     solve_body_joints,
+    solve_fluid_deltas,
+    solve_fluid_velocities,
     solve_particle_particle_contacts,
     solve_particle_shape_contacts,
     # solve_simple_body_joints,
@@ -116,10 +122,10 @@ class SolverXPBD(SolverBase, CouplingInterface):
         XPBD iteration loop, so fluids two-way couple with rigid bodies, cloth,
         and soft bodies. Unlike a fixed-bounds SPH solver, fluid particles are
         free to travel anywhere and collide with shapes through the standard
-        particle contact pipeline. The artificial-pressure cohesion term
-        (``fluid_cohesion``) makes splashes coagulate into strands and droplets
-        instead of dispersing into isolated particles; XSPH viscosity and
-        vorticity confinement act on velocities after the position solve.
+        particle contact pipeline. A bounded cohesion term (``fluid_cohesion``)
+        makes splashes coagulate into strands and droplets instead of dispersing
+        into isolated particles; XSPH viscosity and vorticity confinement act on
+        velocities after the position solve.
 
         .. code-block:: python
 
@@ -162,7 +168,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         fluid_rest_distance: float | None = None,
         fluid_smoothing_length: float | None = None,
         fluid_rest_density: float | None = None,
-        fluid_cohesion: float = 0.1,
+        fluid_cohesion: float = 1.0,
         fluid_viscosity: float = 0.0,
         fluid_vorticity_confinement: float = 0.0,
         fluid_relaxation: float = 1.0,
@@ -193,9 +199,11 @@ class SolverXPBD(SolverBase, CouplingInterface):
             fluid_rest_density: Fluid rest density [kg/m³]. If ``None``, it is calibrated
                 from the mean fluid particle mass so that a regular grid of particles at
                 ``fluid_rest_distance`` spacing is exactly at rest.
-            fluid_cohesion: Strength of the artificial-pressure cohesion term
-                (``k`` in Eq. 13 of the PBF paper). Around ``0.1`` gives water-like
-                splash coagulation; ``0`` disables cohesion.
+            fluid_cohesion: How strongly the fluid holds together, in ``[0, 1]``.
+                Scales a bounded Akinci-style cohesion term that attracts neighbors
+                at mid-range and repels at short range, producing surface-tension-like
+                coagulation of splashes into droplets and strands. ``0`` disables
+                cohesion so splashes disperse into individual particles.
             fluid_viscosity: XSPH viscosity in ``[0, 1]``: per-substep blend toward the
                 kernel-weighted neighborhood velocity. Small values (``0.01``-``0.1``)
                 suit water; values near ``1`` give honey-like behavior.
@@ -244,7 +252,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self.fluid_rest_distance = fluid_rest_distance
         self.fluid_smoothing_length = fluid_smoothing_length
         self.fluid_rest_density = fluid_rest_density
-        self.fluid_cohesion = max(float(fluid_cohesion), 0.0)
+        self.fluid_cohesion = min(max(float(fluid_cohesion), 0.0), 1.0)
         self.fluid_viscosity = min(max(float(fluid_viscosity), 0.0), 1.0)
         self.fluid_vorticity_confinement = max(float(fluid_vorticity_confinement), 0.0)
         self.fluid_relaxation = max(float(fluid_relaxation), 0.0)
@@ -304,6 +312,8 @@ class SolverXPBD(SolverBase, CouplingInterface):
             self._refresh_kinematic_state()
         if self.enable_restitution and flags & ModelFlags.SHAPE_PROPERTIES:
             self._refresh_rigid_restitution_enabled()
+        if flags & ModelFlags.PARTICLE_PROPERTIES:
+            self._update_fluid_settings()
 
     def _refresh_rigid_restitution_enabled(self) -> None:
         restitution = self.model.shape_material_restitution
@@ -324,6 +334,151 @@ class SolverXPBD(SolverBase, CouplingInterface):
             ``True`` because :meth:`notify_model_changed` refreshes the derived inertial buffers with device work.
         """
         return True
+
+    def _update_fluid_settings(self) -> None:
+        """Resolve fluid parameters and allocate fluid buffers if the model contains fluid particles."""
+        model = self.model
+        self._has_fluid = False
+        if model.particle_count == 0 or model.particle_flags is None:
+            return
+
+        flags = model.particle_flags.numpy()
+        fluid_mask = (flags & int(ParticleFlags.FLUID)) != 0
+        if not fluid_mask.any():
+            return
+
+        rest_distance = self.fluid_rest_distance
+        if rest_distance is None:
+            rest_distance = 2.0 * model.particle_max_radius
+        if rest_distance <= 0.0:
+            raise ValueError("fluid_rest_distance must be positive (or particle radii must be nonzero)")
+
+        h = self.fluid_smoothing_length
+        if h is None:
+            h = 1.8 * rest_distance
+        if h <= rest_distance:
+            raise ValueError("fluid_smoothing_length must be larger than fluid_rest_distance")
+
+        fluid_masses = model.particle_mass.numpy()[fluid_mask]
+        mean_mass = float(fluid_masses.mean())
+
+        rest_density = self.fluid_rest_density
+        if rest_density is None:
+            if mean_mass <= 0.0:
+                raise ValueError(
+                    "fluid_rest_density cannot be calibrated from massless fluid particles; pass it explicitly"
+                )
+            # calibrate against a regular particle grid at rest spacing so that
+            # grid-initialized fluid starts exactly at rest density
+            n = int(math.ceil(h / rest_distance))
+            lattice_sum = 0.0
+            for ix in range(-n, n + 1):
+                for iy in range(-n, n + 1):
+                    for iz in range(-n, n + 1):
+                        r_sq = float(ix * ix + iy * iy + iz * iz) * rest_distance * rest_distance
+                        lattice_sum += _poly6(r_sq, h)
+            rest_density = mean_mass * lattice_sum
+        if rest_density <= 0.0:
+            raise ValueError("fluid_rest_density must be positive")
+
+        # scale-invariant CFM regularizer: a small fraction of the constraint-
+        # gradient denominator of a particle in the bulk of the rest lattice
+        if mean_mass > 0.0:
+            n = int(math.ceil(h / rest_distance))
+            grad_sq_sum = 0.0
+            for ix in range(-n, n + 1):
+                for iy in range(-n, n + 1):
+                    for iz in range(-n, n + 1):
+                        if ix == 0 and iy == 0 and iz == 0:
+                            continue
+                        r = math.sqrt(float(ix * ix + iy * iy + iz * iz)) * rest_distance
+                        if r >= h:
+                            continue
+                        g = 45.0 / (math.pi * h**6) * (h - r) ** 2 * mean_mass / rest_density
+                        grad_sq_sum += g * g / mean_mass
+            relaxation_epsilon = 1.0e-3 * grad_sq_sum
+        else:
+            relaxation_epsilon = 1.0e-6
+
+        self._has_fluid = True
+        self._fluid_rest_distance_eff = rest_distance
+        self._fluid_h = h
+        self._fluid_rest_density_eff = rest_density
+        self._fluid_eps = relaxation_epsilon
+        self._fluid_max_delta = 0.5 * h
+        # bound the per-pair cohesion bias to a small fraction of the rest
+        # spacing per iteration so the term stays contractive (no overshoot
+        # oscillation) regardless of neighborhood size, and weak enough that
+        # the incompressibility correction dominates in the bulk
+        self._fluid_cohesion_step = 0.02 * rest_distance * self.fluid_cohesion
+
+        n = model.particle_count
+        if self._fluid_density is None or len(self._fluid_density) != n:
+            self._fluid_density = wp.zeros(n, dtype=wp.float32, device=model.device)
+            self._fluid_lambda = wp.zeros(n, dtype=wp.float32, device=model.device)
+            self._fluid_vorticity = wp.zeros(n, dtype=wp.vec3, device=model.device)
+
+    def update_render_particles(
+        self,
+        state: State,
+        smoothing: float = 0.5,
+        anisotropy_scale: float = 1.0,
+        anisotropy_min: float = 0.2,
+        anisotropy_max: float = 2.0,
+    ) -> None:
+        """Compute smoothed, anisotropic render particles for fluid surface rendering.
+
+        Mirrors Flex's smoothed-particle and anisotropy outputs: particle positions
+        are Laplacian-smoothed toward their kernel-weighted neighborhood center, and
+        per-particle ellipsoid axes are fit to the neighborhood covariance so that
+        stretched splashes render as connected sheets and strands rather than
+        individual spheres. Results are written to :attr:`render_positions`,
+        :attr:`render_anisotropy`, :attr:`render_anisotropy_secondary`, and
+        :attr:`render_anisotropy_tertiary`, which can be passed to
+        ``Viewer.log_fluid()``.
+
+        Args:
+            state: State whose ``particle_q``/``particle_qd`` are used.
+            smoothing: Position smoothing strength in ``[0, 1]``.
+            anisotropy_scale: Stretch multiplier for the ellipsoid fit. ``0`` keeps spheres.
+            anisotropy_min: Minimum ellipsoid axis scale as a fraction of particle radius.
+            anisotropy_max: Maximum ellipsoid axis scale as a fraction of particle radius.
+        """
+        model = self.model
+        if model.particle_count == 0 or model.particle_grid is None:
+            return
+
+        n = model.particle_count
+        if self.render_positions is None or len(self.render_positions) != n:
+            self.render_positions = wp.zeros(n, dtype=wp.vec3, device=model.device)
+            self.render_anisotropy = wp.zeros(n, dtype=wp.vec4, device=model.device)
+            self.render_anisotropy_secondary = wp.zeros(n, dtype=wp.vec4, device=model.device)
+            self.render_anisotropy_tertiary = wp.zeros(n, dtype=wp.vec4, device=model.device)
+
+        h = self._fluid_h if self._has_fluid else 2.0 * model.particle_max_radius
+        with wp.ScopedDevice(model.device):
+            model.particle_grid.build(state.particle_q, radius=h)
+
+        wp.launch(
+            kernel=compute_sph_render_particles,
+            dim=n,
+            inputs=[
+                model.particle_grid.id,
+                state.particle_q,
+                state.particle_qd,
+                model.particle_flags,
+                h,
+                smoothing,
+                anisotropy_scale,
+                anisotropy_min,
+                anisotropy_max,
+                self.render_positions,
+                self.render_anisotropy,
+                self.render_anisotropy_secondary,
+                self.render_anisotropy_tertiary,
+            ],
+            device=model.device,
+        )
 
     def copy_kinematic_body_state(self, model: Model, state_in: State, state_out: State):
         """Copy kinematic body poses and velocities from an input state to an output state.
@@ -562,6 +717,8 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 if model.particle_count > 1 and model.particle_grid is not None:
                     # Search radius must cover the maximum interaction distance used by the contact query
                     search_radius = model.particle_max_radius * 2.0 + model.particle_cohesion
+                    if self._has_fluid:
+                        search_radius = max(search_radius, self._fluid_h)
                     with wp.ScopedDevice(model.device):
                         model.particle_grid.build(state_out.particle_q, radius=search_radius)
 
@@ -695,6 +852,44 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                     model.particle_max_radius,
                                     dt,
                                     self.soft_contact_relaxation,
+                                ],
+                                outputs=[particle_deltas],
+                                device=model.device,
+                            )
+
+                        # position-based fluid density constraints
+                        if self._has_fluid and model.particle_count > 1 and model.particle_grid is not None:
+                            wp.launch(
+                                kernel=compute_fluid_lambdas,
+                                dim=model.particle_count,
+                                inputs=[
+                                    model.particle_grid.id,
+                                    particle_q,
+                                    model.particle_mass,
+                                    model.particle_inv_mass,
+                                    model.particle_flags,
+                                    self._fluid_h,
+                                    self._fluid_rest_density_eff,
+                                    self._fluid_eps,
+                                ],
+                                outputs=[self._fluid_density, self._fluid_lambda],
+                                device=model.device,
+                            )
+                            wp.launch(
+                                kernel=solve_fluid_deltas,
+                                dim=model.particle_count,
+                                inputs=[
+                                    model.particle_grid.id,
+                                    particle_q,
+                                    model.particle_mass,
+                                    model.particle_inv_mass,
+                                    model.particle_flags,
+                                    self._fluid_lambda,
+                                    self._fluid_h,
+                                    self._fluid_rest_density_eff,
+                                    self._fluid_cohesion_step,
+                                    self._fluid_max_delta,
+                                    self.fluid_relaxation,
                                 ],
                                 outputs=[particle_deltas],
                                 device=model.device,
@@ -903,6 +1098,52 @@ class SolverXPBD(SolverBase, CouplingInterface):
 
                         body_q, body_qd = self._apply_body_deltas(model, state_in, state_out, body_deltas, dt)
 
+            # post-projection fluid velocity pass: XSPH viscosity and vorticity confinement
+            if (
+                model.particle_count
+                and self._has_fluid
+                and model.particle_grid is not None
+                and (self.fluid_viscosity > 0.0 or self.fluid_vorticity_confinement > 0.0)
+            ):
+                if self.fluid_vorticity_confinement > 0.0:
+                    wp.launch(
+                        kernel=compute_fluid_vorticity,
+                        dim=model.particle_count,
+                        inputs=[
+                            model.particle_grid.id,
+                            particle_q,
+                            particle_qd,
+                            model.particle_mass,
+                            model.particle_flags,
+                            self._fluid_density,
+                            self._fluid_h,
+                        ],
+                        outputs=[self._fluid_vorticity],
+                        device=model.device,
+                    )
+                new_particle_qd = wp.empty_like(particle_qd)
+                wp.launch(
+                    kernel=solve_fluid_velocities,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        particle_q,
+                        particle_qd,
+                        model.particle_mass,
+                        model.particle_inv_mass,
+                        model.particle_flags,
+                        self._fluid_density,
+                        self._fluid_vorticity,
+                        self._fluid_h,
+                        self.fluid_viscosity,
+                        self.fluid_vorticity_confinement,
+                        dt,
+                    ],
+                    outputs=[new_particle_qd],
+                    device=model.device,
+                )
+                particle_qd = new_particle_qd
+
             self._contact_impulse = contact_impulse
             self._contact_impulse_capacity = contacts.rigid_contact_max if contacts is not None else 0
             self._last_dt = dt
@@ -931,6 +1172,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
             if model.particle_count:
                 if particle_q.ptr != state_out.particle_q.ptr:
                     state_out.particle_q.assign(particle_q)
+                if particle_qd.ptr != state_out.particle_qd.ptr:
                     state_out.particle_qd.assign(particle_qd)
 
             if model.body_count:

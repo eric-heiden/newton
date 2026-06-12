@@ -41,6 +41,28 @@ def spiky_kernel_gradient(r_vec: wp.vec3, r: float, h: float) -> wp.vec3:
     return result
 
 
+@wp.func
+def cohesion_kernel(r: float, h: float) -> float:
+    """Normalized Akinci-style cohesion spline.
+
+    Returns +1 at the maximum-attraction distance ``r = h/2``, falls to zero at
+    ``r = h``, and turns negative (repulsive) below ``r ~ 0.27 h`` so isolated
+    particle clusters reach a stable spacing instead of collapsing to a point.
+    See Akinci et al., "Versatile Surface Tension and Adhesion for SPH Fluids" (2013).
+    """
+    q = r / h
+    result = float(0.0)
+    if q < 1.0:
+        a = 1.0 - q
+        s = a * a * a * q * q * q
+        if q <= 0.5:
+            result = 2.0 * s - 1.0 / 64.0
+        else:
+            result = s
+        result *= 64.0
+    return result
+
+
 @wp.kernel
 def copy_kinematic_body_state_kernel(
     body_flags: wp.array[wp.int32],
@@ -364,7 +386,11 @@ def compute_fluid_lambdas(
     generalized with per-particle masses: the constraint for fluid particle i is
     ``C_i = rho_i / rho_0 - 1`` and the denominator accumulates the
     inverse-mass-weighted squared constraint gradients of all participating
-    particles.
+    particles. The constraint acts on compression only; under-dense particles
+    (free surfaces, sparse splashes) are handled by the bounded cohesion term in
+    :func:`solve_fluid_deltas` because the raw attractive branch diverges for
+    near-isolated particles whose density deficit saturates at ``-1`` while
+    their gradient denominator vanishes.
     """
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid, tid)
@@ -404,8 +430,6 @@ def compute_fluid_lambdas(
     grad_sum += particle_invmass[i] * wp.dot(grad_i, grad_i)
     fluid_density[i] = density
 
-    # clamp to compression only so particles at the free surface are not pulled
-    # inward by the density constraint (cohesion is handled separately)
     c = wp.max(density * inv_rest_density - 1.0, 0.0)
     fluid_lambda[i] = -c / (grad_sum + relaxation_epsilon)
 
@@ -420,8 +444,7 @@ def solve_fluid_deltas(
     fluid_lambda: wp.array[float],
     smoothing_length: float,
     rest_density: float,
-    cohesion: float,
-    cohesion_w_ref: float,
+    cohesion_step: float,
     max_delta: float,
     relaxation: float,
     # outputs
@@ -429,11 +452,12 @@ def solve_fluid_deltas(
 ):
     """Accumulate density-constraint position corrections for fluid particles.
 
-    Includes the artificial-pressure term ``s_corr`` (Eq. 13 of the PBF paper)
-    which pulls neighbors toward the reference spacing and produces the
-    surface-tension-like cohesion that makes splashes coagulate.
-    ``cohesion_w_ref`` is the poly6 kernel value at the reference distance,
-    precomputed on the host.
+    In addition to the incompressibility correction, each neighbor pair receives
+    a bounded cohesion bias of at most ``cohesion_step`` meters per iteration
+    along the pair direction, following the sign of :func:`cohesion_kernel`:
+    attraction at mid-range, short-range repulsion. This produces the
+    surface-tension-like coagulation of splashes without the divergence of
+    constraint-based attraction for near-isolated particles.
     """
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid, tid)
@@ -450,9 +474,9 @@ def solve_fluid_deltas(
     h = smoothing_length
     inv_rest_density = 1.0 / rest_density
     lambda_i = fluid_lambda[i]
-    m_i = particle_mass[i]
 
     delta = wp.vec3(0.0)
+    num_neighbors = int(0)
 
     query = wp.hash_grid_query(grid, x, h)
     j = int(0)
@@ -467,19 +491,22 @@ def solve_fluid_deltas(
         if r_sq >= h * h:
             continue
         r = wp.sqrt(r_sq)
-
-        s_corr = float(0.0)
-        if cohesion > 0.0 and cohesion_w_ref > 0.0:
-            # fourth power per the PBF paper; scaled by the pair mass to stay
-            # commensurate with the mass-weighted lambdas
-            w_ratio = poly6_kernel(r_sq, h) / cohesion_w_ref
-            w_ratio_sq = w_ratio * w_ratio
-            s_corr = -cohesion * w_ratio_sq * w_ratio_sq * 0.5 * (m_i + particle_mass[j])
+        num_neighbors += 1
 
         grad = spiky_kernel_gradient(r_vec, r, h)
-        delta += (lambda_i + fluid_lambda[j] + s_corr) * (particle_mass[j] * inv_rest_density) * grad
+        delta += (lambda_i + fluid_lambda[j]) * (particle_mass[j] * inv_rest_density) * grad * w_i
 
-    delta = delta * w_i
+        if cohesion_step > 0.0 and r > 1.0e-6:
+            # bounded position bias toward (or away from) the neighbor
+            delta += (-cohesion_step * cohesion_kernel(r, h) / r) * r_vec
+
+    if num_neighbors == 0:
+        return
+
+    # average the accumulated correction over the contributing constraints
+    # (Macklin et al., "Unified Particle Physics", Sec. 5) -- the Jacobi-style
+    # simultaneous update diverges otherwise
+    delta = delta / float(num_neighbors)
     delta_len = wp.length(delta)
     if delta_len > max_delta:
         delta *= max_delta / delta_len

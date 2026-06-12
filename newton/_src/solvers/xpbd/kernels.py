@@ -15,6 +15,31 @@ from ...math import (
 from ...sim import BodyFlags, JointType
 from ...sim.contacts import contact_surface_point, contact_surface_separation
 
+PI = wp.constant(3.141592653589793)
+
+
+@wp.func
+def poly6_kernel(r_sq: float, h: float) -> float:
+    """Poly6 smoothing kernel used for fluid density estimation."""
+    h_sq = h * h
+    result = float(0.0)
+    if r_sq < h_sq:
+        x = h_sq - r_sq
+        h9 = h_sq * h_sq * h_sq * h_sq * h
+        result = 315.0 / (64.0 * PI * h9) * x * x * x
+    return result
+
+
+@wp.func
+def spiky_kernel_gradient(r_vec: wp.vec3, r: float, h: float) -> wp.vec3:
+    """Gradient of the spiky kernel used for fluid density constraint gradients."""
+    result = wp.vec3(0.0)
+    if r > 1.0e-6 and r < h:
+        h6 = h * h * h * h * h * h
+        x = h - r
+        result = (-45.0 / (PI * h6) * x * x / r) * r_vec
+    return result
+
 
 @wp.kernel
 def copy_kinematic_body_state_kernel(
@@ -273,6 +298,7 @@ def solve_particle_particle_contacts(
     v = particle_v[i]
     radius = particle_radius[i]
     w1 = particle_invmass[i]
+    i_fluid = particle_flags[i] & ParticleFlags.FLUID
 
     # particle contact
     query = wp.hash_grid_query(grid, x, radius + max_radius + k_cohesion)
@@ -282,6 +308,9 @@ def solve_particle_particle_contacts(
 
     while wp.hash_grid_query_next(query, index):
         neighbor_flag = particle_flags[index]
+        if i_fluid != 0 and (neighbor_flag & ParticleFlags.FLUID) != 0:
+            # Fluid-fluid interactions are handled by the density constraint.
+            continue
         if (
             (neighbor_flag & ParticleFlags.ACTIVE) != 0
             and (is_proxy == 0 or ((neighbor_flag & ParticleFlags.PROXY) == 0 and particle_invmass[index] > 0.0))
@@ -313,6 +342,267 @@ def solve_particle_particle_contacts(
                 delta += (delta_f - delta_n) / denom
 
     wp.atomic_add(deltas, i, delta * w1 * relaxation)
+
+
+@wp.kernel
+def compute_fluid_lambdas(
+    grid: wp.uint64,
+    particle_x: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
+    particle_invmass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    smoothing_length: float,
+    rest_density: float,
+    relaxation_epsilon: float,
+    # outputs
+    fluid_density: wp.array[float],
+    fluid_lambda: wp.array[float],
+):
+    """Compute SPH densities and density-constraint Lagrange multipliers.
+
+    Implements Eqs. 8-11 of Macklin & Müller, "Position Based Fluids" (2013),
+    generalized with per-particle masses: the constraint for fluid particle i is
+    ``C_i = rho_i / rho_0 - 1`` and the denominator accumulates the
+    inverse-mass-weighted squared constraint gradients of all participating
+    particles.
+    """
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    if i == -1:
+        return
+    flags = particle_flags[i]
+    if (flags & ParticleFlags.ACTIVE) == 0 or (flags & ParticleFlags.FLUID) == 0:
+        fluid_density[i] = 0.0
+        fluid_lambda[i] = 0.0
+        return
+
+    x = particle_x[i]
+    h = smoothing_length
+    inv_rest_density = 1.0 / rest_density
+
+    density = particle_mass[i] * poly6_kernel(0.0, h)
+    grad_i = wp.vec3(0.0)
+    grad_sum = float(0.0)
+
+    query = wp.hash_grid_query(grid, x, h)
+    j = int(0)
+    while wp.hash_grid_query_next(query, j):
+        if j == i:
+            continue
+        flags_j = particle_flags[j]
+        if (flags_j & ParticleFlags.ACTIVE) == 0 or (flags_j & ParticleFlags.FLUID) == 0:
+            continue
+        r_vec = x - particle_x[j]
+        r_sq = wp.dot(r_vec, r_vec)
+        if r_sq >= h * h:
+            continue
+        density += particle_mass[j] * poly6_kernel(r_sq, h)
+        grad_j = -(particle_mass[j] * inv_rest_density) * spiky_kernel_gradient(r_vec, wp.sqrt(r_sq), h)
+        grad_sum += particle_invmass[j] * wp.dot(grad_j, grad_j)
+        grad_i -= grad_j
+
+    grad_sum += particle_invmass[i] * wp.dot(grad_i, grad_i)
+    fluid_density[i] = density
+
+    # clamp to compression only so particles at the free surface are not pulled
+    # inward by the density constraint (cohesion is handled separately)
+    c = wp.max(density * inv_rest_density - 1.0, 0.0)
+    fluid_lambda[i] = -c / (grad_sum + relaxation_epsilon)
+
+
+@wp.kernel
+def solve_fluid_deltas(
+    grid: wp.uint64,
+    particle_x: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
+    particle_invmass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    fluid_lambda: wp.array[float],
+    smoothing_length: float,
+    rest_density: float,
+    cohesion: float,
+    cohesion_w_ref: float,
+    max_delta: float,
+    relaxation: float,
+    # outputs
+    deltas: wp.array[wp.vec3],
+):
+    """Accumulate density-constraint position corrections for fluid particles.
+
+    Includes the artificial-pressure term ``s_corr`` (Eq. 13 of the PBF paper)
+    which pulls neighbors toward the reference spacing and produces the
+    surface-tension-like cohesion that makes splashes coagulate.
+    ``cohesion_w_ref`` is the poly6 kernel value at the reference distance,
+    precomputed on the host.
+    """
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    if i == -1:
+        return
+    flags = particle_flags[i]
+    if (flags & ParticleFlags.ACTIVE) == 0 or (flags & ParticleFlags.FLUID) == 0:
+        return
+    w_i = particle_invmass[i]
+    if w_i == 0.0:
+        return
+
+    x = particle_x[i]
+    h = smoothing_length
+    inv_rest_density = 1.0 / rest_density
+    lambda_i = fluid_lambda[i]
+    m_i = particle_mass[i]
+
+    delta = wp.vec3(0.0)
+
+    query = wp.hash_grid_query(grid, x, h)
+    j = int(0)
+    while wp.hash_grid_query_next(query, j):
+        if j == i:
+            continue
+        flags_j = particle_flags[j]
+        if (flags_j & ParticleFlags.ACTIVE) == 0 or (flags_j & ParticleFlags.FLUID) == 0:
+            continue
+        r_vec = x - particle_x[j]
+        r_sq = wp.dot(r_vec, r_vec)
+        if r_sq >= h * h:
+            continue
+        r = wp.sqrt(r_sq)
+
+        s_corr = float(0.0)
+        if cohesion > 0.0 and cohesion_w_ref > 0.0:
+            # fourth power per the PBF paper; scaled by the pair mass to stay
+            # commensurate with the mass-weighted lambdas
+            w_ratio = poly6_kernel(r_sq, h) / cohesion_w_ref
+            w_ratio_sq = w_ratio * w_ratio
+            s_corr = -cohesion * w_ratio_sq * w_ratio_sq * 0.5 * (m_i + particle_mass[j])
+
+        grad = spiky_kernel_gradient(r_vec, r, h)
+        delta += (lambda_i + fluid_lambda[j] + s_corr) * (particle_mass[j] * inv_rest_density) * grad
+
+    delta = delta * w_i
+    delta_len = wp.length(delta)
+    if delta_len > max_delta:
+        delta *= max_delta / delta_len
+
+    wp.atomic_add(deltas, i, delta * relaxation)
+
+
+@wp.kernel
+def compute_fluid_vorticity(
+    grid: wp.uint64,
+    particle_x: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    fluid_density: wp.array[float],
+    smoothing_length: float,
+    # outputs
+    fluid_vorticity: wp.array[wp.vec3],
+):
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    if i == -1:
+        return
+    flags = particle_flags[i]
+    if (flags & ParticleFlags.ACTIVE) == 0 or (flags & ParticleFlags.FLUID) == 0:
+        fluid_vorticity[i] = wp.vec3(0.0)
+        return
+
+    x = particle_x[i]
+    v = particle_v[i]
+    h = smoothing_length
+    omega = wp.vec3(0.0)
+
+    query = wp.hash_grid_query(grid, x, h)
+    j = int(0)
+    while wp.hash_grid_query_next(query, j):
+        if j == i:
+            continue
+        flags_j = particle_flags[j]
+        if (flags_j & ParticleFlags.ACTIVE) == 0 or (flags_j & ParticleFlags.FLUID) == 0:
+            continue
+        r_vec = x - particle_x[j]
+        r_sq = wp.dot(r_vec, r_vec)
+        if r_sq >= h * h:
+            continue
+        rho_j = wp.max(fluid_density[j], 1.0e-6)
+        grad = spiky_kernel_gradient(r_vec, wp.sqrt(r_sq), h)
+        omega += particle_mass[j] / rho_j * wp.cross(particle_v[j] - v, grad)
+
+    fluid_vorticity[i] = omega
+
+
+@wp.kernel
+def solve_fluid_velocities(
+    grid: wp.uint64,
+    particle_x: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
+    particle_invmass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    fluid_density: wp.array[float],
+    fluid_vorticity: wp.array[wp.vec3],
+    smoothing_length: float,
+    viscosity: float,
+    vorticity_confinement: float,
+    dt: float,
+    # outputs
+    v_out: wp.array[wp.vec3],
+):
+    """Post-projection velocity pass: XSPH viscosity and vorticity confinement.
+
+    Non-fluid particles pass their velocity through unchanged so the output
+    buffer can replace the particle velocity array wholesale.
+    """
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    if i == -1:
+        return
+    v = particle_v[i]
+    flags = particle_flags[i]
+    if (flags & ParticleFlags.ACTIVE) == 0 or (flags & ParticleFlags.FLUID) == 0 or particle_invmass[i] == 0.0:
+        v_out[i] = v
+        return
+
+    x = particle_x[i]
+    h = smoothing_length
+    omega_i = fluid_vorticity[i]
+
+    rho_i = wp.max(fluid_density[i], 1.0e-6)
+    weight_sum = particle_mass[i] / rho_i * poly6_kernel(0.0, h)
+    v_weighted = v * weight_sum
+    eta = wp.vec3(0.0)
+
+    query = wp.hash_grid_query(grid, x, h)
+    j = int(0)
+    while wp.hash_grid_query_next(query, j):
+        if j == i:
+            continue
+        flags_j = particle_flags[j]
+        if (flags_j & ParticleFlags.ACTIVE) == 0 or (flags_j & ParticleFlags.FLUID) == 0:
+            continue
+        r_vec = x - particle_x[j]
+        r_sq = wp.dot(r_vec, r_vec)
+        if r_sq >= h * h:
+            continue
+        rho_j = wp.max(fluid_density[j], 1.0e-6)
+        w = particle_mass[j] / rho_j * poly6_kernel(r_sq, h)
+        v_weighted += particle_v[j] * w
+        weight_sum += w
+        if vorticity_confinement > 0.0:
+            grad = spiky_kernel_gradient(r_vec, wp.sqrt(r_sq), h)
+            eta += (wp.length(fluid_vorticity[j]) - wp.length(omega_i)) * grad
+
+    v_new = v
+    if viscosity > 0.0 and weight_sum > 1.0e-6:
+        v_new = v + viscosity * (v_weighted / weight_sum - v)
+
+    if vorticity_confinement > 0.0:
+        eta_len = wp.length(eta)
+        if eta_len > 1.0e-6:
+            v_new += vorticity_confinement * dt * wp.cross(eta / eta_len, omega_i)
+
+    v_out[i] = v_new
 
 
 @wp.kernel

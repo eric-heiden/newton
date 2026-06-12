@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 import warnings
 
 import warp as wp
@@ -44,6 +45,13 @@ _COMPUTE_BODY_VELOCITY_DEPRECATION_MSG = (
     "or later. Leave it at False because XPBD now updates rigid-body velocities incrementally after every position "
     "correction."
 )
+
+
+def _poly6(r_sq: float, h: float) -> float:
+    if r_sq >= h * h:
+        return 0.0
+    x = h * h - r_sq
+    return 315.0 / (64.0 * math.pi * h**9) * x * x * x
 
 
 class SolverXPBD(SolverBase, CouplingInterface):
@@ -100,6 +108,27 @@ class SolverXPBD(SolverBase, CouplingInterface):
 
         See :ref:`Joint feature support` for the full comparison across solvers.
 
+    Fluids:
+        Particles flagged with :attr:`newton.ParticleFlags.FLUID` are simulated
+        as a position-based fluid (Macklin & Müller, "Position Based Fluids",
+        2013): instead of pairwise contact constraints, fluid particle pairs
+        generate SPH density constraints that are solved inside the regular
+        XPBD iteration loop, so fluids two-way couple with rigid bodies, cloth,
+        and soft bodies. Unlike a fixed-bounds SPH solver, fluid particles are
+        free to travel anywhere and collide with shapes through the standard
+        particle contact pipeline. The artificial-pressure cohesion term
+        (``fluid_cohesion``) makes splashes coagulate into strands and droplets
+        instead of dispersing into isolated particles; XSPH viscosity and
+        vorticity confinement act on velocities after the position solve.
+
+        .. code-block:: python
+
+            builder.add_particle_grid(
+                ...,
+                flags=newton.ParticleFlags.ACTIVE | newton.ParticleFlags.FLUID,
+            )
+            solver = newton.solvers.SolverXPBD(model, iterations=3, fluid_rest_distance=0.05)
+
     Example
     -------
 
@@ -130,36 +159,49 @@ class SolverXPBD(SolverBase, CouplingInterface):
         rigid_contact_con_weighting: bool = True,
         angular_damping: float = 0.0,
         enable_restitution: bool = False,
+        fluid_rest_distance: float | None = None,
+        fluid_smoothing_length: float | None = None,
+        fluid_rest_density: float | None = None,
+        fluid_cohesion: float = 0.1,
+        fluid_viscosity: float = 0.0,
+        fluid_vorticity_confinement: float = 0.0,
+        fluid_relaxation: float = 1.0,
         deterministic: wp.DeterministicMode | None = None,
     ):
         """Initialize the XPBD solver.
 
         Args:
-            model: Simulation model to integrate.
-            iterations: Number of constraint-solver iterations per time step. Defaults to 2.
-            soft_body_relaxation: Relaxation factor applied to tetrahedral constraint corrections
-                [dimensionless]. Defaults to 0.9.
-            soft_contact_relaxation: Relaxation factor applied to particle-particle and particle-shape contact
-                corrections [dimensionless]. Defaults to 0.9.
-            joint_linear_relaxation: Relaxation factor applied to linear joint constraint corrections
-                [dimensionless]. Defaults to 0.7.
-            joint_angular_relaxation: Relaxation factor applied to angular joint constraint corrections
-                [dimensionless]. Defaults to 0.4.
-            joint_linear_compliance: Compliance shared by linear joint constraints [m/N]. Defaults to 0.0.
-            joint_angular_compliance: Compliance shared by angular joint constraints [rad/(N·m)]. Defaults to 0.0.
-            rigid_contact_relaxation: Relaxation factor applied to rigid contact constraint corrections
-                [dimensionless]. Defaults to 0.8.
-            rigid_contact_restitution_iterations: Number of outer iterations of the rigid-body restitution
-                velocity solve. Each outer iteration solves every contact manifold (body pair) independently
-                with a fixed number of inner Gauss-Seidel sweeps, then couples manifolds by averaging the
-                resulting velocity changes per body, so values above 1 primarily matter when a body
-                participates in several manifolds (or when a large manifold leaves its inner sweeps
-                under-converged). Defaults to 2.
-            rigid_contact_con_weighting: Whether to divide each rigid body's contact correction by its number of
-                active contacts. Defaults to ``True``.
-            angular_damping: Rigid-body angular velocity damping coefficient [1/s]. Defaults to 0.0.
-            enable_restitution: Whether to apply restitution to rigid and particle-shape contacts after the
-                positional solve. Defaults to ``False``.
+            model: Model to simulate.
+            iterations: Number of XPBD constraint iterations per step.
+            soft_body_relaxation: Relaxation factor for soft body (FEM) constraints.
+            soft_contact_relaxation: Relaxation factor for particle contact constraints.
+            joint_linear_relaxation: Relaxation factor for linear joint corrections.
+            joint_angular_relaxation: Relaxation factor for angular joint corrections.
+            joint_linear_compliance: Compliance of linear joint constraints [m/N].
+            joint_angular_compliance: Compliance of angular joint constraints [rad/(N·m)].
+            rigid_contact_relaxation: Relaxation factor for rigid contact constraints.
+            rigid_contact_con_weighting: Whether to divide rigid contact corrections by the
+                number of active contacts per body.
+            angular_damping: Angular damping coefficient applied during body integration.
+            enable_restitution: Whether to apply restitution at contacts.
+            fluid_rest_distance: Rest spacing between fluid particles [m]. If ``None``,
+                twice the maximum particle radius is used (touching spheres). Particles
+                spawned on a grid with this spacing are exactly at rest density.
+            fluid_smoothing_length: SPH kernel support radius [m]. If ``None``,
+                ``1.8 * fluid_rest_distance`` is used, mirroring the rest-distance to
+                interaction-radius ratio used by Flex fluids.
+            fluid_rest_density: Fluid rest density [kg/m³]. If ``None``, it is calibrated
+                from the mean fluid particle mass so that a regular grid of particles at
+                ``fluid_rest_distance`` spacing is exactly at rest.
+            fluid_cohesion: Strength of the artificial-pressure cohesion term
+                (``k`` in Eq. 13 of the PBF paper). Around ``0.1`` gives water-like
+                splash coagulation; ``0`` disables cohesion.
+            fluid_viscosity: XSPH viscosity in ``[0, 1]``: per-substep blend toward the
+                kernel-weighted neighborhood velocity. Small values (``0.01``-``0.1``)
+                suit water; values near ``1`` give honey-like behavior.
+            fluid_vorticity_confinement: Vorticity confinement strength that re-injects
+                rotational motion lost to the position solve. ``0`` disables it.
+            fluid_relaxation: Per-iteration scale on fluid density corrections.
             deterministic: Opt-in determinism for this solver's atomic-emitting
                 kernel module. Pass a :class:`warp.DeterministicMode`, or
                 ``None`` (default) to inherit the current
@@ -198,6 +240,24 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self._rigid_restitution_enabled = False
         self._refresh_rigid_restitution_enabled()
         self._compute_body_velocity_from_position_delta = False
+
+        self.fluid_rest_distance = fluid_rest_distance
+        self.fluid_smoothing_length = fluid_smoothing_length
+        self.fluid_rest_density = fluid_rest_density
+        self.fluid_cohesion = max(float(fluid_cohesion), 0.0)
+        self.fluid_viscosity = min(max(float(fluid_viscosity), 0.0), 1.0)
+        self.fluid_vorticity_confinement = max(float(fluid_vorticity_confinement), 0.0)
+        self.fluid_relaxation = max(float(fluid_relaxation), 0.0)
+
+        self.render_positions: wp.array[wp.vec3] | None = None
+        self.render_anisotropy: wp.array[wp.vec4] | None = None
+        self.render_anisotropy_secondary: wp.array[wp.vec4] | None = None
+        self.render_anisotropy_tertiary: wp.array[wp.vec4] | None = None
+
+        self._fluid_density: wp.array[wp.float32] | None = None
+        self._fluid_lambda: wp.array[wp.float32] | None = None
+        self._fluid_vorticity: wp.array[wp.vec3] | None = None
+        self._update_fluid_settings()
 
         self._init_kinematic_state()
 

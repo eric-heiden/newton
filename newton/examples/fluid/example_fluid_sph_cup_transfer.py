@@ -55,10 +55,10 @@ class Example:
         self.spot_a = np.array(args.spot_a, dtype=np.float32)
         self.spot_b = np.array(args.spot_b, dtype=np.float32)
         self.lift_height = args.lift_height
-        # the gripper pinches the cup wall at the rim from above; the hand
-        # frame sits ~0.105 m above the fingertips
-        self.fingertip_offset = 0.105
-        self.rim_depth = 0.03
+        # IK link 11 is effectively the grasp frame between the fingertips
+        # (ik_cube_stacking targets object centers with it directly)
+        self.fingertip_offset = 0.015
+        self.rim_depth = 0.02
         self.grasp_radius = args.cup_inner_radius + 0.004
 
         # cup geometry: octagonal wall of thin boxes plus a bottom plate
@@ -100,7 +100,7 @@ class Example:
             pos=wp.vec3(
                 float(self.spot_a[0] - 0.5 * (dim_xy - 1) * args.spacing),
                 float(self.spot_a[1] - 0.5 * (dim_xy - 1) * args.spacing),
-                3.0 * wall_thickness,
+                1.2 * wall_thickness,
             ),
             rot=wp.quat_identity(),
             vel=wp.vec3(0.0),
@@ -176,8 +176,6 @@ class Example:
             renderer.ambient_ground = (0.52, 0.54, 0.56)
             if hasattr(renderer, "exposure"):
                 renderer.exposure = 1.1
-        if hasattr(self.viewer, "register_ui_callback"):
-            self.viewer.register_ui_callback(self.gui, position="side")
 
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         self._update_cup_state(self.cup_pos, np.zeros(3, dtype=np.float32))
@@ -423,7 +421,7 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--fps", type=float, default=60.0)
-        parser.add_argument("--substeps", type=int, default=6)
+        parser.add_argument("--substeps", type=int, default=8)
         parser.add_argument("--speed", type=float, default=1.0)
         parser.add_argument("--gravity", type=float, default=-9.81)
 

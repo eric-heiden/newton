@@ -3167,6 +3167,7 @@ class SolverMuJoCo(SolverBase):
         save_to_mjcf: str | None = None,
         ls_parallel: bool | None = None,  # Deprecated: being removed from mujoco_warp
         use_mujoco_contacts: bool = True,
+        requires_grad: bool | None = None,
         include_sites: bool = True,
         skip_visual_only_geoms: bool = True,
     ):
@@ -3206,6 +3207,7 @@ class SolverMuJoCo(SolverBase):
             save_to_mjcf: Optional path to save the generated MJCF model file.
             ls_parallel: Deprecated. Parallel line search is being removed from ``mujoco_warp``; passing this option emits a ``DeprecationWarning``.
             use_mujoco_contacts: If True, use the MuJoCo contact solver. If False, use the Newton contact solver (newton contacts must be passed in through the step function in that case).
+            requires_grad: Enable ``mujoco_warp`` gradient tracking for differentiable stepping. If ``None``, uses ``model.requires_grad``. Only supported with the ``mujoco_warp`` backend.
             include_sites: If ``True`` (default), Newton shapes marked with ``ShapeFlags.SITE`` are exported as MuJoCo sites. Sites are non-colliding reference points used for sensor attachment, debugging, or as frames of reference. If ``False``, sites are skipped during export. Defaults to ``True``.
             skip_visual_only_geoms: If ``True`` (default), geometries used only for visualization (i.e. not involved in collision) are excluded from the exported MuJoCo spec. This avoids mismatches with models that use explicit ``<contact>`` definitions for collision geometry.
         """
@@ -3219,6 +3221,9 @@ class SolverMuJoCo(SolverBase):
             )
 
         super().__init__(model)
+        if requires_grad is None:
+            requires_grad = model.requires_grad
+        self.requires_grad = bool(requires_grad)
 
         # Import and cache MuJoCo modules (only happens once per class)
         mujoco, _ = self.import_mujoco()
@@ -3364,6 +3369,8 @@ class SolverMuJoCo(SolverBase):
         if disable_contacts:
             disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
         self.use_mujoco_cpu = use_mujoco_cpu
+        if self.requires_grad and use_mujoco_cpu:
+            raise ValueError("SolverMuJoCo(requires_grad=True) requires the mujoco_warp backend.")
         if use_mujoco_contacts or use_mujoco_cpu:
             mujoco_attrs_for_warn = getattr(model, "mujoco", None)
             solref_mode_attr = (
@@ -3464,6 +3471,37 @@ class SolverMuJoCo(SolverBase):
     @event_scope
     def _mujoco_warp_step(self):
         self._mujoco_warp.step(self.mjw_model, self.mjw_data)
+
+    def enable_grad(self, fields: Iterable[str] | None = None) -> None:
+        """Enable ``mujoco_warp`` gradient tracking on this solver's runtime data.
+
+        Args:
+            fields: Optional ``mujoco_warp`` data field names to mark as differentiable.
+                ``None`` uses MJWarp's default smooth-dynamics field set.
+        """
+        if self.use_mujoco_cpu:
+            raise ValueError("SolverMuJoCo.enable_grad() requires the mujoco_warp backend.")
+        enable_grad = getattr(self._mujoco_warp, "enable_grad", None)
+        if enable_grad is None:
+            raise ImportError(
+                "The installed mujoco_warp package does not expose enable_grad(). "
+                "Install a differentiable mujoco_warp build such as google-deepmind/mujoco_warp#1423."
+            )
+        enable_grad(self.mjw_data, fields=fields, mjm=self.mj_model)
+        self.requires_grad = True
+
+    def disable_grad(self, fields: Iterable[str] | None = None) -> None:
+        """Disable ``mujoco_warp`` gradient tracking on this solver's runtime data."""
+        if self.use_mujoco_cpu:
+            raise ValueError("SolverMuJoCo.disable_grad() requires the mujoco_warp backend.")
+        disable_grad = getattr(self._mujoco_warp, "disable_grad", None)
+        if disable_grad is None:
+            raise ImportError(
+                "The installed mujoco_warp package does not expose disable_grad(). "
+                "Install a differentiable mujoco_warp build such as google-deepmind/mujoco_warp#1423."
+            )
+        disable_grad(self.mjw_data, fields=fields, mjm=self.mj_model)
+        self.requires_grad = False
 
     @event_scope
     @override
@@ -6365,6 +6403,8 @@ class SolverMuJoCo(SolverBase):
                 nconmax=nconmax,
                 njmax=njmax,
             )
+            if self.requires_grad:
+                self.enable_grad()
 
             # expand model fields that can be expanded:
             self._expand_model_fields(self.mjw_model, nworld)

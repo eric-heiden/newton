@@ -40,6 +40,84 @@ def _expected_positive_limit_solref(ke: float, kd: float, factor: float) -> np.n
     )
 
 
+@wp.kernel
+def _joint_q_loss_kernel(joint_q: wp.array[wp.float32], loss: wp.array[wp.float32]):
+    loss[0] = joint_q[0]
+
+
+class TestMuJoCoSolverDifferentiability(unittest.TestCase):
+    def test_requires_grad_enables_mjwarp_data_gradients(self):
+        """SolverMuJoCo opts into differentiable MJWarp runtime data."""
+        builder = newton.ModelBuilder()
+        link = builder.add_link(mass=1.0, com=wp.vec3(0.0, 0.0, 0.0), inertia=wp.mat33(np.eye(3)))
+        joint = builder.add_joint_revolute(-1, link)
+        builder.add_articulation([joint])
+        model = builder.finalize(requires_grad=True)
+
+        solver = SolverMuJoCo(model, disable_contacts=True)
+        self.assertTrue(solver.requires_grad)
+        self.assertTrue(solver.mjw_data.qpos.requires_grad)
+        self.assertTrue(solver.mjw_data.qvel.requires_grad)
+        self.assertTrue(solver.mjw_data.ctrl.requires_grad)
+
+        solver.disable_grad()
+        self.assertFalse(solver.requires_grad)
+        self.assertFalse(solver.mjw_data.qpos.requires_grad)
+
+        solver.enable_grad(fields=["qpos"])
+        self.assertTrue(solver.requires_grad)
+        self.assertTrue(solver.mjw_data.qpos.requires_grad)
+        self.assertFalse(solver.mjw_data.qvel.requires_grad)
+
+    def test_requires_grad_rejects_mujoco_cpu_backend(self):
+        """Differentiable stepping is only provided by the MJWarp backend."""
+        builder = newton.ModelBuilder()
+        link = builder.add_link(mass=1.0, com=wp.vec3(0.0, 0.0, 0.0), inertia=wp.mat33(np.eye(3)))
+        joint = builder.add_joint_revolute(-1, link)
+        builder.add_articulation([joint])
+        model = builder.finalize()
+
+        with self.assertRaisesRegex(ValueError, "requires the mujoco_warp backend"):
+            SolverMuJoCo(model, use_mujoco_cpu=True, requires_grad=True)
+
+    def test_step_gradient_flows_to_joint_force(self):
+        """Gradients flow through SolverMuJoCo.step() to Newton control arrays."""
+        builder = newton.ModelBuilder()
+        link = builder.add_link(mass=1.0, com=wp.vec3(0.0, 0.0, 0.0), inertia=wp.mat33(np.eye(3)))
+        joint = builder.add_joint_revolute(-1, link, axis=wp.vec3(0.0, 0.0, 1.0))
+        builder.add_articulation([joint])
+        model = builder.finalize(requires_grad=True)
+
+        solver = SolverMuJoCo(
+            model,
+            disable_contacts=True,
+            requires_grad=True,
+            integrator="euler",
+            iterations=4,
+        )
+        state0 = model.state(requires_grad=True)
+        state1 = model.state(requires_grad=True)
+        control = model.control(requires_grad=True)
+        control.joint_f.assign(np.array([0.25], dtype=np.float32))
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state0)
+
+        loss = wp.zeros(1, dtype=wp.float32, requires_grad=True)
+        with wp.Tape() as tape:
+            solver.step(state0, state1, control, None, 0.01)
+            wp.launch(_joint_q_loss_kernel, dim=1, inputs=[state1.joint_q], outputs=[loss])
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Running the tape backwards may produce incorrect gradients.*",
+                category=UserWarning,
+            )
+            tape.backward(loss=loss)
+
+        grad = tape.gradients.get(control.joint_f)
+        self.assertIsNotNone(grad)
+        self.assertGreater(abs(float(grad.numpy()[0])), 0.0)
+
+
 class TestMuJoCoSolver(unittest.TestCase):
     def _run_substeps_for_frame(self, sim_dt, sim_substeps):
         """Helper method to run simulation substeps for one rendered frame."""

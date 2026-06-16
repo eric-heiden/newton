@@ -4007,6 +4007,14 @@ class SolverMuJoCo(SolverBase):
         is_mjwarp = SolverMuJoCo._data_is_mjwarp(mj_data)
         single_world_template = False
         if is_mjwarp:
+            if self.requires_grad and wp._src.context.runtime.tape is not None:
+                has_joint_forces = control is not None and control.joint_f is not None
+                has_body_forces = state.body_f is not None
+                if has_joint_forces:
+                    mj_data.qfrc_applied = wp.zeros_like(mj_data.qfrc_applied, requires_grad=True)
+                    mj_data.xfrc_applied = wp.zeros_like(mj_data.xfrc_applied, requires_grad=True)
+                elif has_body_forces:
+                    mj_data.xfrc_applied = wp.zeros_like(mj_data.xfrc_applied, requires_grad=True)
             ctrl = mj_data.ctrl
             qfrc = mj_data.qfrc_applied
             xfrc = mj_data.xfrc_applied

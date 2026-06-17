@@ -10,12 +10,19 @@ speed: crank it up and the water's inertia makes it slosh over the rim."""
 
 from __future__ import annotations
 
+import tempfile
+import warnings
+from pathlib import Path
+
 import numpy as np
 import warp as wp
 
 import newton
 import newton.examples
 import newton.ik as ik
+
+# Cache the cooked cup SDF on disk so repeated runs skip the voxelization.
+_SDF_CACHE_DIR = Path(tempfile.gettempdir()) / "newton_cup_transfer_sdf"
 
 
 @wp.kernel
@@ -28,6 +35,24 @@ def set_cup_state(
 ):
     body_q[body_index] = xform
     body_qd[body_index] = wp.spatial_vector(linear_velocity, wp.vec3(0.0))
+
+
+@wp.kernel
+def interp_cup_state(
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_index: int,
+    old_pos: wp.array[wp.vec3],
+    new_pos: wp.array[wp.vec3],
+    linear_velocity: wp.array[wp.vec3],
+    alpha: float,
+):
+    # Device-side per-substep cup pose so the whole substep loop is CUDA-graph
+    # capturable: the host writes old/new/velocity once per frame and the graph
+    # interpolates with a constant ``alpha`` baked into each unrolled substep.
+    p = old_pos[0] + alpha * (new_pos[0] - old_pos[0])
+    body_q[body_index] = wp.transform(p, wp.quat_identity())
+    body_qd[body_index] = wp.spatial_vector(linear_velocity[0], wp.vec3(0.0))
 
 
 class Example:
@@ -47,10 +72,15 @@ class Example:
         self.fps = args.fps
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = args.substeps
-        self.sim_dt = self.frame_dt / self.sim_substeps
         self.viewer = viewer
+        self.wall_thickness = 0.010
+        # Adaptive substeps: the cup's peak speed grows with the robot speed, so
+        # refine the timestep as the user speeds up to keep the moving wall from
+        # sweeping past the water in one step (see _substeps_for_speed).
+        self.base_substeps = args.substeps
         self.speed = args.speed
+        self.sim_substeps = self._substeps_for_speed(self.speed)
+        self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.spot_a = np.array(args.spot_a, dtype=np.float32)
         self.spot_b = np.array(args.spot_b, dtype=np.float32)
@@ -62,7 +92,7 @@ class Example:
 
         self.cup_inner_radius = args.cup_inner_radius
         self.cup_height = args.cup_height
-        wall_thickness = 0.010
+        wall_thickness = self.wall_thickness
 
         # IK runs on a robot-only model
         urdf = newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf"
@@ -83,6 +113,14 @@ class Example:
             label="cup",
         )
         cup_mesh = self._build_cup_mesh(self.cup_inner_radius, wall_thickness, self.cup_height)
+        # Build an SDF on the cup so the ~100k water particles collide with it via
+        # one cheap SDF sample each instead of a per-triangle mesh query.
+        cup_mesh.build_sdf(
+            max_resolution=args.sdf_resolution,
+            narrow_band_range=(-0.03, 0.03),
+            margin=0.02,
+            cache_dir=_SDF_CACHE_DIR,
+        )
         builder.add_shape_mesh(
             self.cup_body,
             mesh=cup_mesh,
@@ -120,8 +158,16 @@ class Example:
         )
 
         self.model = builder.finalize()
-        self.model.particle_max_velocity = 3.0
-        self.model.soft_contact_mu = 0.2
+        self._apply_water_velocity_cap()
+        # grippy fluid-shape friction so spilled water crawls to a stop instead
+        # of sliding far across the floor and aliasing the neighbor grid
+        self.model.soft_contact_mu = 0.3
+        # roomier hash grid: when the arm spills water at high --speed it spreads
+        # well past the cup; the default 128^3 grid would alias far cells onto
+        # the cup region and stall the neighbor queries
+        with wp.ScopedDevice(self.model.device):
+            self.model.particle_grid = wp.HashGrid(256, 256, 256)
+            self.model.particle_grid.reserve(self.model.particle_count)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -133,6 +179,15 @@ class Example:
             fluid_rest_distance=args.spacing,
             fluid_cohesion=args.cohesion,
             fluid_viscosity=args.viscosity,
+            fluid_relaxation=args.relaxation,
+            max_diffuse_particles=args.foam_max_particles,
+            diffuse_lifetime=1.5,
+            diffuse_threshold=1.0,
+            diffuse_spawn_probability=0.5,
+            # carrying the cup fast slams water into the wall in over-compressed
+            # clumps; capping above the bulk neighbor count bounds the per-warp
+            # cost so the frame rate holds up (see the wave-pool example)
+            fluid_max_neighbors=args.max_neighbors,
         )
 
         self._setup_ik()
@@ -144,7 +199,6 @@ class Example:
         self.place_spot = self.spot_b.copy()
         self.cup_attached = False
         self.cup_pos = np.array([self.spot_a[0], self.spot_a[1], 0.0], dtype=np.float32)
-        self.prev_cup_pos = self.cup_pos.copy()
         self.ee_pos = self.home_pos.copy()
         self._update_cup_state(self.cup_pos, np.zeros(3, dtype=np.float32))
 
@@ -169,6 +223,48 @@ class Example:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
         self._update_cup_state(self.cup_pos, np.zeros(3, dtype=np.float32))
+
+        # Per-frame cup keyframe (start/end pose + velocity) that the captured
+        # substep loop interpolates on device.
+        self._cup_old = wp.zeros(1, dtype=wp.vec3, device=self.model.device)
+        self._cup_new = wp.zeros(1, dtype=wp.vec3, device=self.model.device)
+        self._cup_vel = wp.zeros(1, dtype=wp.vec3, device=self.model.device)
+
+        # Replay the whole substep loop (cup pose, collide, fluid solve) from a
+        # CUDA graph. Only the IK/eval_fk pose update stays on the host each
+        # frame; it writes the cup keyframe arrays the graph reads. Prime the
+        # reorder scratch now -- it allocates on first use, which cannot happen
+        # inside the capture below.
+        self.solver.reorder_particles(self.state_0)
+        self.graph = None
+        self.use_cuda_graph = wp.get_device(self.model.device).is_cuda
+
+    def _substeps_for_speed(self, speed):
+        # The wall-crossing speed (0.5*wall/sim_dt, the most a particle or the
+        # wall may move per substep without skipping the contact) scales with the
+        # substep count, while the cup's peak speed grows ~linearly with the
+        # robot speed. Add substeps as the carry speeds up so the wall stays
+        # collision-tight -- a CCD-style timestep refinement -- capped so an
+        # extreme slider value cannot stall the frame. 4 substeps already cover
+        # the default and 2x carries; faster carries refine further.
+        return int(min(16, max(self.base_substeps, np.ceil(2.0 * speed))))
+
+    def _apply_water_velocity_cap(self):
+        # Cap the water just under the per-substep wall-crossing speed so a fast
+        # carry pushes it up over the rim instead of letting it tunnel the wall.
+        self.model.particle_max_velocity = 0.85 * 0.5 * self.wall_thickness / self.sim_dt
+
+    def _set_speed(self, speed):
+        """Update the robot speed and, if it changes the substep count, refine the
+        timestep and re-capture the graph (the captured loop is unrolled per
+        substep, so its count is baked in)."""
+        self.speed = speed
+        substeps = self._substeps_for_speed(speed)
+        if substeps != self.sim_substeps:
+            self.sim_substeps = substeps
+            self.sim_dt = self.frame_dt / substeps
+            self._apply_water_velocity_cap()
+            self.graph = None
 
     @staticmethod
     def _build_cup_mesh(inner_radius, wall_thickness, height, segments=40):
@@ -281,7 +377,10 @@ class Example:
                 device=self.model.device,
             )
 
-    def step(self):
+    def _advance_robot(self):
+        """Host-side per-frame update: solve IK, pose the arm, and stage the cup
+        keyframe arrays the captured substep loop reads. Returns the phase
+        progress ``t`` so :meth:`step` can advance the phase machine."""
         name, duration = self.PHASES[self.phase_index]
         self.phase_time += self.frame_dt * self.speed
         t = min(self.phase_time / duration, 1.0)
@@ -321,18 +420,66 @@ class Example:
         else:
             new_pos = self.cup_pos.copy()
             new_pos[2] = 0.0
-        cup_vel = (new_pos - self.prev_cup_pos) / self.frame_dt
-        self.prev_cup_pos = self.cup_pos.copy()
+        old_pos = self.cup_pos.copy()
+        cup_vel = (new_pos - old_pos) / self.frame_dt
         self.cup_pos = new_pos
-        self._update_cup_state(new_pos, cup_vel)
         self.ee_pos = ee_target
 
-        # fluid substeps against the kinematically posed shapes
-        for _ in range(self.sim_substeps):
+        # stage the cup keyframe for the device-side per-substep interpolation
+        self._cup_old.assign(old_pos.reshape(1, 3))
+        self._cup_new.assign(new_pos.reshape(1, 3))
+        self._cup_vel.assign(cup_vel.reshape(1, 3))
+        return t
+
+    def simulate(self):
+        # Re-sort the water into spatial order once per frame so the density
+        # solve's neighbor reads stay cache-coherent after the arm churns or
+        # spills it (a pure relabel; see SolverXPBD.reorder_particles).
+        self.solver.reorder_particles(self.state_0)
+
+        # fluid substeps against the kinematically posed shapes; the cup pose is
+        # interpolated per substep -- teleporting it a full frame at once creates
+        # penetrations the position solver converts into large velocities,
+        # slingshotting particles out of the cup during the lift
+        for k in range(self.sim_substeps):
+            alpha = float(k + 1) / float(self.sim_substeps)
+            wp.launch(
+                interp_cup_state,
+                dim=1,
+                inputs=[
+                    self.state_0.body_q,
+                    self.state_0.body_qd,
+                    self.cup_body,
+                    self._cup_old,
+                    self._cup_new,
+                    self._cup_vel,
+                    alpha,
+                ],
+                device=self.model.device,
+            )
             self.state_0.clear_forces()
             self.model.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, None, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
+
+    def step(self):
+        t = self._advance_robot()
+
+        if self.use_cuda_graph:
+            if self.graph is None:
+                try:
+                    with wp.ScopedCapture() as capture:
+                        self.simulate()
+                    self.graph = capture.graph
+                except Exception as exc:
+                    warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
+                    self.use_cuda_graph = False
+                    self.graph = None
+                    self.simulate()
+            else:
+                wp.capture_launch(self.graph)
+        else:
+            self.simulate()
 
         if t >= 1.0:
             self.phase_index = (self.phase_index + 1) % len(self.PHASES)
@@ -352,8 +499,14 @@ class Example:
         finally:
             if show_fluid:
                 self.viewer.show_fluid = show_fluid
-        if show_fluid:
+        # Hide the fluid surface while debugging with raw particles, so toggling
+        # "Show Particles" in the GUI leaves only the particles visible.
+        if show_fluid and not self.viewer.show_particles:
             self._log_fluid()
+        elif self.solver.diffuse_positions is not None:
+            # the foam is emitted by _log_fluid; when that is skipped, clear the
+            # last foam batch so it doesn't stay frozen on screen
+            self.viewer.log_fluid_diffuse("/model/fluid/diffuse", None)
         self.viewer.end_frame()
 
     def _log_fluid(self):
@@ -370,10 +523,45 @@ class Example:
             anisotropy_tertiary=self.solver.render_anisotropy_tertiary,
             hidden=False,
         )
+        if getattr(self.viewer, "show_fluid_diffuse", False) and self.solver.diffuse_positions is not None:
+            self.viewer.log_fluid_diffuse(
+                "/model/fluid/diffuse",
+                self.solver.diffuse_positions,
+                self.solver.diffuse_velocities,
+                radius=0.0033,
+                color=(0.9, 0.95, 1.0, 1.1),
+                motion_blur_scale=3.0,
+                lifetime=self.solver.diffuse_lifetime,
+                surface_bias=0.025,
+                hidden=False,
+            )
 
     def gui(self, ui):
-        _, self.speed = ui.slider_float("Robot Speed", self.speed, 0.25, 5.0, "%.2f")
-        ui.text("Crank up the speed to spill the water.")
+        changed_speed, speed = ui.slider_float("Robot Speed", self.speed, 0.25, 5.0, "%.2f")
+        if changed_speed:
+            self._set_speed(speed)
+        ui.text(f"Crank up the speed to spill the water.  (substeps: {self.sim_substeps})")
+
+        ui.separator()
+        ui.text("Fluid properties")
+        # These feed the solver as plain Python floats that the captured graph
+        # bakes in, so any change must refresh the solver's derived constants and
+        # invalidate the graph to force a re-capture on the next step.
+        changed = False
+        c, self.solver.fluid_relaxation = ui.slider_float("Relaxation", self.solver.fluid_relaxation, 0.05, 1.0, "%.2f")
+        changed |= c
+        c, self.solver.fluid_cohesion = ui.slider_float("Cohesion", self.solver.fluid_cohesion, 0.0, 1.0, "%.2f")
+        changed |= c
+        c, self.solver.fluid_viscosity = ui.slider_float("Viscosity", self.solver.fluid_viscosity, 0.0, 1.0, "%.2f")
+        changed |= c
+        # Keep the cap below the wall-crossing speed or fast water tunnels the cup.
+        c, self.model.particle_max_velocity = ui.slider_float(
+            "Max speed", self.model.particle_max_velocity, 0.25, 3.0, "%.2f"
+        )
+        changed |= c
+        if changed:
+            self.solver._update_fluid_settings()
+            self.graph = None
 
     def test_final(self):
         q = self.state_0.particle_q.numpy()
@@ -391,8 +579,18 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--fps", type=float, default=60.0)
-        parser.add_argument("--substeps", type=int, default=8)
-        parser.add_argument("--iterations", type=int, default=3)
+        # ~100k water particles. The cup carries a texture SDF so the water
+        # collides via one cheap SDF sample per particle. This is the *base*
+        # substep count, used at the default and 2x carries; faster carries scale
+        # it up so the moving wall stays collision-tight (see _substeps_for_speed).
+        parser.add_argument("--substeps", type=int, default=4)
+        # The under-relaxed density correction (see --relaxation) needs several
+        # more iterations to converge: with these fine 100k particles too few
+        # leaves the water buzzing instead of settling, while too low a relaxation
+        # would over-compress it. 8 settles it and keeps the column filled.
+        parser.add_argument("--iterations", type=int, default=8)
+        # cap fluid neighbors above the bulk (~80) so a hard slosh can't stall a warp
+        parser.add_argument("--max-neighbors", type=int, default=128)
         parser.add_argument("--speed", type=float, default=1.0)
         parser.add_argument("--gravity", type=float, default=-9.81)
 
@@ -402,13 +600,27 @@ class Example:
         parser.add_argument("--cup-inner-radius", type=float, default=0.05)
         parser.add_argument("--cup-height", type=float, default=0.13)
         parser.add_argument("--cup-opacity", type=float, default=0.35)
+        parser.add_argument("--sdf-resolution", type=int, default=256, help="Cup SDF grid resolution.")
 
-        parser.add_argument("--spacing", type=float, default=0.011)
-        parser.add_argument("--radius", type=float, default=0.0055)
-        parser.add_argument("--fill-layers", type=int, default=8)
+        # ~100k particles filling the cup. The fill leaves headroom so a slosh
+        # has somewhere to go.
+        parser.add_argument("--spacing", type=float, default=0.0016)
+        parser.add_argument("--radius", type=float, default=0.0008)
+        parser.add_argument("--fill-layers", type=int, default=57)
         parser.add_argument("--rest-density", type=float, default=1000.0)
         parser.add_argument("--cohesion", type=float, default=0.6)
-        parser.add_argument("--viscosity", type=float, default=0.05)
+        # The summed (standard-PBF) density correction overshoots at full
+        # strength while the cup is carried -- the water buzzes at its velocity
+        # cap instead of settling. Under-relaxing the density push lets it come
+        # to rest; --iterations compensates for the gentler per-iteration push.
+        parser.add_argument("--relaxation", type=float, default=0.3)
+        # The XSPH viscosity pass is a full extra neighbor sweep per substep
+        # (~40% of the frame at 100k); the density + cohesion solve already reads
+        # smooth here, so it is off by default. Raise it for thicker, syrupy flow.
+        parser.add_argument("--viscosity", type=float, default=0.0)
+        # Foam/spray is barely visible for a carried cup but its spawn pass scans
+        # every fluid particle each step; off by default. Raise to add spray.
+        parser.add_argument("--foam-max-particles", type=int, default=0)
         parser.add_argument("--fluid-color", type=float, nargs=4, default=(0.113, 0.425, 0.55, 0.8))
 
         parser.add_argument("--camera-pos", type=float, nargs=3, default=(1.45, -0.85, 0.75))

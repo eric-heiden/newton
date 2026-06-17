@@ -2902,3 +2902,108 @@ def convert_joint_impulse_to_parent_f(
     f = wp.spatial_top(impulse) * inv_dt
     tau = wp.spatial_bottom(impulse) * inv_dt
     wp.atomic_add(body_parent_f, id_c, wp.spatial_vector(f, tau))
+
+
+# ---------------------------------------------------------------------------
+# Fluid particle spatial reordering (neighbor-read locality)
+
+
+@wp.func
+def part1by2(n: wp.uint32) -> wp.uint32:
+    """Spread ten bits so three coordinates can be interleaved."""
+    n = n & wp.uint32(0x3FF)
+    n = (n | (n << wp.uint32(16))) & wp.uint32(0xFF0000FF)
+    n = (n | (n << wp.uint32(8))) & wp.uint32(0x0300F00F)
+    n = (n | (n << wp.uint32(4))) & wp.uint32(0x030C30C3)
+    n = (n | (n << wp.uint32(2))) & wp.uint32(0x09249249)
+    return n
+
+
+@wp.kernel
+def compute_particle_bounds_min(
+    particle_q: wp.array[wp.vec3],
+    bounds_min: wp.array[wp.float32],
+):
+    tid = wp.tid()
+    p = particle_q[tid]
+    wp.atomic_min(bounds_min, 0, p[0])
+    wp.atomic_min(bounds_min, 1, p[1])
+    wp.atomic_min(bounds_min, 2, p[2])
+
+
+@wp.kernel
+def compute_morton_keys(
+    particle_q: wp.array[wp.vec3],
+    bounds_min: wp.array[wp.float32],
+    inv_cell: float,
+    keys: wp.array[wp.int32],
+    indices: wp.array[wp.int32],
+):
+    tid = wp.tid()
+    p = particle_q[tid]
+    ix = wp.clamp(int((p[0] - bounds_min[0]) * inv_cell), 0, 1023)
+    iy = wp.clamp(int((p[1] - bounds_min[1]) * inv_cell), 0, 1023)
+    iz = wp.clamp(int((p[2] - bounds_min[2]) * inv_cell), 0, 1023)
+    code = (
+        part1by2(wp.uint32(ix))
+        | (part1by2(wp.uint32(iy)) << wp.uint32(1))
+        | (part1by2(wp.uint32(iz)) << wp.uint32(2))
+    )
+    keys[tid] = wp.int32(code)
+    indices[tid] = tid
+
+
+@wp.kernel
+def gather_vec3(src: wp.array[wp.vec3], perm: wp.array[wp.int32], dst: wp.array[wp.vec3]):
+    tid = wp.tid()
+    dst[tid] = src[perm[tid]]
+
+
+@wp.kernel
+def gather_float(src: wp.array[wp.float32], perm: wp.array[wp.int32], dst: wp.array[wp.float32]):
+    tid = wp.tid()
+    dst[tid] = src[perm[tid]]
+
+
+@wp.kernel
+def gather_int32(src: wp.array[wp.int32], perm: wp.array[wp.int32], dst: wp.array[wp.int32]):
+    tid = wp.tid()
+    dst[tid] = src[perm[tid]]
+
+
+@wp.kernel
+def gather_uint32(src: wp.array[wp.uint32], perm: wp.array[wp.int32], dst: wp.array[wp.uint32]):
+    tid = wp.tid()
+    dst[tid] = src[perm[tid]]
+
+
+@wp.kernel
+def clamp_body_velocities(
+    body_inv_mass: wp.array[float],
+    max_linear: float,
+    max_angular: float,
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Clamp dynamic-body velocity and clear non-finite components."""
+    tid = wp.tid()
+    if body_inv_mass[tid] == 0.0:
+        return
+    qd = body_qd[tid]
+    lin = wp.spatial_top(qd)
+    ang = wp.spatial_bottom(qd)
+
+    if not (wp.isfinite(lin[0]) and wp.isfinite(lin[1]) and wp.isfinite(lin[2])):
+        lin = wp.vec3(0.0)
+    if not (wp.isfinite(ang[0]) and wp.isfinite(ang[1]) and wp.isfinite(ang[2])):
+        ang = wp.vec3(0.0)
+
+    if max_linear > 0.0:
+        speed = wp.length(lin)
+        if speed > max_linear:
+            lin *= max_linear / speed
+    if max_angular > 0.0:
+        speed = wp.length(ang)
+        if speed > max_angular:
+            ang *= max_angular / speed
+
+    body_qd[tid] = wp.spatial_vector(lin, ang)

@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import warp as wp
 
@@ -175,6 +177,11 @@ class Example:
             color=(0.35, 0.38, 0.42),
         )
 
+        # small low-density primitives that bob on the passing waves; their
+        # buoyancy is emergent from the unified XPBD fluid + contact solve
+        water_top = args.emit_lower[1] + (args.dim_z - 1) * spacing
+        self.float_bodies = self._add_floats(builder, args, water_top)
+
         self.model = builder.finalize()
         self.model.particle_max_velocity = 0.5 * radius / self.sim_dt
         self.model.soft_contact_mu = 0.1
@@ -204,6 +211,20 @@ class Example:
             fluid_rest_distance=spacing,
             fluid_cohesion=args.cohesion,
             fluid_viscosity=args.viscosity,
+            max_diffuse_particles=args.foam_max_particles,
+            diffuse_lifetime=args.foam_lifetime,
+            diffuse_threshold=1.2,
+            diffuse_spawn_probability=0.5,
+            # Cranking the paddle amplitude slams water into momentary clumps at
+            # many times the rest neighbor count (~30-80), and a single such
+            # particle stalls its whole warp -- the cause of the FPS collapse at
+            # high amplitude. Capping above the settled bulk leaves calm water
+            # untouched but bounds those clumps, so the frame rate holds up no
+            # matter how violent the paddle gets.
+            fluid_max_neighbors=args.max_neighbors,
+            # keep a yanked float from diverging if the user grabs and flings it
+            body_max_velocity=12.0,
+            body_max_angular_velocity=40.0,
         )
 
         self.fluid_color = tuple(args.fluid_color)
@@ -220,7 +241,19 @@ class Example:
             self.viewer.show_fluid = use_fluid_surface
         self.viewer.set_camera(pos=wp.vec3(args.camera_pos), pitch=args.camera_pitch, yaw=args.camera_yaw)
 
+        # CUDA graph capture: the whole substep loop (paddle, collide, picking,
+        # solve) is replayed as a single graph, eliminating per-substep launch
+        # overhead. Recaptured only when a GUI-tunable scalar baked into the
+        # kernels changes.
+        self.graph = None
+        self.use_cuda_graph = wp.get_device(self.model.device).is_cuda
+        self._graph_key = None
+
+    def _graph_key_tuple(self):
+        return (round(self.paddle_amplitude, 6), round(self.solver.fluid_viscosity, 6))
+
     def simulate(self):
+        self.solver.reorder_particles(self.state_0)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             wp.launch(
@@ -247,7 +280,23 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        self.simulate()
+        if self.use_cuda_graph:
+            key = self._graph_key_tuple()
+            if self.graph is None or key != self._graph_key:
+                try:
+                    with wp.ScopedCapture() as capture:
+                        self.simulate()
+                    self.graph = capture.graph
+                    self._graph_key = key
+                except Exception as exc:
+                    warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
+                    self.use_cuda_graph = False
+                    self.graph = None
+                    self.simulate()
+            else:
+                wp.capture_launch(self.graph)
+        else:
+            self.simulate()
         self.sim_time += self.frame_dt
 
     def gui(self, ui):
@@ -266,6 +315,16 @@ class Example:
         if mean_speed < 1.0e-3:
             raise ValueError("Wave pool fluid is static; the paddle generated no waves")
 
+        if self.float_bodies:
+            float_q = self.state_0.body_q.numpy()[self.float_bodies]
+            if not np.all(np.isfinite(float_q)):
+                raise ValueError("Floating primitives contain non-finite transforms")
+            if np.abs(float_q[:, 1]).max() > self.pool_half_y + 0.3:
+                raise ValueError("A floating primitive escaped the pool side walls")
+            # low-density primitives must float, not sink through the pool floor
+            if float_q[:, 2].min() < 0.0:
+                raise ValueError("A floating primitive sank through the pool floor")
+
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         show_fluid = getattr(self.viewer, "show_fluid", False)
@@ -276,8 +335,14 @@ class Example:
         finally:
             if show_fluid:
                 self.viewer.show_fluid = show_fluid
-        if show_fluid:
+        # Hide the fluid surface while debugging with raw particles, so toggling
+        # "Show Particles" in the GUI leaves only the particles visible.
+        if show_fluid and not self.viewer.show_particles:
             self._log_fluid_surface()
+        elif self.solver.diffuse_positions is not None:
+            # the foam is emitted by _log_fluid_surface; when that is skipped,
+            # clear the last foam batch so it doesn't stay frozen on screen
+            self.viewer.log_fluid_diffuse("/model/fluid/diffuse", None)
         self.viewer.end_frame()
 
     def _log_fluid_surface(self):
@@ -298,19 +363,80 @@ class Example:
             anisotropy_tertiary=self.solver.render_anisotropy_tertiary,
             hidden=False,
         )
+        if getattr(self.viewer, "show_fluid_diffuse", False) and self.solver.diffuse_positions is not None:
+            self.viewer.log_fluid_diffuse(
+                "/model/fluid/diffuse",
+                self.solver.diffuse_positions,
+                self.solver.diffuse_velocities,
+                radius=0.006,
+                color=(0.9, 0.95, 1.0, 1.1),
+                motion_blur_scale=3.0,
+                lifetime=self.solver.diffuse_lifetime,
+                surface_bias=0.035,
+                hidden=False,
+            )
+
+    @staticmethod
+    def _add_floats(builder, args, water_top):
+        """Drop a few small, low-density primitives that float on the waves.
+
+        Densities are given as fractions of the fluid rest density (``< 1``
+        floats); the buoyancy is emergent from the unified XPBD fluid-density and
+        particle-shape contact solve -- no special coupling force is applied, as
+        in the interactive-tank example.
+        """
+        rng = np.random.default_rng(5)
+        size = args.float_size
+        # (primitive kind, density as a fraction of water, RGB color)
+        specs = (
+            ("sphere", 0.45, (0.95, 0.55, 0.20)),
+            ("box", 0.55, (0.25, 0.65, 0.95)),
+            ("capsule", 0.35, (0.95, 0.85, 0.30)),
+            ("sphere", 0.60, (0.40, 0.85, 0.45)),
+            ("box", 0.40, (0.92, 0.35, 0.55)),
+            ("capsule", 0.50, (0.62, 0.45, 0.95)),
+        )
+        bodies = []
+        n = max(int(args.float_count), 0)
+        for i in range(n):
+            kind, fraction, color = specs[i % len(specs)]
+            # scatter along the deep-to-mid pool (clear of the paddle and beach),
+            # alternating across the width so the waves rock each one differently
+            x = -1.6 + 1.6 * (float(i) / float(max(n - 1, 1)))
+            y = (0.22 if i % 2 == 0 else -0.22) + float(rng.uniform(-0.05, 0.05))
+            z = water_top + 0.12 + 0.05 * float(i)
+            cfg = newton.ModelBuilder.ShapeConfig(density=fraction * args.rest_density, mu=0.3)
+            if kind == "capsule":
+                # the capsule's length is along local +Z; lay it on its side so
+                # it floats like a log instead of bobbing end-up
+                axis = wp.vec3(0.0, 1.0, 0.0) if i % 4 == 0 else wp.vec3(1.0, 0.0, 0.0)
+                q = wp.quat_from_axis_angle(axis, 0.5 * np.pi)
+            else:
+                q = wp.quat_from_axis_angle(wp.vec3(0.3, 0.7, 0.2), float(rng.uniform(0.0, 0.5)))
+            body = builder.add_body(xform=wp.transform(wp.vec3(x, y, z), q), label=f"float_{i}")
+            if kind == "sphere":
+                builder.add_shape_sphere(body, radius=size, cfg=cfg, color=color)
+            elif kind == "box":
+                builder.add_shape_box(body, hx=size, hy=size, hz=0.7 * size, cfg=cfg, color=color)
+            else:
+                builder.add_shape_capsule(body, radius=0.65 * size, half_height=size, cfg=cfg, color=color)
+            bodies.append(body)
+        return bodies
 
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--fps", type=float, default=60.0)
-        parser.add_argument("--substeps", type=int, default=4)
-        parser.add_argument("--iterations", type=int, default=3)
+        # ~100k particles at 2 PBF iterations (real-time standard). The long pool
+        # keeps spacing coarser than the tank/dam-break scenes for the same count.
+        parser.add_argument("--substeps", type=int, default=2)
+        parser.add_argument("--iterations", type=int, default=2)
         parser.add_argument("--render-mode", choices=["fluid", "particles"], default="fluid")
 
-        parser.add_argument("--dim-x", type=int, default=52)
-        parser.add_argument("--dim-y", type=int, default=18)
-        parser.add_argument("--dim-z", type=int, default=8)
-        parser.add_argument("--spacing", type=float, default=0.05)
+        parser.add_argument("--dim-x", type=int, default=123)
+        parser.add_argument("--dim-y", type=int, default=43)
+        parser.add_argument("--dim-z", type=int, default=19)
+        parser.add_argument("--spacing", type=float, default=0.0211)
         parser.add_argument("--emit-lower", type=float, nargs=2, default=(-2.05, 0.025))
         parser.add_argument("--rest-density", type=float, default=1000.0)
         parser.add_argument("--gravity", type=float, default=-9.81)
@@ -327,12 +453,21 @@ class Example:
 
         parser.add_argument("--cohesion", type=float, default=0.6)
         parser.add_argument("--viscosity", type=float, default=0.03)
+        # Cap fluid neighbors above the settled bulk (~80) so high-amplitude
+        # clumps can't stall a warp; 0 disables the cap.
+        parser.add_argument("--max-neighbors", type=int, default=128)
 
+        # small low-density primitives (spheres/boxes/capsules) that float on the waves
+        parser.add_argument("--float-count", type=int, default=6)
+        parser.add_argument("--float-size", type=float, default=0.08)
+
+        parser.add_argument("--foam-max-particles", type=int, default=20000)
+        parser.add_argument("--foam-lifetime", type=float, default=1.8)
         parser.add_argument("--render-smoothing", type=float, default=0.6)
         parser.add_argument("--render-anisotropy-scale", type=float, default=1.0)
         parser.add_argument("--fluid-color", type=float, nargs=4, default=(0.113, 0.425, 0.55, 0.8))
         parser.add_argument("--fluid-radius-scale", type=float, default=1.8)
-        parser.add_argument("--fluid-blur-radius", type=float, default=0.08)
+        parser.add_argument("--fluid-blur-radius", type=float, default=0.034)
 
         parser.add_argument("--camera-pos", type=float, nargs=3, default=(0.9, -2.4, 1.5))
         parser.add_argument("--camera-pitch", type=float, default=-26.0)

@@ -5,7 +5,9 @@
 
 A funnel-shaped mesh collider is filled with viscous fluid particles that
 flow out through a narrow aperture at the bottom, demonstrating viscoplastic
-material behavior with mesh collisions.
+material behavior with mesh collisions. In ViewerGL the particles are
+rendered as a creamy, vanilla-sauce-like liquid surface; pass
+``--render-mode particles`` to see the raw MPM particles instead.
 """
 
 import numpy as np
@@ -76,7 +78,13 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
 
-        self.viewer.show_particles = True
+        # vanilla-sauce fluid surface in ViewerGL; raw particles elsewhere
+        self.use_fluid_surface = options.render_mode == "fluid" and getattr(self.viewer, "fluids", None) is not None
+        self.fluid_color = tuple(options.fluid_color)
+        self.fluid_blur_radius = 3.0 * options.voxel_size
+        self.viewer.show_particles = not self.use_fluid_surface
+        if hasattr(self.viewer, "show_fluid"):
+            self.viewer.show_fluid = self.use_fluid_surface
         self.viewer.set_model(self.model)
         if hasattr(self.viewer, "camera"):
             self.viewer.set_camera(pos=wp.vec3(0.45, -0.15, 0.25), pitch=-20.0, yaw=160.0)
@@ -105,8 +113,33 @@ class Example:
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
-        self.viewer.log_state(self.state_0)
+        show_fluid = getattr(self.viewer, "show_fluid", False)
+        if show_fluid:
+            self.viewer.show_fluid = False
+        try:
+            self.viewer.log_state(self.state_0)
+        finally:
+            if show_fluid:
+                self.viewer.show_fluid = show_fluid
+        if show_fluid:
+            self._log_fluid_surface()
         self.viewer.end_frame()
+
+    def _log_fluid_surface(self):
+        """Render the MPM particles as a glossy, opaque vanilla-sauce liquid."""
+        self.viewer.log_fluid(
+            "/model/fluid",
+            self.state_0.particle_q,
+            radii=self.model.particle_radius,
+            radius_scale=2.4,
+            color=self.fluid_color,
+            reflectance=0.04,
+            specular_intensity=0.9,
+            specular_power=180.0,
+            blur_radius_world=self.fluid_blur_radius,
+            shadow_opacity=0.9,
+            hidden=False,
+        )
 
     @staticmethod
     def create_parser():
@@ -120,6 +153,16 @@ class Example:
         parser.add_argument("--gravity", type=float, nargs=3, default=[0, 0, -10])
         parser.add_argument("--fps", type=float, default=240.0)
         parser.add_argument("--substeps", type=int, default=1)
+
+        # Rendering
+        parser.add_argument("--render-mode", choices=["fluid", "particles"], default="fluid")
+        parser.add_argument(
+            "--fluid-color",
+            type=float,
+            nargs=4,
+            default=(0.96, 0.89, 0.70, 0.08),
+            help="Fluid albedo (rgb) and transmittance (a); the default is an opaque vanilla sauce",
+        )
 
         # Material parameters
         parser.add_argument("--density", type=float, default=1000.0)

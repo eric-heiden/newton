@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import warp as wp
 
@@ -96,6 +98,10 @@ class Example:
             fluid_cohesion=args.cohesion,
             fluid_viscosity=args.viscosity,
             fluid_vorticity_confinement=args.vorticity_confinement,
+            max_diffuse_particles=args.foam_max_particles,
+            diffuse_lifetime=args.foam_lifetime,
+            diffuse_threshold=1.2,
+            diffuse_spawn_probability=0.5,
         )
 
         self.state_0 = self.model.state()
@@ -117,6 +123,11 @@ class Example:
             self.viewer.show_fluid = use_fluid_surface
         self.viewer.set_camera(pos=wp.vec3(1.6, -2.3, 1.1), pitch=-17.0, yaw=121.0)
 
+        # Capture the whole substep loop (collide, picking, solve) into a CUDA
+        # graph replayed once per frame, eliminating per-substep launch overhead.
+        self.graph = None
+        self.use_cuda_graph = wp.get_device(self.model.device).is_cuda
+
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -126,7 +137,21 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        self.simulate()
+        if self.use_cuda_graph:
+            if self.graph is None:
+                try:
+                    with wp.ScopedCapture() as capture:
+                        self.simulate()
+                    self.graph = capture.graph
+                except Exception as exc:
+                    warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
+                    self.use_cuda_graph = False
+                    self.graph = None
+                    self.simulate()
+            else:
+                wp.capture_launch(self.graph)
+        else:
+            self.simulate()
         self.sim_time += self.frame_dt
 
     def test_final(self):
@@ -152,8 +177,14 @@ class Example:
         finally:
             if show_fluid:
                 self.viewer.show_fluid = show_fluid
-        if show_fluid:
+        # Hide the fluid surface while debugging with raw particles, so toggling
+        # "Show Particles" in the GUI leaves only the particles visible.
+        if show_fluid and not self.viewer.show_particles:
             self._log_fluid_surface()
+        elif self.solver.diffuse_positions is not None:
+            # the foam is emitted by _log_fluid_surface; when that is skipped,
+            # clear the last foam batch so it doesn't stay frozen on screen
+            self.viewer.log_fluid_diffuse("/model/fluid/diffuse", None)
         self.viewer.end_frame()
 
     def _log_fluid_surface(self):
@@ -175,19 +206,34 @@ class Example:
             anisotropy_tertiary=self.solver.render_anisotropy_tertiary,
             hidden=False,
         )
+        if getattr(self.viewer, "show_fluid_diffuse", False) and self.solver.diffuse_positions is not None:
+            self.viewer.log_fluid_diffuse(
+                "/model/fluid/diffuse",
+                self.solver.diffuse_positions,
+                self.solver.diffuse_velocities,
+                radius=0.006,
+                color=(0.9, 0.95, 1.0, 1.1),
+                motion_blur_scale=3.0,
+                lifetime=self.solver.diffuse_lifetime,
+                surface_bias=0.03,
+                hidden=False,
+            )
 
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--fps", type=float, default=60.0)
-        parser.add_argument("--substeps", type=int, default=6)
-        parser.add_argument("--iterations", type=int, default=3)
+        # ~100k particles: finer resolution needs more substeps to keep the CFL
+        # velocity clamp (15 * spacing * substeps m/s) from throttling the water,
+        # and 2 PBF iterations (the real-time standard) keeps it fast.
+        parser.add_argument("--substeps", type=int, default=8)
+        parser.add_argument("--iterations", type=int, default=2)
         parser.add_argument("--render-mode", choices=["fluid", "particles"], default="fluid")
 
-        parser.add_argument("--dim-x", type=int, default=14)
-        parser.add_argument("--dim-y", type=int, default=20)
-        parser.add_argument("--dim-z", type=int, default=24)
-        parser.add_argument("--spacing", type=float, default=0.05)
+        parser.add_argument("--dim-x", type=int, default=34)
+        parser.add_argument("--dim-y", type=int, default=49)
+        parser.add_argument("--dim-z", type=int, default=59)
+        parser.add_argument("--spacing", type=float, default=0.0205)
         parser.add_argument("--rest-density", type=float, default=1000.0)
         parser.add_argument("--gravity", type=float, default=-9.81)
 
@@ -195,12 +241,14 @@ class Example:
         parser.add_argument("--viscosity", type=float, default=0.05)
         parser.add_argument("--vorticity-confinement", type=float, default=0.0)
 
+        parser.add_argument("--foam-max-particles", type=int, default=16000)
+        parser.add_argument("--foam-lifetime", type=float, default=1.8)
         parser.add_argument("--render-smoothing", type=float, default=0.6)
         parser.add_argument("--render-anisotropy-scale", type=float, default=1.0)
         parser.add_argument("--fluid-color", type=float, nargs=4, default=(0.113, 0.425, 0.55, 0.8))
         parser.add_argument("--fluid-ior", type=float, default=1.0)
         parser.add_argument("--fluid-radius-scale", type=float, default=1.8)
-        parser.add_argument("--fluid-blur-radius", type=float, default=0.1)
+        parser.add_argument("--fluid-blur-radius", type=float, default=0.045)
         return parser
 
 

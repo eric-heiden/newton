@@ -533,6 +533,9 @@ If you run the examples from a source checkout with uv, use
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_xpbd_cereal_bowl.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_xpbd_cereal_bowl.jpg" alt="XPBD Cereal Bowl">
+      </a>
     </td>
   </tr>
   <tr>
@@ -543,6 +546,47 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples fluid_xpbd_dam_break</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples fluid_xpbd_cereal_bowl</code>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_xpbd_interactive_tank.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_xpbd_interactive_tank.jpg" alt="XPBD Interactive Tank">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_xpbd_wave_pool.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_xpbd_wave_pool.jpg" alt="XPBD Wave Pool">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_xpbd_cup_transfer.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_xpbd_cup_transfer.jpg" alt="XPBD Cup Transfer">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_xpbd_interactive_tank</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_xpbd_wave_pool</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_xpbd_cup_transfer</code>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_xpbd_cup.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_xpbd_cup.jpg" alt="XPBD Cup">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_xpbd_cup</code>
     </td>
   </tr>
   <tr>

@@ -968,6 +968,7 @@ def test_mixed_winding_convex_pile_contact_normal(test, device):
             wp.array([0.0], dtype=wp.float32, device=device),
             1,
             wp.array([int(ShapeFlags.COLLIDE_PARTICLES)], dtype=wp.int32, device=device),
+            wp.array([-1], dtype=wp.int32, device=device),  # shape_sdf_index (no SDF)
             wp.array([0], dtype=wp.int32, device=device),
             wp.empty(0, dtype=HeightfieldData, device=device),
             wp.empty(0, dtype=wp.float32, device=device),

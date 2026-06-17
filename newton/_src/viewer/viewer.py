@@ -3317,7 +3317,11 @@ class ViewerBase(ABC):
         radii=None,
         radius_scale: float = 1.0,
         color=(0.113, 0.425, 0.55, 0.8),
+        absorption: tuple[float, float, float] | None = None,
         ior: float = 1.0,
+        reflectance: float = 0.1,
+        specular_intensity: float = 1.2,
+        specular_power: float = 400.0,
         blur_radius_world: float | None = None,
         shadow_opacity: float = 0.5,
         anisotropy=None,
@@ -3331,12 +3335,34 @@ class ViewerBase(ABC):
         rendering the samples as plain points. :class:`ViewerGL` overrides this
         with the Flex-style fluid pipeline.
 
+        The material parameters cover the spectrum from clear to opaque
+        liquids. Example settings:
+
+        * Water: ``color=(0.113, 0.425, 0.55, 0.8)`` (defaults).
+        * Milk: ``color=(0.93, 0.91, 0.86, 0.05)``, ``reflectance=0.03``,
+          ``specular_intensity=0.5``, ``specular_power=60.0``.
+        * Honey: ``color=(0.85, 0.55, 0.12, 0.55)``,
+          ``absorption=(0.2, 1.1, 2.6)``, ``reflectance=0.05``,
+          ``specular_power=240.0``.
+
         Args:
             name: Unique path/name for the fluid batch.
             points: Particle positions [m], shape [particle_count, 3].
             radii: Particle radii [m] (array, scalar, or ``None``).
-            color: Water color and opacity term used by the composite shader.
+            color: Fluid albedo (rgb) and transmittance (a). Transmittance 1
+                renders a clear liquid where the refracted scene shows
+                through; 0 renders an opaque scattering body such as milk.
+            absorption: Per-channel Beer-Lambert absorption applied to light
+                transmitted through the volume; higher values tint thick
+                regions toward the complementary color. Defaults to
+                ``1 - color.rgb``.
             ior: Index of refraction controlling refraction/reflection offsets.
+            reflectance: Fresnel reflectance at normal incidence; grazing
+                angles always approach full reflection.
+            specular_intensity: Strength of the sun specular highlight.
+            specular_power: Phong exponent of the highlight; high values give
+                a tight glossy sparkle (water), low values a soft sheen
+                (milk).
             blur_radius_world: World-space radius of the surface smoothing
                 filter [m]. Defaults to twice the particle radius.
             shadow_opacity: Dither density of the fluid shadow-map splats;

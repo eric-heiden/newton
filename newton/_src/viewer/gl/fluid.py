@@ -472,7 +472,11 @@ uniform vec2 inv_tex_scale;
 uniform vec2 clip_pos_to_eye;
 uniform vec2 tex_scale;
 uniform vec4 color;
+uniform vec3 absorption;
 uniform float ior;
+uniform float reflectance;
+uniform float specular_intensity;
+uniform float specular_power;
 uniform vec3 sky_color;
 uniform vec3 ground_color;
 uniform vec3 up_vec;
@@ -541,6 +545,11 @@ void main()
     if (abs(zr.z) < abs(zl.z)) dx = zr;
     if (abs(zb.z) < abs(zt.z)) dy = zb;
 
+    // Silhouette pixels have a depth jump on both sides, so their finite-
+    // difference normals are unreliable; blend them toward the view direction
+    // there to avoid a speckled reflection fringe around the liquid.
+    float edge = smoothstep(underwater_radius, 4.0 * underwater_radius, abs(dx.z) + abs(dy.z));
+
     vec4 worldPos = inv_view * vec4(eyePos, 1.0);
 
     float shadow = shadowSample(worldPos.xyz);
@@ -548,10 +557,19 @@ void main()
     vec3 l = (view * vec4(light_dir, 0.0)).xyz;
     vec3 v = -normalize(eyePos);
 
-    vec3 n = normalize(cross(dx, dy));
+    vec3 n = normalize(mix(normalize(cross(dx, dy)), v, edge));
     vec3 h = normalize(v + l);
 
-    float fresnel = 0.1 + (1.0 - 0.1) * cube(1.0 - max(dot(n, v), 0.0));
+    float fresnel = reflectance + (1.0 - reflectance) * cube(1.0 - max(dot(n, v), 0.0));
+    // opaque scattering liquids (milk, sauces) have matte surfaces: strongly
+    // damp the mirror-like grazing reflection of the sky/scene that otherwise
+    // reads as a metallic gray rim on them. Clear liquids (color.w -> 1) keep
+    // their full Fresnel sheen.
+    fresnel *= mix(0.2, 1.0, color.w);
+    // Opacity ramp: 1 for fully opaque scattering liquids (milk), 0 for clear
+    // water. Drives the milk-specific neutral sheen and warm ambient below so
+    // the clear-water path (color.w >= 0.5) is left exactly as-is.
+    float opaque = 1.0 - smoothstep(0.0, 0.5, color.w);
     float ln = dot(l, n);
 
     vec3 rEye = reflect(-v, n).xyz;
@@ -569,7 +587,7 @@ void main()
     float thickness = max(texture(thickness_tex, refractCoord).x, 0.3);
     // Beer-Lambert variant of the Flex transmission: the shipped linear form
     // goes negative once the accumulated thickness exceeds ~1.4
-    vec3 transmission = exp(-(vec3(1.0) - color.xyz) * thickness) * color.w;
+    vec3 transmission = exp(-absorption * thickness);
     vec3 refractCol = texture(scene_tex, refractCoord).xyz * transmission;
 
     vec2 sceneReflectCoord = TexCoord - rEye.xy * tex_scale * reflectScale / eyeZ;
@@ -578,19 +596,32 @@ void main()
     vec3 reflectCol = sceneReflect
         + mix(ground_color, sky_color, smoothstep(0.15, 0.25, upCoord(rWorld)) * shadow);
 
-    vec3 diffuse = color.xyz
-        * mix(vec3(0.29, 0.379, 0.59), vec3(1.0), (ln * 0.5 + 0.5) * max(shadow, 0.4))
-        * (1.0 - color.w);
-    vec3 specular = vec3(1.2 * pow(max(dot(h, n), 0.0), 400.0));
+    // Opaque scattering liquids (milk) must not mirror the colored environment
+    // map or carry the scene's shadow on their sheen: that grazing reflection
+    // reads as an iridescent "pearl" rim and a dark fringe where the reflected
+    // ray samples into shadow. Swap it for a neutral, unshadowed sheen tinted
+    // by the liquid's own albedo.
+    vec3 sheen = mix(color.xyz, vec3(1.0), 0.4);
+    reflectCol = mix(reflectCol, sheen, opaque);
 
-    vec3 surfaceCol = diffuse + (mix(refractCol, reflectCol, fresnel) + specular) * color.w;
+    // Flex's cold-blue ambient suits water but tints milk's shadowed side blue;
+    // warm it toward a neutral grey for opaque liquids.
+    vec3 ambientShade = mix(vec3(0.29, 0.379, 0.59), vec3(0.5, 0.49, 0.47), opaque);
+    vec3 diffuse = color.xyz
+        * mix(ambientShade, vec3(1.0), (ln * 0.5 + 0.5) * max(shadow, 0.4));
+    vec3 specular = vec3(specular_intensity * pow(max(dot(h, n), 0.0), specular_power));
+
+    // color.w is the transmittance of the volume: 1 = clear (the refracted
+    // scene shows through), 0 = opaque scattering body (milk). The Fresnel
+    // sheen and specular highlight sit on top either way.
+    vec3 body = mix(diffuse, refractCol, color.w);
+    vec3 surfaceCol = mix(body, reflectCol, fresnel) + specular;
 
     // When the surface sits at the near plane the camera is inside the
     // water: shade the pixel as looking through the volume (absorbed scene,
     // no surface lighting) instead of showing the splats in front of the eye.
     float submerged = 1.0 - smoothstep(2.0 * underwater_radius, 5.0 * underwater_radius, -eyeZ);
-    vec3 throughCol = texture(scene_tex, TexCoord).xyz * transmission
-        + color.xyz * (1.0 - color.w) * 0.15;
+    vec3 throughCol = mix(color.xyz * 0.15, texture(scene_tex, TexCoord).xyz * transmission, color.w);
     FragColor.xyz = mix(surfaceCol, throughCol, submerged);
     FragColor.w = 1.0;
 
@@ -865,15 +896,33 @@ class _Program:
 class FluidBatch:
     """GPU vertex data for one logged fluid (positions plus anisotropy)."""
 
+    _MATERIAL_ATTRS = (
+        "color",
+        "absorption",
+        "ior",
+        "reflectance",
+        "specular_intensity",
+        "specular_power",
+        "blur_radius_world",
+        "max_blur_radius",
+        "shadow_opacity",
+        "thickness_scale",
+        "thickness_gain",
+    )
+
     def __init__(self, gl, capacity: int):
         self._gl = gl
         self.capacity = max(int(capacity), 1)
         self.count = 0
         self.hidden = False
 
-        # material (Flex demo defaults)
+        # material (Flex demo defaults; tuned for water)
         self.color = (0.113, 0.425, 0.55, 0.8)
+        self.absorption = None  # None derives Beer-Lambert terms from (1 - color.rgb)
         self.ior = 1.0
+        self.reflectance = 0.1
+        self.specular_intensity = 1.2
+        self.specular_power = 400.0
         self.blur_radius_world = 0.06
         self.max_blur_radius = 8.0
         self.shadow_opacity = 0.5
@@ -914,26 +963,11 @@ class FluidBatch:
     def _ensure_capacity(self, count: int):
         if count <= self.capacity:
             return
-        material = (
-            self.color,
-            self.ior,
-            self.blur_radius_world,
-            self.max_blur_radius,
-            self.thickness_scale,
-            self.thickness_gain,
-            self.shadow_opacity,
-        )
+        material = {attr: getattr(self, attr) for attr in self._MATERIAL_ATTRS}
         self.destroy()
         self.__init__(self._gl, max(count, self.capacity * 2))
-        (
-            self.color,
-            self.ior,
-            self.blur_radius_world,
-            self.max_blur_radius,
-            self.thickness_scale,
-            self.thickness_gain,
-            self.shadow_opacity,
-        ) = material
+        for attr, value in material.items():
+            setattr(self, attr, value)
 
     def update(
         self, points, radii, radius_scale=1.0, anisotropy=None, anisotropy_secondary=None, anisotropy_tertiary=None
@@ -1341,8 +1375,10 @@ class FluidRenderer:
         clip_pos_to_eye = (tan_half_fov * aspect, tan_half_fov)
         inv_buf_viewport = (1.0 / bw, 1.0 / bh)
 
+        # _sun_direction points toward the sun, matching the scene shaders'
+        # to-light convention (shadow offsets, wrap diffuse, speculars)
         sun = np.asarray(host._sun_direction, dtype=np.float32)
-        light_dir = -sun / max(np.linalg.norm(sun), 1.0e-6)
+        light_dir = sun / max(np.linalg.norm(sun), 1.0e-6)
 
         up_vec = np.zeros(3, dtype=np.float32)
         up_vec[int(host.camera.up_axis)] = 1.0
@@ -1442,7 +1478,14 @@ class FluidRenderer:
                 prog.set_vec2("clip_pos_to_eye", clip_pos_to_eye)
                 prog.set_vec2("tex_scale", (1.0 / aspect, 1.0))
                 prog.set_vec4("color", material.color)
+                absorption = material.absorption
+                if absorption is None:
+                    absorption = tuple(max(1.0 - c, 0.0) for c in material.color[:3])
+                prog.set_vec3("absorption", absorption)
                 prog.set_float("ior", material.ior)
+                prog.set_float("reflectance", material.reflectance)
+                prog.set_float("specular_intensity", material.specular_intensity)
+                prog.set_float("specular_power", material.specular_power)
                 prog.set_float("underwater_radius", material.blur_radius_world)
                 prog.set_vec3("sky_color", host.sky_upper)
                 prog.set_vec3("ground_color", host.ambient_ground)

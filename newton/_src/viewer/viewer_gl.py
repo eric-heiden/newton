@@ -1610,7 +1610,11 @@ class ViewerGL(ViewerBase):
         radii: wp.array[wp.float32] | float | None = None,
         radius_scale: float = 1.0,
         color: tuple[float, float, float, float] = (0.113, 0.425, 0.55, 0.8),
+        absorption: tuple[float, float, float] | None = None,
         ior: float = 1.0,
+        reflectance: float = 0.1,
+        specular_intensity: float = 1.2,
+        specular_power: float = 400.0,
         blur_radius_world: float | None = None,
         shadow_opacity: float = 0.5,
         anisotropy: wp.array[wp.vec4] | None = None,
@@ -1636,7 +1640,11 @@ class ViewerGL(ViewerBase):
         batch = self.fluids[name]
         batch.hidden = hidden
         batch.color = tuple(float(c) for c in color)
+        batch.absorption = None if absorption is None else tuple(float(a) for a in absorption)
         batch.ior = float(ior)
+        batch.reflectance = float(reflectance)
+        batch.specular_intensity = float(specular_intensity)
+        batch.specular_power = float(specular_power)
         if blur_radius_world is not None:
             batch.blur_radius_world = float(blur_radius_world)
         elif isinstance(radii, (int, float)):

@@ -12,7 +12,19 @@ from ...sim import Contacts, Control, Model, ModelFlags, State
 from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
 from . import kernels, restitution_kernels
-from ..sph.kernels import compute_sph_render_particles
+from ..sph.kernels import (
+    advance_sph_diffuse_seed,
+    collide_sph_diffuse_particles_with_shapes,
+    compute_sph_render_particles,
+    spawn_sph_diffuse_particles,
+    update_sph_diffuse_particles,
+)
+from .fluid_kernels import (
+    compute_fluid_lambdas,
+    compute_fluid_vorticity,
+    solve_fluid_deltas,
+    solve_fluid_velocities,
+)
 from .kernels import (
     accumulate_weighted_contact_impulse,
     apply_body_delta_velocities,
@@ -21,15 +33,18 @@ from .kernels import (
     apply_particle_deltas,
     apply_particle_shape_restitution,
     bending_constraint,
-    compute_fluid_lambdas,
-    compute_fluid_vorticity,
+    clamp_body_velocities,
+    compute_morton_keys,
+    compute_particle_bounds_min,
     convert_contact_impulse_to_force,
     convert_joint_impulse_to_parent_f,
     copy_kinematic_body_state_kernel,
+    gather_float,
+    gather_int32,
+    gather_uint32,
+    gather_vec3,
     solve_body_contact_positions,
     solve_body_joints,
-    solve_fluid_deltas,
-    solve_fluid_velocities,
     solve_particle_particle_contacts,
     solve_particle_shape_contacts,
     # solve_simple_body_joints,
@@ -127,6 +142,12 @@ class SolverXPBD(SolverBase, CouplingInterface):
         into isolated particles; XSPH viscosity and vorticity confinement act on
         velocities after the position solve.
 
+        An optional render-only foam/spray layer (``max_diffuse_particles``)
+        spawns Flex-style diffuse particles from a trapped-air/wave-crest
+        potential over the fluid surface. The results in
+        :attr:`diffuse_positions` and :attr:`diffuse_velocities` can be passed
+        to ``Viewer.log_fluid_diffuse()``.
+
         .. code-block:: python
 
             builder.add_particle_grid(
@@ -172,6 +193,19 @@ class SolverXPBD(SolverBase, CouplingInterface):
         fluid_viscosity: float = 0.0,
         fluid_vorticity_confinement: float = 0.0,
         fluid_relaxation: float = 1.0,
+        fluid_max_neighbors: int = 0,
+        body_max_velocity: float = 0.0,
+        body_max_angular_velocity: float = 0.0,
+        max_diffuse_particles: int = 0,
+        diffuse_threshold: float = 2.0,
+        diffuse_lifetime: float = 1.5,
+        diffuse_drag: float = 0.8,
+        diffuse_buoyancy: float = 0.25,
+        diffuse_ballistic: int = 8,
+        diffuse_spawn_probability: float = 0.35,
+        diffuse_jitter: float | None = None,
+        diffuse_surface_density_ratio: float = 0.92,
+        diffuse_shape_collision: bool = True,
         deterministic: wp.DeterministicMode | None = None,
     ):
         """Initialize the XPBD solver.
@@ -210,6 +244,39 @@ class SolverXPBD(SolverBase, CouplingInterface):
             fluid_vorticity_confinement: Vorticity confinement strength that re-injects
                 rotational motion lost to the position solve. ``0`` disables it.
             fluid_relaxation: Per-iteration scale on fluid density corrections.
+            fluid_max_neighbors: Cap on the neighbors each fluid particle processes
+                in the density solve. ``0`` (default) processes all neighbors; a
+                positive value bounds the per-particle cost so a momentary
+                over-compressed clump cannot stall its whole warp. Set it above
+                the bulk neighbor count (so the rest state is never truncated and
+                stays consistent with the rest-density calibration).
+            body_max_velocity: Per-substep cap on dynamic-body linear speed [m/s].
+                ``0`` (default) disables it. A small positive value prevents a
+                body slammed into deep penetration from receiving a divergent
+                correction velocity that tunnels and blows up to NaN.
+            body_max_angular_velocity: Per-substep cap on dynamic-body angular
+                speed [rad/s]. ``0`` (default) disables it.
+            max_diffuse_particles: Maximum secondary foam/spray particles. Set to
+                ``0`` (default) to disable the diffuse particle layer. When enabled,
+                foam state is written to :attr:`diffuse_positions` and
+                :attr:`diffuse_velocities`, which can be passed to
+                ``Viewer.log_fluid_diffuse()``.
+            diffuse_threshold: Trapped-air/wave-crest potential needed to emit a
+                diffuse particle. The potential favors surface particles whose
+                neighborhood is rapidly compressing or cresting.
+            diffuse_lifetime: Diffuse particle lifetime [s].
+            diffuse_drag: Blend rate toward neighboring fluid velocity [1/s].
+            diffuse_buoyancy: Fraction of gravity canceled while a diffuse
+                particle has fluid neighbors.
+            diffuse_ballistic: Neighbor count below which a diffuse particle falls
+                ballistically (spray) instead of advecting with the fluid (foam).
+            diffuse_spawn_probability: Per-step spawn probability multiplier once
+                the diffuse potential exceeds ``diffuse_threshold``.
+            diffuse_jitter: Spawn offset radius [m]. If ``None``, a fraction of the
+                fluid smoothing length is used.
+            diffuse_surface_density_ratio: Density threshold used to classify
+                surface particles as diffuse emitters.
+            diffuse_shape_collision: Whether diffuse particles collide with shapes.
             deterministic: Opt-in determinism for this solver's atomic-emitting
                 kernel module. Pass a :class:`warp.DeterministicMode`, or
                 ``None`` (default) to inherit the current
@@ -256,16 +323,47 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self.fluid_viscosity = min(max(float(fluid_viscosity), 0.0), 1.0)
         self.fluid_vorticity_confinement = max(float(fluid_vorticity_confinement), 0.0)
         self.fluid_relaxation = max(float(fluid_relaxation), 0.0)
+        self.fluid_max_neighbors = int(fluid_max_neighbors)
+        self.body_max_velocity = max(float(body_max_velocity), 0.0)
+        self.body_max_angular_velocity = max(float(body_max_angular_velocity), 0.0)
+
+        self.max_diffuse_particles = max(int(max_diffuse_particles), 0)
+        self.diffuse_threshold = float(max(diffuse_threshold, 0.0))
+        self.diffuse_lifetime = float(max(diffuse_lifetime, 1.0e-6))
+        self.diffuse_drag = float(max(diffuse_drag, 0.0))
+        self.diffuse_buoyancy = float(max(diffuse_buoyancy, 0.0))
+        self.diffuse_ballistic = max(int(diffuse_ballistic), 1)
+        self.diffuse_spawn_probability = float(max(diffuse_spawn_probability, 0.0))
+        self.diffuse_jitter = diffuse_jitter
+        self.diffuse_surface_density_ratio = float(max(diffuse_surface_density_ratio, 0.0))
+        self.diffuse_shape_collision = bool(diffuse_shape_collision)
+        self.diffuse_enabled = self.max_diffuse_particles > 0
 
         self.render_positions: wp.array[wp.vec3] | None = None
         self.render_anisotropy: wp.array[wp.vec4] | None = None
         self.render_anisotropy_secondary: wp.array[wp.vec4] | None = None
         self.render_anisotropy_tertiary: wp.array[wp.vec4] | None = None
 
+        self.diffuse_positions: wp.array[wp.vec4] | None = None
+        self.diffuse_velocities: wp.array[wp.vec4] | None = None
+        self.diffuse_worlds: wp.array[wp.int32] | None = None
+        self.diffuse_slot_states: wp.array[wp.int32] | None = None
+        self.diffuse_spawn_counter: wp.array[wp.int32] | None = None
+        self.diffuse_frame_seed: wp.array[wp.int32] | None = None
+        self._diffuse_empty_bodies: tuple | None = None
+
         self._fluid_density: wp.array[wp.float32] | None = None
         self._fluid_lambda: wp.array[wp.float32] | None = None
         self._fluid_vorticity: wp.array[wp.vec3] | None = None
+        self._all_fluid = False
+        # Lazily allocated scratch for reorder_particles (spatial sort buffers
+        # plus per-dtype gather destinations, keyed by array label).
+        self._reorder_keys: wp.array[wp.int32] | None = None
+        self._reorder_indices: wp.array[wp.int32] | None = None
+        self._reorder_bounds: wp.array[wp.float32] | None = None
+        self._reorder_scratch: dict = {}
         self._update_fluid_settings()
+        self._ensure_diffuse_storage()
 
         self._init_kinematic_state()
 
@@ -343,9 +441,14 @@ class SolverXPBD(SolverBase, CouplingInterface):
             return
 
         flags = model.particle_flags.numpy()
+        active_mask = (flags & int(ParticleFlags.ACTIVE)) != 0
         fluid_mask = (flags & int(ParticleFlags.FLUID)) != 0
         if not fluid_mask.any():
             return
+        # whether every active particle is fluid: lets the solver skip the
+        # particle-particle contact kernel entirely (fluid-fluid pairs are
+        # handled by the density constraint, so that kernel would be pure waste)
+        self._all_fluid = not bool((active_mask & ~fluid_mask).any())
 
         rest_distance = self.fluid_rest_distance
         if rest_distance is None:
@@ -418,6 +521,95 @@ class SolverXPBD(SolverBase, CouplingInterface):
             self._fluid_lambda = wp.zeros(n, dtype=wp.float32, device=model.device)
             self._fluid_vorticity = wp.zeros(n, dtype=wp.vec3, device=model.device)
 
+    def reorder_particles(self, state: State) -> None:
+        """Sort fluid particles into spatial order to keep the density solve fast.
+
+        Free fluid particles are created in spatial order, so the hash-grid
+        neighbor gathers in the density constraint start cache-coherent. As the
+        fluid spreads, consecutive particle indices scatter across memory and
+        those neighbor reads lose locality, multiplying the solve cost. Sorting
+        the particles back into Morton (Z-curve) order restores it.
+
+        The reorder is a pure relabeling, so the simulation result is unchanged.
+        It only runs when every active particle is a free fluid particle;
+        reordering would otherwise scramble the index-based topology of cloth or
+        soft bodies. Call it once per frame, before the substep loop. Every step
+        is on device and CUDA-graph-capturable, so it may run inside a captured
+        region.
+
+        Args:
+            state: State whose ``particle_q`` defines the sort order; its
+                ``particle_q`` and ``particle_qd`` are permuted in place along
+                with the model's per-particle arrays.
+        """
+        model = self.model
+        n = model.particle_count
+        if not self._all_fluid or not self._has_fluid or n <= 1:
+            return
+
+        dev = model.device
+        if self._reorder_keys is None or len(self._reorder_indices) < 2 * n:
+            # radix_sort_pairs sorts the first n entries using the rest as scratch
+            self._reorder_keys = wp.empty(2 * n, dtype=wp.int32, device=dev)
+            self._reorder_indices = wp.empty(2 * n, dtype=wp.int32, device=dev)
+            self._reorder_bounds = wp.empty(3, dtype=wp.float32, device=dev)
+            self._reorder_scratch = {}
+
+        # Morton key per particle relative to the cloud's lower corner.
+        self._reorder_bounds.fill_(1.0e30)
+        wp.launch(compute_particle_bounds_min, dim=n, inputs=[state.particle_q, self._reorder_bounds], device=dev)
+        wp.launch(
+            compute_morton_keys,
+            dim=n,
+            inputs=[
+                state.particle_q,
+                self._reorder_bounds,
+                1.0 / self._fluid_h,
+                self._reorder_keys,
+                self._reorder_indices,
+            ],
+            device=dev,
+        )
+        wp.utils.radix_sort_pairs(self._reorder_keys, self._reorder_indices, n)
+        perm = self._reorder_indices  # first n entries: old indices in sorted order
+
+        # Permute every per-particle array by the same permutation (pure relabel).
+        for owner, name in (
+            (state, "particle_q"),
+            (state, "particle_qd"),
+            (model, "particle_q"),
+            (model, "particle_qd"),
+            (model, "particle_colors"),
+            (model, "particle_mass"),
+            (model, "particle_inv_mass"),
+            (model, "particle_radius"),
+            (model, "particle_flags"),
+            (model, "particle_world"),
+        ):
+            self._permute_particle_array(getattr(owner, name, None), perm, n, f"{type(owner).__name__}.{name}")
+
+    def _permute_particle_array(self, arr, perm, n: int, label: str) -> None:
+        """Gather ``arr`` by ``perm`` into cached scratch, then copy it back in place."""
+        if arr is None or len(arr) != n:
+            return
+        dtype = arr.dtype
+        if dtype == wp.vec3:
+            kernel = gather_vec3
+        elif dtype == wp.float32:
+            kernel = gather_float
+        elif dtype == wp.uint32:
+            kernel = gather_uint32
+        elif dtype == wp.int32:
+            kernel = gather_int32
+        else:
+            return
+        scratch = self._reorder_scratch.get(label)
+        if scratch is None or len(scratch) != n or scratch.dtype != dtype:
+            scratch = wp.empty(n, dtype=dtype, device=self.model.device)
+            self._reorder_scratch[label] = scratch
+        wp.launch(kernel, dim=n, inputs=[arr, perm, scratch], device=self.model.device)
+        wp.copy(arr, scratch)
+
     def update_render_particles(
         self,
         state: State,
@@ -479,6 +671,158 @@ class SolverXPBD(SolverBase, CouplingInterface):
             ],
             device=model.device,
         )
+
+    def _ensure_diffuse_storage(self) -> None:
+        if not self.diffuse_enabled:
+            return
+        if self.diffuse_positions is not None and len(self.diffuse_positions) == self.max_diffuse_particles:
+            return
+        device = self.model.device
+        self.diffuse_positions = wp.zeros(self.max_diffuse_particles, dtype=wp.vec4, device=device)
+        self.diffuse_velocities = wp.zeros(self.max_diffuse_particles, dtype=wp.vec4, device=device)
+        self.diffuse_worlds = wp.zeros(self.max_diffuse_particles, dtype=wp.int32, device=device)
+        self.diffuse_slot_states = wp.zeros(self.max_diffuse_particles, dtype=wp.int32, device=device)
+        self.diffuse_spawn_counter = wp.zeros(1, dtype=wp.int32, device=device)
+        self.diffuse_frame_seed = wp.zeros(1, dtype=wp.int32, device=device)
+
+    def clear_diffuse_particles(self) -> None:
+        """Kill all live diffuse foam/spray particles."""
+        if self.diffuse_positions is not None:
+            self.diffuse_positions.zero_()
+        if self.diffuse_velocities is not None:
+            self.diffuse_velocities.zero_()
+        if self.diffuse_slot_states is not None:
+            self.diffuse_slot_states.zero_()
+
+    def _step_diffuse_particles(self, state_out: State, dt: float) -> None:
+        """Advance, spawn, and collide the diffuse foam/spray layer.
+
+        Runs over the final particle state of a step. Spawning reuses the
+        fluid densities computed by the last constraint iteration; the hash
+        grid is rebuilt over the final positions because
+        :func:`spawn_sph_diffuse_particles` iterates particles through
+        ``wp.hash_grid_point_id``.
+        """
+        model = self.model
+        h = self._fluid_h
+        jitter = 0.12 * h if self.diffuse_jitter is None else max(float(self.diffuse_jitter), 0.0)
+        # effectively unbounded: XPBD fluids have no solver bounds
+        bounds_lower = wp.vec3(-1.0e9, -1.0e9, -1.0e9)
+        bounds_upper = wp.vec3(1.0e9, 1.0e9, 1.0e9)
+
+        with wp.ScopedDevice(model.device):
+            model.particle_grid.build(state_out.particle_q, radius=h)
+
+        wp.launch(
+            kernel=update_sph_diffuse_particles,
+            dim=self.max_diffuse_particles,
+            inputs=[
+                model.particle_grid.id,
+                state_out.particle_q,
+                state_out.particle_qd,
+                model.particle_flags,
+                model.gravity,
+                h,
+                bounds_lower,
+                bounds_upper,
+                0.0,
+                self.diffuse_lifetime,
+                self.diffuse_drag,
+                self.diffuse_buoyancy,
+                self.diffuse_ballistic,
+                dt,
+                self.diffuse_positions,
+                self.diffuse_velocities,
+                self.diffuse_worlds,
+                self.diffuse_slot_states,
+            ],
+            device=model.device,
+        )
+
+        wp.launch(
+            kernel=advance_sph_diffuse_seed,
+            dim=1,
+            inputs=[self.diffuse_frame_seed],
+            device=model.device,
+        )
+        wp.launch(
+            kernel=spawn_sph_diffuse_particles,
+            dim=model.particle_count,
+            inputs=[
+                model.particle_grid.id,
+                state_out.particle_q,
+                state_out.particle_qd,
+                model.particle_flags,
+                model.particle_world,
+                self._fluid_density,
+                h,
+                self._fluid_rest_density_eff,
+                self.diffuse_threshold,
+                self.diffuse_spawn_probability,
+                jitter,
+                self.diffuse_surface_density_ratio,
+                self.diffuse_ballistic,
+                bounds_lower,
+                bounds_upper,
+                0.0,
+                self.diffuse_frame_seed,
+                self.diffuse_spawn_counter,
+                self.diffuse_positions,
+                self.diffuse_velocities,
+                self.diffuse_worlds,
+                self.diffuse_slot_states,
+            ],
+            device=model.device,
+        )
+
+        if self.diffuse_shape_collision and model.shape_count > 0 and model.shape_transform is not None:
+            if model.body_count > 0:
+                body_q, body_qd, body_f = state_out.body_q, state_out.body_qd, state_out.body_f
+                body_com, body_flags = model.body_com, model.body_flags
+            else:
+                if self._diffuse_empty_bodies is None:
+                    self._diffuse_empty_bodies = (
+                        wp.empty(0, dtype=wp.transform, device=model.device),
+                        wp.empty(0, dtype=wp.spatial_vector, device=model.device),
+                        wp.empty(0, dtype=wp.spatial_vector, device=model.device),
+                        wp.empty(0, dtype=wp.vec3, device=model.device),
+                        wp.empty(0, dtype=wp.int32, device=model.device),
+                    )
+                body_q, body_qd, body_f, body_com, body_flags = self._diffuse_empty_bodies
+            wp.launch(
+                kernel=collide_sph_diffuse_particles_with_shapes,
+                dim=self.max_diffuse_particles,
+                inputs=[
+                    self.diffuse_positions,
+                    self.diffuse_velocities,
+                    self.diffuse_worlds,
+                    body_q,
+                    body_qd,
+                    body_f,
+                    body_com,
+                    body_flags,
+                    model.shape_transform,
+                    model.shape_body,
+                    model.shape_type,
+                    model.shape_scale,
+                    model.shape_source_ptr,
+                    model.shape_flags,
+                    model.shape_margin,
+                    model.shape_world,
+                    model.shape_heightfield_index,
+                    model.heightfield_data,
+                    model.heightfield_elevations,
+                    model.shape_count,
+                    0.25 * h,
+                    0.0,
+                    0.5 * self._fluid_rest_distance_eff,
+                    0.0,
+                    0.0,
+                    0.2,
+                    0.0,
+                ],
+                device=model.device,
+            )
 
     def copy_kinematic_body_state(self, model: Model, state_in: State, state_out: State):
         """Copy kinematic body poses and velocities from an input state to an output state.
@@ -834,7 +1178,11 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                 device=model.device,
                             )
 
-                        if model.particle_max_radius > 0.0 and model.particle_count > 1:
+                        # Particle-particle contacts. Skipped entirely when every
+                        # active particle is fluid: fluid-fluid pairs are resolved
+                        # by the density constraint, so this kernel would only burn
+                        # a grid query per particle to reject everything.
+                        if model.particle_max_radius > 0.0 and model.particle_count > 1 and not self._all_fluid:
                             # assert model.particle_grid.reserved, "model.particle_grid must be built, see HashGrid.build()"
                             assert model.particle_grid is not None
                             wp.launch(
@@ -871,6 +1219,8 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                     self._fluid_h,
                                     self._fluid_rest_density_eff,
                                     self._fluid_eps,
+                                    self.fluid_max_neighbors,
+                                    self._fluid_rest_distance_eff,
                                 ],
                                 outputs=[self._fluid_density, self._fluid_lambda],
                                 device=model.device,
@@ -890,6 +1240,8 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                     self._fluid_cohesion_step,
                                     self._fluid_max_delta,
                                     self.fluid_relaxation,
+                                    self.fluid_max_neighbors,
+                                    self._fluid_rest_distance_eff,
                                 ],
                                 outputs=[particle_deltas],
                                 device=model.device,
@@ -1358,6 +1710,33 @@ class SolverXPBD(SolverBase, CouplingInterface):
 
             if model.body_count:
                 self.copy_kinematic_body_state(model, state_in, state_out)
+
+                # Stabilize dynamic bodies: clamp velocity and reset any
+                # non-finite component before it can tunnel or poison contacts.
+                if self.body_max_velocity > 0.0 or self.body_max_angular_velocity > 0.0:
+                    wp.launch(
+                        kernel=clamp_body_velocities,
+                        dim=model.body_count,
+                        inputs=[
+                            self.body_inv_mass_effective,
+                            self.body_max_velocity,
+                            self.body_max_angular_velocity,
+                        ],
+                        outputs=[state_out.body_qd],
+                        device=model.device,
+                    )
+
+            # secondary foam/spray layer over the final fluid state (render
+            # only, no feedback on the simulation)
+            if (
+                self.diffuse_enabled
+                and self._has_fluid
+                and model.particle_count
+                and model.particle_grid is not None
+                and not requires_grad
+            ):
+                self._ensure_diffuse_storage()
+                self._step_diffuse_particles(state_out, dt)
 
     @override
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:

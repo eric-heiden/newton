@@ -2324,6 +2324,7 @@ def update_joint_transforms_kernel(
     newton_joint_X_c: wp.array[wp.transform],
     # Newton model data (DOF-indexed)
     newton_joint_axis: wp.array[wp.vec3],
+    newton_dof_jnt_pos: wp.array[wp.vec3],
     # outputs
     jnt_pos: wp.array2d[wp.vec3],
     jnt_axis: wp.array2d[wp.vec3],
@@ -2366,10 +2367,15 @@ def update_joint_transforms_kernel(
     body_quat[world, mjc_body] = quat_xyzw_to_wxyz(tf.q)
 
     # Update joint axis and position (DOF-indexed for axis)
+    joint_pos = child_xform.p
     if newton_dof >= 0:
         axis = newton_joint_axis[newton_dof]
         jnt_axis[world, mjc_jnt] = wp.quat_rotate(child_xform.q, axis)
-    jnt_pos[world, mjc_jnt] = child_xform.p
+        if newton_dof_jnt_pos:
+            dof_pos = newton_dof_jnt_pos[newton_dof]
+            if wp.abs(dof_pos[0]) < 1.0e20 and wp.abs(dof_pos[1]) < 1.0e20 and wp.abs(dof_pos[2]) < 1.0e20:
+                joint_pos = dof_pos
+    jnt_pos[world, mjc_jnt] = joint_pos
 
 
 @wp.kernel(enable_backward=False)

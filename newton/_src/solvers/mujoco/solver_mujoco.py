@@ -940,6 +940,16 @@ class SolverMuJoCo(SolverBase):
         )
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
+                name="dof_jnt_pos",
+                frequency=AttributeFrequency.JOINT_DOF,
+                assignment=AttributeAssignment.MODEL,
+                dtype=wp.vec3,
+                default=wp.vec3(1.0e30, 1.0e30, 1.0e30),
+                namespace="mujoco",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
                 name="jnt_actgravcomp",
                 frequency=AttributeFrequency.JOINT_DOF,
                 assignment=AttributeAssignment.MODEL,
@@ -4822,6 +4832,15 @@ class SolverMuJoCo(SolverBase):
         body_gravcomp = get_custom_attribute("gravcomp")
         joint_springref = get_custom_attribute("dof_springref")
         joint_ref = get_custom_attribute("dof_ref")
+        joint_dof_jnt_pos = get_custom_attribute("dof_jnt_pos")
+
+        def joint_pos_for_dof(dof_idx: int, fallback: wp.vec3) -> np.ndarray | wp.vec3:
+            if joint_dof_jnt_pos is None:
+                return fallback
+            dof_pos = joint_dof_jnt_pos[dof_idx]
+            if np.all(np.abs(dof_pos) < 1.0e20):
+                return dof_pos
+            return fallback
 
         def joint_has_raw_limit_solref(dof_idx: int) -> bool:
             if joint_solref_limit is None:
@@ -5534,7 +5553,7 @@ class SolverMuJoCo(SolverBase):
 
                     joint_params = {
                         "armature": KINEMATIC_ARMATURE if child_is_kinematic else joint_armature[qd_start + i],
-                        "pos": joint_pos,
+                        "pos": joint_pos_for_dof(ai, joint_pos),
                     }
                     # Set friction
                     joint_params["frictionloss"] = joint_friction[ai]
@@ -5652,7 +5671,7 @@ class SolverMuJoCo(SolverBase):
 
                     joint_params = {
                         "armature": KINEMATIC_ARMATURE if child_is_kinematic else joint_armature[qd_start + i],
-                        "pos": joint_pos,
+                        "pos": joint_pos_for_dof(ai, joint_pos),
                     }
                     # Set friction
                     joint_params["frictionloss"] = joint_friction[ai]
@@ -6906,6 +6925,8 @@ class SolverMuJoCo(SolverBase):
         if self.mjc_jnt_to_newton_jnt is not None and self.mjc_jnt_to_newton_jnt.shape[1] > 0:
             nworld = self.mjc_jnt_to_newton_jnt.shape[0]
             njnt = self.mjc_jnt_to_newton_jnt.shape[1]
+            mujoco_attrs = getattr(self.model, "mujoco", None)
+            joint_dof_jnt_pos = getattr(mujoco_attrs, "dof_jnt_pos", None) if mujoco_attrs is not None else None
 
             wp.launch(
                 update_joint_transforms_kernel,
@@ -6920,6 +6941,7 @@ class SolverMuJoCo(SolverBase):
                     self.model.joint_X_c,
                     # Newton model data (DOF-indexed)
                     self.model.joint_axis,
+                    joint_dof_jnt_pos,
                 ],
                 outputs=[
                     self.mjw_model.jnt_pos,

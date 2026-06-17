@@ -369,6 +369,8 @@ def parse_mjcf(
     has_solreflimit_mode = solreflimit_mode_key in builder.custom_attributes
     solref_mode_key = "mujoco:solref_mode"
     has_solref_mode = solref_mode_key in builder.custom_attributes
+    dof_jnt_pos_key = "mujoco:dof_jnt_pos"
+    has_dof_jnt_pos = dof_jnt_pos_key in builder.custom_attributes
     builder_custom_attr_eq: list[ModelBuilder.CustomAttribute] = builder.get_custom_attributes_by_frequency(
         ["mujoco:equality_constraint"]
     )
@@ -1636,6 +1638,10 @@ def parse_mjcf(
                             dof_custom_attributes[solreflimit_mode_key][current_dof_index + dof_offset] = (
                                 solreflimit_mode
                             )
+                    if has_dof_jnt_pos:
+                        dof_custom_attributes.setdefault(dof_jnt_pos_key, {})
+                        for dof_offset in range(3):
+                            dof_custom_attributes[dof_jnt_pos_key][current_dof_index + dof_offset] = joint_pos[-1]
                     # Lift frictionloss into the builder's per-DOF friction array so it
                     # reaches the MuJoCo spec (joint_friction[qd_start]) on export.
                     ball_friction = parse_float(joint_attrib, "frictionloss", 0.0)
@@ -1754,6 +1760,8 @@ def parse_mjcf(
                     # away from their imported default values.
                     solreflimit_mode = SOLREF_MODE_RAW if "solreflimit" in joint_attrib else SOLREF_MODE_MJCF_DEFAULT
                     dof_custom_attributes.setdefault(solreflimit_mode_key, {})[current_dof_index] = solreflimit_mode
+                if has_dof_jnt_pos:
+                    dof_custom_attributes.setdefault(dof_jnt_pos_key, {})[current_dof_index] = joint_pos[-1]
 
                 # Track this MJCF joint's name and DOF offset within the combined Newton joint
                 mjcf_joint_dof_offsets.append((joint_name[-1], current_dof_index))

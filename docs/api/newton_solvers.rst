@@ -90,14 +90,6 @@ Supported Features
      - 🟨 no self-collision
      - ✅
      - 🟨 basic :sup:`2`
-   * - :class:`~newton.solvers.SolverSPH`
-     - Semi-implicit
-     - ❌
-     - ❌
-     - ✅ fluids
-     - ❌
-     - ❌
-     - ❌
    * - :class:`~newton.solvers.SolverStyle3D`
      - Implicit
      - ❌
@@ -438,7 +430,6 @@ See the `DiffSim examples on GitHub`_ for the current reference workflows.
    SolverKamino
    SolverMuJoCo
    SolverNotifyFlags
-   SolverSPH
    SolverSemiImplicit
    SolverStyle3D
    SolverVBD

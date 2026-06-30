@@ -44,6 +44,25 @@ def _make_kinematic_front_dynamic_back_model(device=None):
     return builder.finalize(device=device)
 
 
+def _make_static_wall_dynamic_back_model(device=None):
+    """Model with a static wall in front and a dynamic box behind it."""
+    builder = newton.ModelBuilder()
+    wall_shape = builder.add_shape_box(
+        body=-1,
+        xform=wp.transform(wp.vec3(0.0, 0.0, -1.0), wp.quat_identity()),
+        hx=1.0,
+        hy=1.0,
+        hz=0.1,
+    )
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+        mass=1.0,
+        inertia=wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+    )
+    builder.add_shape_box(body=body, hx=0.2, hy=0.2, hz=0.2)
+    return builder.finalize(device=device), wall_shape, body
+
+
 def _make_model_no_shapes(device=None):
     """Model with one body and no shapes (shape_count == 0)."""
     builder = newton.ModelBuilder()
@@ -142,6 +161,27 @@ class TestPickingSetup(unittest.TestCase):
 
         self.assertFalse(picking.is_picking())
         self.assertEqual(picking.pick_body.numpy()[0], -1)
+
+    def test_pick_mask_skips_static_occluder(self):
+        """Masked static shapes do not block picking dynamic bodies behind them."""
+        model, wall_shape, body = _make_static_wall_dynamic_back_model(device="cpu")
+        state = model.state()
+        picking = Picking(model)
+
+        ray_start = wp.vec3(0.0, 0.0, -3.0)
+        ray_dir = wp.vec3(0.0, 0.0, 1.0)
+        picking.pick(state, ray_start, ray_dir)
+        self.assertFalse(picking.is_picking())
+        self.assertEqual(picking.pick_body.numpy()[0], -1)
+
+        picking.release()
+        mask = np.ones(model.shape_count, dtype=np.int32)
+        mask[wall_shape] = 0
+        picking.set_pickable_shapes(mask)
+        picking.pick(state, ray_start, ray_dir)
+
+        self.assertTrue(picking.is_picking())
+        self.assertEqual(picking.pick_body.numpy()[0], body)
 
     def test_pick_empty_model_no_crash(self):
         """pick() with a model that has no shapes returns without error."""

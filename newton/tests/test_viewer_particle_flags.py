@@ -52,6 +52,7 @@ class TestViewerParticleFlags(unittest.TestCase):
 
         viewer = _LogPointsProbe()
         viewer.set_model(model)
+        viewer.show_particles = True
         viewer._log_particles(state)
 
         self.assertTrue(viewer.log_points_called)
@@ -65,6 +66,7 @@ class TestViewerParticleFlags(unittest.TestCase):
 
         viewer = _LogPointsProbe()
         viewer.set_model(model)
+        viewer.show_particles = True
         viewer._log_particles(state)
 
         self.assertTrue(viewer.log_points_called)
@@ -79,6 +81,7 @@ class TestViewerParticleFlags(unittest.TestCase):
 
         viewer = _LogPointsProbe()
         viewer.set_model(model)
+        viewer.show_particles = True
         viewer._log_particles(state)
 
         self.assertTrue(viewer.log_points_called)
@@ -94,10 +97,26 @@ class TestViewerParticleFlags(unittest.TestCase):
 
         viewer = _LogPointsProbe()
         viewer.set_model(model)
+        viewer.show_particles = True
         viewer._log_particles(state)
 
         self.assertTrue(viewer.log_points_called)
         self.assertEqual(len(viewer.logged_points), 2)
+
+    def test_hidden_particles_skip_particle_data(self):
+        active = int(newton.ParticleFlags.ACTIVE)
+        model = self._build_model([active, active])
+        state = model.state()
+
+        viewer = _LogPointsProbe()
+        viewer.set_model(model)
+        viewer.show_particles = False
+        viewer.show_fluid = False
+        viewer._log_particles(state)
+
+        self.assertTrue(viewer.log_points_called)
+        self.assertIsNone(viewer.logged_points)
+        self.assertTrue(viewer.logged_hidden)
 
 
 if __name__ == "__main__":

@@ -46,7 +46,7 @@ def _enable_example_deprecation_warnings() -> None:
 
 
 def download_external_git_folder(git_url: str, folder_path: str, force_refresh: bool = False):
-    from newton._src.utils.download_assets import download_git_folder  # noqa: PLC0415
+    from newton.utils import download_git_folder  # noqa: PLC0415
 
     return download_git_folder(git_url, folder_path, force_refresh=force_refresh)
 

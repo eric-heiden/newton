@@ -844,6 +844,87 @@ def raycast_kernel(
         _spinlock_release(lock)
 
 
+@wp.kernel
+def raycast_pick_kernel(
+    # Model
+    body_q: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    shape_transform: wp.array[wp.transform],
+    geom_type: wp.array[int],
+    geom_size: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_pickable: wp.array[int],
+    # Ray
+    ray_origin: wp.vec3,
+    ray_direction: wp.vec3,
+    # Lock helper
+    lock: wp.array[wp.int32],
+    # Output
+    min_dist: wp.array[float],
+    min_index: wp.array[int],
+    min_body_index: wp.array[int],
+    # Optional: world offsets for multi-world picking
+    shape_world: wp.array[int],
+    world_offsets: wp.array[wp.vec3],
+    visible_worlds_mask: wp.array[int],
+):
+    """Computes the nearest pickable shape intersection for viewer picking."""
+    shape_idx = wp.tid()
+
+    if shape_pickable.shape[0] > 0 and shape_pickable[shape_idx] == 0:
+        return
+
+    # Skip shapes from non-visible worlds
+    if visible_worlds_mask and shape_world.shape[0] > 0:
+        world_idx = shape_world[shape_idx]
+        if world_idx >= 0:
+            if visible_worlds_mask[world_idx] == 0:
+                return
+
+    # compute shape transform
+    b = shape_body[shape_idx]
+
+    X_wb = wp.transform_identity()
+    if b >= 0:
+        X_wb = body_q[b]
+
+    X_bs = shape_transform[shape_idx]
+
+    geom_to_world = wp.mul(X_wb, X_bs)
+
+    # Apply world offset if available (for multi-world picking)
+    if shape_world.shape[0] > 0 and world_offsets.shape[0] > 0:
+        world_idx = shape_world[shape_idx]
+        if world_idx >= 0 and world_idx < world_offsets.shape[0]:
+            offset = world_offsets[world_idx]
+            geom_to_world = wp.transform(geom_to_world.p + offset, geom_to_world.q)
+
+    geomtype = geom_type[shape_idx]
+
+    if geomtype == GeoType.MESH or geomtype == GeoType.CONVEX_MESH or geomtype == GeoType.HFIELD:
+        mesh_id = shape_source_ptr[shape_idx]
+    else:
+        mesh_id = wp.uint64(0)
+
+    t, _normal = ray_intersect_geom(
+        geom_to_world,
+        geom_size[shape_idx],
+        geomtype,
+        ray_origin,
+        ray_direction,
+        mesh_id,
+    )
+
+    if t >= 0.0 and t < min_dist[0]:
+        _spinlock_acquire(lock)
+        # Still use an atomic inside the spinlock to get a volatile read
+        old_min = wp.atomic_min(min_dist, 0, t)
+        if t <= old_min:
+            min_index[0] = shape_idx
+            min_body_index[0] = b
+        _spinlock_release(lock)
+
+
 def intersect_ray(
     model: Model,
     *,

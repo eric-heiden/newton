@@ -9,7 +9,7 @@ The pipeline follows Flex's ``demo/opengl/shadersGL.cpp``:
    buffer.
 2. Accumulate optical thickness from enlarged point sprites, depth-tested
    against the scene.
-3. Smooth the depth buffer with a single 2D bilateral filter whose radius
+3. Smooth the depth buffer with a separable bilateral filter whose radius
    adapts to the projected particle size (range falloff 5.5).
 4. Composite the surface over the scene: one-sided finite-difference normals,
    Schlick Fresnel, screen-space refraction and reflection taps, shadow-mapped
@@ -81,6 +81,64 @@ def _pack_fluid_vertices(
     dest[base + 15] = a3[3] * r
 
 
+@wp.kernel
+def _mark_live_diffuse_particles(
+    positions: wp.array[wp.vec4],
+    live_mask: wp.array[wp.int32],
+):
+    tid = wp.tid()
+    live_mask[tid] = wp.int32(1) if positions[tid][3] > 0.0 else wp.int32(0)
+
+
+@wp.kernel
+def _store_compacted_count(
+    live_mask: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    count: wp.array[wp.int32],
+):
+    last = live_mask.shape[0] - 1
+    count[0] = offsets[last] + live_mask[last]
+
+
+@wp.kernel
+def _compact_diffuse_sort_keys(
+    positions: wp.array[wp.vec4],
+    live_mask: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    view_row: wp.vec4,
+    sort_keys: wp.array[wp.float32],
+    sort_indices: wp.array[wp.int32],
+):
+    tid = wp.tid()
+    if live_mask[tid] == 0:
+        return
+
+    position = positions[tid]
+    compacted = offsets[tid]
+    sort_keys[compacted] = (
+        position[0] * view_row[0] + position[1] * view_row[1] + position[2] * view_row[2] + view_row[3]
+    )
+    sort_indices[compacted] = tid
+
+
+@wp.kernel
+def _pack_sorted_diffuse_vertices(
+    positions: wp.array[wp.vec4],
+    velocities: wp.array[wp.vec4],
+    use_velocities: int,
+    sort_indices: wp.array[wp.int32],
+    out_positions: wp.array[wp.vec4],
+    out_velocities: wp.array[wp.vec4],
+):
+    tid = wp.tid()
+    source = sort_indices[tid]
+    out_positions[tid] = positions[source]
+    if use_velocities != 0:
+        out_velocities[tid] = velocities[source]
+    else:
+        out_velocities[tid] = wp.vec4(0.0)
+
+
 # --------------------------------------------------------------------------
 # Ellipsoid depth pass (Flex vertex/geometry/fragmentEllipsoidDepthShader)
 
@@ -100,7 +158,6 @@ out vec4 InvQ0;
 out vec4 InvQ1;
 out vec4 InvQ2;
 out vec4 InvQ3;
-out vec4 NdcPos;
 
 float Sign(float x) { return x < 0.0 ? -1.0 : 1.0; }
 
@@ -175,8 +232,6 @@ void main()
     InvQ2 = invq[2];
     InvQ3 = invq[3];
 
-    vec4 ndcPos = projection * view * vec4(worldPos, 1.0);
-    NdcPos = ndcPos / max(abs(ndcPos.w), 1.0e-8);
     gl_Position = vec4(worldPos, 1.0);
 }
 """
@@ -191,7 +246,6 @@ in vec4 InvQ0[];
 in vec4 InvQ1[];
 in vec4 InvQ2[];
 in vec4 InvQ3[];
-in vec4 NdcPos[];
 
 flat out vec4 FragInvQ0;
 flat out vec4 FragInvQ1;
@@ -200,13 +254,9 @@ flat out vec4 FragInvQ3;
 
 void main()
 {
-    vec4 ndcPos = NdcPos[0];
-    const float ndcBound = 1.0;
-    if (ndcPos.x < -ndcBound || ndcPos.x > ndcBound) return;
-    if (ndcPos.y < -ndcBound || ndcPos.y > ndcBound) return;
-
     vec4 bounds = Bounds[0];
     if (bounds.x == bounds.y || bounds.z == bounds.w) return;
+    if (bounds.y < -1.0 || bounds.x > 1.0 || bounds.w < -1.0 || bounds.z > 1.0) return;
 
     FragInvQ0 = InvQ0[0];
     FragInvQ1 = InvQ1[0];
@@ -397,12 +447,13 @@ uniform sampler2D depth_tex;
 uniform float blur_radius_world;
 uniform float blur_scale;
 uniform float max_blur_radius;
-
-float sqr(float x) { return x * x; }
+uniform vec2 blur_direction;
 
 void main()
 {
-    float depth = texelFetch(depth_tex, ivec2(gl_FragCoord.xy), 0).x;
+    ivec2 tex_size = textureSize(depth_tex, 0);
+    ivec2 center_coord = clamp(ivec2(gl_FragCoord.xy), ivec2(0), tex_size - ivec2(1));
+    float depth = texelFetch(depth_tex, center_coord, 0).x;
     if (depth == 0.0) {
         FragEyeZ = 0.0;
         return;
@@ -420,32 +471,32 @@ void main()
     float wsum = 0.0;
     float count = 0.0;
 
-    for (float y = -taps; y <= taps; y += 1.0) {
-        for (float x = -taps; x <= taps; x += 1.0) {
-            float s = texelFetch(depth_tex, ivec2(gl_FragCoord.xy) + ivec2(int(x), int(y)), 0).x;
+    for (float offset = -taps; offset <= taps; offset += 1.0) {
+        ivec2 sample_coord = center_coord + ivec2(blur_direction * offset);
+        sample_coord = clamp(sample_coord, ivec2(0), tex_size - ivec2(1));
+        float s = texelFetch(depth_tex, sample_coord, 0).x;
 
-            // spatial domain
-            float r1 = length(vec2(x, y)) * radiusInv;
-            float w = exp(-(r1 * r1));
+        // spatial domain
+        float r1 = abs(offset) * radiusInv;
+        float w = exp(-(r1 * r1));
 
-            // range domain on the depth difference preserves silhouettes
-            float r2 = (s - depth) * blurDepthFalloff;
-            float g = exp(-(r2 * r2));
+        // range domain on the depth difference preserves silhouettes
+        float r2 = (s - depth) * blurDepthFalloff;
+        float g = exp(-(r2 * r2));
 
-            float wBoundary = step(radius, max(abs(x), abs(y)));
-            float wFrac = 1.0 - wBoundary * frac;
+        float wBoundary = step(radius, abs(offset));
+        float wFrac = 1.0 - wBoundary * frac;
 
-            sum += s * w * g * wFrac;
-            wsum += w * g * wFrac;
-            count += g * wFrac;
-        }
+        sum += s * w * g * wFrac;
+        wsum += w * g * wFrac;
+        count += g * wFrac;
     }
 
     if (wsum > 0.0) {
         sum /= wsum;
     }
 
-    float blend = count / sqr(2.0 * radius + 1.0);
+    float blend = count / (2.0 * radius + 1.0);
     FragEyeZ = mix(depth, sum, blend);
 }
 """
@@ -645,16 +696,13 @@ uniform mat4 projection;
 out vec4 WorldPosLife;
 out vec4 EyePos;
 out vec3 EyeVel;
-out vec4 NdcPos;
 
 void main()
 {
     WorldPosLife = aPositionLife;
     EyePos = view * vec4(aPositionLife.xyz, 1.0);
     EyeVel = (view * vec4(aVelocity.xyz, 0.0)).xyz;
-    vec4 ndcPos = projection * EyePos;
-    NdcPos = ndcPos / max(abs(ndcPos.w), 1.0e-8);
-    gl_Position = ndcPos;
+    gl_Position = projection * EyePos;
 }
 """
 
@@ -666,7 +714,6 @@ layout (triangle_strip, max_vertices = 4) out;
 in vec4 WorldPosLife[];
 in vec4 EyePos[];
 in vec3 EyeVel[];
-in vec4 NdcPos[];
 
 uniform mat4 projection;
 uniform float point_scale;
@@ -683,11 +730,6 @@ void main()
 {
     float life = WorldPosLife[0].w;
     if (life <= 0.0) return;
-
-    vec4 ndcPos = NdcPos[0];
-    const float ndcBound = 1.0;
-    if (ndcPos.x < -ndcBound || ndcPos.x > ndcBound) return;
-    if (ndcPos.y < -ndcBound || ndcPos.y > ndcBound) return;
 
     vec3 v = EyeVel[0];
     vec3 p = EyePos[0].xyz;
@@ -860,6 +902,7 @@ class _Program:
         if geometry is not None:
             shaders.append(Shader(geometry, "geometry"))
         self.program = ShaderProgram(*shaders)
+        self._uniform_locations: dict[str, int] = {}
 
     def __enter__(self):
         self._gl.glUseProgram(self.program.id)
@@ -868,8 +911,17 @@ class _Program:
     def __exit__(self, exc_type, exc_value, traceback):
         self._gl.glUseProgram(0)
 
+    def destroy(self):
+        if self.program is not None:
+            self.program.delete()
+            self.program = None
+
     def _loc(self, name: str) -> int:
-        return self._gl.glGetUniformLocation(self.program.id, ctypes.c_char_p(name.encode()))
+        location = self._uniform_locations.get(name)
+        if location is None:
+            location = self._gl.glGetUniformLocation(self.program.id, ctypes.c_char_p(name.encode()))
+            self._uniform_locations[name] = location
+        return location
 
     def set_mat4(self, name: str, m: np.ndarray):
         data = np.ascontiguousarray(m, dtype=np.float32)
@@ -946,6 +998,7 @@ class FluidBatch:
 
         self._packed_gpu = None
         self._dummy_radii = None
+        self._dummy_anisotropy = None
         self._cuda_vbo = None
         self._interop_failed = False
 
@@ -959,15 +1012,18 @@ class FluidBatch:
             self.vbo = None
         self._packed_gpu = None
         self._dummy_radii = None
+        self._dummy_anisotropy = None
 
     def _ensure_capacity(self, count: int):
         if count <= self.capacity:
             return
         material = {attr: getattr(self, attr) for attr in self._MATERIAL_ATTRS}
+        hidden = self.hidden
         self.destroy()
         self.__init__(self._gl, max(count, self.capacity * 2))
         for attr, value in material.items():
             setattr(self, attr, value)
+        self.hidden = hidden
 
     def update(
         self, points, radii, radius_scale=1.0, anisotropy=None, anisotropy_secondary=None, anisotropy_tertiary=None
@@ -979,6 +1035,19 @@ class FluidBatch:
             return
 
         count = int(len(points))
+        if radii is not None and not isinstance(radii, (int, float, np.integer, np.floating)):
+            if len(radii) != count:
+                raise ValueError(f"radii length must match points length ({len(radii)} != {count})")
+
+        anisotropy_arrays = (anisotropy, anisotropy_secondary, anisotropy_tertiary)
+        anisotropy_count = sum(value is not None for value in anisotropy_arrays)
+        if anisotropy_count not in (0, 3):
+            raise ValueError("anisotropy, anisotropy_secondary, and anisotropy_tertiary must be provided together")
+        if anisotropy_count == 3:
+            for value in anisotropy_arrays:
+                if len(value) != count:
+                    raise ValueError(f"anisotropy length must match points length ({len(value)} != {count})")
+
         self._ensure_capacity(count)
         self.count = count
         if count == 0:
@@ -989,7 +1058,15 @@ class FluidBatch:
 
         if isinstance(points, wp.array) and points.device.is_cuda:
             device = points.device
-            if self._dummy_radii is None:
+            for name, value in (
+                ("radii", radii if isinstance(radii, wp.array) else None),
+                ("anisotropy", anisotropy),
+                ("anisotropy_secondary", anisotropy_secondary),
+                ("anisotropy_tertiary", anisotropy_tertiary),
+            ):
+                if isinstance(value, wp.array) and value.device != device:
+                    raise ValueError(f"{name} and points must be stored on the same device")
+            if self._dummy_radii is None or self._dummy_radii.device != device:
                 self._dummy_radii = wp.zeros(1, dtype=float, device=device)
             if scalar_radius:
                 radii_array = self._dummy_radii
@@ -999,7 +1076,12 @@ class FluidBatch:
                 radii_array = radii
                 uniform_radius = 0.0
                 use_radii = 1
-            dummy4 = anisotropy if use_aniso else wp.zeros(1, dtype=wp.vec4, device=device)
+            if use_aniso:
+                dummy4 = anisotropy
+            else:
+                if self._dummy_anisotropy is None or self._dummy_anisotropy.device != device:
+                    self._dummy_anisotropy = wp.zeros(1, dtype=wp.vec4, device=device)
+                dummy4 = self._dummy_anisotropy
 
             # CUDA-GL interop: pack straight into the mapped vertex buffer.
             # This avoids a per-frame device-to-host copy of the packed data
@@ -1011,38 +1093,42 @@ class FluidBatch:
                         self._cuda_vbo = wp.RegisteredGLBuffer(
                             int(self.vbo.value), device, flags=wp.RegisteredGLBuffer.WRITE_DISCARD
                         )
-                    dest = self._cuda_vbo.map(dtype=wp.float32, shape=(self.capacity * 16,))
+                    dest = self._cuda_vbo.map(dtype=wp.float32, shape=(self.capacity * FLUID_VERTEX_STRIDE,))
                 except Exception:
                     self._interop_failed = True
                     self._cuda_vbo = None
                     dest = None
             if dest is None:
-                if self._packed_gpu is None or len(self._packed_gpu) < self.capacity * 16:
-                    self._packed_gpu = wp.empty(self.capacity * 16, dtype=float, device=device)
+                if self._packed_gpu is None or len(self._packed_gpu) < self.capacity * FLUID_VERTEX_STRIDE:
+                    self._packed_gpu = wp.empty(self.capacity * FLUID_VERTEX_STRIDE, dtype=float, device=device)
                 dest = self._packed_gpu
 
-            wp.launch(
-                _pack_fluid_vertices,
-                dim=count,
-                inputs=[
-                    points,
-                    radii_array,
-                    use_radii,
-                    uniform_radius,
-                    float(radius_scale),
-                    dummy4,
-                    anisotropy_secondary if use_aniso else dummy4,
-                    anisotropy_tertiary if use_aniso else dummy4,
-                    1 if use_aniso else 0,
-                    dest,
-                ],
-                device=device,
-            )
-            if self._cuda_vbo is not None and not self._interop_failed:
-                self._cuda_vbo.unmap()
+            mapped_vbo = self._cuda_vbo is not None and not self._interop_failed
+            try:
+                wp.launch(
+                    _pack_fluid_vertices,
+                    dim=count,
+                    inputs=[
+                        points,
+                        radii_array,
+                        use_radii,
+                        uniform_radius,
+                        float(radius_scale),
+                        dummy4,
+                        anisotropy_secondary if use_aniso else dummy4,
+                        anisotropy_tertiary if use_aniso else dummy4,
+                        1 if use_aniso else 0,
+                        dest,
+                    ],
+                    device=device,
+                )
+            finally:
+                if mapped_vbo:
+                    self._cuda_vbo.unmap()
+            if mapped_vbo:
                 self.count = count
                 return
-            host = self._packed_gpu[: count * 16].numpy()
+            host = self._packed_gpu[: count * FLUID_VERTEX_STRIDE].numpy()
         else:
             host_points = points.numpy() if isinstance(points, wp.array) else np.asarray(points)
             host_points = host_points.astype(np.float32, copy=False)
@@ -1110,6 +1196,19 @@ class DiffuseBatch:
 
         self._host_positions = np.zeros((0, 4), dtype=np.float32)
         self._host_velocities = np.zeros((0, 4), dtype=np.float32)
+        self._source_positions = None
+        self._source_velocities = None
+
+        self._cuda_position_vbo = None
+        self._cuda_velocity_vbo = None
+        self._cuda_device = None
+        self._interop_failed = False
+        self._live_mask = None
+        self._live_offsets = None
+        self._live_count = None
+        self._sort_keys = None
+        self._sort_indices = None
+        self._dummy_velocities = None
 
         self.vao = gl.GLuint()
         self.position_vbo = gl.GLuint()
@@ -1132,6 +1231,10 @@ class DiffuseBatch:
 
     def destroy(self):
         gl = self._gl
+        self._cuda_position_vbo = None
+        self._cuda_velocity_vbo = None
+        self._source_positions = None
+        self._source_velocities = None
         if getattr(self, "vao", None) is not None:
             gl.glDeleteVertexArrays(1, self.vao)
             gl.glDeleteBuffers(1, self.position_vbo)
@@ -1142,15 +1245,42 @@ class DiffuseBatch:
         if count <= self.capacity:
             return
         material = (self.radius, self.color, self.motion_blur_scale, self.diffusion, self.lifetime, self.surface_bias)
+        hidden = self.hidden
         self.destroy()
         self.__init__(self._gl, max(count, self.capacity * 2))
         self.radius, self.color, self.motion_blur_scale, self.diffusion, self.lifetime, self.surface_bias = material
+        self.hidden = hidden
 
     def update(self, positions, velocities):
         if positions is None:
             self.count = 0
+            self._source_positions = None
+            self._source_velocities = None
             return
 
+        count = len(positions)
+        if velocities is not None and len(velocities) != count:
+            raise ValueError(f"velocities length must match positions length ({len(velocities)} != {count})")
+        self._ensure_capacity(count)
+
+        cuda_positions = isinstance(positions, wp.array) and positions.device.is_cuda
+        if cuda_positions and isinstance(velocities, wp.array) and velocities.device != positions.device:
+            raise ValueError("positions and velocities must be stored on the same device")
+        cuda_velocities = velocities is None or (
+            cuda_positions and isinstance(velocities, wp.array) and velocities.device == positions.device
+        )
+        if cuda_positions and cuda_velocities and not self._interop_failed:
+            self._source_positions = positions
+            self._source_velocities = velocities
+            # The exact live count is computed on device in sort_for_view().
+            self.count = count
+            return
+
+        self._update_host(positions, velocities)
+
+    def _update_host(self, positions, velocities):
+        self._source_positions = None
+        self._source_velocities = None
         host_positions = positions.numpy() if isinstance(positions, wp.array) else np.asarray(positions)
         host_positions = host_positions.astype(np.float32, copy=False)
         if velocities is None:
@@ -1163,9 +1293,96 @@ class DiffuseBatch:
         self._host_positions = np.ascontiguousarray(host_positions[live])
         self._host_velocities = np.ascontiguousarray(host_velocities[live])
         count = int(self._host_positions.shape[0])
-        self._ensure_capacity(count)
         self.count = count
         self._upload()
+
+    def _ensure_cuda_scratch(self, device):
+        if self._live_mask is not None and self._cuda_device == device:
+            return
+        if self._cuda_device is not None and self._cuda_device != device:
+            self._cuda_position_vbo = None
+            self._cuda_velocity_vbo = None
+        self._cuda_device = device
+        self._live_mask = wp.empty(self.capacity, dtype=wp.int32, device=device)
+        self._live_offsets = wp.empty(self.capacity, dtype=wp.int32, device=device)
+        self._live_count = wp.empty(1, dtype=wp.int32, device=device)
+        self._sort_keys = wp.empty(2 * self.capacity, dtype=wp.float32, device=device)
+        self._sort_indices = wp.empty(2 * self.capacity, dtype=wp.int32, device=device)
+        self._dummy_velocities = wp.zeros(1, dtype=wp.vec4, device=device)
+
+    def _sort_and_upload_cuda(self, view_std: np.ndarray) -> bool:
+        positions = self._source_positions
+        if positions is None:
+            return False
+
+        device = positions.device
+        count = len(positions)
+        self._ensure_cuda_scratch(device)
+        live_mask = self._live_mask[:count]
+        live_offsets = self._live_offsets[:count]
+
+        try:
+            wp.launch(_mark_live_diffuse_particles, dim=count, inputs=[positions], outputs=[live_mask], device=device)
+            wp.utils.array_scan(live_mask, live_offsets, inclusive=False)
+            wp.launch(
+                _store_compacted_count,
+                dim=1,
+                inputs=[live_mask, live_offsets],
+                outputs=[self._live_count],
+                device=device,
+            )
+            live_count = int(self._live_count.numpy()[0])
+            self.count = live_count
+            if live_count == 0:
+                return True
+
+            view_row = wp.vec4(*(float(value) for value in view_std[2]))
+            wp.launch(
+                _compact_diffuse_sort_keys,
+                dim=count,
+                inputs=[positions, live_mask, live_offsets, view_row],
+                outputs=[self._sort_keys, self._sort_indices],
+                device=device,
+            )
+            wp.utils.radix_sort_pairs(self._sort_keys, self._sort_indices, live_count)
+
+            if self._cuda_position_vbo is None:
+                self._cuda_position_vbo = wp.RegisteredGLBuffer(
+                    int(self.position_vbo.value), device, flags=wp.RegisteredGLBuffer.WRITE_DISCARD
+                )
+                self._cuda_velocity_vbo = wp.RegisteredGLBuffer(
+                    int(self.velocity_vbo.value), device, flags=wp.RegisteredGLBuffer.WRITE_DISCARD
+                )
+
+            position_mapped = False
+            velocity_mapped = False
+            try:
+                out_positions = self._cuda_position_vbo.map(dtype=wp.vec4, shape=(self.capacity,))
+                position_mapped = True
+                out_velocities = self._cuda_velocity_vbo.map(dtype=wp.vec4, shape=(self.capacity,))
+                velocity_mapped = True
+                velocities = self._source_velocities
+                use_velocities = int(velocities is not None)
+                if velocities is None:
+                    velocities = self._dummy_velocities
+                wp.launch(
+                    _pack_sorted_diffuse_vertices,
+                    dim=live_count,
+                    inputs=[positions, velocities, use_velocities, self._sort_indices],
+                    outputs=[out_positions, out_velocities],
+                    device=device,
+                )
+            finally:
+                if velocity_mapped:
+                    self._cuda_velocity_vbo.unmap()
+                if position_mapped:
+                    self._cuda_position_vbo.unmap()
+            return True
+        except Exception:
+            self._cuda_position_vbo = None
+            self._cuda_velocity_vbo = None
+            self._interop_failed = True
+            return False
 
     def _upload(self):
         if self.count == 0:
@@ -1179,6 +1396,12 @@ class DiffuseBatch:
 
     def sort_for_view(self, view_std: np.ndarray):
         """Back-to-front sort so premultiplied over-blending composites correctly."""
+        if self._source_positions is not None:
+            positions = self._source_positions
+            velocities = self._source_velocities
+            if self._sort_and_upload_cuda(view_std):
+                return
+            self._update_host(positions, velocities)
         if self.count <= 1:
             return
         rot = view_std[:3, :3]
@@ -1201,9 +1424,8 @@ class DiffuseBatch:
 class FluidRenderer:
     """Owns the fluid render targets and programs; driven by RendererGL."""
 
-    # Fluid depth/thickness/blur run at reduced resolution: the bilateral
-    # blur cost scales with covered pixels times taps squared, and half
-    # resolution also doubles the filter's effective world-space reach.
+    # Fluid depth/thickness/blur run at reduced resolution; half resolution
+    # lowers fill cost and doubles the filter's effective world-space reach.
     RESOLUTION_SCALE = 0.5
 
     def __init__(self, gl):
@@ -1214,9 +1436,11 @@ class FluidRenderer:
         self._buf_height = 0
 
         self._depth_tex = None
+        self._depth_blur_temp_tex = None
         self._depth_smooth_tex = None
         self._thickness_tex = None
         self._scene_tex = None
+        self._scene_depth_half = None
         self._depth_buffer = None
         self._fbo = None
 
@@ -1239,6 +1463,46 @@ class FluidRenderer:
         gl.glVertexAttribPointer(0, 2, gl.GL_FLOAT, gl.GL_FALSE, 8, ctypes.c_void_p(0))
         gl.glEnableVertexAttribArray(0)
         gl.glBindVertexArray(0)
+
+    def _destroy_targets(self):
+        gl = self._gl
+        for name in (
+            "_depth_tex",
+            "_depth_blur_temp_tex",
+            "_depth_smooth_tex",
+            "_thickness_tex",
+            "_scene_tex",
+            "_scene_depth_half",
+        ):
+            texture = getattr(self, name)
+            if texture is not None:
+                gl.glDeleteTextures(1, texture)
+                setattr(self, name, None)
+        if self._depth_buffer is not None:
+            gl.glDeleteRenderbuffers(1, self._depth_buffer)
+            self._depth_buffer = None
+        if self._fbo is not None:
+            gl.glDeleteFramebuffers(1, self._fbo)
+            self._fbo = None
+
+    def destroy(self):
+        self._destroy_targets()
+        gl = self._gl
+        if self._quad_vao is not None:
+            gl.glDeleteVertexArrays(1, self._quad_vao)
+            self._quad_vao = None
+        if self._quad_vbo is not None:
+            gl.glDeleteBuffers(1, self._quad_vbo)
+            self._quad_vbo = None
+        for program in (
+            self._ellipsoid_prog,
+            self._thickness_prog,
+            self._blur_prog,
+            self._composite_prog,
+            self._diffuse_prog,
+            self._shadow_prog,
+        ):
+            program.destroy()
 
     def _make_texture(self, internal_format, fmt, dtype, width=None, height=None, filter_mode=None):
         gl = self._gl
@@ -1269,19 +1533,7 @@ class FluidRenderer:
         gl = self._gl
         if width == self._width and height == self._height and self._fbo is not None:
             return
-        for tex in (
-            self._depth_tex,
-            self._depth_smooth_tex,
-            self._thickness_tex,
-            self._scene_tex,
-            getattr(self, "_scene_depth_half", None),
-        ):
-            if tex is not None:
-                gl.glDeleteTextures(1, tex)
-        if self._depth_buffer is not None:
-            gl.glDeleteRenderbuffers(1, self._depth_buffer)
-        if self._fbo is not None:
-            gl.glDeleteFramebuffers(1, self._fbo)
+        self._destroy_targets()
 
         self._width = width
         self._height = height
@@ -1292,6 +1544,9 @@ class FluidRenderer:
         # with the invalid 0 background, creating a bright rim of phantom
         # surface pixels around the water.
         self._depth_tex = self._make_texture(gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT, bw, bh, filter_mode=gl.GL_NEAREST)
+        self._depth_blur_temp_tex = self._make_texture(
+            gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT, bw, bh, filter_mode=gl.GL_NEAREST
+        )
         self._depth_smooth_tex = self._make_texture(
             gl.GL_R32F, gl.GL_RED, gl.GL_FLOAT, bw, bh, filter_mode=gl.GL_NEAREST
         )
@@ -1351,6 +1606,169 @@ class FluidRenderer:
                 prog.set_float("shadow_opacity", batch.shadow_opacity)
                 batch.draw()
 
+    @staticmethod
+    def _material_value_key(value):
+        if value is None:
+            return None
+        if isinstance(value, (tuple, list)):
+            return tuple(float(v) for v in value)
+        return float(value)
+
+    @classmethod
+    def _surface_material_key(cls, batch):
+        return tuple(cls._material_value_key(getattr(batch, attr)) for attr in FluidBatch._MATERIAL_ATTRS)
+
+    @classmethod
+    def _surface_material_groups(cls, batches):
+        groups = []
+        by_key = {}
+        for batch in batches:
+            key = cls._surface_material_key(batch)
+            group = by_key.get(key)
+            if group is None:
+                group = []
+                by_key[key] = group
+                groups.append(group)
+            group.append(batch)
+        return groups
+
+    def _render_surface_group(
+        self,
+        host,
+        batches,
+        width,
+        height,
+        bw,
+        bh,
+        view,
+        projection,
+        inv_view,
+        inv_projection,
+        light_transform,
+        light_dir,
+        up_vec,
+        blur_point_scale,
+        clip_pos_to_eye,
+        inv_buf_viewport,
+        aspect,
+    ):
+        gl = self._gl
+        if not batches:
+            return
+
+        material = batches[0]
+
+        # 1. copy the resolved scene color for refraction/reflection taps
+        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, host._frame_fbo)
+        gl.glReadBuffer(gl.GL_COLOR_ATTACHMENT0)
+        self._attach(self._scene_tex, with_depth_buffer=False)
+        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, host._frame_fbo)
+        gl.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, gl.GL_COLOR_BUFFER_BIT, gl.GL_NEAREST)
+
+        # 2. ellipsoid depth (reduced resolution)
+        self._attach(self._depth_tex, with_depth_buffer=True)
+        gl.glViewport(0, 0, bw, bh)
+        gl.glClearBufferfv(gl.GL_COLOR, 0, (gl.GLfloat * 4)(0.0, 0.0, 0.0, 0.0))
+        gl.glClear(gl.GL_DEPTH_BUFFER_BIT)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDepthFunc(gl.GL_LESS)
+        gl.glDepthMask(True)
+        gl.glDisable(gl.GL_BLEND)
+        with self._ellipsoid_prog as prog:
+            prog.set_mat4("view", view)
+            prog.set_mat4("projection", projection)
+            prog.set_mat4("inv_view", inv_view)
+            prog.set_mat4("inv_projection", inv_projection)
+            prog.set_vec2("inv_viewport", inv_buf_viewport)
+            for batch in batches:
+                batch.draw()
+
+        # 3. thickness billboards, depth-tested against a downsampled copy of the scene depth
+        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, host._frame_fbo)
+        self._attach(self._thickness_tex, with_depth_buffer=False, depth_tex=self._scene_depth_half)
+        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, host._frame_fbo)
+        gl.glBlitFramebuffer(0, 0, width, height, 0, 0, bw, bh, gl.GL_DEPTH_BUFFER_BIT, gl.GL_NEAREST)
+        gl.glClearBufferfv(gl.GL_COLOR, 0, (gl.GLfloat * 4)(0.0, 0.0, 0.0, 0.0))
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDepthMask(False)
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE)
+        with self._thickness_prog as prog:
+            prog.set_mat4("view", view)
+            prog.set_mat4("projection", projection)
+            for batch in batches:
+                prog.set_float("thickness_scale", batch.thickness_scale)
+                prog.set_float("thickness_gain", batch.thickness_gain)
+                batch.draw()
+        gl.glDisable(gl.GL_BLEND)
+        gl.glDepthMask(True)
+
+        # 4. separable bilateral depth blur (adaptive radius)
+        self._attach(self._depth_blur_temp_tex, with_depth_buffer=False)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        with self._blur_prog as prog:
+            gl.glActiveTexture(gl.GL_TEXTURE0)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._depth_tex)
+            prog.set_int("depth_tex", 0)
+            prog.set_float("blur_radius_world", material.blur_radius_world)
+            prog.set_float("blur_scale", blur_point_scale)
+            prog.set_float("max_blur_radius", material.max_blur_radius)
+            prog.set_vec2("blur_direction", (1.0, 0.0))
+            self._draw_quad()
+
+            self._attach(self._depth_smooth_tex, with_depth_buffer=False)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._depth_blur_temp_tex)
+            prog.set_vec2("blur_direction", (0.0, 1.0))
+            self._draw_quad()
+
+        # 5. composite into the frame buffer; the fragment shader writes the
+        # fluid depth, so the scene depth test resolves occlusion
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, host._frame_fbo)
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+        gl.glViewport(0, 0, width, height)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDepthFunc(gl.GL_LESS)
+        gl.glDepthMask(True)
+        gl.glDisable(gl.GL_BLEND)
+        with self._composite_prog as prog:
+            gl.glActiveTexture(gl.GL_TEXTURE0)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._depth_smooth_tex)
+            gl.glActiveTexture(gl.GL_TEXTURE1)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._thickness_tex)
+            gl.glActiveTexture(gl.GL_TEXTURE2)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._scene_tex)
+            gl.glActiveTexture(gl.GL_TEXTURE3)
+            if host._shadow_texture is not None:
+                gl.glBindTexture(gl.GL_TEXTURE_2D, host._shadow_texture)
+            else:
+                gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+            prog.set_int("depth_tex", 0)
+            prog.set_int("thickness_tex", 1)
+            prog.set_int("scene_tex", 2)
+            prog.set_int("shadow_tex", 3)
+            prog.set_mat4("projection", projection)
+            prog.set_mat4("view", view)
+            prog.set_mat4("inv_view", inv_view)
+            prog.set_mat4("light_transform", light_transform)
+            prog.set_vec3("light_dir", light_dir)
+            prog.set_vec2("inv_tex_scale", inv_buf_viewport)
+            prog.set_vec2("clip_pos_to_eye", clip_pos_to_eye)
+            prog.set_vec2("tex_scale", (1.0 / aspect, 1.0))
+            prog.set_vec4("color", material.color)
+            absorption = material.absorption
+            if absorption is None:
+                absorption = tuple(max(1.0 - c, 0.0) for c in material.color[:3])
+            prog.set_vec3("absorption", absorption)
+            prog.set_float("ior", material.ior)
+            prog.set_float("reflectance", material.reflectance)
+            prog.set_float("specular_intensity", material.specular_intensity)
+            prog.set_float("specular_power", material.specular_power)
+            prog.set_float("underwater_radius", material.blur_radius_world)
+            prog.set_vec3("sky_color", host.sky_upper)
+            prog.set_vec3("ground_color", host.ambient_ground)
+            prog.set_vec3("up_vec", up_vec)
+            self._draw_quad()
+
     def render(self, host, fluids, diffuse):
         """Run the fluid passes over the resolved scene in ``host._frame_fbo``."""
         gl = self._gl
@@ -1383,116 +1801,28 @@ class FluidRenderer:
         up_vec = np.zeros(3, dtype=np.float32)
         up_vec[int(host.camera.up_axis)] = 1.0
 
-        material = batches[0] if batches else None
+        for surface_batches in self._surface_material_groups(batches):
+            self._render_surface_group(
+                host,
+                surface_batches,
+                width,
+                height,
+                bw,
+                bh,
+                view,
+                projection,
+                inv_view,
+                inv_projection,
+                light_transform,
+                light_dir,
+                up_vec,
+                blur_point_scale,
+                clip_pos_to_eye,
+                inv_buf_viewport,
+                aspect,
+            )
 
-        if batches:
-            # 1. copy the resolved scene color for refraction/reflection taps
-            gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, host._frame_fbo)
-            gl.glReadBuffer(gl.GL_COLOR_ATTACHMENT0)
-            self._attach(self._scene_tex, with_depth_buffer=False)
-            gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, host._frame_fbo)
-            gl.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, gl.GL_COLOR_BUFFER_BIT, gl.GL_NEAREST)
-
-            # 2. ellipsoid depth (reduced resolution)
-            self._attach(self._depth_tex, with_depth_buffer=True)
-            gl.glViewport(0, 0, bw, bh)
-            gl.glClearBufferfv(gl.GL_COLOR, 0, (gl.GLfloat * 4)(0.0, 0.0, 0.0, 0.0))
-            gl.glClear(gl.GL_DEPTH_BUFFER_BIT)
-            gl.glEnable(gl.GL_DEPTH_TEST)
-            gl.glDepthFunc(gl.GL_LESS)
-            gl.glDepthMask(True)
-            gl.glDisable(gl.GL_BLEND)
-            with self._ellipsoid_prog as prog:
-                prog.set_mat4("view", view)
-                prog.set_mat4("projection", projection)
-                prog.set_mat4("inv_view", inv_view)
-                prog.set_mat4("inv_projection", inv_projection)
-                prog.set_vec2("inv_viewport", inv_buf_viewport)
-                for batch in batches:
-                    batch.draw()
-
-            # 3. thickness billboards, depth-tested against a downsampled
-            # copy of the scene depth
-            gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, host._frame_fbo)
-            self._attach(self._thickness_tex, with_depth_buffer=False, depth_tex=self._scene_depth_half)
-            gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, host._frame_fbo)
-            gl.glBlitFramebuffer(0, 0, width, height, 0, 0, bw, bh, gl.GL_DEPTH_BUFFER_BIT, gl.GL_NEAREST)
-            gl.glClearBufferfv(gl.GL_COLOR, 0, (gl.GLfloat * 4)(0.0, 0.0, 0.0, 0.0))
-            gl.glEnable(gl.GL_DEPTH_TEST)
-            gl.glDepthMask(False)
-            gl.glEnable(gl.GL_BLEND)
-            gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE)
-            with self._thickness_prog as prog:
-                prog.set_mat4("view", view)
-                prog.set_mat4("projection", projection)
-                for batch in batches:
-                    prog.set_float("thickness_scale", batch.thickness_scale)
-                    prog.set_float("thickness_gain", batch.thickness_gain)
-                    batch.draw()
-            gl.glDisable(gl.GL_BLEND)
-            gl.glDepthMask(True)
-
-            # 4. bilateral depth blur (single 2D pass, adaptive radius)
-            self._attach(self._depth_smooth_tex, with_depth_buffer=False)
-            gl.glDisable(gl.GL_DEPTH_TEST)
-            with self._blur_prog as prog:
-                gl.glActiveTexture(gl.GL_TEXTURE0)
-                gl.glBindTexture(gl.GL_TEXTURE_2D, self._depth_tex)
-                prog.set_int("depth_tex", 0)
-                prog.set_float("blur_radius_world", material.blur_radius_world)
-                prog.set_float("blur_scale", blur_point_scale)
-                prog.set_float("max_blur_radius", material.max_blur_radius)
-                self._draw_quad()
-
-            # 5. composite into the frame buffer; the fragment shader writes the
-            # fluid depth, so the scene depth test resolves occlusion
-            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, host._frame_fbo)
-            gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
-            gl.glViewport(0, 0, width, height)
-            gl.glEnable(gl.GL_DEPTH_TEST)
-            gl.glDepthFunc(gl.GL_LESS)
-            gl.glDepthMask(True)
-            gl.glDisable(gl.GL_BLEND)
-            with self._composite_prog as prog:
-                gl.glActiveTexture(gl.GL_TEXTURE0)
-                gl.glBindTexture(gl.GL_TEXTURE_2D, self._depth_smooth_tex)
-                gl.glActiveTexture(gl.GL_TEXTURE1)
-                gl.glBindTexture(gl.GL_TEXTURE_2D, self._thickness_tex)
-                gl.glActiveTexture(gl.GL_TEXTURE2)
-                gl.glBindTexture(gl.GL_TEXTURE_2D, self._scene_tex)
-                gl.glActiveTexture(gl.GL_TEXTURE3)
-                if host._shadow_texture is not None:
-                    gl.glBindTexture(gl.GL_TEXTURE_2D, host._shadow_texture)
-                else:
-                    gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
-                prog.set_int("depth_tex", 0)
-                prog.set_int("thickness_tex", 1)
-                prog.set_int("scene_tex", 2)
-                prog.set_int("shadow_tex", 3)
-                prog.set_mat4("projection", projection)
-                prog.set_mat4("view", view)
-                prog.set_mat4("inv_view", inv_view)
-                prog.set_mat4("light_transform", light_transform)
-                prog.set_vec3("light_dir", light_dir)
-                prog.set_vec2("inv_tex_scale", inv_buf_viewport)
-                prog.set_vec2("clip_pos_to_eye", clip_pos_to_eye)
-                prog.set_vec2("tex_scale", (1.0 / aspect, 1.0))
-                prog.set_vec4("color", material.color)
-                absorption = material.absorption
-                if absorption is None:
-                    absorption = tuple(max(1.0 - c, 0.0) for c in material.color[:3])
-                prog.set_vec3("absorption", absorption)
-                prog.set_float("ior", material.ior)
-                prog.set_float("reflectance", material.reflectance)
-                prog.set_float("specular_intensity", material.specular_intensity)
-                prog.set_float("specular_power", material.specular_power)
-                prog.set_float("underwater_radius", material.blur_radius_world)
-                prog.set_vec3("sky_color", host.sky_upper)
-                prog.set_vec3("ground_color", host.ambient_ground)
-                prog.set_vec3("up_vec", up_vec)
-                self._draw_quad()
-
-        # 6. diffuse spray/foam over the composited result
+        # diffuse spray/foam over the composited result
         if diffuse_batches:
             gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, host._frame_fbo)
             gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)

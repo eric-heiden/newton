@@ -1578,6 +1578,11 @@ class RendererGL:
     def close(self):
         self._make_current()
 
+        fluid_renderer = getattr(self, "_fluid_renderer", None)
+        if fluid_renderer is not None:
+            fluid_renderer.destroy()
+            self._fluid_renderer = None
+
         if not self.headless:
             self.app.event_loop.dispatch_event("on_exit")
             self.app.platform_event_loop.stop()

@@ -2,17 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ###########################################################################
-# Example Fluid XPBD Cup
+# Example Fluid XPBD Multiworld Cup
 #
-# A single rigid cup sitting on the ground, filled with XPBD position-based
-# fluid, that you grab and swing around with the mouse. It is the minimal
-# "fluid in a moving container" scene -- the common robotics case of a
-# gripper carrying a cup -- stripped of the arm/IK so it is easy to profile
-# and tune. The cup carries a texture SDF, so the water collides with it via
-# one cheap SDF sample per particle, and the whole substep loop is captured
-# in a CUDA graph for high frame rates.
+# Two XPBD fluid cups are built in separate simulation worlds at overlapping
+# physics coordinates. The viewer applies a small world offset so both cups are
+# visible and still overlap on screen. Grab either cup with right-click picking:
+# the other world's cup and fluid should not react.
 #
-# Command: python -m newton.examples fluid_xpbd_cup
+# Command: python -m newton.examples fluid_xpbd_multiworld_cup
 #
 ###########################################################################
 
@@ -34,9 +31,59 @@ from newton.examples.fluid.utils import (
     resolve_particle_spacing,
 )
 
-# Cache the cooked cup SDF on disk so repeated runs skip the voxelization.
+# Share the same cooked SDF cache as the single-cup example.
 _SDF_CACHE_DIR = Path(tempfile.gettempdir()) / "newton_cup_sdf"
-_REFERENCE_SPACING = 0.0024
+_REFERENCE_SPACING = 0.0028
+
+
+@wp.kernel
+def _build_world_mask(
+    particle_world: wp.array[wp.int32],
+    world_id: int,
+    mask: wp.array[wp.int32],
+):
+    i = wp.tid()
+    if particle_world[i] == world_id:
+        mask[i] = wp.int32(1)
+    else:
+        mask[i] = wp.int32(0)
+
+
+@wp.kernel
+def _compact_world_positions(
+    src: wp.array[wp.vec3],
+    mask: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    world_offset: wp.vec3,
+    dst: wp.array[wp.vec3],
+):
+    i = wp.tid()
+    if mask[i] == wp.int32(1):
+        dst[offsets[i]] = src[i] + world_offset
+
+
+@wp.kernel
+def _compact_world_radii(
+    src: wp.array[wp.float32],
+    mask: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    dst: wp.array[wp.float32],
+):
+    i = wp.tid()
+    if mask[i] == wp.int32(1):
+        dst[offsets[i]] = src[i]
+
+
+@wp.kernel
+def _compact_world_vec4(
+    src: wp.array[wp.vec4],
+    mask: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    dst: wp.array[wp.vec4],
+):
+    i = wp.tid()
+    if mask[i] == wp.int32(1):
+        dst[offsets[i]] = src[i]
 
 
 def _points_to_body_frame(points, body_xform):
@@ -47,6 +94,8 @@ def _points_to_body_frame(points, body_xform):
 
 
 class Example:
+    WORLD_COUNT = 2
+
     def __init__(self, viewer, args):
         self.fps = args.fps
         self.frame_dt = 1.0 / self.fps
@@ -55,8 +104,9 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.viewer = viewer
 
+        target_per_world = max(args.particle_count // self.WORLD_COUNT, 1)
         spacing, _ = resolve_particle_spacing(
-            args.particle_count,
+            target_per_world,
             _REFERENCE_SPACING,
             lambda candidate: cylinder_particle_count(
                 candidate,
@@ -78,50 +128,45 @@ class Example:
         builder.default_particle_radius = radius
         builder.default_shape_cfg.mu = 0.2
 
-        # dynamic ceramic cup resting on the ground; grab it with the mouse
-        self.cup_body = builder.add_body(
-            xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
-            label="cup",
-        )
         cup_mesh = self._build_cup_mesh(self.inner_radius, wall_thickness, self.cup_height)
-        # An SDF on the cup lets the water collide with it via one cheap sample
-        # per particle instead of a per-triangle mesh query.
         cup_mesh.build_sdf(
             max_resolution=args.sdf_resolution,
             narrow_band_range=(-0.03, 0.03),
             margin=0.02,
             cache_dir=_SDF_CACHE_DIR,
         )
-        builder.add_shape_mesh(
-            self.cup_body,
-            mesh=cup_mesh,
-            cfg=newton.ModelBuilder.ShapeConfig(density=args.cup_density, mu=0.4),
-            color=(0.8, 0.85, 0.92),
-            opacity=args.cup_opacity,
+
+        self.cup_bodies: list[int] = []
+        cup_colors = (
+            (0.65, 0.84, 0.94),
+            (0.95, 0.63, 0.42),
         )
+        for world in range(self.WORLD_COUNT):
+            builder.begin_world(label=f"xpbd_cup_{world}")
+            cup_body = builder.add_body(
+                xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+                label=f"cup_{world}",
+            )
+            self.cup_bodies.append(cup_body)
+            builder.add_shape_mesh(
+                cup_body,
+                mesh=cup_mesh,
+                cfg=newton.ModelBuilder.ShapeConfig(density=args.cup_density, mu=0.4),
+                color=cup_colors[world],
+                opacity=args.cup_opacity,
+            )
+            self._fill_water(builder, args, wall_thickness)
+            builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.6))
+            builder.end_world()
 
-        self._fill_water(builder, args, wall_thickness)
-
-        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.6))
-
-        self.model = builder.finalize()
-        # The water leaks when the cup is moved because the default CFL cap
-        # (half a particle radius per substep) is far slower than the cup: the
-        # water can't keep up, so the moving wall leaves it behind and it ends
-        # up outside the cup. Cap it instead just under the wall-crossing speed
-        # -- fast enough to ride along with the cup, slow enough that it cannot
-        # cross the thin wall in one substep -- and clamp the cup just under
-        # that so it can never outrun the water (see the solver below).
+        self.model = builder.finalize(device=args.device)
         wall_cross_speed = 0.5 * wall_thickness / self.sim_dt
         self._water_max_velocity = 0.85 * wall_cross_speed
         self._cup_max_velocity = 0.6 * wall_cross_speed
         self.model.particle_max_velocity = self._water_max_velocity
         self.model.soft_contact_mu = 0.3
-        # roomier hash grid: a hard swing can fling water well past the cup, and
-        # the default 128^3 grid would alias far cells onto the cup region
         with wp.ScopedDevice(self.model.device):
             self.model.particle_grid = wp.HashGrid(256, 256, 256)
-            self.model.particle_grid.reserve(self.model.particle_count)
 
         self.solver = newton.solvers.SolverXPBD(
             self.model,
@@ -130,11 +175,7 @@ class Example:
             fluid_cohesion=args.cohesion,
             fluid_viscosity=args.viscosity,
             fluid_relaxation=args.relaxation,
-            # bound the per-warp cost when a swing slams water into the cup wall
             fluid_max_neighbors=args.max_neighbors,
-            # clamp the cup just under the water's max speed so it can never move
-            # faster than the water can follow (which is what leaks it through
-            # the wall); the angular cap keeps the rim from sweeping too fast
             body_max_velocity=self._cup_max_velocity,
             body_max_angular_velocity=10.0,
         )
@@ -143,26 +184,23 @@ class Example:
         self.state_1 = self.model.state()
         self.contacts = self.model.contacts()
 
-        self.fluid_color = tuple(args.fluid_color)
+        self.fluid_colors = (tuple(args.fluid_color_0), tuple(args.fluid_color_1))
         self.fluid_radius_scale = args.fluid_radius_scale
         self.fluid_blur_radius = args.fluid_blur_radius
         self.render_smoothing = args.render_smoothing
-        self.render_anisotropy_scale = args.render_anisotropy_scale
-        self.render_particle_limit = args.render_particle_limit
+        self._render_world_mask = wp.empty(self.model.particle_count, dtype=wp.int32, device=self.model.device)
+        self._render_world_offsets = wp.empty(self.model.particle_count, dtype=wp.int32, device=self.model.device)
+        self._world_render_cache: dict[int, dict[str, wp.array]] = {}
 
         self.viewer.set_model(self.model)
+        self.viewer.set_world_offsets((args.render_world_spacing, 0.0, 0.0))
         self.viewer.picking_enabled = True
         self._apply_picking_params(args.pick_stiffness, args.pick_damping)
-        use_fluid_surface = args.render_mode == "fluid" and getattr(self.viewer, "fluids", None) is not None
-        self.viewer.show_particles = not use_fluid_surface
+        self.viewer.show_particles = False
         if hasattr(self.viewer, "show_fluid"):
-            self.viewer.show_fluid = use_fluid_surface
+            self.viewer.show_fluid = True
         self.viewer.set_camera(pos=wp.vec3(args.camera_pos), pitch=args.camera_pitch, yaw=args.camera_yaw)
 
-        # Replay the whole substep loop (collide, picking, solve) from a CUDA
-        # graph; recaptured only when a GUI-tunable solver scalar changes. Prime
-        # the reorder scratch first -- it allocates on first use, which cannot
-        # happen inside the capture.
         self.solver.reorder_particles(self.state_0)
         self.graph = None
         self.use_cuda_graph = wp.get_device(self.model.device).is_cuda
@@ -205,12 +243,6 @@ class Example:
         )
 
     def _fill_water(self, builder, args, wall_thickness):
-        """Fill the cup cavity with a column of fluid at rest spacing.
-
-        Filling the full inner radius (not a narrower inset block) and starting
-        at the rest spacing avoids the column collapsing into a dense slug at the
-        bottom -- the water sits at rest density across the whole cross-section.
-        """
         spacing = self.particle_spacing
         radius = 0.5 * spacing
         pts = cylinder_particle_positions(spacing, self.inner_radius, wall_thickness, args.fill_height)
@@ -241,8 +273,6 @@ class Example:
         return (round(self.solver.fluid_viscosity, 6), round(self.solver.fluid_cohesion, 6))
 
     def simulate(self):
-        # spatial re-sort once per frame so the density solve's neighbor reads
-        # stay cache-coherent after a swing churns the water
         self.solver.reorder_particles(self.state_0)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -282,29 +312,37 @@ class Example:
 
     def test_final(self):
         q = self.state_0.particle_q.numpy()
-        qd = self.state_0.particle_qd.numpy()
         body_q = self.state_0.body_q.numpy()
-        if not np.all(np.isfinite(q)) or not np.all(np.isfinite(qd)) or not np.all(np.isfinite(body_q)):
-            raise ValueError("XPBD fluid or cup state contains non-finite values")
+        particle_world = self.model.particle_world.numpy()
+        body_world = self.model.body_world.numpy()
+
+        if self.model.world_count != self.WORLD_COUNT:
+            raise ValueError("multiworld cup example must build exactly two worlds")
+        if set(np.unique(particle_world).tolist()) != {0, 1} or set(np.unique(body_world).tolist()) != {0, 1}:
+            raise ValueError("cups and fluids must be split across two worlds")
+        world_counts = np.bincount(particle_world, minlength=self.WORLD_COUNT)[: self.WORLD_COUNT]
+        if np.any(world_counts != world_counts[0]):
+            raise ValueError("fluid particle counts must match across replicated worlds")
+        if not np.all(np.isfinite(q)) or not np.all(np.isfinite(body_q)):
+            raise ValueError("XPBD multiworld cup state contains non-finite values")
         tolerance = 1.0e-4
         if q[:, 2].min() < self.particle_radius - tolerance:
-            raise ValueError("water tunneled below the floor")
-        local_q = _points_to_body_frame(q, body_q[self.cup_body])
-        if local_q[:, 2].min() < self.wall_thickness - self.particle_radius - tolerance:
-            raise ValueError("water tunneled through the cup bottom")
-        radial = np.linalg.norm(local_q[:, :2], axis=1)
-        below_rim = local_q[:, 2] <= self.cup_height + self.particle_radius
-        outer_radius = self.inner_radius + self.wall_thickness + self.particle_radius
-        if np.any(radial[below_rim] > outer_radius + tolerance):
-            raise ValueError("water tunneled through the cup wall")
-        # and it should fill a reasonable fraction of the cup cross-section,
-        # rather than collapsing into a narrow slug at the bottom
-        rmax = float(radial.max())
-        if rmax < 0.5 * self.inner_radius:
-            raise ValueError("water collapsed to a narrow column instead of filling the cup")
-        minimum_fill_top = self.wall_thickness + 0.7 * (self.fill_height - self.wall_thickness)
-        if float(local_q[:, 2].max()) < minimum_fill_top:
-            raise ValueError("water over-compressed instead of retaining its fill height")
+            raise ValueError("multiworld cup water tunneled below the floor")
+        for world in range(self.WORLD_COUNT):
+            particles = q[particle_world == world]
+            local_q = _points_to_body_frame(particles, body_q[self.cup_bodies[world]])
+            radial = np.linalg.norm(local_q[:, :2], axis=1)
+            if local_q[:, 2].min() < self.wall_thickness - self.particle_radius - tolerance:
+                raise ValueError("multiworld cup water tunneled through a cup bottom")
+            below_rim = local_q[:, 2] <= self.cup_height + self.particle_radius
+            outer_radius = self.inner_radius + self.wall_thickness + self.particle_radius
+            if np.any(radial[below_rim] > outer_radius + tolerance):
+                raise ValueError("multiworld cup water tunneled through a cup wall")
+            if float(np.percentile(radial, 95)) > 1.1 * self.inner_radius:
+                raise ValueError("multiworld cup fluid is not inside its cup")
+            minimum_fill_top = self.wall_thickness + 0.7 * (self.fill_height - self.wall_thickness)
+            if float(local_q[:, 2].max()) < minimum_fill_top:
+                raise ValueError("multiworld cup water over-compressed instead of retaining its fill height")
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -316,85 +354,154 @@ class Example:
         finally:
             if show_fluid:
                 self.viewer.show_fluid = show_fluid
-        # Hide the fluid surface while debugging with raw particles, so toggling
-        # "Show Particles" in the GUI leaves only the particles visible.
-        if show_fluid and not self.viewer.show_particles:
-            self._log_fluid_surface()
+
+        if show_fluid:
+            self._log_fluid_surfaces()
+        else:
+            self._hide_fluid_surfaces()
         self.viewer.end_frame()
 
-    def _log_fluid_surface(self):
-        self.solver.update_render_particles(
-            self.state_0,
-            smoothing=self.render_smoothing,
-            anisotropy_scale=self.render_anisotropy_scale,
-            max_particles=self.render_particle_limit,
+    def _hide_fluid_surfaces(self):
+        self.viewer.log_fluid("/model/fluid", None)
+        for world in range(self.WORLD_COUNT):
+            self.viewer.log_fluid(f"/model/fluid/world_{world}", None)
+
+    def _ensure_world_render_cache(self, world: int, count: int) -> dict[str, wp.array]:
+        cache = self._world_render_cache.setdefault(world, {})
+        specs = {
+            "positions": wp.vec3,
+            "radii": wp.float32,
+            "anisotropy": wp.vec4,
+            "anisotropy_secondary": wp.vec4,
+            "anisotropy_tertiary": wp.vec4,
+        }
+        for name, dtype in specs.items():
+            arr = cache.get(name)
+            if arr is None or len(arr) != count:
+                cache[name] = wp.empty(count, dtype=dtype, device=self.model.device)
+        return cache
+
+    def _visual_world_offset(self, world: int) -> wp.vec3:
+        if self.viewer.world_offsets is None:
+            return wp.vec3(0.0)
+        offsets = self.viewer.world_offsets.numpy()
+        if world < 0 or world >= len(offsets):
+            return wp.vec3(0.0)
+        offset = offsets[world]
+        return wp.vec3(float(offset[0]), float(offset[1]), float(offset[2]))
+
+    def _compact_world_render_particles(self, world: int) -> tuple[dict[str, wp.array], int] | tuple[None, int]:
+        n = self.model.particle_count
+        wp.launch(
+            _build_world_mask,
+            dim=n,
+            inputs=[self.model.particle_world, world, self._render_world_mask],
+            device=self.model.device,
         )
-        render_radii = self.model.particle_radius
-        if len(self.solver.render_positions) != self.model.particle_count:
-            render_radii = self.model.particle_max_radius
-        self.viewer.log_fluid(
-            "/model/fluid",
-            self.solver.render_positions,
-            radii=render_radii,
-            radius_scale=self.fluid_radius_scale,
-            color=self.fluid_color,
-            blur_radius_world=self.fluid_blur_radius,
-            anisotropy=self.solver.render_anisotropy,
-            anisotropy_secondary=self.solver.render_anisotropy_secondary,
-            anisotropy_tertiary=self.solver.render_anisotropy_tertiary,
-            hidden=False,
+        wp.utils.array_scan(self._render_world_mask, self._render_world_offsets, inclusive=False)
+        count = int(self._render_world_offsets[-1:].numpy()[0]) + int(self._render_world_mask[-1:].numpy()[0])
+        if count == 0:
+            return None, 0
+
+        cache = self._ensure_world_render_cache(world, count)
+        visual_offset = self._visual_world_offset(world)
+        wp.launch(
+            _compact_world_positions,
+            dim=n,
+            inputs=[
+                self.solver.render_positions,
+                self._render_world_mask,
+                self._render_world_offsets,
+                visual_offset,
+                cache["positions"],
+            ],
+            device=self.model.device,
         )
+        wp.launch(
+            _compact_world_radii,
+            dim=n,
+            inputs=[self.model.particle_radius, self._render_world_mask, self._render_world_offsets, cache["radii"]],
+            device=self.model.device,
+        )
+        for name, src in (
+            ("anisotropy", self.solver.render_anisotropy),
+            ("anisotropy_secondary", self.solver.render_anisotropy_secondary),
+            ("anisotropy_tertiary", self.solver.render_anisotropy_tertiary),
+        ):
+            wp.launch(
+                _compact_world_vec4,
+                dim=n,
+                inputs=[src, self._render_world_mask, self._render_world_offsets, cache[name]],
+                device=self.model.device,
+            )
+        return cache, count
+
+    def _log_fluid_surfaces(self):
+        self.solver.update_render_particles(self.state_0, smoothing=self.render_smoothing)
+        self.viewer.log_fluid("/model/fluid", None)
+
+        for world in range(self.WORLD_COUNT):
+            cache, count = self._compact_world_render_particles(world)
+            if cache is None or count == 0:
+                self.viewer.log_fluid(f"/model/fluid/world_{world}", None)
+                continue
+            self.viewer.log_fluid(
+                f"/model/fluid/world_{world}",
+                cache["positions"],
+                radii=cache["radii"],
+                radius_scale=self.fluid_radius_scale,
+                color=self.fluid_colors[world],
+                blur_radius_world=self.fluid_blur_radius,
+                anisotropy=cache["anisotropy"],
+                anisotropy_secondary=cache["anisotropy_secondary"],
+                anisotropy_tertiary=cache["anisotropy_tertiary"],
+                hidden=False,
+            )
 
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--fps", type=float, default=60.0)
-        # Fine particles need a smaller pressure timestep than rigid-body-only
-        # scenes. Eight substeps keep the density projection below its Jacobi
-        # stability limit without relying on artificial viscosity.
         parser.add_argument("--substeps", type=int, default=8)
         parser.add_argument("--iterations", type=int, default=4)
         parser.add_argument("--max-neighbors", type=int, default=128)
-        parser.add_argument("--render-mode", choices=["fluid", "particles"], default="fluid")
         parser.add_argument("--gravity", type=float, default=-9.81)
 
         parser.add_argument("--cup-inner-radius", type=float, default=0.06)
         parser.add_argument("--cup-height", type=float, default=0.11)
         parser.add_argument("--wall-thickness", type=float, default=0.008)
         parser.add_argument("--cup-density", type=float, default=2000.0)
-        parser.add_argument("--cup-opacity", type=float, default=0.35)
+        parser.add_argument("--cup-opacity", type=float, default=0.38)
         parser.add_argument("--sdf-resolution", type=int, default=192, help="Cup SDF grid resolution.")
 
         parser.add_argument(
             "--particle-count",
             type=parse_particle_count,
-            default=60_000,
-            help="Target fluid particle count; spacing, radius, mass, and fill grid are derived automatically.",
+            default=120_000,
+            help="Target total fluid particle count across both worlds; particle size and fills are derived automatically.",
         )
-        parser.add_argument("--fill-height", type=float, default=0.085)
+        parser.add_argument("--fill-height", type=float, default=0.082)
         parser.add_argument("--rest-density", type=float, default=1000.0)
         parser.add_argument("--cohesion", type=float, default=0.4)
         parser.add_argument("--viscosity", type=float, default=0.0)
-        # Weighted Jacobi relaxation suppresses the particle-scale pressure mode;
-        # four iterations at this weight retain volume without buzzing.
         parser.add_argument("--relaxation", type=float, default=0.6)
         parser.add_argument("--pick-stiffness", type=float, default=400.0)
         parser.add_argument("--pick-damping", type=float, default=40.0)
 
         parser.add_argument("--render-smoothing", type=float, default=0.6)
-        parser.add_argument("--render-anisotropy-scale", type=float, default=1.0)
-        parser.add_argument(
-            "--render-particle-limit",
-            type=int,
-            default=250_000,
-            help="Maximum particles splatted by the fluid renderer; 0 renders all simulated particles.",
-        )
-        parser.add_argument("--fluid-color", type=float, nargs=4, default=(0.113, 0.425, 0.55, 0.8))
+        parser.add_argument("--fluid-color-0", type=float, nargs=4, default=(0.05, 0.45, 0.72, 0.78))
+        parser.add_argument("--fluid-color-1", type=float, nargs=4, default=(0.95, 0.48, 0.18, 0.55))
         parser.add_argument("--fluid-radius-scale", type=float, default=1.8)
         parser.add_argument("--fluid-blur-radius", type=float, default=0.02)
+        parser.add_argument(
+            "--render-world-spacing",
+            type=float,
+            default=0.08,
+            help="Visual offset between worlds; smaller than the cup diameter so the cups overlap on screen.",
+        )
 
-        parser.add_argument("--camera-pos", type=float, nargs=3, default=(0.32, -0.32, 0.22))
-        parser.add_argument("--camera-pitch", type=float, default=-22.0)
+        parser.add_argument("--camera-pos", type=float, nargs=3, default=(0.25, -0.32, 0.20))
+        parser.add_argument("--camera-pitch", type=float, default=-23.0)
         parser.add_argument("--camera-yaw", type=float, default=135.0)
         return parser
 

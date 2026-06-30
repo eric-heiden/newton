@@ -1002,9 +1002,10 @@ def create_soft_contacts(
     shape_scale: wp.array[wp.vec3],
     shape_source_ptr: wp.array[wp.uint64],
     shape_world: wp.array[int],  # World indices for shapes
+    soft_shape_indices: wp.array[int],
+    num_soft_shapes: int,
     margin: float,
     soft_contact_max: int,
-    shape_count: int,
     shape_flags: wp.array[wp.int32],
     shape_sdf_index: wp.array[wp.int32],
     shape_heightfield_index: wp.array[wp.int32],
@@ -1020,7 +1021,8 @@ def create_soft_contacts(
     soft_contact_tids: wp.array[int],
 ):
     tid = wp.tid()
-    particle_index, shape_index = tid // shape_count, tid % shape_count
+    particle_index = tid // num_soft_shapes
+    shape_index = soft_shape_indices[tid % num_soft_shapes]
     if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
         return
     if (shape_flags[shape_index] & ShapeFlags.COLLIDE_PARTICLES) == 0:

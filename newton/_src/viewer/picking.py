@@ -44,6 +44,7 @@ class Picking:
         self.pick_damping = pick_damping
         self.world_offsets = world_offsets
         self.visible_worlds_mask: wp.array | None = None
+        self.shape_pickable = wp.array([], dtype=wp.int32, device=model.device if model else "cpu")
 
         self.min_dist = None
         self.min_index = None
@@ -144,6 +145,26 @@ class Picking:
 
         return wp.array(effective, dtype=float, device=model.device)
 
+    def set_pickable_shapes(self, mask) -> None:
+        """Set an optional per-shape picking mask.
+
+        Args:
+            mask: A 1-D truthy/falsy mask with one entry per model shape, or
+                ``None`` to consider all shapes during picking.
+        """
+        device = self.model.device if self.model is not None else "cpu"
+        if mask is None:
+            self.shape_pickable = wp.array([], dtype=wp.int32, device=device)
+            return
+
+        mask_np = np.asarray(mask, dtype=np.int32)
+        if self.model is not None and mask_np.shape != (self.model.shape_count,):
+            raise ValueError(f"Picking mask must have shape ({self.model.shape_count},), got {mask_np.shape}.")
+        if mask_np.ndim != 1:
+            raise ValueError(f"Picking mask must be one-dimensional, got {mask_np.ndim} dimensions.")
+
+        self.shape_pickable = wp.array(mask_np, dtype=wp.int32, device=device)
+
     def is_picking(self) -> bool:
         """Checks if picking is active.
 
@@ -237,7 +258,7 @@ class Picking:
             world_offsets = wp.array([], dtype=wp.vec3, device=self.model.device)
 
         wp.launch(
-            kernel=raycast.raycast_kernel,
+            kernel=raycast.raycast_pick_kernel,
             dim=num_geoms,
             inputs=[
                 state.body_q,
@@ -246,6 +267,7 @@ class Picking:
                 self.model.shape_type,
                 self.model.shape_scale,
                 self.model.shape_source_ptr,
+                self.shape_pickable,
                 p,
                 d,
                 self.lock,

@@ -678,8 +678,9 @@ def test_mixed_winding_convex_pile_contact_normal(test, device):
             wp.array([wp.vec3(1.0, 1.0, 1.0)], dtype=wp.vec3, device=device),
             wp.array([mesh.id], dtype=wp.uint64, device=device),
             wp.array([-1], dtype=wp.int32, device=device),
-            0.0,
+            wp.array([0], dtype=wp.int32, device=device),
             1,
+            0.0,
             1,
             wp.array([int(ShapeFlags.COLLIDE_PARTICLES)], dtype=wp.int32, device=device),
             wp.array([-1], dtype=wp.int32, device=device),  # shape_sdf_index (no SDF)
@@ -778,6 +779,70 @@ add_function_test(
     TestMeshSignQueries,
     "test_parity_sign_accuracy_exceeds_normal_query",
     test_parity_sign_accuracy_exceeds_normal_query,
+    devices=devices,
+    check_output=False,
+)
+
+
+# ============================================================================
+# Soft-contact candidate compaction and replay storage
+# ============================================================================
+
+
+class TestSoftContactCandidates(unittest.TestCase):
+    pass
+
+
+def test_soft_contact_candidates_exclude_non_particle_shapes(test, device):
+    builder = newton.ModelBuilder(gravity=0.0)
+    builder.default_particle_radius = 0.1
+    active = int(ParticleFlags.ACTIVE)
+    builder.add_particle(pos=(0.45, 0.0, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.1, flags=active)
+    builder.add_particle(pos=(-0.45, 0.0, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.1, flags=active)
+
+    particle_shape = builder.add_shape_sphere(
+        body=-1,
+        radius=0.5,
+        cfg=newton.ModelBuilder.ShapeConfig(
+            density=0.0,
+            has_shape_collision=False,
+            has_particle_collision=True,
+        ),
+    )
+    builder.add_shape_sphere(
+        body=-1,
+        xform=wp.transform(wp.vec3(5.0, 0.0, 0.0), wp.quat_identity()),
+        radius=0.5,
+        cfg=newton.ModelBuilder.ShapeConfig(density=0.0, has_particle_collision=False),
+    )
+    builder.add_shape_sphere(
+        body=-1,
+        xform=wp.transform(wp.vec3(10.0, 0.0, 0.0), wp.quat_identity()),
+        radius=0.5,
+        cfg=newton.ModelBuilder.ShapeConfig(
+            density=0.0,
+            has_shape_collision=False,
+            has_particle_collision=False,
+        ),
+    )
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, soft_contact_max=1)
+    contacts = pipeline.contacts()
+
+    test.assertEqual(pipeline._num_soft_shapes, 1)
+    test.assertEqual(pipeline._num_soft_sdf_shapes, 0)
+    test.assertEqual(pipeline._soft_shape_indices.numpy().tolist(), [particle_shape])
+    test.assertEqual(pipeline._soft_contact_candidate_max, 2)
+    test.assertEqual(contacts.soft_contact_tids.size, 2)
+
+    pipeline.collide(model.state(), contacts)
+    test.assertEqual(int(contacts.soft_contact_count.numpy()[0]), 2)
+
+
+add_function_test(
+    TestSoftContactCandidates,
+    "test_soft_contact_candidates_exclude_non_particle_shapes",
+    test_soft_contact_candidates_exclude_non_particle_shapes,
     devices=devices,
     check_output=False,
 )

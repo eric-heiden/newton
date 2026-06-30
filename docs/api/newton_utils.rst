@@ -33,6 +33,7 @@ newton.utils
    create_straight_cable_points
    create_straight_cable_points_and_quaternions
    download_asset
+   download_git_folder
    event_scope
    load_texture
    normalize_texture

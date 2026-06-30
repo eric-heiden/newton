@@ -35,7 +35,7 @@ def create_soft_contacts_sdf(
     texture_sdf_data: wp.array[TextureSDFData],
     sdf_shape_indices: wp.array[int],
     num_sdf_shapes: int,
-    shape_count: int,
+    replay_tid_offset: int,
     margin: float,
     soft_contact_max: int,
     # outputs
@@ -102,10 +102,8 @@ def create_soft_contacts_sdf(
     d, n = scale_sdf_result_to_world(d_unscaled, grad_unscaled, sdf_scale, inv_sdf_scale, min_sdf_scale)
 
     if d < margin + radius:
-        # use a globally-consistent tid (matching create_soft_contacts' layout)
-        # so deterministic replay sees a stable producer id per contact
-        global_tid = particle_index * shape_count + shape_index
-        index = counter_increment(soft_contact_count, 0, soft_contact_tids, global_tid)
+        replay_tid = replay_tid_offset + tid
+        index = counter_increment(soft_contact_count, 0, soft_contact_tids, replay_tid)
 
         if index < soft_contact_max:
             body_pos = wp.transform_point(X_bs, x_local - n * d)

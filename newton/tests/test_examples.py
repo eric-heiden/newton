@@ -22,7 +22,9 @@ from typing import Any
 
 import warp as wp
 
+import newton
 import newton.tests.unittest_utils
+from newton.examples.fluid.utils import add_tank_walls
 from newton.tests.unittest_utils import (
     USD_AVAILABLE,
     add_function_test,
@@ -731,52 +733,36 @@ add_example_test(
 
 
 class TestFluidExamples(unittest.TestCase):
-    pass
+    def test_tank_walls_are_flush(self):
+        half_x = 0.85
+        half_y = 0.6
+        height = 0.55
+        thickness = 0.1
+        builder = newton.ModelBuilder(up_axis="Z")
+        walls = add_tank_walls(builder, half_x, half_y, height, thickness, (1.0, 1.0, 1.0), 0.3)
+
+        expected_bounds = (
+            ((-0.95, -0.6, 0.0), (-0.85, 0.6, 0.55)),
+            ((0.85, -0.6, 0.0), (0.95, 0.6, 0.55)),
+            ((-0.95, -0.7, 0.0), (0.95, -0.6, 0.55)),
+            ((-0.95, 0.6, 0.0), (0.95, 0.7, 0.55)),
+        )
+        for shape, (expected_lower, expected_upper) in zip(walls, expected_bounds, strict=True):
+            transform = builder.shape_transform[shape]
+            extents = builder.shape_scale[shape]
+            for axis in range(3):
+                self.assertAlmostEqual(float(transform[axis] - extents[axis]), expected_lower[axis])
+                self.assertAlmostEqual(float(transform[axis] + extents[axis]), expected_upper[axis])
 
 
-add_example_test(
-    TestFluidExamples,
-    name="fluid.example_fluid_sph_dam_break",
-    devices=cuda_test_devices,
-    test_options={"num-frames": 30},
-    use_viewer=True,
-)
-
-add_example_test(
-    TestFluidExamples,
-    name="fluid.example_fluid_sph_interactive_tank",
-    devices=cuda_test_devices,
-    test_options={
-        "num-frames": 30,
-        "dim-x": 34,
-        "dim-y": 22,
-        "dim-z": 6,
-        "spacing": 0.08,
-        "radius": 0.06,
-        "smoothing-length": 0.172,
-        "shape-collision-distance": 0.06,
-        "fluid-carve-clearance": 0.08,
-        "fluid-diffuse-max-particles": 2000,
-    },
-    use_viewer=True,
-)
-
-add_example_test(
-    TestFluidExamples,
-    name="fluid.example_fluid_sph_cup_transfer",
-    devices=cuda_test_devices,
-    test_options={"num-frames": 60, "substeps": 4, "fill-layers": 5},
-    use_viewer=True,
-)
-
-# The XPBD fluid examples default to ~100k particles; the tests override the
-# grid down to a few thousand so CI stays fast while still exercising the full
+# The XPBD fluid examples default to roughly 100k particles; the tests request
+# a few thousand so CI stays fast while still exercising the full
 # fluid pipeline (the perf of the 100k defaults is validated separately).
 add_example_test(
     TestFluidExamples,
     name="fluid.example_fluid_xpbd_dam_break",
     devices=cuda_test_devices,
-    test_options={"num-frames": 60, "dim-x": 14, "dim-y": 20, "dim-z": 24, "spacing": 0.05, "substeps": 4},
+    test_options={"num-frames": 60, "particle-count": 6720, "substeps": 4},
     use_viewer=True,
 )
 
@@ -784,8 +770,9 @@ add_example_test(
     TestFluidExamples,
     name="fluid.example_fluid_xpbd_cereal_bowl",
     devices=cuda_test_devices,
-    # coarser milk + low SDF resolution keep CI fast
-    test_options={"num-frames": 90, "spacing": 0.006, "sdf-resolution": 64, "cereal-sdf-resolution": 32},
+    # Coarser milk and a low SDF resolution keep CI fast while still exercising
+    # cereal, milk, bowl, and ground contacts.
+    test_options={"num-frames": 180, "particle-count": 3600, "sdf-resolution": 64},
     use_viewer=True,
 )
 
@@ -793,7 +780,28 @@ add_example_test(
     TestFluidExamples,
     name="fluid.example_fluid_xpbd_interactive_tank",
     devices=cuda_test_devices,
-    test_options={"num-frames": 90, "dim-z": 8, "spacing": 0.04},
+    test_options={"num-frames": 90, "particle-count": 9500},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_xpbd_multi_fluid_tank",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 60, "particle-count": 9600, "foam-max-particles": 0},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_xpbd_multiworld_cup",
+    devices=cuda_test_devices,
+    test_options={
+        "num-frames": 20,
+        "particle-count": 1740,
+        "fill-height": 0.055,
+        "sdf-resolution": 48,
+    },
     use_viewer=True,
 )
 
@@ -801,7 +809,7 @@ add_example_test(
     TestFluidExamples,
     name="fluid.example_fluid_xpbd_wave_pool",
     devices=cuda_test_devices,
-    test_options={"num-frames": 120, "dim-x": 52, "dim-y": 18, "dim-z": 8, "spacing": 0.05},
+    test_options={"num-frames": 120, "particle-count": 7500},
     use_viewer=True,
 )
 
@@ -810,7 +818,7 @@ add_example_test(
     name="fluid.example_fluid_xpbd_cup_transfer",
     devices=cuda_test_devices,
     # coarser water + low SDF resolution keep CI fast
-    test_options={"num-frames": 40, "substeps": 4, "spacing": 0.008, "fill-layers": 6, "sdf-resolution": 48},
+    test_options={"num-frames": 40, "particle-count": 384, "sdf-resolution": 48},
     use_viewer=True,
 )
 
@@ -819,26 +827,7 @@ add_example_test(
     name="fluid.example_fluid_xpbd_cup",
     devices=cuda_test_devices,
     # coarse water + low SDF resolution keep CI fast
-    test_options={"num-frames": 60, "spacing": 0.008, "sdf-resolution": 48},
-    use_viewer=True,
-)
-
-add_example_test(
-    TestFluidExamples,
-    name="fluid.example_fluid_sph_wave_pool",
-    devices=cuda_test_devices,
-    test_options={
-        "num-frames": 90,
-        "dim-x": 48,
-        "dim-y": 20,
-        "dim-z": 8,
-        "spacing": 0.06,
-        "radius": 0.045,
-        "smoothing-length": 0.129,
-        "paddle-period": 1.2,
-        "fluid-diffuse-threshold": 0.4,
-        "fluid-diffuse-max-particles": 4000,
-    },
+    test_options={"num-frames": 60, "particle-count": 1450, "sdf-resolution": 48},
     use_viewer=True,
 )
 

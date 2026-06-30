@@ -29,9 +29,11 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.fluid.utils import parse_particle_count, resolve_particle_spacing
 
 # Cache cooked SDFs on disk so repeated runs skip the (slow) voxelization.
 _SDF_CACHE_DIR = Path(tempfile.gettempdir()) / "newton_cereal_bowl_sdf"
+_REFERENCE_SPACING = 0.003
 
 
 def create_bowl_mesh(base_radius, rim_radius, height, thickness, segments=48, profile_steps=10):
@@ -131,6 +133,23 @@ def create_torus_mesh(major_radius, minor_radius, segments_major=20, segments_mi
     )
 
 
+def _milk_particle_count(spacing, base_radius, rim_radius, height, thickness, fill_height):
+    radius = 0.5 * spacing
+    inner_rim = rim_radius - thickness
+    inner_base = max(base_radius - thickness, 0.25 * base_radius)
+    lower = np.array([-inner_rim, -inner_rim, thickness + radius])
+    upper = np.array([inner_rim, inner_rim, fill_height])
+    dimensions = np.maximum(((upper - lower) / spacing).astype(int) + 1, 1)
+    axis_x = lower[0] + spacing * np.arange(dimensions[0])
+    axis_y = lower[1] + spacing * np.arange(dimensions[1])
+    axis_z = lower[2] + spacing * np.arange(dimensions[2])
+    radial_sq = np.sort((axis_x[:, None] ** 2 + axis_y[None, :] ** 2).ravel())
+    cos_angle = np.clip(1.0 - (axis_z - thickness) / (height - thickness), 0.0, 1.0)
+    sin_angle = np.sqrt(1.0 - cos_angle**2)
+    cavity_radius = inner_base + (inner_rim - inner_base) * sin_angle - spacing
+    return int(np.searchsorted(radial_sq, cavity_radius * cavity_radius, side="left").sum())
+
+
 class Example:
     def __init__(self, viewer, args):
         self.fps = args.fps
@@ -140,11 +159,28 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.viewer = viewer
 
-        spacing = args.spacing
+        spacing, _ = resolve_particle_spacing(
+            args.particle_count,
+            _REFERENCE_SPACING,
+            lambda candidate: _milk_particle_count(
+                candidate,
+                args.bowl_base_radius,
+                args.bowl_rim_radius,
+                args.bowl_height,
+                args.bowl_thickness,
+                args.fill_height,
+            ),
+        )
         radius = 0.5 * spacing
 
         self.bowl_height = args.bowl_height
         self.bowl_rim_radius = args.bowl_rim_radius
+        self.cereal_major_radius = args.cereal_major_radius
+        self.cereal_minor_radius = args.cereal_minor_radius
+        self.cereal_outer_radius = args.cereal_major_radius + args.cereal_minor_radius
+        self.cereal_should_float = args.cereal_density < args.rest_density
+        self.body_max_velocity = args.body_max_velocity
+        self.body_max_angular_velocity = args.body_max_angular_velocity
 
         builder = newton.ModelBuilder(up_axis="Z", gravity=args.gravity)
         builder.default_particle_radius = radius
@@ -176,15 +212,14 @@ class Example:
             color=(0.92, 0.93, 0.96),
         )
 
-        # torus cereal pieces: a visual mesh plus a ring of sphere colliders
-        # (sphere contacts are cheap and robust against the bowl mesh and the
-        # fluid particles, and give the body a torus-like inertia)
-        self.cereal_bodies = self._add_cereal(builder, args)
+        # The torus SDF handles milk contact; analytic capsules provide robust
+        # rigid contact while preserving each ring's hole.
+        self.cereal_bodies = self._add_cereal(builder, args, spacing)
 
         # milk: a cylinder of fluid particles trimmed to the bowl cavity
-        self._add_milk(builder, args)
+        self._add_milk(builder, args, spacing)
 
-        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.6))
+        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.03))
 
         self.model = builder.finalize()
         # Fixed physical velocity cap: at this resolution the usual
@@ -200,7 +235,7 @@ class Example:
         # spill compact (~0.8 m) so the solve stays cheap under aggressive
         # picking. Milk does cling to ceramic, so this also reads naturally.
         self.model.soft_contact_mu = 1.0
-        self.model.rigid_contact_max = 32768
+        self.model.rigid_contact_max = 65536
         # A roomier hash grid: when the bowl is tipped and milk spills, the
         # particles spread past the bowl. 256^3 covers ~1.4 m at this smoothing
         # length, comfortably enclosing a friction-contained spill so far cells
@@ -222,19 +257,18 @@ class Example:
             # above the bulk count leaves the in-bowl fluid untouched but bounds
             # that tail, roughly doubling the framerate when the milk disperses.
             fluid_max_neighbors=args.max_neighbors,
-            # A light cereal slammed by the hard-thrown bowl can otherwise pick
-            # up a divergent contact-correction velocity (>200 m/s), tunnel, and
-            # blow up to NaN -- which then poisons the milk it touches. These
-            # caps keep dynamic bodies sane while still allowing brisk throws.
+            # Keep pathological contact corrections bounded without clipping
+            # interactive throws or ordinary ring rolling.
             body_max_velocity=args.body_max_velocity,
             body_max_angular_velocity=args.body_max_angular_velocity,
+            rigid_contact_relaxation=args.rigid_contact_relaxation,
+            angular_damping=args.angular_damping,
         )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
-        # With SDF colliders each particle makes ~1 contact, so the default
-        # shape_count*particle_count soft-contact capacity is hugely over-sized;
-        # cap it so the XPBD particle-shape solve doesn't iterate empty slots.
+        # Only the bowl and nearby cereal proxies can contact a given particle;
+        # avoid allocating/iterating the full particle-by-shape cross product.
         soft_contact_max = min(self.model.shape_count * self.model.particle_count, 6 * self.model.particle_count)
         self._collision_pipeline = newton.CollisionPipeline(
             self.model, soft_contact_max=soft_contact_max, broad_phase="explicit"
@@ -264,74 +298,117 @@ class Example:
         self.use_cuda_graph = wp.get_device(self.model.device).is_cuda
 
     @staticmethod
-    def _add_cereal(builder, args):
-        """Drop rings of torus cereal above the milk surface.
+    def _add_cereal(builder, args, spacing):
+        """Place rings of torus cereal near the milk surface.
 
-        Each cereal is a single torus mesh carrying an analytic-quality SDF, so it
-        collides as a proper torus with both the milk (one SDF sample per nearby
-        particle) and the other rigids -- no multi-sphere approximation.
+        Each cereal uses its torus mesh for rendering, inertia, and milk contact.
+        Tangent capsules form a compound torus for robust rigid contact without
+        the redundant manifolds of concave mesh contact.
         """
-        # coarse collision mesh: the SDF (voxelized at cereal_sdf_resolution) keeps
-        # the milk-facing shape smooth, while the few triangles keep torus-torus
-        # and torus-bowl rigid contact counts low
         torus_mesh = create_torus_mesh(
             args.cereal_major_radius, args.cereal_minor_radius, segments_major=12, segments_minor=8
         )
-        # one SDF shared across every cereal (the builder deduplicates by mesh)
         torus_mesh.build_sdf(
-            max_resolution=args.cereal_sdf_resolution,
-            narrow_band_range=(-args.cereal_minor_radius, args.cereal_minor_radius),
-            margin=0.5 * args.cereal_minor_radius,
+            target_voxel_size=0.5 * spacing,
+            narrow_band_range=(-2.0 * spacing, 2.0 * spacing),
+            margin=2.0 * spacing,
             cache_dir=_SDF_CACHE_DIR,
         )
+        collision_segments = max(args.cereal_collision_segments, 3)
         rng = np.random.default_rng(7)
         # golden-tan palette with slight per-piece variation
         base_color = np.array([0.82, 0.6, 0.3])
 
         bodies = []
-        per_layer = 7
-        layers = max(1, args.cereal_count // per_layer + (args.cereal_count % per_layer > 0))
-        idx = 0
-        for layer in range(layers):
-            z = args.bowl_height + 0.03 + 0.035 * layer
-            for k in range(per_layer):
-                if idx >= args.cereal_count:
-                    break
-                if k == 0:
-                    pos = np.array([0.0, 0.0, z])
-                else:
-                    ang = 2.0 * np.pi * (k - 1) / (per_layer - 1) + 0.5 * layer
-                    ring_r = 0.45 * args.bowl_rim_radius
-                    pos = np.array([ring_r * np.cos(ang), ring_r * np.sin(ang), z])
-                pos[:2] += rng.uniform(-0.004, 0.004, size=2)
-                rot = wp.quat_rpy(
-                    float(rng.uniform(-0.4, 0.4)),
-                    float(rng.uniform(-0.4, 0.4)),
-                    float(rng.uniform(0.0, 2.0 * np.pi)),
-                )
-                body = builder.add_body(
-                    xform=wp.transform(wp.vec3(*pos), rot),
-                    label=f"cereal_{idx}",
-                )
-                color = tuple(np.clip(base_color + rng.uniform(-0.06, 0.06, size=3), 0.0, 1.0))
-                # the torus carries a texture SDF and collides as a proper torus
-                # with both the milk (one SDF sample per nearby particle) and the
-                # other rigids (a coarse collision mesh keeps the torus-torus and
-                # torus-bowl contact counts low)
-                builder.add_shape_mesh(
+        outer_radius = args.cereal_major_radius + args.cereal_minor_radius
+        lattice_spacing = 2.0 * outer_radius
+        usable_center_radius = max(args.bowl_rim_radius - outer_radius, 0.0)
+        axial_radius = max(int(usable_center_radius / lattice_spacing), 0)
+        hex_slots = []
+        for axial_q in range(-axial_radius, axial_radius + 1):
+            for axial_r in range(-axial_radius, axial_radius + 1):
+                if max(abs(axial_q), abs(axial_r), abs(-axial_q - axial_r)) <= axial_radius:
+                    x = lattice_spacing * (axial_q + 0.5 * axial_r)
+                    y = lattice_spacing * (0.5 * np.sqrt(3.0) * axial_r)
+                    hex_slots.append((x, y))
+        hex_slots.sort(key=lambda p: (p[0] * p[0] + p[1] * p[1], np.arctan2(p[1], p[0])))
+
+        # Start on the milk instead of dropping a tall artificial stack. Slots
+        # are generated center-out so the default scene remains a calm layer;
+        # unusually large cereal counts still stack only after the slot set is
+        # exhausted.
+        layer_capacity = len(hex_slots)
+        base_z = args.fill_height + args.cereal_minor_radius + spacing
+        for idx in range(args.cereal_count):
+            layer, slot = divmod(idx, layer_capacity)
+            x, y = hex_slots[slot]
+            if layer:
+                # Upper layers sit over triangular gaps rather than directly
+                # above another ring, avoiding a high-energy vertical impact.
+                x += 0.5 * lattice_spacing
+                y += np.sqrt(3.0) / 6.0 * lattice_spacing
+            layer_angle = 0.35 * layer
+            cos_angle = np.cos(layer_angle)
+            sin_angle = np.sin(layer_angle)
+            pos = np.array(
+                [
+                    cos_angle * x - sin_angle * y,
+                    sin_angle * x + cos_angle * y,
+                    base_z + 1.5 * outer_radius * layer,
+                ]
+            )
+            rot = wp.quat_rpy(
+                float(rng.uniform(-0.2, 0.2)),
+                float(rng.uniform(-0.2, 0.2)),
+                float(rng.uniform(0.0, 2.0 * np.pi)),
+            )
+            body = builder.add_body(
+                xform=wp.transform(wp.vec3(*pos), rot),
+                label=f"cereal_{idx}",
+            )
+            color = tuple(np.clip(base_color + rng.uniform(-0.06, 0.06, size=3), 0.0, 1.0))
+            torus_cfg = newton.ModelBuilder.ShapeConfig(
+                density=args.cereal_density,
+                mu=0.2,
+                has_shape_collision=False,
+                has_particle_collision=True,
+            )
+            builder.add_shape_mesh(
+                body,
+                mesh=torus_mesh,
+                cfg=torus_cfg,
+                color=color,
+            )
+
+            rigid_collider_cfg = newton.ModelBuilder.ShapeConfig(
+                density=0.0,
+                mu=0.03,
+                mu_torsional=0.0,
+                mu_rolling=0.0,
+                has_particle_collision=False,
+                is_visible=False,
+            )
+            capsule_half_height = args.cereal_major_radius * np.sin(np.pi / collision_segments)
+            for segment in range(collision_segments):
+                angle = 2.0 * np.pi * segment / collision_segments
+                radial = wp.vec3(np.cos(angle), np.sin(angle), 0.0)
+                tangent = wp.vec3(-np.sin(angle), np.cos(angle), 0.0)
+                builder.add_shape_capsule(
                     body,
-                    mesh=torus_mesh,
-                    cfg=newton.ModelBuilder.ShapeConfig(density=args.cereal_density, mu=0.3),
-                    color=color,
+                    xform=wp.transform(
+                        radial * args.cereal_major_radius,
+                        wp.quat_between_vectors(wp.vec3(0.0, 0.0, 1.0), tangent),
+                    ),
+                    radius=args.cereal_minor_radius,
+                    half_height=capsule_half_height,
+                    cfg=rigid_collider_cfg,
                 )
-                bodies.append(body)
-                idx += 1
+            bodies.append(body)
         return bodies
 
     @staticmethod
-    def _add_milk(builder, args):
+    def _add_milk(builder, args, spacing):
         """Fill the bowl cavity with fluid particles up to the fill height."""
-        spacing = args.spacing
         radius = 0.5 * spacing
         thickness = args.bowl_thickness
         height = args.bowl_height
@@ -385,6 +462,7 @@ class Example:
                     with wp.ScopedCapture() as capture:
                         self.simulate()
                     self.graph = capture.graph
+                    wp.capture_launch(self.graph)
                 except Exception as exc:
                     warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
                     self.use_cuda_graph = False
@@ -403,17 +481,69 @@ class Example:
         body_q = self.state_0.body_q.numpy()
         if not np.all(np.isfinite(body_q)):
             raise ValueError("bodies contain non-finite transforms")
-        # the milk should still mostly be inside the bowl
+        body_qd = self.state_0.body_qd.numpy()
+        if not np.all(np.isfinite(body_qd)):
+            raise ValueError("bodies contain non-finite velocities")
+
+        bowl_q = body_q[self.bowl_body]
+        milk_local = self._points_to_body_frame(q, bowl_q)
+        cereal_local = self._points_to_body_frame(body_q[self.cereal_bodies, :3], bowl_q)
+
+        # Validate against the moving bowl, not the world-space ground. The old
+        # checks allowed spilled milk and cereal to settle nearby and still pass.
         radius = float(self.model.particle_max_radius)
-        in_bowl = (q[:, 2] > -2.0 * radius) & (np.linalg.norm(q[:, :2], axis=1) < 2.0 * self.bowl_rim_radius)
-        if np.count_nonzero(in_bowl) < 0.8 * len(q):
-            raise ValueError("most of the milk left the bowl")
-        # the cereal should float on the milk rather than sink to the bowl floor
-        cereal_z = body_q[self.cereal_bodies, 2]
-        if cereal_z.mean() < 0.3 * self.bowl_height:
-            raise ValueError("cereal sank to the bottom of the bowl")
-        if cereal_z.max() > self.bowl_height + 0.2:
+        if milk_local[:, 2].min() < radius - 5.0e-4:
+            raise ValueError("milk tunneled through the bowl floor")
+        milk_r = np.linalg.norm(milk_local[:, :2], axis=1)
+        in_bowl = (milk_local[:, 2] < self.bowl_height + 2.0 * radius) & (milk_r < self.bowl_rim_radius + 2.0 * radius)
+        if np.count_nonzero(in_bowl) < 0.99 * len(q):
+            raise ValueError("more than one percent of the milk left the bowl")
+
+        cereal_r = np.linalg.norm(cereal_local[:, :2], axis=1)
+        if np.any(cereal_r > self.bowl_rim_radius + self.cereal_outer_radius):
+            raise ValueError("cereal left the bowl")
+        torus_axes_world = self._rotate_vectors(
+            body_q[self.cereal_bodies, 3:7],
+            np.broadcast_to((0.0, 0.0, 1.0), (len(self.cereal_bodies), 3)),
+        )
+        bowl_q_inv = np.array([-bowl_q[3], -bowl_q[4], -bowl_q[5], bowl_q[6]])
+        torus_axes_local = self._rotate_vectors(
+            np.broadcast_to(bowl_q_inv, (len(self.cereal_bodies), 4)),
+            torus_axes_world,
+        )
+        vertical_extent = self.cereal_minor_radius + self.cereal_major_radius * np.sqrt(
+            np.maximum(1.0 - torus_axes_local[:, 2] ** 2, 0.0)
+        )
+        if np.any(cereal_local[:, 2] < vertical_extent - 2.0e-3):
+            raise ValueError("cereal tunneled through the bowl floor")
+        if cereal_local[:, 2].max() > self.bowl_height + 2.0 * self.cereal_outer_radius:
             raise ValueError("cereal was ejected from the bowl")
+        if self.cereal_should_float and self.sim_time > 0.5:
+            milk_surface = np.percentile(milk_local[in_bowl, 2], 95)
+            if np.median(cereal_local[:, 2]) <= milk_surface:
+                raise ValueError("low-density cereal failed to float on the milk")
+
+        cereal_speed = np.linalg.norm(body_qd[self.cereal_bodies, :3], axis=1)
+        if self.body_max_velocity > 0.0 and np.percentile(cereal_speed, 95) > 1.05 * self.body_max_velocity:
+            raise ValueError("cereal linear velocity exceeded the configured cap")
+        cereal_angular_speed = np.linalg.norm(body_qd[self.cereal_bodies, 3:], axis=1)
+        if (
+            self.body_max_angular_velocity > 0.0
+            and np.percentile(cereal_angular_speed, 95) > 1.05 * self.body_max_angular_velocity
+        ):
+            raise ValueError("cereal angular velocity exceeded the configured cap")
+
+    @staticmethod
+    def _points_to_body_frame(points, body_q):
+        relative = points - body_q[:3]
+        q_xyz_inv = -body_q[3:6]
+        twice_cross = 2.0 * np.cross(q_xyz_inv, relative)
+        return relative + body_q[6] * twice_cross + np.cross(q_xyz_inv, twice_cross)
+
+    @staticmethod
+    def _rotate_vectors(quaternions, vectors):
+        twice_cross = 2.0 * np.cross(quaternions[:, :3], vectors)
+        return vectors + quaternions[:, 3:4] * twice_cross + np.cross(quaternions[:, :3], twice_cross)
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -441,11 +571,11 @@ class Example:
             "/model/fluid",
             self.solver.render_positions,
             radii=self.model.particle_radius,
-            radius_scale=1.8,
+            radius_scale=1.9,
             color=self.fluid_color,
-            reflectance=0.015,
-            specular_intensity=0.18,
-            specular_power=60.0,
+            reflectance=0.025,
+            specular_intensity=0.16,
+            specular_power=45.0,
             blur_radius_world=self.fluid_blur_radius,
             anisotropy=self.solver.render_anisotropy,
             anisotropy_secondary=self.solver.render_anisotropy_secondary,
@@ -457,16 +587,19 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--fps", type=float, default=60.0)
-        # ~100k milk particles. The bowl and cereal carry texture SDFs so milk
-        # collides via one cheap SDF sample per particle (2 PBF iterations).
-        parser.add_argument("--substeps", type=int, default=6)
+        # Eight substeps keep rigid motion below the bowl wall thickness, while
+        # four relaxed PBF iterations keep the ~30k-particle milk incompressible.
+        parser.add_argument("--substeps", type=int, default=8)
         parser.add_argument("--iterations", type=int, default=4)
         # Cap fluid neighbors above the in-bowl bulk (~200) so over-compressed
         # clumps from a hard throw can't stall a warp; 0 disables the cap.
         parser.add_argument("--max-neighbors", type=int, default=256)
-        # Keep dynamic bodies from diverging when slammed by a hard throw; 0 disables.
-        parser.add_argument("--body-max-velocity", type=float, default=20.0)
-        parser.add_argument("--body-max-angular-velocity", type=float, default=50.0)
+        # Safety caps stay above interactive throws and normal cereal rolling
+        # speeds; 0 disables.
+        parser.add_argument("--body-max-velocity", type=float, default=4.0)
+        parser.add_argument("--body-max-angular-velocity", type=float, default=180.0)
+        parser.add_argument("--rigid-contact-relaxation", type=float, default=0.65)
+        parser.add_argument("--angular-damping", type=float, default=0.0)
         # Capped low so a hard yank of the bowl can't fling milk into a wide
         # thin film (see soft_contact_mu); 1.5 m/s still slosh-es freely at the
         # bowl scale while keeping a spill compact and the PBF solve cheap.
@@ -481,19 +614,18 @@ class Example:
         parser.add_argument("--bowl-density", type=float, default=2000.0)
         parser.add_argument("--sdf-resolution", type=int, default=256, help="Bowl SDF grid resolution.")
 
-        parser.add_argument("--cereal-count", type=int, default=21)
+        parser.add_argument("--cereal-count", type=int, default=19)
         parser.add_argument("--cereal-major-radius", type=float, default=0.016)
         parser.add_argument("--cereal-minor-radius", type=float, default=0.007)
-        # light, like puffed cereal: heavier pieces sink through the coarse milk
-        # and poke through the thin bowl floor
+        parser.add_argument("--cereal-collision-segments", type=int, default=8)
+        # Light like puffed cereal; the torus SDF displaces its actual milk volume.
         parser.add_argument("--cereal-density", type=float, default=150.0)
-        parser.add_argument("--cereal-sdf-resolution", type=int, default=64, help="Per-cereal torus SDF resolution.")
-
-        # ~30k milk particles. Finer milk over-compresses ("jams") against the
-        # walls when the bowl is dragged, which stalls the neighbor grid; this
-        # resolution stays fast and contained under picking. The fill leaves
-        # freeboard so a slosh has somewhere to go instead of jamming.
-        parser.add_argument("--spacing", type=float, default=0.003)
+        parser.add_argument(
+            "--particle-count",
+            type=parse_particle_count,
+            default=30_000,
+            help="Target milk particle count; spacing, radius, mass, and the carved fill grid are derived automatically.",
+        )
         parser.add_argument("--fill-height", type=float, default=0.045)
         parser.add_argument("--rest-density", type=float, default=1000.0)
         # Milk has weak surface tension; the previous 1.0 was unphysically sticky
@@ -504,14 +636,14 @@ class Example:
         # The summed (standard-PBF) density correction overshoots at full strength,
         # leaving the milk buzzing instead of settling. Under-relaxing it lets the
         # milk come to rest; --iterations compensates for the gentler push.
-        parser.add_argument("--relaxation", type=float, default=0.3)
+        parser.add_argument("--relaxation", type=float, default=0.6)
 
-        parser.add_argument("--render-smoothing", type=float, default=0.6)
+        parser.add_argument("--render-smoothing", type=float, default=0.7)
         parser.add_argument(
             "--fluid-color",
             type=float,
             nargs=4,
-            default=(0.93, 0.91, 0.86, 0.06),
+            default=(0.97, 0.98, 0.965, 0.015),
             help="Fluid albedo (rgb) and transmittance (a); the default is opaque milk",
         )
         return parser

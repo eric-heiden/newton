@@ -145,6 +145,7 @@ class Contacts:
         requested_attributes: set[str] | None = None,
         contact_matching: bool = False,
         contact_report: bool = False,
+        soft_contact_candidate_max: int | None = None,
     ):
         """
         Initialize Contacts storage.
@@ -176,6 +177,8 @@ class Contacts:
                 :attr:`rigid_contact_broken_indices`,
                 :attr:`rigid_contact_broken_count`) populated each frame by
                 the collision pipeline.  Requires ``contact_matching=True``.
+            soft_contact_candidate_max: Number of particle-shape candidate
+                threads requiring replay storage. Defaults to ``soft_contact_max``.
 
         .. experimental::
 
@@ -322,7 +325,9 @@ class Contacts:
             """Contact velocity on body [m/s], shape (soft_contact_max,), dtype :class:`vec3`."""
             self.soft_contact_normal = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
             """Contact normal direction [unitless], shape (soft_contact_max,), dtype :class:`vec3`."""
-            self.soft_contact_tids = wp.full(soft_contact_max, -1, dtype=int)
+            if soft_contact_candidate_max is None:
+                soft_contact_candidate_max = soft_contact_max
+            self.soft_contact_tids = wp.full(soft_contact_candidate_max, -1, dtype=int)
 
             # Extended contact attributes (optional, allocated on demand)
             self.force: wp.array | None = None

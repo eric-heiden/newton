@@ -86,10 +86,11 @@ __all__ += [
 # ==================================================================================
 # asset management
 # ==================================================================================
-from ._src.utils.download_assets import download_asset  # noqa: E402
+from ._src.utils.download_assets import download_asset, download_git_folder  # noqa: E402
 
 __all__ += [
     "download_asset",
+    "download_git_folder",
 ]
 
 # ==================================================================================

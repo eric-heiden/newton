@@ -119,6 +119,9 @@ def solve_particle_shape_contacts(
     particle_invmass: wp.array[float],
     particle_radius: wp.array[float],
     particle_flags: wp.array[wp.int32],
+    required_particle_flags: wp.int32,
+    static_contacts_only: wp.int32,
+    apply_body_reaction: wp.int32,
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
@@ -151,7 +154,12 @@ def solve_particle_shape_contacts(
     body_index = shape_body[shape_index]
     particle_index = contact_particle[tid]
 
-    if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
+    flags = particle_flags[particle_index]
+    if (flags & ParticleFlags.ACTIVE) == 0:
+        return
+    if required_particle_flags != 0 and (flags & required_particle_flags) != required_particle_flags:
+        return
+    if static_contacts_only != 0 and body_index >= 0 and body_m_inv[body_index] > 0.0:
         return
 
     px = particle_x[particle_index]
@@ -218,7 +226,7 @@ def solve_particle_shape_contacts(
 
     wp.atomic_add(delta, particle_index, w1 * delta_total)
 
-    if body_index >= 0:
+    if body_index >= 0 and apply_body_reaction != 0:
         # apply_body_deltas() treats body_delta as a velocity-like correction:
         # it multiplies by inverse mass/inertia and dt to update the body pose.
         # delta_total is a positional contact correction, matching the particle
@@ -236,6 +244,7 @@ def solve_particle_particle_contacts(
     particle_invmass: wp.array[float],
     particle_radius: wp.array[float],
     particle_flags: wp.array[wp.int32],
+    particle_world: wp.array[wp.int32],
     k_mu: float,
     k_cohesion: float,
     max_radius: float,
@@ -259,9 +268,10 @@ def solve_particle_particle_contacts(
     radius = particle_radius[i]
     w1 = particle_invmass[i]
     i_fluid = particle_flags[i] & ParticleFlags.FLUID
+    world_id = particle_world[i]
 
     # particle contact
-    query = wp.hash_grid_query(grid, x, radius + max_radius + k_cohesion)
+    query = wp.hash_grid_query(grid, x, radius + max_radius + k_cohesion, world_id)
     index = int(0)
 
     delta = wp.vec3(0.0)
@@ -2783,6 +2793,65 @@ def gather_int32(src: wp.array[wp.int32], perm: wp.array[wp.int32], dst: wp.arra
 def gather_uint32(src: wp.array[wp.uint32], perm: wp.array[wp.int32], dst: wp.array[wp.uint32]):
     tid = wp.tid()
     dst[tid] = src[perm[tid]]
+
+
+@wp.kernel
+def clamp_body_motion(
+    body_q_prev: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_inv_mass: wp.array[float],
+    max_linear: float,
+    max_angular: float,
+    dt: float,
+    # in/out
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Bound a dynamic body's integrated motion before constraint solving.
+
+    The ordinary integration result is preserved unless a velocity component
+    is non-finite or exceeds its configured limit. In that case, the pose is
+    rebuilt from the previous center-of-mass transform and bounded velocity so
+    a single force spike cannot move a body through a thin collider before the
+    final velocity clamp runs.
+    """
+    tid = wp.tid()
+    if body_inv_mass[tid] == 0.0:
+        return
+
+    qd = body_qd[tid]
+    lin = wp.spatial_top(qd)
+    ang = wp.spatial_bottom(qd)
+    rebuild_pose = False
+
+    if not (wp.isfinite(lin[0]) and wp.isfinite(lin[1]) and wp.isfinite(lin[2])):
+        lin = wp.vec3(0.0)
+        rebuild_pose = True
+    if not (wp.isfinite(ang[0]) and wp.isfinite(ang[1]) and wp.isfinite(ang[2])):
+        ang = wp.vec3(0.0)
+        rebuild_pose = True
+
+    if max_linear > 0.0:
+        speed = wp.length(lin)
+        if speed > max_linear:
+            lin *= max_linear / speed
+            rebuild_pose = True
+    if max_angular > 0.0:
+        speed = wp.length(ang)
+        if speed > max_angular:
+            ang *= max_angular / speed
+            rebuild_pose = True
+
+    if rebuild_pose:
+        q_prev = body_q_prev[tid]
+        com = body_com[tid]
+        p_prev = wp.transform_get_translation(q_prev)
+        r_prev = wp.transform_get_rotation(q_prev)
+        x_com_prev = p_prev + wp.quat_rotate(r_prev, com)
+        r = wp.normalize(r_prev + wp.quat(ang, 0.0) * r_prev * 0.5 * dt)
+        x_com = x_com_prev + lin * dt
+        body_q[tid] = wp.transform(x_com - wp.quat_rotate(r, com), r)
+        body_qd[tid] = wp.spatial_vector(lin, ang)
 
 
 @wp.kernel

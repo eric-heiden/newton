@@ -2550,6 +2550,11 @@ class ViewerBase(ABC):
 
     def _log_particles(self, state: newton.State):
         if self.model.particle_count:
+            if not self.show_particles and not self.show_fluid:
+                self.log_fluid(name="/model/fluid", points=None, hidden=True)
+                self.log_points(name="/model/particles", points=None, hidden=True)
+                return
+
             points = state.particle_q
             radii = self.model.particle_radius
 

@@ -1991,6 +1991,12 @@ class ViewerGL(ViewerBase):
         self._invalidate_pbo()
         if self._image_logger is not None:
             self._image_logger.clear()
+        for batch in self.fluids.values():
+            batch.destroy()
+        self.fluids.clear()
+        for batch in self.fluid_diffuse.values():
+            batch.destroy()
+        self.fluid_diffuse.clear()
         self.renderer.close()
 
     @property

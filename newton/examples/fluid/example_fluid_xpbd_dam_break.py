@@ -8,7 +8,7 @@
 # ground plane, splashes against a static pillar, and carries a light
 # dynamic box along with the wave. The fluid is simulated as a
 # position-based fluid (PBF) inside SolverXPBD: particles flagged with
-# ParticleFlags.FLUID generate SPH density constraints instead of
+# ParticleFlags.FLUID generate density constraints instead of
 # pairwise contacts, so the fluid two-way couples with rigid bodies and
 # is not confined to solver bounds.
 #
@@ -25,6 +25,10 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.fluid.utils import parse_particle_count, resolve_particle_grid
+
+_REFERENCE_SPACING = 0.0205
+_FLUID_SIZE = (34 * _REFERENCE_SPACING, 49 * _REFERENCE_SPACING, 59 * _REFERENCE_SPACING)
 
 
 class Example:
@@ -36,20 +40,22 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.viewer = viewer
 
-        spacing = args.spacing
+        particle_grid = resolve_particle_grid(args.particle_count, _FLUID_SIZE, _REFERENCE_SPACING)
+        spacing = particle_grid.spacing
         radius = 0.5 * spacing
         mass = args.rest_density * spacing**3
+        dim_x, dim_y, dim_z = particle_grid.dimensions
 
         builder = newton.ModelBuilder(up_axis="Z", gravity=args.gravity)
         builder.default_particle_radius = radius
 
         builder.add_particle_grid(
-            pos=wp.vec3(-1.2, -0.5 * args.dim_y * spacing, radius),
+            pos=wp.vec3(-1.2, -0.5 * dim_y * spacing, radius),
             rot=wp.quat_identity(),
             vel=wp.vec3(0.0),
-            dim_x=args.dim_x,
-            dim_y=args.dim_y,
-            dim_z=args.dim_z,
+            dim_x=dim_x,
+            dim_y=dim_y,
+            dim_z=dim_z,
             cell_x=spacing,
             cell_y=spacing,
             cell_z=spacing,
@@ -143,6 +149,7 @@ class Example:
                     with wp.ScopedCapture() as capture:
                         self.simulate()
                     self.graph = capture.graph
+                    wp.capture_launch(self.graph)
                 except Exception as exc:
                     warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
                     self.use_cuda_graph = False
@@ -162,7 +169,7 @@ class Example:
         if not np.all(np.isfinite(qd)):
             raise ValueError("XPBD fluid particles contain non-finite velocities")
         radius = float(self.model.particle_max_radius)
-        if q[:, 2].min() < -2.0 * radius:
+        if q[:, 2].min() < radius - 1.0e-5:
             raise ValueError("XPBD fluid particles fell through the ground plane")
         if np.abs(q[:, :2]).max() > 10.0:
             raise ValueError("XPBD fluid particles dispersed unrealistically far")
@@ -230,10 +237,12 @@ class Example:
         parser.add_argument("--iterations", type=int, default=2)
         parser.add_argument("--render-mode", choices=["fluid", "particles"], default="fluid")
 
-        parser.add_argument("--dim-x", type=int, default=34)
-        parser.add_argument("--dim-y", type=int, default=49)
-        parser.add_argument("--dim-z", type=int, default=59)
-        parser.add_argument("--spacing", type=float, default=0.0205)
+        parser.add_argument(
+            "--particle-count",
+            type=parse_particle_count,
+            default=100_000,
+            help="Target fluid particle count; spacing and grid dimensions are derived automatically.",
+        )
         parser.add_argument("--rest-density", type=float, default=1000.0)
         parser.add_argument("--gravity", type=float, default=-9.81)
 

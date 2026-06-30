@@ -4,11 +4,63 @@
 import unittest
 
 import numpy as np
-import warp as wp
 
 import newton
-from newton.examples.fluid.example_fluid_sph_interactive_tank import Example
+from newton._src.viewer.gl.fluid import FluidBatch, FluidRenderer, _Program
 from newton.viewer import ViewerNull
+
+
+class _FluidMaterialProbe:
+    def __init__(self, color=(0.113, 0.425, 0.55, 0.8), absorption=None, blur_radius_world=0.06):
+        for attr in FluidBatch._MATERIAL_ATTRS:
+            setattr(self, attr, getattr(self, "_default_" + attr)())
+        self.color = color
+        self.absorption = absorption
+        self.blur_radius_world = blur_radius_world
+
+    @staticmethod
+    def _default_color():
+        return (0.113, 0.425, 0.55, 0.8)
+
+    @staticmethod
+    def _default_absorption():
+        return None
+
+    @staticmethod
+    def _default_ior():
+        return 1.0
+
+    @staticmethod
+    def _default_reflectance():
+        return 0.1
+
+    @staticmethod
+    def _default_specular_intensity():
+        return 1.2
+
+    @staticmethod
+    def _default_specular_power():
+        return 400.0
+
+    @staticmethod
+    def _default_blur_radius_world():
+        return 0.06
+
+    @staticmethod
+    def _default_max_blur_radius():
+        return 8.0
+
+    @staticmethod
+    def _default_shadow_opacity():
+        return 0.5
+
+    @staticmethod
+    def _default_thickness_scale():
+        return 4.0
+
+    @staticmethod
+    def _default_thickness_gain():
+        return 0.0015
 
 
 class _LogFluidProbe(ViewerNull):
@@ -47,6 +99,15 @@ class _LogFluidProbe(ViewerNull):
 
     def log_points(self, name, points, radii=None, colors=None, hidden=False):
         self.logged_points = {"name": name, "points": points, "radii": radii, "hidden": hidden}
+
+
+class _UniformProbeGL:
+    def __init__(self):
+        self.lookup_count = 0
+
+    def glGetUniformLocation(self, program, name):
+        self.lookup_count += 1
+        return 7
 
 
 class TestViewerFluid(unittest.TestCase):
@@ -120,107 +181,25 @@ class TestViewerFluid(unittest.TestCase):
         self.assertEqual(viewer.logged_points["name"], "fallback")
         self.assertFalse(viewer.logged_points["hidden"])
 
-    def test_interactive_tank_parser_defaults(self):
-        args = Example.create_parser().parse_args([])
+    def test_fluid_renderer_groups_surface_batches_by_material(self):
+        water = _FluidMaterialProbe(color=(0.1, 0.4, 0.6, 0.8))
+        water_later = _FluidMaterialProbe(color=(0.1, 0.4, 0.6, 0.8))
+        honey = _FluidMaterialProbe(color=(0.9, 0.5, 0.1, 0.45), absorption=(0.2, 1.1, 2.6))
 
-        self.assertEqual(args.render_mode, "fluid")
-        self.assertEqual(args.substeps, 3)
-        self.assertEqual(args.pbf_iterations, 3)
-        self.assertGreater(args.box_count, 0)
-        self.assertGreater(args.pick_stiffness, 0.0)
-        self.assertTrue(args.show_diffuse)
-        self.assertGreater(args.fluid_diffuse_max_particles, 0)
-        self.assertAlmostEqual(args.buoyancy_scale, 1.0)
-        self.assertGreater(args.box_linear_drag, 0.0)
-        self.assertGreater(args.box_quadratic_drag, 0.0)
-        self.assertGreater(args.box_floor_stiffness, 0.0)
-        self.assertGreater(min(args.box_density_fractions), 0.0)
-        self.assertGreater(max(args.box_density_fractions), 1.0)
-        self.assertEqual(len(args.fluid_color), 4)
-        self.assertGreater(args.fluid_radius_scale, 1.0)
-        self.assertGreater(args.fluid_blur_radius, 0.0)
-        self.assertGreater(args.foam_radius, 0.0)
-        self.assertGreater(args.foam_motion_blur, 0.0)
+        groups = FluidRenderer._surface_material_groups([water, honey, water_later])
 
-    def test_interactive_tank_rollout_floats_and_sinks_boxes_by_density(self):
-        args = Example.create_parser().parse_args(
-            [
-                "--viewer",
-                "null",
-                "--no-show-bounds",
-                "--box-count",
-                "3",
-                "--box-density-fractions",
-                "0.30",
-                "0.60",
-                "1.60",
-                "--spacing",
-                "0.08",
-                "--radius",
-                "0.06",
-                "--smoothing-length",
-                "0.172",
-                "--shape-collision-distance",
-                "0.06",
-                "--shape-collision-margin",
-                "0.003",
-                "--particle-collision-margin",
-                "0.003",
-                "--fluid-carve-clearance",
-                "0.08",
-                "--dim-x",
-                "34",
-                "--dim-y",
-                "22",
-                "--dim-z",
-                "6",
-                "--emit-lower",
-                "-1.24",
-                "-0.78",
-                "0.06",
-                "--fluid-diffuse-max-particles",
-                "0",
-                "--fluid-render-update-interval",
-                "1",
-            ]
-        )
-        viewer = ViewerNull(num_frames=1)
-        example = Example(viewer, args)
+        self.assertEqual(groups, [[water, water_later], [honey]])
 
-        max_speed = 0.0
-        for _frame in range(240):
-            example.step()
-            wp.synchronize()
-            body_qd = example.state_0.body_qd.numpy()[example.box_body_ids]
-            max_speed = max(max_speed, float(np.linalg.norm(body_qd[:, :3], axis=1).max()))
+    def test_program_caches_uniform_locations(self):
+        gl = _UniformProbeGL()
+        program = _Program.__new__(_Program)
+        program._gl = gl
+        program.program = type("ProgramProbe", (), {"id": 3})()
+        program._uniform_locations = {}
 
-        body_q = example.state_0.body_q.numpy()[example.box_body_ids]
-        half_z = np.asarray([float(h[2]) for h in example.box_half_extents], dtype=np.float32)
-        box_surface = example.box_water_height.numpy()
-
-        self.assertTrue(np.all(np.isfinite(body_q)))
-        self.assertLess(max_speed, 4.0)
-
-        # Boxes lighter than water float partially submerged with a draft that
-        # roughly tracks their density fraction.
-        for box_idx, target_fraction in ((0, 0.30), (1, 0.60)):
-            surface = float(box_surface[box_idx])
-            bottom = float(body_q[box_idx, 2] - half_z[box_idx])
-            top = float(body_q[box_idx, 2] + half_z[box_idx])
-            self.assertLess(bottom, surface, f"floating box {box_idx} lost contact with the water")
-            self.assertGreater(top, surface - 0.10, f"floating box {box_idx} is fully submerged")
-            submerged_fraction = (surface - bottom) / (2.0 * float(half_z[box_idx]))
-            self.assertLess(
-                abs(submerged_fraction - target_fraction),
-                0.35,
-                f"floating box {box_idx} draft {submerged_fraction:.2f} far from density fraction",
-            )
-
-        # The denser-than-water box fully submerges and settles near the floor.
-        sinker_top = float(body_q[2, 2] + half_z[2])
-        sinker_bottom = float(body_q[2, 2] - half_z[2])
-        self.assertLess(sinker_top, float(box_surface[2]) + 0.02, "dense box did not fully submerge")
-        self.assertLess(sinker_bottom, args.bounds_lower[2] + 0.25, "dense box did not sink to the tank floor")
+        self.assertEqual(program._loc("projection"), 7)
+        self.assertEqual(program._loc("projection"), 7)
+        self.assertEqual(gl.lookup_count, 1)
 
 
 if __name__ == "__main__":

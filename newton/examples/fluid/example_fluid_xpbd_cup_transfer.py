@@ -19,6 +19,10 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.fluid.utils import parse_particle_count, resolve_particle_grid
+
+_REFERENCE_SPACING = 0.0016
+_REFERENCE_FILL_HEIGHT = 57 * _REFERENCE_SPACING
 import newton.ik as ik
 
 # Cache the cooked cup SDF on disk so repeated runs skip the voxelization.
@@ -94,6 +98,17 @@ class Example:
         self.cup_height = args.cup_height
         wall_thickness = self.wall_thickness
 
+        fill_width = self.cup_inner_radius * 1.35
+        particle_grid = resolve_particle_grid(
+            args.particle_count,
+            (fill_width, fill_width, _REFERENCE_FILL_HEIGHT),
+            _REFERENCE_SPACING,
+            minimum=(2, 2, 2),
+        )
+        spacing = particle_grid.spacing
+        radius = particle_grid.radius
+        dim_x, dim_y, dim_z = particle_grid.dimensions
+
         # IK runs on a robot-only model
         urdf = newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf"
         ik_builder = newton.ModelBuilder()
@@ -101,7 +116,7 @@ class Example:
         self.ik_model = ik_builder.finalize()
 
         builder = newton.ModelBuilder(gravity=args.gravity)
-        builder.default_particle_radius = args.radius
+        builder.default_particle_radius = radius
         builder.add_urdf(urdf, xform=wp.transform(wp.vec3(0.0), wp.quat_identity()), enable_self_collisions=False)
         builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.4), color=(0.55, 0.56, 0.54))
 
@@ -135,25 +150,23 @@ class Example:
             builder.body_flags[i] = int(newton.BodyFlags.KINEMATIC)
 
         # water column inside the cup
-        fill = self.cup_inner_radius * 1.35
-        dim_xy = max(int(fill / args.spacing), 2)
         builder.add_particle_grid(
             pos=wp.vec3(
-                float(self.spot_a[0] - 0.5 * (dim_xy - 1) * args.spacing),
-                float(self.spot_a[1] - 0.5 * (dim_xy - 1) * args.spacing),
+                float(self.spot_a[0] - 0.5 * (dim_x - 1) * spacing),
+                float(self.spot_a[1] - 0.5 * (dim_y - 1) * spacing),
                 1.2 * wall_thickness,
             ),
             rot=wp.quat_identity(),
             vel=wp.vec3(0.0),
-            dim_x=dim_xy,
-            dim_y=dim_xy,
-            dim_z=args.fill_layers,
-            cell_x=args.spacing,
-            cell_y=args.spacing,
-            cell_z=args.spacing,
-            mass=args.rest_density * args.spacing**3,
-            jitter=0.0005,
-            radius_mean=args.radius,
+            dim_x=dim_x,
+            dim_y=dim_y,
+            dim_z=dim_z,
+            cell_x=spacing,
+            cell_y=spacing,
+            cell_z=spacing,
+            mass=args.rest_density * spacing**3,
+            jitter=0.3 * spacing,
+            radius_mean=radius,
             flags=newton.ParticleFlags.ACTIVE | newton.ParticleFlags.FLUID,
         )
 
@@ -176,7 +189,7 @@ class Example:
         self.solver = newton.solvers.SolverXPBD(
             self.model,
             iterations=args.iterations,
-            fluid_rest_distance=args.spacing,
+            fluid_rest_distance=spacing,
             fluid_cohesion=args.cohesion,
             fluid_viscosity=args.viscosity,
             fluid_relaxation=args.relaxation,
@@ -245,8 +258,8 @@ class Example:
         # substep count, while the cup's peak speed grows ~linearly with the
         # robot speed. Add substeps as the carry speeds up so the wall stays
         # collision-tight -- a CCD-style timestep refinement -- capped so an
-        # extreme slider value cannot stall the frame. 4 substeps already cover
-        # the default and 2x carries; faster carries refine further.
+        # extreme slider value cannot stall the frame. The default eight
+        # substeps also keep the density projection in its stable regime.
         return int(min(16, max(self.base_substeps, np.ceil(2.0 * speed))))
 
     def _apply_water_velocity_cap(self):
@@ -471,6 +484,7 @@ class Example:
                     with wp.ScopedCapture() as capture:
                         self.simulate()
                     self.graph = capture.graph
+                    wp.capture_launch(self.graph)
                 except Exception as exc:
                     warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
                     self.use_cuda_graph = False
@@ -544,9 +558,8 @@ class Example:
 
         ui.separator()
         ui.text("Fluid properties")
-        # These feed the solver as plain Python floats that the captured graph
-        # bakes in, so any change must refresh the solver's derived constants and
-        # invalidate the graph to force a re-capture on the next step.
+        # These feed the solver as Python floats that the captured graph bakes
+        # in, so any change must force a re-capture on the next step.
         changed = False
         c, self.solver.fluid_relaxation = ui.slider_float("Relaxation", self.solver.fluid_relaxation, 0.05, 1.0, "%.2f")
         changed |= c
@@ -560,7 +573,6 @@ class Example:
         )
         changed |= c
         if changed:
-            self.solver._update_fluid_settings()
             self.graph = None
 
     def test_final(self):
@@ -572,6 +584,9 @@ class Example:
         # at default speed the water should still be carried with the cup
         active = (self.model.particle_flags.numpy() & int(newton.ParticleFlags.ACTIVE)) != 0
         heights = q[active][:, 2]
+        radius = float(self.model.particle_max_radius)
+        if heights.min() < radius - 1.0e-5:
+            raise ValueError("water tunneled below the floor")
         if heights.max() < 0.005:
             raise ValueError("All water ended on the floor; the cup carry failed")
 
@@ -579,16 +594,12 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--fps", type=float, default=60.0)
-        # ~100k water particles. The cup carries a texture SDF so the water
-        # collides via one cheap SDF sample per particle. This is the *base*
-        # substep count, used at the default and 2x carries; faster carries scale
-        # it up so the moving wall stays collision-tight (see _substeps_for_speed).
-        parser.add_argument("--substeps", type=int, default=4)
-        # The under-relaxed density correction (see --relaxation) needs several
-        # more iterations to converge: with these fine 100k particles too few
-        # leaves the water buzzing instead of settling, while too low a relaxation
-        # would over-compress it. 8 settles it and keeps the column filled.
-        parser.add_argument("--iterations", type=int, default=8)
+        # ~100k water particles. A smaller pressure timestep suppresses the
+        # particle-scale Jacobi mode and also keeps the moving SDF wall
+        # collision-tight. Four iterations at eight substeps retain the same 32
+        # density iterations per rendered frame as the former 4 x 8 setup.
+        parser.add_argument("--substeps", type=int, default=8)
+        parser.add_argument("--iterations", type=int, default=4)
         # cap fluid neighbors above the bulk (~80) so a hard slosh can't stall a warp
         parser.add_argument("--max-neighbors", type=int, default=128)
         parser.add_argument("--speed", type=float, default=1.0)
@@ -602,19 +613,16 @@ class Example:
         parser.add_argument("--cup-opacity", type=float, default=0.35)
         parser.add_argument("--sdf-resolution", type=int, default=256, help="Cup SDF grid resolution.")
 
-        # ~100k particles filling the cup. The fill leaves headroom so a slosh
-        # has somewhere to go.
-        parser.add_argument("--spacing", type=float, default=0.0016)
-        parser.add_argument("--radius", type=float, default=0.0008)
-        parser.add_argument("--fill-layers", type=int, default=57)
+        parser.add_argument(
+            "--particle-count",
+            type=parse_particle_count,
+            default=100_000,
+            help="Target fluid particle count; spacing, radius, mass, and fill dimensions are derived automatically.",
+        )
         parser.add_argument("--rest-density", type=float, default=1000.0)
         parser.add_argument("--cohesion", type=float, default=0.6)
-        # The summed (standard-PBF) density correction overshoots at full
-        # strength while the cup is carried -- the water buzzes at its velocity
-        # cap instead of settling. Under-relaxing the density push lets it come
-        # to rest; --iterations compensates for the gentler per-iteration push.
-        parser.add_argument("--relaxation", type=float, default=0.3)
-        # The XSPH viscosity pass is a full extra neighbor sweep per substep
+        parser.add_argument("--relaxation", type=float, default=0.6)
+        # The viscosity pass is a full extra neighbor sweep per substep
         # (~40% of the frame at 100k); the density + cohesion solve already reads
         # smooth here, so it is off by default. Raise it for thicker, syrupy flow.
         parser.add_argument("--viscosity", type=float, default=0.0)

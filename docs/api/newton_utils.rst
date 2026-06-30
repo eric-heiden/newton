@@ -30,6 +30,7 @@ newton.utils
    color_srgb_to_linear
    compute_world_offsets
    download_asset
+   download_git_folder
    event_scope
    load_texture
    normalize_texture

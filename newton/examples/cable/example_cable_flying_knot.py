@@ -12,9 +12,11 @@
 # The throw motion is the paper's executed end-effector trajectory,
 # digitized from the follow-through figure of the paper and refit with the
 # paper's own 8-control-point Bezier command parametrization (Appendix D).
-# An xArm7 (the paper's robot, with the paper's 3-DOF translating base)
-# tracks the handle trajectory via Newton's IK module and is animated
-# kinematically. The rope is a chain of capsules coupled by cable joints,
+# An xArm7 (the paper's robot) bolted to a fixed pedestal tracks the
+# handle trajectory with its 7 joints via Newton's IK module and is
+# animated kinematically. (The paper's command also translates the robot
+# base; here the mount is chosen so the fixed-base arm can reach the
+# whole trajectory.) The rope is a chain of capsules coupled by cable joints,
 # simulated with SolverVBD; its root capsule is driven kinematically along
 # the recorded trajectory, mirroring the paper's position-driven particle
 # rope model.
@@ -329,7 +331,10 @@ class Example:
         self.t_hold = getattr(args, "t_hold", 1.5)
         self.duration = self.t_settle + self.t_throw + self.t_flight + self.t_lift + self.t_hold
         self.num_frames = int(round(self.duration * self.fps))
-        self.lift_height = getattr(args, "lift_height", 0.7)
+        self.lift_height = getattr(args, "lift_height", 0.55)
+        # Drift the lift away from the pedestal so the loose knot cannot snag
+        # on the column while it tightens.
+        self.lift_drift = getattr(args, "lift_drift", 0.12)
 
         # --- Handle-tip trajectory (position + rope-root axis) ------------
         self.n_sub_total = self.num_frames * self.sim_substeps
@@ -455,9 +460,11 @@ class Example:
         self.viewer.set_model(self.model)
         self._set_camera()
 
-        # Rope centerline recording for knot metrics.
+        # Rope centerline recording for knot metrics; arm-base recording for
+        # the fixed-pedestal check.
         self.frame_index = 0
         self.rope_traj: list[np.ndarray] = []
+        self.base_traj: list[np.ndarray] = []
 
         self.capture()
 
@@ -496,10 +503,10 @@ class Example:
         mask = (t > t2) & (t <= t3)
         u = np.clip((t[mask] - t2) / self.t_lift, 0.0, 1.0)
         smooth = u * u * (3.0 - 2.0 * u)
-        lift = end_scaled + np.outer(smooth, [0.0, 0.0, self.lift_height])
-        pos[mask] = lift
+        lift_vec = np.array([self.lift_drift, 0.0, self.lift_height])
+        pos[mask] = end_scaled + np.outer(smooth, lift_vec)
         # Hold: final pose.
-        pos[t > t3] = end_scaled + np.array([0.0, 0.0, self.lift_height])
+        pos[t > t3] = end_scaled + lift_vec
 
         pos[:, 2] += self.z_offset
 
@@ -587,23 +594,19 @@ class Example:
 
         urdf_xml = preprocess_xarm_urdf(xarm_dir / "xarm7.urdf")
 
-        # Base: elevated column mount + the paper's 3-DOF translating base
-        # (their Bezier command is 7 joints + 3 base translations).
-        self.base_pos = np.array([0.0, 0.0, self.z_offset + 0.3])
-        base_lim = 0.2
-        base_joint = {
-            "joint_type": newton.JointType.D6,
-            "linear_axes": [
-                newton.ModelBuilder.JointDofConfig(axis=ax, limit_lower=-base_lim, limit_upper=base_lim)
-                for ax in ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0])
-            ],
-        }
+        # Fixed mount: the paper's command includes 3 base translations, but a
+        # translating base reads as an unrealistic sliding pedestal. Instead the
+        # arm is bolted to a static pedestal and the 7 arm joints alone track
+        # the command. The mount is chosen by a workspace search
+        # (scripts/flying_knot/fixed_base_search.py) so the entire trajectory
+        # stays reachable; peak flange IK error is ~14 mm at the whip peak.
+        self.base_pos = np.array([0.30, -0.20, self.z_offset + 0.20])
 
         def build_arm(b: newton.ModelBuilder):
             b.add_urdf(
                 urdf_xml,
                 xform=wp.transform(wp.vec3(*self.base_pos), wp.quat_identity()),
-                base_joint=base_joint,
+                floating=False,
                 enable_self_collisions=False,
                 collapse_fixed_joints=False,
             )
@@ -616,18 +619,21 @@ class Example:
         for s in range(n_shapes_before, len(builder.shape_collision_group)):
             builder.shape_collision_group[s] = 0
 
-        # Pedestal column (visual only): parented to the translating base so
-        # it reads as a lift column, long enough to always reach the floor.
-        pole_len = self.base_pos[2] + base_lim + 0.1
+        # Pedestal column: static world geometry from the floor to the mount.
+        # Collision stays on so the rope rests against the column instead of
+        # tunneling through it during the lift phase.
         builder.add_shape_cylinder(
-            body=n_bodies_before,  # link_base
-            xform=wp.transform(wp.vec3(0.0, 0.0, -pole_len / 2), wp.quat_identity()),
+            body=-1,
+            xform=wp.transform(wp.vec3(self.base_pos[0], self.base_pos[1], self.base_pos[2] / 2), wp.quat_identity()),
             radius=0.075,
-            half_height=pole_len / 2,
-            cfg=newton.ModelBuilder.ShapeConfig(density=0.0, has_shape_collision=False, has_particle_collision=False),
+            half_height=self.base_pos[2] / 2,
+            cfg=newton.ModelBuilder.ShapeConfig(
+                density=0.0, ke=1.0e5, kd=0.0, mu=self.friction, has_particle_collision=False
+            ),
             color=(0.35, 0.36, 0.4),
             label="pedestal",
         )
+        self.arm_base_body = n_bodies_before  # link_base, must remain fixed
 
         # Solve IK for the arm to track the handle over all frames.
         self.arm_body_q_frames = self._solve_arm_ik(build_arm, arm_body_count)
@@ -678,8 +684,9 @@ class Example:
         joint_q = wp.zeros((1, n_coords), dtype=wp.float32)
         # Ready-pose initial guess: elbow bent toward +x.
         init = np.zeros(n_coords, dtype=np.float32)
-        init[4] = 0.6  # joint2 (after 3 base coords + joint1)
-        init[6] = 0.8  # joint4
+        off = n_coords - 7
+        init[off + 1] = 0.6  # joint2
+        init[off + 3] = 0.8  # joint4
         joint_q.assign(init.reshape(1, -1))
 
         ik_state = ik_model.state()
@@ -767,7 +774,10 @@ class Example:
             self.simulate()
         self.sim_time += self.frame_dt
         self.frame_index += 1
-        self.rope_traj.append(self.rope_centerline(self.state_0.body_q.numpy()))
+        body_q = self.state_0.body_q.numpy()
+        self.rope_traj.append(self.rope_centerline(body_q))
+        if self.use_arm:
+            self.base_traj.append(body_q[self.arm_base_body].copy())
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -797,6 +807,13 @@ class Example:
         assert np.isfinite(body_q).all(), "Non-finite body transforms"
         assert np.isfinite(body_qd).all(), "Non-finite body velocities"
 
+        # The robot is bolted to a static pedestal: its base link must not move.
+        if self.use_arm and self.base_traj:
+            base = np.array(self.base_traj)
+            base_drift = np.abs(base - base[0]).max()
+            print(f"arm base transform drift over {len(base)} frames: {base_drift:.2e}")
+            assert base_drift < 1.0e-6, f"arm base moved: max transform drift {base_drift:.2e}"
+
         nodes = self.rope_traj[-1] if self.rope_traj else self.rope_centerline(body_q)
         metrics = self.knot_metrics(nodes)
         print(
@@ -814,6 +831,7 @@ class Example:
                 metrics_crossings=metrics["crossings"],
                 metrics_length_ratio=metrics["length_ratio"],
                 ik_errors=getattr(self, "ik_errors", np.zeros(1)),
+                base_traj=np.array(self.base_traj, dtype=np.float32) if self.base_traj else np.zeros((0, 7)),
             )
             print(f"saved rope trajectory to {self.save_traj}")
 
@@ -845,7 +863,8 @@ def add_arguments(parser):
     parser.add_argument("--t-flight", type=float, default=2.0, dest="t_flight")
     parser.add_argument("--t-lift", type=float, default=2.5, dest="t_lift")
     parser.add_argument("--t-hold", type=float, default=1.5, dest="t_hold")
-    parser.add_argument("--lift-height", type=float, default=0.7, dest="lift_height")
+    parser.add_argument("--lift-height", type=float, default=0.55, dest="lift_height")
+    parser.add_argument("--lift-drift", type=float, default=0.12, dest="lift_drift")
 
 
 if __name__ == "__main__":

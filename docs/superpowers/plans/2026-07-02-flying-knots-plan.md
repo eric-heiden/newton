@@ -42,3 +42,14 @@ Executed in `~/repos/newton-worktrees/flying-knots` (branch `flying-knots` off o
       link videos/figures, parameter tables, PR usage, limitations. Update top-level index if the
       site has a report listing.
 - [ ] Commit worktree branch + report repo.
+
+## Revision (2026-07-03): fixed pedestal
+
+The D6 translating base (paper's 10-DOF command) made the robot/pedestal
+slide up to 0.40 m during the throw. Replaced with a fixed mount found by
+workspace search (fixed_base_search.py): mount (0.30, -0.20, z_off+0.20),
+7-DOF IK, mean 0.04 mm / max 13.5 mm flange error. Pedestal is static
+world geometry with collision on; the lift drifts 0.12 m away from the
+column after pole-snag stripped the knot in 4/8 trials (now 7/8).
+verify_fixed_base.py + test_final assert zero base drift (0.000e+00 over
+484 frames).

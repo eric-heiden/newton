@@ -50,7 +50,7 @@ def main():
     presets = {
         "default": (np.array([0.72, -0.10, example.z_offset + 0.22]), np.array([1.55, -1.30, 0.18])),
         "side": (np.array([0.70, -0.05, example.z_offset + 0.28]), np.array([0.10, -1.95, 0.15])),
-        "closeup": (np.array([0.77, -0.22, example.z_offset + 0.25]), np.array([1.15, 0.55, 0.12])),
+        "closeup": (np.array([0.85, -0.22, example.z_offset + 0.22]), np.array([1.15, 0.55, 0.12])),
         "front": (np.array([0.72, -0.10, example.z_offset + 0.35]), np.array([1.7, 0.3, 0.2])),
     }
     cam_target, delta = presets[args.camera]

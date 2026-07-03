@@ -55,12 +55,13 @@ def fig_writhe(outdir: Path):
 
 
 def fig_ik(outdir: Path):
-    d = np.load("/tmp/fk/champ_arm/champion_000_r0.npz")
+    d = np.load("/tmp/fk/champ_arm_fixed2/champion_000_r0.npz")
     errs = d["ik_errors"] * 1000.0
     t = np.arange(len(errs)) / FPS
     fig, ax = plt.subplots(figsize=(8.2, 3.2))
     ax.plot(t, errs, color="tab:blue", lw=1.5)
     ax.axvspan(1.5, 1.5 + 0.56, color="orange", alpha=0.15, label="throw window")
+    ax.set_yscale("symlog", linthresh=1.0)
     ax.set_xlabel("Simulation time [s]")
     ax.set_ylabel("IK flange tracking error [mm]")
     ax.grid(alpha=0.3)

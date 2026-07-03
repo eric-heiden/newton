@@ -36,6 +36,13 @@ def main():
     ap.add_argument("--camera", default="default")
     ap.add_argument("--require-knot", action="store_true", dest="require_knot")
     ap.add_argument("--verify-in-frame", action="store_true", dest="verify_in_frame")
+    ap.add_argument(
+        "--max-knot-pos",
+        type=float,
+        default=None,
+        dest="max_knot_pos",
+        help="fail (exit 5) if the final knot sits below this arc-length fraction (0=handle, 1=tip)",
+    )
     args, extra = ap.parse_known_args()
 
     import imageio_ffmpeg  # noqa: PLC0415
@@ -158,6 +165,17 @@ def main():
         if args.verify_in_frame and (ndc_max.max() >= 0.95 or ndc_max.mean() >= 0.8):
             print("knot cluster left the frame; exiting 4 for retry")
             sys.exit(4)
+
+    if args.max_knot_pos is not None:
+        nodes = example.rope_traj[-1]
+        idx = knot_cluster(nodes)
+        seg = np.linalg.norm(np.diff(nodes, axis=0), axis=1)
+        arc = np.concatenate([[0], np.cumsum(seg)])
+        knot_pos = float(arc[idx].mean() / arc[-1]) if len(idx) else 1.0
+        print(f"final knot arc-length position: {knot_pos:.2f} (0=handle, 1=tip)")
+        if knot_pos > args.max_knot_pos:
+            print(f"knot ended too close to the rope end (> {args.max_knot_pos}); exiting 5 for retry")
+            sys.exit(5)
 
     example.test_final()
     if args.require_knot:

@@ -14,7 +14,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "newton" / "examples" / "cable"))
 
-from example_cable_flying_knot import count_crossings, polyline_writhe  # noqa: E402
+from example_cable_flying_knot import count_crossings, polyline_writhe
 
 
 def trefoil(n=400, closed=True):

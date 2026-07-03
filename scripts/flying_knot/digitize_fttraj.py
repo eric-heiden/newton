@@ -18,13 +18,13 @@ Outputs (in this directory):
 
 from pathlib import Path
 
-import matplotlib
+import matplotlib  # noqa: TID253
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # noqa: TID253
 import numpy as np
-from PIL import Image
-from scipy.special import comb
+from PIL import Image  # noqa: TID253
+from scipy.special import comb  # noqa: TID253
 
 HERE = Path(__file__).parent
 

@@ -302,7 +302,7 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         # Throw command scaling
-        self.time_scale = getattr(args, "time_scale", 1.0)
+        self.time_scale = getattr(args, "time_scale", 0.8)
         self.throw_scale = getattr(args, "throw_scale", 1.0)
         self.z_offset = getattr(args, "z_offset", 1.1)
 
@@ -311,11 +311,11 @@ class Example:
         self.rope_segments = getattr(args, "rope_segments", 36)
         self.rope_radius = getattr(args, "rope_radius", 0.005)
         self.rope_linear_density = getattr(args, "rope_density", 0.05)  # [kg/m]
-        self.tip_mass = getattr(args, "tip_mass", 0.025)  # [kg]
+        self.tip_mass = getattr(args, "tip_mass", 0.05)  # [kg]
         self.stretch_stiffness = getattr(args, "stretch_stiffness", 2.0e5)
-        self.bend_stiffness = getattr(args, "bend_stiffness", 5.0e-3)
+        self.bend_stiffness = getattr(args, "bend_stiffness", 2.0e-3)
         self.bend_damping = getattr(args, "bend_damping", 1.0e-4)
-        self.stretch_damping = getattr(args, "stretch_damping", 1.0e1)
+        self.stretch_damping = getattr(args, "stretch_damping", 0.5)
         self.friction = getattr(args, "friction", 1.0)
         self.use_arm = not getattr(args, "no_arm", False)
         self.save_traj = getattr(args, "save_traj", None)
@@ -420,7 +420,7 @@ class Example:
             builder.body_inertia[b] = wp.mat33(0.0)
             builder.body_inv_inertia[b] = wp.mat33(0.0)
 
-        builder.add_ground_plane()
+        builder.add_ground_plane(color=(0.42, 0.44, 0.47))
         builder.color()
         self.model = builder.finalize()
 
@@ -823,7 +823,7 @@ class Example:
 
 
 def add_arguments(parser):
-    parser.add_argument("--time-scale", type=float, default=1.0, dest="time_scale")
+    parser.add_argument("--time-scale", type=float, default=0.8, dest="time_scale")
     parser.add_argument("--throw-scale", type=float, default=1.0, dest="throw_scale")
     parser.add_argument("--z-offset", type=float, default=1.1, dest="z_offset")
     parser.add_argument("--substeps", type=int, default=32)
@@ -832,10 +832,10 @@ def add_arguments(parser):
     parser.add_argument("--rope-segments", type=int, default=36, dest="rope_segments")
     parser.add_argument("--rope-radius", type=float, default=0.005, dest="rope_radius")
     parser.add_argument("--rope-density", type=float, default=0.05, dest="rope_density")
-    parser.add_argument("--tip-mass", type=float, default=0.025, dest="tip_mass")
+    parser.add_argument("--tip-mass", type=float, default=0.05, dest="tip_mass")
     parser.add_argument("--stretch-stiffness", type=float, default=2.0e5, dest="stretch_stiffness")
-    parser.add_argument("--stretch-damping", type=float, default=1.0e1, dest="stretch_damping")
-    parser.add_argument("--bend-stiffness", type=float, default=5.0e-3, dest="bend_stiffness")
+    parser.add_argument("--stretch-damping", type=float, default=0.5, dest="stretch_damping")
+    parser.add_argument("--bend-stiffness", type=float, default=2.0e-3, dest="bend_stiffness")
     parser.add_argument("--bend-damping", type=float, default=1.0e-4, dest="bend_damping")
     parser.add_argument("--friction", type=float, default=1.0)
     parser.add_argument("--no-arm", action="store_true", dest="no_arm")

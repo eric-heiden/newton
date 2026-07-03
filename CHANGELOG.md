@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Add `cable_flying_knot` example: an xArm7 ties a mid-air overhand knot with a SolverVBD cable rope, replaying the throw trajectory from Suresh & Atkeson's Flying Knots paper
 
 - Add `cloth_stiff_material_hanging` and `cloth_stiff_material_stretch` examples regression-guarding the new Neo-Hookean triangle material (stability under gravity at extreme stiffness, and bulk area-preservation across a Poisson-ratio sweep)
 - Add three VBD contact examples — `vbd_rigid_rigid_contact`, `vbd_soft_rigid_contact`, and `vbd_soft_rigid_mix_contact` — demonstrating rigid-rigid, soft (particle-rigid), and mixed cloth-bag contacts

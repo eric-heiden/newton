@@ -30,13 +30,14 @@ def main():
     ap.add_argument("--start", type=float, default=0.0, help="start recording at sim time [s]")
     ap.add_argument("--end", type=float, default=1.0e9, help="stop recording at sim time [s]")
     ap.add_argument("--camera", default="default")
+    ap.add_argument("--require-knot", action="store_true", dest="require_knot")
     args, extra = ap.parse_known_args()
 
-    import imageio_ffmpeg
+    import imageio_ffmpeg  # noqa: PLC0415
+    from example_cable_flying_knot import Example, add_arguments  # noqa: PLC0415
 
-    import newton.examples
-    import newton.viewer
-    from example_cable_flying_knot import Example, add_arguments
+    import newton.examples  # noqa: PLC0415
+    import newton.viewer  # noqa: PLC0415
 
     parser = newton.examples.create_parser()
     add_arguments(parser)
@@ -46,14 +47,20 @@ def main():
     example = Example(viewer, ex_args)
 
     # Camera presets (tuned for the flying-knot scene).
-    cam_target = np.array([0.72, -0.08, example.z_offset + 0.25])
     presets = {
-        "default": (cam_target + np.array([2.3, -2.1, 0.55]), None),
-        "side": (cam_target + np.array([0.3, -2.9, 0.35]), None),
-        "closeup": (cam_target + np.array([1.5, -1.4, 0.2]), None),
-        "front": (cam_target + np.array([2.9, 0.4, 0.4]), None),
+        "default": (np.array([0.72, -0.10, example.z_offset + 0.22]), np.array([1.55, -1.30, 0.18])),
+        "side": (np.array([0.70, -0.05, example.z_offset + 0.28]), np.array([0.10, -1.95, 0.15])),
+        "closeup": (np.array([0.77, -0.22, example.z_offset + 0.25]), np.array([1.15, 0.55, 0.12])),
+        "front": (np.array([0.72, -0.10, example.z_offset + 0.35]), np.array([1.7, 0.3, 0.2])),
     }
-    pos, _ = presets[args.camera]
+    cam_target, delta = presets[args.camera]
+    pos = cam_target + delta
+
+    # Brighter studio-like backdrop so the rope reads clearly.
+    r = viewer.renderer
+    r.sky_upper = (0.62, 0.70, 0.80)
+    r.sky_lower = (0.42, 0.44, 0.50)
+    r.background_color = r.sky_upper
     d = cam_target - pos
     yaw = float(np.degrees(np.arctan2(d[1], d[0])))
     pitch = float(np.degrees(np.arctan2(d[2], np.linalg.norm(d[:2]))))
@@ -85,6 +92,11 @@ def main():
     print(f"wrote {args.output}: {written} frames at {args.fps} fps ({written / args.fps:.1f}s)")
 
     example.test_final()
+    if args.require_knot:
+        m = example.knot_metrics(example.rope_traj[-1])
+        if not (abs(m["writhe"]) > 2.0 and m["length_ratio"] < 0.95):
+            print("no knot in this run; exiting 3 for retry")
+            sys.exit(3)
 
 
 if __name__ == "__main__":

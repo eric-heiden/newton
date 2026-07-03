@@ -9,10 +9,10 @@ Usage: uv run python scripts/flying_knot/plot_rope_traj.py TRAJ.npz [OUT.png]
 import sys
 from pathlib import Path
 
-import matplotlib
+import matplotlib  # noqa: TID253
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # noqa: TID253
 import numpy as np
 
 
@@ -41,7 +41,9 @@ def main():
         ax.set_zlim(0, 2.0)
         ax.set_box_aspect((1.1, 1.2, 2.0))
         ax.tick_params(labelsize=5)
-    fig.suptitle(f"writhe={float(d['metrics_writhe']):+.2f} crossings={int(d['metrics_crossings'])} ratio={float(d['metrics_length_ratio']):.3f}")
+    fig.suptitle(
+        f"writhe={float(d['metrics_writhe']):+.2f} crossings={int(d['metrics_crossings'])} ratio={float(d['metrics_length_ratio']):.3f}"
+    )
     fig.tight_layout()
     fig.savefig(out, dpi=110)
     print(f"wrote {out}")

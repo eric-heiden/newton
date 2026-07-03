@@ -413,6 +413,13 @@ add_example_test(
 )
 add_example_test(
     TestCableExamples,
+    name="cable.example_cable_flying_knot",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 20, "no-arm": True, "t-settle": 0.2, "t-flight": 0.2, "t-lift": 0.2, "t-hold": 0.1},
+)
+add_example_test(
+    TestCableExamples,
     name="cable.example_cable_pile",
     devices=test_devices,
     use_viewer=True,

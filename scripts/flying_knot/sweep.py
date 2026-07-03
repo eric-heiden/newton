@@ -50,12 +50,16 @@ GRIDS = {
         "t-flight": [0.8, 2.0],
         "rope-segments": [36, 48],
     },
-    "focus2": {
+    "champion": {
         "time-scale": [0.8],
-        "throw-scale": [0.95, 1.0, 1.05],
-        "tip-mass": [0.06],
-        "bend-stiffness": [1e-3],
-        "friction": [1.0, 1.5],
+        "tip-mass": [0.05],
+        "bend-stiffness": [0.002],
+        "stretch-damping": [0.5],
+    },
+    "basin": {
+        "time-scale": [0.78, 0.8, 0.82],
+        "tip-mass": [0.045, 0.05, 0.055],
+        "bend-stiffness": [0.0015, 0.002, 0.003],
         "stretch-damping": [0.5],
     },
 }
@@ -85,7 +89,7 @@ def analyze(npz_path: Path) -> dict:
     }
 
 
-def run_one(params: dict, tag: str, outdir: Path, extra_args: list[str]) -> dict:
+def run_one(params: dict, tag: str, outdir: Path, extra_args: list[str], use_arm: bool = False) -> dict:
     npz = outdir / f"{tag}.npz"
     cmd = [
         "uv",
@@ -95,18 +99,18 @@ def run_one(params: dict, tag: str, outdir: Path, extra_args: list[str]) -> dict
         "cable_flying_knot",
         "--viewer",
         "null",
-        "--no-arm",
         "--test",
         "--num-frames",
         "600",
         "--save-traj",
         str(npz),
+        *([] if use_arm else ["--no-arm"]),
         *extra_args,
     ]
     for k, v in params.items():
         cmd += [f"--{k}", str(v)]
     t0 = time.time()
-    proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=900)
+    proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=900, check=False)
     elapsed = time.time() - t0
     rec = {"params": params, "tag": tag, "elapsed_s": round(elapsed, 1)}
     if proc.returncode != 0 or not npz.exists():
@@ -122,6 +126,7 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--workers", type=int, default=3)
+    ap.add_argument("--arm", action="store_true")
     ap.add_argument("--outdir", default="/tmp/fk/sweep")
     ap.add_argument("extra", nargs="*", help="extra args passed to the example")
     args = ap.parse_args()
@@ -136,14 +141,14 @@ def main():
     jobs = []
     for i, combo in enumerate(combos):
         for r in range(args.repeats):
-            jobs.append((dict(zip(keys, combo)), f"{args.grid}_{i:03d}_r{r}"))
+            jobs.append((dict(zip(keys, combo, strict=True)), f"{args.grid}_{i:03d}_r{r}"))
     print(f"grid '{args.grid}': {len(combos)} configs x {args.repeats} repeats = {len(jobs)} runs")
 
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
 
     results = []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = [pool.submit(run_one, params, tag, outdir, args.extra) for params, tag in jobs]
+        futures = [pool.submit(run_one, params, tag, outdir, args.extra, args.arm) for params, tag in jobs]
         for i, fut in enumerate(futures):
             rec = fut.result()
             results.append(rec)

@@ -71,6 +71,11 @@ GRIDS = {
         "t-flight": [0.8, 2.0],
         "rope-segments": [36, 48],
     },
+    "mjc_retune": {
+        "time-scale": [0.7, 0.75, 0.8],
+        "throw-scale": [1.0, 1.15],
+        "tip-mass": [0.05, 0.06, 0.07],
+    },
     "champion": {
         "time-scale": [0.8],
         "tip-mass": [0.05],
@@ -138,14 +143,16 @@ def analyze(npz_path: Path) -> dict:
     }
 
 
-def run_one(params: dict, tag: str, outdir: Path, extra_args: list[str], use_arm: bool = False) -> dict:
+def run_one(
+    params: dict, tag: str, outdir: Path, extra_args: list[str], use_arm: bool = False, module: str = "cable_flying_knot"
+) -> dict:
     npz = outdir / f"{tag}.npz"
     cmd = [
         "uv",
         "run",
         "-m",
         "newton.examples",
-        "cable_flying_knot",
+        module,
         "--viewer",
         "null",
         "--test",
@@ -153,7 +160,7 @@ def run_one(params: dict, tag: str, outdir: Path, extra_args: list[str], use_arm
         "600",
         "--save-traj",
         str(npz),
-        *([] if use_arm else ["--no-arm"]),
+        *([] if (use_arm or module != "cable_flying_knot") else ["--no-arm"]),
         *extra_args,
     ]
     for k, v in params.items():
@@ -176,6 +183,7 @@ def main():
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--workers", type=int, default=3)
     ap.add_argument("--arm", action="store_true")
+    ap.add_argument("--module", default="cable_flying_knot")
     ap.add_argument("--outdir", default="/tmp/fk/sweep")
     ap.add_argument("extra", nargs="*", help="extra args passed to the example")
     args = ap.parse_args()
@@ -197,7 +205,7 @@ def main():
 
     results = []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = [pool.submit(run_one, params, tag, outdir, args.extra, args.arm) for params, tag in jobs]
+        futures = [pool.submit(run_one, params, tag, outdir, args.extra, args.arm, args.module) for params, tag in jobs]
         for i, fut in enumerate(futures):
             rec = fut.result()
             results.append(rec)

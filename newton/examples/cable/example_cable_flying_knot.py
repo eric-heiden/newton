@@ -831,6 +831,7 @@ class Example:
                 metrics_crossings=metrics["crossings"],
                 metrics_length_ratio=metrics["length_ratio"],
                 ik_errors=getattr(self, "ik_errors", np.zeros(1)),
+                arm_joint_q=getattr(self, "arm_joint_q", np.zeros((0, 7))).astype(np.float32),
                 base_traj=np.array(self.base_traj, dtype=np.float32) if self.base_traj else np.zeros((0, 7)),
             )
             print(f"saved rope trajectory to {self.save_traj}")

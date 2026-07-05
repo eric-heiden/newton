@@ -34,6 +34,7 @@ def main():
     ap.add_argument("--start", type=float, default=0.0, help="start recording at sim time [s]")
     ap.add_argument("--end", type=float, default=1.0e9, help="stop recording at sim time [s]")
     ap.add_argument("--camera", default="default")
+    ap.add_argument("--module", default="cable_flying_knot", choices=["cable_flying_knot", "cable_flying_knot_mujoco"])
     ap.add_argument("--require-knot", action="store_true", dest="require_knot")
     ap.add_argument("--verify-in-frame", action="store_true", dest="verify_in_frame")
     ap.add_argument(
@@ -46,7 +47,10 @@ def main():
     args, extra = ap.parse_known_args()
 
     import imageio_ffmpeg  # noqa: PLC0415
-    from example_cable_flying_knot import Example, add_arguments  # noqa: PLC0415
+    if args.module == "cable_flying_knot_mujoco":
+        from example_cable_flying_knot_mujoco import Example, add_arguments  # noqa: PLC0415
+    else:
+        from example_cable_flying_knot import Example, add_arguments  # noqa: PLC0415
 
     import newton.examples  # noqa: PLC0415
     import newton.viewer  # noqa: PLC0415

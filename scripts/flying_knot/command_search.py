@@ -123,7 +123,7 @@ def main():
         if best is not None:
             thetas[0] = np.array(best["theta"])  # keep the incumbent
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            recs = list(pool.map(lambda p: evaluate(p[1], f"g{gen}_i{p[0]}", outdir), enumerate(thetas)))
+            recs = list(pool.map(lambda p, g=gen: evaluate(p[1], f"g{g}_i{p[0]}", outdir), enumerate(thetas)))
         recs.sort(key=lambda r: -r["score"])
         history.extend(recs)
         if best is None or recs[0]["score"] > best["score"]:

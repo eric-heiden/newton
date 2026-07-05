@@ -76,6 +76,11 @@ GRIDS = {
         "throw-scale": [1.0, 1.15],
         "tip-mass": [0.05, 0.06, 0.07],
     },
+    "kinroot_focus": {
+        "time-scale": [0.72, 0.75, 0.78],
+        "throw-scale": [1.1, 1.15, 1.2],
+        "tip-mass": [0.06, 0.07, 0.08],
+    },
     "mjc_follow": {
         "time-scale": [0.7, 0.8],
         "tip-mass": [0.05, 0.07],

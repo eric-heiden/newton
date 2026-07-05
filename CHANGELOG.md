@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Add `cable_flying_knot_mujoco` example: the flying-knot xArm7 simulated dynamically by SolverMuJoCo and coupled to the SolverVBD rope through the experimental coupled-solver framework, driven by a C2-continuous joint reference
 - Add `cable_flying_knot` example: an xArm7 ties a mid-air overhand knot with a SolverVBD cable rope, replaying the throw trajectory from Suresh & Atkeson's Flying Knots paper
 
 - Add `cloth_stiff_material_hanging` and `cloth_stiff_material_stretch` examples regression-guarding the new Neo-Hookean triangle material (stability under gravity at extreme stiffness, and bulk area-preservation across a Poisson-ratio sweep)

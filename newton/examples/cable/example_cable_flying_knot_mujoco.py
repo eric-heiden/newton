@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import warp as wp
@@ -208,12 +209,15 @@ def drive_root_from_ee(
     num_steps: int,
     ee_body: int,
     root_body: int,
+    root_local: int,
     tip_offset: wp.vec3,
     seg_half: float,
     axis_sched: wp.array[wp.vec3],
     quat_sched: wp.array[wp.quat],
     body_q0: wp.array[wp.transform],
     body_q1: wp.array[wp.transform],
+    entry_q0: wp.array[wp.transform],
+    entry_q1: wp.array[wp.transform],
 ):
     """Kinematic root drive: place the rope root at the live handle tip.
 
@@ -228,6 +232,43 @@ def drive_root_from_ee(
     T = wp.transform(tip + a * seg_half, quat_sched[idx])
     body_q0[root_body] = T
     body_q1[root_body] = T
+    # The coupled solver reconciles entry-local output states over the parent
+    # state, and VBD leaves kinematic bodies untouched in its output, so the
+    # prescribed pose must also be written into the entry buffers.
+    entry_q0[root_local] = T
+    entry_q1[root_local] = T
+
+
+@wp.kernel
+def drive_root_from_schedule(
+    step_idx: wp.array[wp.int32],
+    num_steps: int,
+    root_body: int,
+    root_local: int,
+    pos_sched: wp.array[wp.vec3],
+    quat_sched: wp.array[wp.quat],
+    vel_sched: wp.array[wp.spatial_vector],
+    body_q0: wp.array[wp.transform],
+    body_q1: wp.array[wp.transform],
+    body_qd0: wp.array[wp.spatial_vector],
+    body_qd1: wp.array[wp.spatial_vector],
+    entry_q0: wp.array[wp.transform],
+    entry_q1: wp.array[wp.transform],
+    entry_qd0: wp.array[wp.spatial_vector],
+    entry_qd1: wp.array[wp.spatial_vector],
+):
+    idx = wp.min(step_idx[0], num_steps - 1)
+    T = wp.transform(pos_sched[idx], quat_sched[idx])
+    v = vel_sched[idx]
+    body_q0[root_body] = T
+    body_q1[root_body] = T
+    body_qd0[root_body] = v
+    body_qd1[root_body] = v
+    # See drive_root_from_ee: entry output buffers must be written directly.
+    entry_q0[root_local] = T
+    entry_q1[root_local] = T
+    entry_qd0[root_local] = v
+    entry_qd1[root_local] = v
 
 
 @wp.kernel
@@ -417,6 +458,18 @@ class Example:
         self.num_frames = int(round(self.duration * self.fps))
         self.lift_height = getattr(args, "lift_height", 0.7)
         self.n_sub_total = self.num_frames * self.sim_substeps
+        if getattr(args, "command", "digitized") == "searched":
+            # Best command from scripts/flying_knot/command_search.py (cross-
+            # entropy search over Bezier control point deltas + timing/tip
+            # mass): coils the rope to |writhe| 2.7 under the coupled
+            # dynamics, though the tip does not yet thread the loop reliably.
+            self.bezier_delta_file = str(Path(newton.examples.get_asset("flying_knot_searched_command.npz")))
+            self.time_scale = 0.6904
+            self.t_throw = T_THROW * self.time_scale
+            self.tip_mass = 0.049
+            self.duration = self.t_settle + self.t_throw + self.t_flight + self.t_lift + self.t_hold
+            self.num_frames = int(round(self.duration * self.fps))
+            self.n_sub_total = self.num_frames * self.sim_substeps
 
         xarm_dir = default_xarm_dir()
         if xarm_dir is None:
@@ -502,11 +555,7 @@ class Example:
             builder.shape_collision_group[s] = 0
 
         # Rope (VBD entry), hanging from the handle tip at t=0.
-        rope_body_start, rope_joint_start, rope_shape_start = (
-            builder.body_count,
-            builder.joint_count,
-            builder.shape_count,
-        )
+        rope_shape_start = builder.shape_count
         seg_len = self.rope_length / self.rope_segments
         tip0 = self.tip_pos_frames[0]
         rope_points = [
@@ -558,9 +607,10 @@ class Example:
             )
             self.rope_joints = [*rope_joints, attach_joint]
         else:
-            # Kinematic root: prescribed from the live EE pose + the trailing
-            # axis schedule (as in the kinematic example, but the tip position
-            # comes from the MuJoCo dynamics, so it stays smooth).
+            # Kinematic root ("kinematic": prescribed from the live EE pose;
+            # "command": prescribed from the analytic command schedule exactly
+            # as in the kinematic example, while the MuJoCo arm tracks the
+            # same command dynamically).
             root = rope_bodies[0]
             builder.body_mass[root] = 0.0
             builder.body_inv_mass[root] = 0.0
@@ -629,6 +679,11 @@ class Example:
             ),
         )
 
+        vbd_entry = self.solver._entries["vbd"]
+        self.vbd_entry_state_0 = vbd_entry.state_0
+        self.vbd_entry_state_1 = vbd_entry.state_1
+        self.root_local = int(vbd_entry.body_global_to_local.numpy()[self.rope_bodies[0]])
+
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
@@ -642,10 +697,20 @@ class Example:
         self.q_ref_wp = wp.array2d(self.q_ref_sub.astype(np.float32), dtype=float)
         self.qd_ref_wp = wp.array2d(self.qd_ref_sub.astype(np.float32), dtype=float)
         self.step_idx = wp.zeros(1, dtype=wp.int32)
-        if self.root_drive == "kinematic":
-            axes_sub, quats_sub = self._root_axis_schedule()
+        if self.root_drive in ("kinematic", "command"):
+            axes_sub, quats_sub, tips_sub = self._root_axis_schedule()
             self.root_axis_wp = wp.array(axes_sub.astype(np.float32), dtype=wp.vec3)
             self.root_quat_wp = wp.array(quats_sub.astype(np.float32), dtype=wp.quat)
+            root_pos = tips_sub + axes_sub * (self.seg_len / 2)
+            self.root_pos_wp = wp.array(root_pos.astype(np.float32), dtype=wp.vec3)
+            # Spatial velocity of the prescribed root (angular from the axis
+            # rotation, linear at the body origin), so the VBD entry sees the
+            # correct kinematic velocity instead of a zero-velocity teleport.
+            lin = np.gradient(root_pos, self.sim_dt, axis=0)
+            ang = np.cross(axes_sub[:-1], np.diff(axes_sub, axis=0)) / self.sim_dt
+            ang = np.vstack([ang, ang[-1:]])
+            vel = np.concatenate([ang, lin], axis=1)
+            self.root_vel_wp = wp.array(vel.astype(np.float32), dtype=wp.spatial_vector)
 
         self.viewer.set_model(self.model)
         self._set_camera()
@@ -734,7 +799,7 @@ class Example:
         axes /= np.linalg.norm(axes, axis=1, keepdims=True)
         axes[t_sub <= self.t_settle] = down
         quats = self._axis_quats(axes)
-        return axes, quats
+        return axes, quats, tips_sub
 
     def _axis_quats(self, axes: np.ndarray) -> np.ndarray:
         """Twist-free EE orientation series aligning +z with the handle axis."""
@@ -800,6 +865,55 @@ class Example:
                 self.simulate()
             self.graph = cap.graph
 
+    def _drive_root(self, post_step: bool):
+        """Prescribe the kinematic rope-root pose in parent and entry states."""
+        if self.root_drive == "kinematic":
+            wp.launch(
+                drive_root_from_ee,
+                dim=1,
+                inputs=[
+                    self.step_idx,
+                    self.n_sub_total,
+                    self.ee_body,
+                    self.rope_bodies[0],
+                    self.root_local,
+                    wp.vec3(0.0, 0.0, HANDLE_LENGTH),
+                    self.seg_len / 2,
+                    self.root_axis_wp,
+                    self.root_quat_wp,
+                ],
+                outputs=[
+                    self.state_0.body_q,
+                    self.state_1.body_q,
+                    self.vbd_entry_state_0.body_q,
+                    self.vbd_entry_state_1.body_q,
+                ],
+            )
+        elif self.root_drive == "command":
+            wp.launch(
+                drive_root_from_schedule,
+                dim=1,
+                inputs=[
+                    self.step_idx,
+                    self.n_sub_total,
+                    self.rope_bodies[0],
+                    self.root_local,
+                    self.root_pos_wp,
+                    self.root_quat_wp,
+                    self.root_vel_wp,
+                ],
+                outputs=[
+                    self.state_0.body_q,
+                    self.state_1.body_q,
+                    self.state_0.body_qd,
+                    self.state_1.body_qd,
+                    self.vbd_entry_state_0.body_q,
+                    self.vbd_entry_state_1.body_q,
+                    self.vbd_entry_state_0.body_qd,
+                    self.vbd_entry_state_1.body_qd,
+                ],
+            )
+
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -815,24 +929,13 @@ class Example:
                 ],
                 outputs=[self.control.joint_target_q, self.control.joint_target_qd],
             )
-            if self.root_drive == "kinematic":
-                wp.launch(
-                    drive_root_from_ee,
-                    dim=1,
-                    inputs=[
-                        self.step_idx,
-                        self.n_sub_total,
-                        self.ee_body,
-                        self.rope_bodies[0],
-                        wp.vec3(0.0, 0.0, HANDLE_LENGTH),
-                        self.seg_len / 2,
-                        self.root_axis_wp,
-                        self.root_quat_wp,
-                    ],
-                    outputs=[self.state_0.body_q, self.state_1.body_q],
-                )
+            self._drive_root(post_step=False)
             self.model.collide(self.state_0, self.contacts, collision_pipeline=self.collision_pipeline)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            # The coupled solver reconciles entry output states over the parent
+            # output, and prescribed kinematic poses do not survive the entry
+            # solve, so re-apply the root prescription to the output state.
+            self._drive_root(post_step=True)
             newton.eval_ik(self.model, self.state_1, self.state_1.joint_q, self.state_1.joint_qd)
             self.state_0, self.state_1 = self.state_1, self.state_0
             wp.launch(advance_step, dim=1, inputs=[self.step_idx])
@@ -944,8 +1047,9 @@ def add_arguments(parser):
     parser.add_argument("--follow-scale", type=float, default=1.0, dest="follow_scale")
     parser.add_argument("--axis-weight", type=float, default=0.0, dest="axis_weight")
     parser.add_argument("--bezier-delta-file", type=str, default=None, dest="bezier_delta_file")
+    parser.add_argument("--command", type=str, default="digitized", choices=["digitized", "searched"])
     parser.add_argument(
-        "--root-drive", type=str, default="attached", choices=["attached", "kinematic"], dest="root_drive"
+        "--root-drive", type=str, default="attached", choices=["attached", "kinematic", "command"], dest="root_drive"
     )
     parser.add_argument("--gain-scale", type=float, default=1.0, dest="gain_scale")
     parser.add_argument("--effort-scale", type=float, default=1.0, dest="effort_scale")

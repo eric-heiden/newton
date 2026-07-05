@@ -79,9 +79,7 @@ def main():
     xs = np.arange(0.05, 0.56, 0.1)
     ys = np.arange(-0.55, 0.16, 0.1)
     zs = z0 + np.arange(0.0, 0.51, 0.125)
-    candidates = [
-        (x, y, z) for x in xs for y in ys for z in zs if geometric_ok((x, y, z), flanges)
-    ]
+    candidates = [(x, y, z) for x in xs for y in ys for z in zs if geometric_ok((x, y, z), flanges)]
     print(f"{len(candidates)} geometrically feasible mounts")
 
     results = []
@@ -107,10 +105,12 @@ def main():
             flush=True,
         )
 
-    results.sort(key=lambda r: (r[0] if r[2] < 0.05 else r[0] + 1e3))
+    results.sort(key=lambda r: r[0] if r[2] < 0.05 else r[0] + 1e3)
     print("\nbest mounts (err < 5 cm):")
     for peak, p95, err, mount in results[:8]:
-        print(f"  ({mount[0]:.2f}, {mount[1]:.2f}, {mount[2]:.2f})  peak {peak:.1f} rad/s  p99.5 {p95:.1f}  err {err:.3f}")
+        print(
+            f"  ({mount[0]:.2f}, {mount[1]:.2f}, {mount[2]:.2f})  peak {peak:.1f} rad/s  p99.5 {p95:.1f}  err {err:.3f}"
+        )
 
 
 if __name__ == "__main__":

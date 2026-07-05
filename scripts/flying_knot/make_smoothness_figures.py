@@ -72,8 +72,12 @@ def main():
     jerk_m = np.diff(qdd_m, axis=0) * FPS
     n = min(len(qm), len(qm_ref) - 1)
     track = np.abs(qm[:n] - qm_ref[1 : n + 1]).max()
-    print(f"kinematic: peak |qd| {np.abs(qd_k).max():.1f}  |qdd| {np.abs(qdd_k).max():.0f}  |jerk| {np.abs(jerk_k).max():.2e}")
-    print(f"mujoco:    peak |qd| {np.abs(qd_m).max():.1f}  |qdd| {np.abs(qdd_m).max():.0f}  |jerk| {np.abs(jerk_m).max():.2e}")
+    print(
+        f"kinematic: peak |qd| {np.abs(qd_k).max():.1f}  |qdd| {np.abs(qdd_k).max():.0f}  |jerk| {np.abs(jerk_k).max():.2e}"
+    )
+    print(
+        f"mujoco:    peak |qd| {np.abs(qd_m).max():.1f}  |qdd| {np.abs(qdd_m).max():.0f}  |jerk| {np.abs(jerk_m).max():.2e}"
+    )
     print(f"mujoco max joint tracking error vs C2 reference: {track:.4f} rad")
 
 

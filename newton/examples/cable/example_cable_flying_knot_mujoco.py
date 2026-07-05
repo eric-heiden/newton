@@ -45,6 +45,9 @@ from newton.examples.cable.example_cable_flying_knot import (
     default_xarm_dir,
     polyline_writhe,
     preprocess_xarm_urdf,
+    quat_between,
+    quat_from_z_to,
+    quat_mul,
 )
 from newton.solvers import SolverMuJoCo, SolverVBD
 
@@ -200,6 +203,34 @@ def apply_joint_targets(
 
 
 @wp.kernel
+def drive_root_from_ee(
+    step_idx: wp.array[wp.int32],
+    num_steps: int,
+    ee_body: int,
+    root_body: int,
+    tip_offset: wp.vec3,
+    seg_half: float,
+    axis_sched: wp.array[wp.vec3],
+    quat_sched: wp.array[wp.quat],
+    body_q0: wp.array[wp.transform],
+    body_q1: wp.array[wp.transform],
+):
+    """Kinematic root drive: place the rope root at the live handle tip.
+
+    The tip position comes from the dynamically simulated EE body (previous
+    substep, a lag of one sim_dt), while the root orientation follows the
+    precomputed twist-free trailing-axis schedule as in the kinematic
+    example.
+    """
+    idx = wp.min(step_idx[0], num_steps - 1)
+    tip = wp.transform_point(body_q0[ee_body], tip_offset)
+    a = axis_sched[idx]
+    T = wp.transform(tip + a * seg_half, quat_sched[idx])
+    body_q0[root_body] = T
+    body_q1[root_body] = T
+
+
+@wp.kernel
 def advance_step(step_idx: wp.array[wp.int32]):
     step_idx[0] = step_idx[0] + 1
 
@@ -212,6 +243,8 @@ def solve_branch_continuous_ik(
     *,
     posture_weight: float = 0.1,
     flange_weight: float = 0.0,
+    axis_weight: float = 0.0,
+    axis_quats: np.ndarray | None = None,
     max_step: float = 0.02,
     iters: int = 12,
     n_arm_coords: int = 7,
@@ -261,10 +294,22 @@ def solve_branch_continuous_ik(
     n_coords = ik_model.joint_coord_count
     posture_anchor = wp.zeros(n_coords, dtype=wp.float32)
     posture_obj = IKObjectivePosture(n_coords=n_coords, anchor=posture_anchor, weight=posture_weight)
+    objectives = [flange_obj, tip_obj, limit_obj, posture_obj]
+    rot_obj = None
+    if axis_weight > 0.0 and axis_quats is not None:
+        # Steer the handle axis like the demonstrator's wrist: the twist-free
+        # orientation series aligns EE +z with the trailing-velocity axis.
+        rot_obj = ik.IKObjectiveRotation(
+            link_index=ee_index,
+            link_offset_rotation=wp.quat_identity(),
+            target_rotations=wp.array([wp.vec4(*axis_quats[0])], dtype=wp.vec4),
+            weight=axis_weight,
+        )
+        objectives.append(rot_obj)
     solver = ik.IKSolver(
         model=ik_model,
         n_problems=1,
-        objectives=[flange_obj, tip_obj, limit_obj, posture_obj],
+        objectives=objectives,
         optimizer=ik.IKOptimizer.LM,
         jacobian_mode=ik.IKJacobianType.AUTODIFF,
     )
@@ -276,15 +321,23 @@ def solve_branch_continuous_ik(
 
     ik_state = ik_model.state()
 
-    def solve_target(flange, tip, n_iters):
+    def solve_target(flange, tip, quat, n_iters):
         # Anchor the posture at the current (warm-start) configuration.
         wp.copy(posture_anchor, joint_q.reshape((-1,)))
         flange_obj.set_target_position(0, wp.vec3(*flange))
         tip_obj.set_target_position(0, wp.vec3(*tip))
+        if rot_obj is not None and quat is not None:
+            rot_obj.set_target_rotation(0, wp.vec4(*quat))
         solver.step(joint_q, joint_q, iterations=n_iters)
 
+    def nlerp_quat(qa, qb, alpha):
+        if qa @ qb < 0.0:
+            qb = -qb
+        q = (1.0 - alpha) * qa + alpha * qb
+        return q / np.linalg.norm(q)
+
     posture_obj.weight = 0.0
-    solve_target(flanges[0], tips[0], 96)
+    solve_target(flanges[0], tips[0], axis_quats[0] if axis_quats is not None else None, 96)
     posture_obj.weight = posture_weight
     q_frames = np.zeros((len(tips), n_arm_coords), dtype=np.float64)
     q_frames[0] = joint_q.numpy()[0][:n_arm_coords]
@@ -294,9 +347,13 @@ def solve_branch_continuous_ik(
         n_sub = max(1, int(np.ceil(dist / max_step)))
         for k in range(1, n_sub + 1):
             alpha = k / n_sub
+            quat = None
+            if axis_quats is not None:
+                quat = nlerp_quat(axis_quats[i - 1], axis_quats[i], alpha)
             solve_target(
                 flanges[i - 1] + alpha * (flanges[i] - flanges[i - 1]),
                 tips[i - 1] + alpha * (tips[i] - tips[i - 1]),
+                quat,
                 iters,
             )
         q_np = joint_q.numpy()[0]
@@ -342,6 +399,11 @@ class Example:
         self.ref_filter_width = getattr(args, "ref_filter_width", 5)
         self.posture_weight = getattr(args, "posture_weight", 0.1)
         self.flange_weight = getattr(args, "flange_weight", 0.0)
+        self.attach_bend_scale = getattr(args, "attach_bend_scale", 1.0)
+        self.follow_scale = getattr(args, "follow_scale", 1.0)
+        self.axis_weight = getattr(args, "axis_weight", 0.0)
+        self.bezier_delta_file = getattr(args, "bezier_delta_file", None)
+        self.root_drive = getattr(args, "root_drive", "attached")
         self.gain_scale = getattr(args, "gain_scale", 1.0)
         self.effort_scale = getattr(args, "effort_scale", 1.0)
 
@@ -400,7 +462,9 @@ class Example:
         builder.joint_armature[: self.n_arm_coords] = [0.05] * self.n_arm_coords
         # POSITION_VELOCITY drive: the C2 velocity reference feeds forward, so
         # tracking does not lag by (kd/ke) * qd during the fast throw.
-        builder.joint_target_mode[: self.n_arm_coords] = [int(newton.JointTargetMode.POSITION_VELOCITY)] * self.n_arm_coords
+        builder.joint_target_mode[: self.n_arm_coords] = [
+            int(newton.JointTargetMode.POSITION_VELOCITY)
+        ] * self.n_arm_coords
 
         # Gravity compensation for clean PD tracking (as in the Franka examples).
         gravcomp = builder.custom_attributes["mujoco:gravcomp"]
@@ -445,7 +509,9 @@ class Example:
         )
         seg_len = self.rope_length / self.rope_segments
         tip0 = self.tip_pos_frames[0]
-        rope_points = [wp.vec3(*(tip0 + np.array([0.0, 0.0, -1.0]) * (i * seg_len))) for i in range(self.rope_segments + 1)]
+        rope_points = [
+            wp.vec3(*(tip0 + np.array([0.0, 0.0, -1.0]) * (i * seg_len))) for i in range(self.rope_segments + 1)
+        ]
         capsule_volume = math.pi * self.rope_radius**2 * seg_len + 4.0 / 3.0 * math.pi * self.rope_radius**3
         rope_density = self.rope_linear_density * seg_len / capsule_volume
         rope_cfg = newton.ModelBuilder.ShapeConfig(density=rope_density, ke=1.0e5, kd=0.0, mu=self.friction)
@@ -475,21 +541,32 @@ class Example:
             label="tip_weight",
         )
 
-        # Attachment: handle tip -> rope root, owned by the VBD entry with the
-        # EE body arriving as a proxy. Bend stiffness ~rope so the rope pivots
-        # at the handle tip like a tied-on cord.
-        attach_joint = builder.add_joint_cable(
-            parent=self.ee_body,
-            child=rope_bodies[0],
-            parent_xform=wp.transform(wp.vec3(0.0, 0.0, HANDLE_LENGTH), wp.quat_identity()),
-            child_xform=wp.transform(wp.vec3(0.0, 0.0, -seg_len / 2), wp.quat_identity()),
-            stretch_stiffness=self.stretch_stiffness,
-            stretch_damping=self.stretch_damping,
-            bend_stiffness=self.bend_stiffness,
-            bend_damping=self.bend_damping,
-            label="rope_attach",
-        )
-        self.rope_joints = [*rope_joints, attach_joint]
+        if self.root_drive == "attached":
+            # Attachment: handle tip -> rope root, owned by the VBD entry with
+            # the EE body arriving as a proxy. Bend stiffness ~rope so the rope
+            # pivots at the handle tip like a tied-on cord.
+            attach_joint = builder.add_joint_cable(
+                parent=self.ee_body,
+                child=rope_bodies[0],
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, HANDLE_LENGTH), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(0.0, 0.0, -seg_len / 2), wp.quat_identity()),
+                stretch_stiffness=self.stretch_stiffness,
+                stretch_damping=self.stretch_damping,
+                bend_stiffness=self.bend_stiffness * self.attach_bend_scale,
+                bend_damping=self.bend_damping * self.attach_bend_scale,
+                label="rope_attach",
+            )
+            self.rope_joints = [*rope_joints, attach_joint]
+        else:
+            # Kinematic root: prescribed from the live EE pose + the trailing
+            # axis schedule (as in the kinematic example, but the tip position
+            # comes from the MuJoCo dynamics, so it stays smooth).
+            root = rope_bodies[0]
+            builder.body_mass[root] = 0.0
+            builder.body_inv_mass[root] = 0.0
+            builder.body_inertia[root] = wp.mat33(0.0)
+            builder.body_inv_inertia[root] = wp.mat33(0.0)
+            self.rope_joints = list(rope_joints)
         rope_shapes = list(range(rope_shape_start, builder.shape_count))
         ground_shape = builder.add_ground_plane(color=(0.42, 0.44, 0.47))
         self.rope_shapes = [*rope_shapes, ground_shape]
@@ -526,6 +603,7 @@ class Example:
                     solver=lambda v: SolverVBD(
                         model=v,
                         iterations=self.vbd_iterations,
+                        rigid_body_contact_buffer_size=1024,
                         rigid_contact_history=True,
                     ),
                     bodies=self.rope_bodies,
@@ -534,15 +612,19 @@ class Example:
                 ),
             ],
             coupling=SolverCoupledProxy.Config(
-                proxies=[
-                    SolverCoupledProxy.Proxy(
-                        source="mjc",
-                        destination="vbd",
-                        bodies=[self.ee_body],
-                        mass_scale=getattr(args, "mass_scale", 1.0),
-                        mode=getattr(args, "coupling_mode", "lagged"),
-                    ),
-                ],
+                proxies=(
+                    [
+                        SolverCoupledProxy.Proxy(
+                            source="mjc",
+                            destination="vbd",
+                            bodies=[self.ee_body],
+                            mass_scale=getattr(args, "mass_scale", 1.0),
+                            mode=getattr(args, "coupling_mode", "lagged"),
+                        ),
+                    ]
+                    if True  # keep proxy in both modes; empty proxy list breaks coupled stepping
+                    else []
+                ),
                 iterations=getattr(args, "proxy_iterations", 1),
             ),
         )
@@ -560,6 +642,10 @@ class Example:
         self.q_ref_wp = wp.array2d(self.q_ref_sub.astype(np.float32), dtype=float)
         self.qd_ref_wp = wp.array2d(self.qd_ref_sub.astype(np.float32), dtype=float)
         self.step_idx = wp.zeros(1, dtype=wp.int32)
+        if self.root_drive == "kinematic":
+            axes_sub, quats_sub = self._root_axis_schedule()
+            self.root_axis_wp = wp.array(axes_sub.astype(np.float32), dtype=wp.vec3)
+            self.root_quat_wp = wp.array(quats_sub.astype(np.float32), dtype=wp.quat)
 
         self.viewer.set_model(self.model)
         self._set_camera()
@@ -592,11 +678,21 @@ class Example:
         end = bezier_eval(BEZIER_CTRL, np.array([1.0]))[0]
         centroid = 0.5 * (BEZIER_CTRL.max(axis=0) + BEZIER_CTRL.min(axis=0))
 
+        # Optionally amplify the follow-through (last three Bezier control
+        # points) about the centroid: with a free-pivot rope attachment the
+        # loop must be driven by the hand path itself, not by prescribing the
+        # rope-root orientation as in the kinematic example.
+        ctrl = BEZIER_CTRL.copy()
+        if self.bezier_delta_file:
+            ctrl = ctrl + np.load(self.bezier_delta_file)["delta"]
+        ctrl[5:] = centroid + self.follow_scale * (ctrl[5:] - centroid)
+        end = bezier_eval(ctrl, np.array([1.0]))[0]
+
         pos = np.zeros((n, 3))
         pos[t <= t0] = start
         mask = (t > t0) & (t <= t1)
         s = (t[mask] - t0) / self.t_throw
-        pos[mask] = centroid + self.throw_scale * (bezier_eval(BEZIER_CTRL, s) - centroid)
+        pos[mask] = centroid + self.throw_scale * (bezier_eval(ctrl, s) - centroid)
         end_scaled = centroid + self.throw_scale * (end - centroid)
         pos[(t > t1) & (t <= t2)] = end_scaled
         mask = (t > t2) & (t <= t3)
@@ -620,6 +716,37 @@ class Example:
         axis[t <= self.t_settle] = down
         return axis
 
+    def _root_axis_schedule(self) -> tuple[np.ndarray, np.ndarray]:
+        """Trailing-axis direction + twist-free quats at substep resolution."""
+        t_sub = (np.arange(self.n_sub_total) + 1) * self.sim_dt
+        t_frames = np.arange(len(self.tip_pos_frames)) * self.frame_dt
+        tips_sub = np.stack([np.interp(t_sub, t_frames, self.tip_pos_frames[:, k]) for k in range(3)], axis=1)
+        vel = np.gradient(tips_sub, self.sim_dt, axis=0)
+        speed = np.linalg.norm(vel, axis=1)
+        down = np.array([0.0, 0.0, -1.0])
+        w = np.clip(speed / 2.5, 0.0, 0.85)
+        axes = (1.0 - w[:, None]) * down - w[:, None] * (vel / np.maximum(speed, 1e-9)[:, None])
+        axes /= np.linalg.norm(axes, axis=1, keepdims=True)
+        k = max(1, int(0.02 / self.sim_dt))
+        kernel = np.ones(k) / k
+        for dim in range(3):
+            axes[:, dim] = np.convolve(axes[:, dim], kernel, mode="same")
+        axes /= np.linalg.norm(axes, axis=1, keepdims=True)
+        axes[t_sub <= self.t_settle] = down
+        quats = self._axis_quats(axes)
+        return axes, quats
+
+    def _axis_quats(self, axes: np.ndarray) -> np.ndarray:
+        """Twist-free EE orientation series aligning +z with the handle axis."""
+        quats = np.zeros((len(axes), 4))
+        q = quat_from_z_to(axes[0])
+        quats[0] = q
+        for i in range(1, len(axes)):
+            q = quat_mul(quat_between(axes[i - 1], axes[i]), q)
+            q /= np.linalg.norm(q)
+            quats[i] = q
+        return quats
+
     def _solve_arm_ik(self, tips: np.ndarray) -> np.ndarray:
         """Branch-continuous IK over frame-rate tip targets (7-DOF arm)."""
         axes = self._tip_axis(tips)
@@ -631,6 +758,8 @@ class Example:
             flanges,
             posture_weight=self.posture_weight,
             flange_weight=self.flange_weight,
+            axis_weight=self.axis_weight,
+            axis_quats=self._axis_quats(axes) if self.axis_weight > 0.0 else None,
         )
         self.ik_errors = errs
         qd = np.abs(np.diff(q_frames, axis=0)).max() * self.fps
@@ -686,6 +815,22 @@ class Example:
                 ],
                 outputs=[self.control.joint_target_q, self.control.joint_target_qd],
             )
+            if self.root_drive == "kinematic":
+                wp.launch(
+                    drive_root_from_ee,
+                    dim=1,
+                    inputs=[
+                        self.step_idx,
+                        self.n_sub_total,
+                        self.ee_body,
+                        self.rope_bodies[0],
+                        wp.vec3(0.0, 0.0, HANDLE_LENGTH),
+                        self.seg_len / 2,
+                        self.root_axis_wp,
+                        self.root_quat_wp,
+                    ],
+                    outputs=[self.state_0.body_q, self.state_1.body_q],
+                )
             self.model.collide(self.state_0, self.contacts, collision_pipeline=self.collision_pipeline)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             newton.eval_ik(self.model, self.state_1, self.state_1.joint_q, self.state_1.joint_qd)
@@ -795,6 +940,13 @@ def add_arguments(parser):
     parser.add_argument("--ref-filter-width", type=int, default=5, dest="ref_filter_width")
     parser.add_argument("--posture-weight", type=float, default=0.1, dest="posture_weight")
     parser.add_argument("--flange-weight", type=float, default=0.0, dest="flange_weight")
+    parser.add_argument("--attach-bend-scale", type=float, default=1.0, dest="attach_bend_scale")
+    parser.add_argument("--follow-scale", type=float, default=1.0, dest="follow_scale")
+    parser.add_argument("--axis-weight", type=float, default=0.0, dest="axis_weight")
+    parser.add_argument("--bezier-delta-file", type=str, default=None, dest="bezier_delta_file")
+    parser.add_argument(
+        "--root-drive", type=str, default="attached", choices=["attached", "kinematic"], dest="root_drive"
+    )
     parser.add_argument("--gain-scale", type=float, default=1.0, dest="gain_scale")
     parser.add_argument("--effort-scale", type=float, default=1.0, dest="effort_scale")
     parser.add_argument("--rope-length", type=float, default=1.1, dest="rope_length")

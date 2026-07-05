@@ -76,6 +76,19 @@ GRIDS = {
         "throw-scale": [1.0, 1.15],
         "tip-mass": [0.05, 0.06, 0.07],
     },
+    "mjc_follow": {
+        "time-scale": [0.7, 0.8],
+        "tip-mass": [0.05, 0.07],
+        "follow-scale": [1.3, 1.6, 2.0],
+        "ref-filter-width": [3],
+    },
+    "mjc_axis": {
+        "time-scale": [0.75],
+        "throw-scale": [1.0, 1.2],
+        "tip-mass": [0.06],
+        "flange-weight": [0.2, 0.5],
+        "attach-bend-scale": [1.0, 10.0, 40.0],
+    },
     "champion": {
         "time-scale": [0.8],
         "tip-mass": [0.05],

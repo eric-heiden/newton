@@ -21,7 +21,6 @@ from ...sim import (
     BodyFlags,
     Contacts,
     Control,
-    EqType,
     JointTargetMode,
     JointType,
     Model,
@@ -36,6 +35,7 @@ from ...sim.graph_coloring import color_graph, plot_graph
 from ...utils import topological_sort
 from ...utils.benchmark import event_scope
 from ...utils.import_utils import string_to_warp
+from ..coupled.interface import CouplingEndpointKind, CouplingInterface
 from ..solver import SolverBase
 from .constants import (
     DEFAULT_LIMIT_GAIN_RTOL,
@@ -49,6 +49,7 @@ from .constants import (
     SOLREF_MODE_MJCF_DEFAULT,
     SOLREF_MODE_RAW,
 )
+from .enums import EqType as _EqType
 from .equality import MJC_OBJ_BODY, MjcEqualityTargetKind, _register_equality_constraint_attributes
 from .kernels import (
     _snapshot_nacon_count,
@@ -65,6 +66,9 @@ from .kernels import (
     convert_warp_coords_to_mj_kernel,
     create_convert_mjw_contacts_to_newton_kernel,
     create_inverse_shape_mapping_kernel,
+    eval_mujoco_coupling_effective_mass_block_kernel,
+    eval_mujoco_coupling_effective_mass_kernel,
+    eval_mujoco_coupling_gravity_acceleration_kernel,
     recompute_jnt_eq_anchor1_kernel,
     repeat_array_kernel,
     reset_joint_state_kernel,
@@ -158,8 +162,10 @@ def _finalize_deprecated_dof_passive_damping(
         lambda model=model: model.joint_damping,
         _DEPRECATED_DOF_PASSIVE_DAMPING_MESSAGE,
     )
-    model.attribute_frequency[custom_attr.key] = custom_attr.frequency
-    model.attribute_assignment[custom_attr.key] = custom_attr.assignment
+    model._set_attribute_spec(
+        custom_attr.key,
+        Model.AttributeSpec(custom_attr.frequency, assignment=custom_attr.assignment),
+    )
 
 
 def _required_specifier(package: str, requirements: Iterable[str]) -> str | None:
@@ -341,7 +347,7 @@ def _make_nonplanar_mujoco_mesh(
     return inflated_vertices, inflated_indices, max(maxhullvert, 4)
 
 
-class SolverMuJoCo(SolverBase):
+class SolverMuJoCo(SolverBase, CouplingInterface):
     """
     This solver provides an interface to simulate physics using the `MuJoCo <https://github.com/google-deepmind/mujoco>`_ physics engine,
     optimized with GPU acceleration through `mujoco_warp <https://github.com/google-deepmind/mujoco_warp>`_. It supports both MuJoCo and
@@ -407,6 +413,9 @@ class SolverMuJoCo(SolverBase):
 
             solver.render_mujoco_viewer()
     """
+
+    EqType = _EqType
+    """MuJoCo equality constraint type."""
 
     class CtrlSource(IntEnum):
         """Control source for MuJoCo actuators.
@@ -789,7 +798,7 @@ class SolverMuJoCo(SolverBase):
                 frequency=AttributeFrequency.SHAPE,
                 assignment=AttributeAssignment.MODEL,
                 dtype=wp.int32,
-                # See docs/integrations/mujoco.rst > "Shape-material contact
+                # See docs/solvers/mujoco.rst > "Shape-material contact
                 # stiffness and damping" for the three modes. Default is
                 # MJCF_DEFAULT so existing builder-API ke/kd defaults keep
                 # working; opt into force-space scaling by setting
@@ -3410,7 +3419,7 @@ class SolverMuJoCo(SolverBase):
                         "(use_mujoco_contacts=False); on this backend these shapes silently fall back to "
                         "the legacy convert_solref(ke, kd, 1, 1) approximation and shape_material_ke/kd "
                         "will not behave as force-space gains. See "
-                        "docs/integrations/mujoco.rst > 'Shape-material contact stiffness and damping'.",
+                        "docs/solvers/mujoco.rst > 'Shape-material contact stiffness and damping'.",
                         stacklevel=2,
                     )
         if separate_worlds is None:
@@ -3649,6 +3658,126 @@ class SolverMuJoCo(SolverBase):
         """
         self._last_contact_generation.fill_(_GENERATION_SENTINEL)
         self._last_nacon_count.zero_()
+
+    @override
+    def coupling_eval_gravity_acceleration(
+        self,
+        out_body_acceleration: wp.array[wp.vec3] | None,
+        out_particle_acceleration: wp.array[wp.vec3] | None,
+    ) -> None:
+        """Evaluate MuJoCo's internally applied gravity acceleration for coupling."""
+        if out_particle_acceleration is not None:
+            super().coupling_eval_gravity_acceleration(None, out_particle_acceleration)
+
+        if out_body_acceleration is None or out_body_acceleration.shape[0] == 0:
+            return
+
+        body_gravcomp = getattr(self.mjw_model, "body_gravcomp", None) if self.mjw_model is not None else None
+        if body_gravcomp is None or self.mjc_body_to_newton is None or self.model.body_world is None:
+            super().coupling_eval_gravity_acceleration(out_body_acceleration, None)
+            return
+
+        wp.launch(
+            eval_mujoco_coupling_gravity_acceleration_kernel,
+            dim=out_body_acceleration.shape[0],
+            inputs=[
+                self.model.gravity,
+                self.model.body_world,
+                self.mjc_body_to_newton,
+                body_gravcomp,
+            ],
+            outputs=[out_body_acceleration],
+            device=self.model.device,
+        )
+
+    @override
+    def coupling_eval_effective_mass(
+        self,
+        endpoint_kind: wp.array[int],
+        endpoint_index: wp.array[int],
+        endpoint_local_pos: wp.array[wp.vec3],
+        out: wp.array[float],
+    ) -> None:
+        """Evaluate MuJoCo articulated effective masses for coupling endpoints."""
+        if (
+            self.mjw_model is None
+            or self.mjc_body_to_newton is None
+            or self.model.body_world is None
+            or self.model.body_mass is None
+            or self.model.particle_mass is None
+        ):
+            super().coupling_eval_effective_mass(endpoint_kind, endpoint_index, endpoint_local_pos, out)
+            return
+
+        wp.launch(
+            eval_mujoco_coupling_effective_mass_kernel,
+            dim=out.shape[0],
+            inputs=[
+                endpoint_kind,
+                endpoint_index,
+                endpoint_local_pos,
+                int(CouplingEndpointKind.BODY),
+                int(CouplingEndpointKind.PARTICLE),
+                self.model.body_mass,
+                self.model.particle_mass,
+                self.model.body_world,
+                self.mjc_body_to_newton,
+                self.mjw_model.body_invweight0,
+            ],
+            outputs=[out],
+            device=self.model.device,
+        )
+
+    @override
+    def coupling_eval_effective_mass_block(
+        self,
+        endpoint_kind: wp.array[int],
+        endpoint_index: wp.array[int],
+        endpoint_local_pos: wp.array[wp.vec3],
+        out_mass: wp.array[float],
+        out_inertia: wp.array[wp.mat33] | None = None,
+    ) -> None:
+        """Evaluate MuJoCo articulated effective mass and inertia blocks."""
+        if out_inertia is None:
+            self.coupling_eval_effective_mass(endpoint_kind, endpoint_index, endpoint_local_pos, out_mass)
+            return
+
+        if (
+            self.mjw_model is None
+            or self.mjc_body_to_newton is None
+            or self.model.body_world is None
+            or self.model.body_mass is None
+            or self.model.body_inertia is None
+            or self.model.particle_mass is None
+        ):
+            super().coupling_eval_effective_mass_block(
+                endpoint_kind,
+                endpoint_index,
+                endpoint_local_pos,
+                out_mass,
+                out_inertia,
+            )
+            return
+
+        wp.launch(
+            eval_mujoco_coupling_effective_mass_block_kernel,
+            dim=out_mass.shape[0],
+            inputs=[
+                endpoint_kind,
+                endpoint_index,
+                endpoint_local_pos,
+                int(CouplingEndpointKind.BODY),
+                int(CouplingEndpointKind.PARTICLE),
+                self.model.body_mass,
+                self.model.body_inertia,
+                self.model.particle_mass,
+                self.model.body_world,
+                self.mjc_body_to_newton,
+                self.mjw_model.body_invweight0,
+            ],
+            outputs=[out_mass, out_inertia],
+            device=self.model.device,
+        )
 
     def _convert_contacts_to_mjwarp(self, model: Model, state_in: State, contacts: Contacts):
         # Ensure the inverse shape mapping exists (lazy creation)
@@ -4468,7 +4597,7 @@ class SolverMuJoCo(SolverBase):
         """
         Convert a Newton model and state to MuJoCo (Warp) model and data.
 
-        See ``docs/integrations/mujoco.rst`` for user-facing documentation of
+        See ``docs/solvers/mujoco.rst`` for user-facing documentation of
         all conversions performed here.  Keep that file in sync when changing
         this method.
 
@@ -5292,7 +5421,7 @@ class SolverMuJoCo(SolverBase):
                     rolling,
                 ]
 
-                # solref per mujoco.solref_mode. See docs/integrations/mujoco.rst
+                # solref per mujoco.solref_mode. See docs/solvers/mujoco.rst
                 # > "Shape-material contact stiffness and damping".
                 solref_mode_for_shape = (
                     int(shape_mjc_solref_mode[shape]) if shape_mjc_solref_mode is not None else SOLREF_MODE_MJCF_DEFAULT
@@ -5924,7 +6053,7 @@ class SolverMuJoCo(SolverBase):
             elif target_kind == int(MjcEqualityTargetKind.MIMIC) and target >= 0:
                 converted_mimic_targets.add(target)
 
-            if constraint_type == EqType.CONNECT:
+            if constraint_type == _EqType.CONNECT:
                 self.has_connect_constraints = True
                 eq = add_body_equality(i)
                 eq.type = mujoco.mjtEq.mjEQ_CONNECT
@@ -5937,7 +6066,7 @@ class SolverMuJoCo(SolverBase):
                 if eq_constraint_solimp is not None:
                     eq.solimp = eq_constraint_solimp[i]
 
-            elif constraint_type == EqType.JOINT:
+            elif constraint_type == _EqType.JOINT:
                 eq = spec.add_equality()
                 eq.type = mujoco.mjtEq.mjEQ_JOINT
                 eq.active = eq_constraint_enabled[i]
@@ -5951,7 +6080,7 @@ class SolverMuJoCo(SolverBase):
                 if eq_constraint_solimp is not None:
                     eq.solimp = eq_constraint_solimp[i]
 
-            elif constraint_type == EqType.WELD:
+            elif constraint_type == _EqType.WELD:
                 eq = add_body_equality(i)
                 eq.type = mujoco.mjtEq.mjEQ_WELD
                 eq.active = eq_constraint_enabled[i]

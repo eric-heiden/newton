@@ -272,6 +272,33 @@ def drive_root_from_schedule(
 
 
 @wp.kernel
+def apply_rope_air_drag(
+    body_indices: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    k_perp: float,
+    k_par: float,
+    body_f: wp.array[wp.spatial_vector],
+):
+    """Quadratic aerodynamic drag on rope capsules (per-segment cylinder drag).
+
+    Real cotton cord at whip speeds (5-7 m/s) sees drag comparable to half its
+    weight; it is what keeps a thrown loop open in air, and the VBD rope has
+    no aerodynamic model of its own.
+    """
+    tid = wp.tid()
+    b = body_indices[tid]
+    v = wp.spatial_top(body_qd[b])  # linear velocity at COM, world frame
+    axis = wp.quat_rotate(wp.transform_get_rotation(body_q[b]), wp.vec3(0.0, 0.0, 1.0))
+    v_par = wp.dot(v, axis) * axis
+    v_perp = v - v_par
+    f = -k_perp * wp.length(v_perp) * v_perp - k_par * wp.length(v_par) * v_par
+    t = wp.spatial_bottom(body_f[b])
+    fw = wp.spatial_top(body_f[b]) + f
+    body_f[b] = wp.spatial_vector(fw, t)
+
+
+@wp.kernel
 def advance_step(step_idx: wp.array[wp.int32]):
     step_idx[0] = step_idx[0] + 1
 
@@ -445,6 +472,27 @@ class Example:
         self.axis_weight = getattr(args, "axis_weight", 0.0)
         self.bezier_delta_file = getattr(args, "bezier_delta_file", None)
         self.root_drive = getattr(args, "root_drive", "attached")
+        self.ik_max_step = getattr(args, "ik_max_step", 0.02)
+        self.ik_iters = getattr(args, "ik_iters", 12)
+        self.command_kind = getattr(args, "command", "digitized")
+        self.air_drag = getattr(args, "air_drag", 0.0)
+        self.replay_file = getattr(args, "replay_file", None)
+        self.replay_node = getattr(args, "replay_node", 3)
+        self.yank_vec = np.array(
+            [getattr(args, "yank_dx", 0.0), getattr(args, "yank_dy", 0.0), getattr(args, "yank_dz", 0.0)]
+        )
+        self.yank_delay = getattr(args, "yank_delay", 0.2)
+        self.yank_t = getattr(args, "yank_t", 0.2)
+        if self.command_kind == "replay":
+            # The replayed node is `replay_node` segments from the old root:
+            # shorten the rope so the tail matches the recorded system.
+            self.rope_segments = self.rope_segments - self.replay_node
+            self.rope_length = self.rope_length * self.rope_segments / (self.rope_segments + self.replay_node)
+        # Lasso parameters: rx, rz, yaw, y_amp, span_deg, loop_frac, rdx, rdy, rdz.
+        self.lasso_params = np.array([0.28, 0.30, 0.25, 0.08, 380.0, 0.75, -0.25, -0.05, -0.30])
+        lasso_file = getattr(args, "lasso_file", None)
+        if lasso_file:
+            self.lasso_params = np.load(lasso_file)["params"]
         self.gain_scale = getattr(args, "gain_scale", 1.0)
         self.effort_scale = getattr(args, "effort_scale", 1.0)
 
@@ -460,13 +508,17 @@ class Example:
         self.n_sub_total = self.num_frames * self.sim_substeps
         if getattr(args, "command", "digitized") == "searched":
             # Best command from scripts/flying_knot/command_search.py (cross-
-            # entropy search over Bezier control point deltas + timing/tip
-            # mass): coils the rope to |writhe| 2.7 under the coupled
-            # dynamics, though the tip does not yet thread the loop reliably.
+            # entropy search over Bezier control-point deltas + timing + tip
+            # mass, with a threading-persistence objective and a dynamic-
+            # feasibility penalty): ties and holds the overhand knot under the
+            # fully dynamic coupled simulation. The IK discretization is part
+            # of the optimized reference and is pinned alongside the command.
             self.bezier_delta_file = str(Path(newton.examples.get_asset("flying_knot_searched_command.npz")))
-            self.time_scale = 0.6904
+            self.time_scale = 0.7861
             self.t_throw = T_THROW * self.time_scale
-            self.tip_mass = 0.049
+            self.tip_mass = 0.0399
+            self.ik_max_step = 0.035
+            self.ik_iters = 8
             self.duration = self.t_settle + self.t_throw + self.t_flight + self.t_lift + self.t_hold
             self.num_frames = int(round(self.duration * self.fps))
             self.n_sub_total = self.num_frames * self.sim_substeps
@@ -693,6 +745,12 @@ class Example:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
 
+        # Aerodynamic drag on the rope (0.5 * rho * Cd * d * L per segment).
+        self.rope_body_wp = wp.array(self.rope_bodies, dtype=wp.int32)
+        seg_area = 2.0 * self.rope_radius * self.seg_len
+        self.drag_k_perp = self.air_drag * 0.5 * 1.2 * 1.1 * seg_area
+        self.drag_k_par = 0.02 * self.drag_k_perp
+
         # Device-side reference buffers.
         self.q_ref_wp = wp.array2d(self.q_ref_sub.astype(np.float32), dtype=float)
         self.qd_ref_wp = wp.array2d(self.qd_ref_sub.astype(np.float32), dtype=float)
@@ -733,6 +791,33 @@ class Example:
         t3 = t2 + self.t_lift
         return t0, t1, t2, t3
 
+    def _lasso_throw(self, u: np.ndarray, start: np.ndarray) -> np.ndarray:
+        """Parametric lasso throw: a tilted circular sweep plus a retreat.
+
+        Unlike the digitized human command (which relied on wrist steering the
+        demonstrator applied), this family is designed for a free-pivot rope:
+        the hand itself traces the loop that the rope should inherit.
+        """
+        (rx, rz, yaw, y_amp, span_deg, loop_frac, rdx, rdy, rdz) = self.lasso_params
+        span = np.radians(span_deg)
+        theta0 = 0.0  # start at the loop's forward edge; sweep goes up and back
+        # Split the throw into loop and retreat.
+        ul = np.clip(u / loop_frac, 0.0, 1.0)
+        ur = np.clip((u - loop_frac) / (1.0 - loop_frac), 0.0, 1.0)
+        theta = theta0 + span * ul
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        # Loop center chosen so the sweep starts at the hand's rest position.
+        cx0 = -rx * np.cos(theta0)
+        cz0 = -rz * np.sin(theta0)
+        x = (cx0 + rx * np.cos(theta)) * cy
+        y = (cx0 + rx * np.cos(theta)) * sy + y_amp * np.sin(theta - theta0)
+        z = cz0 + rz * np.sin(theta)
+        pos = start + np.stack([x, y, z], axis=1)
+        # Retreat: pull away smoothly to strip the loop over the tip.
+        smooth = ur * ur * (3.0 - 2.0 * ur)
+        pos += np.outer(smooth, [rdx, rdy, rdz])
+        return pos
+
     def _build_tip_schedule(self) -> np.ndarray:
         """Handle-tip positions at frame rate (task-space keyframes for IK)."""
         n = self.num_frames + 1
@@ -753,18 +838,49 @@ class Example:
         ctrl[5:] = centroid + self.follow_scale * (ctrl[5:] - centroid)
         end = bezier_eval(ctrl, np.array([1.0]))[0]
 
+        if self.command_kind == "replay":
+            # Replay a recorded rope-node trajectory from a successful
+            # kinematic-example run: the motion of a node a few segments from
+            # the steered root already contains the orientation-steering
+            # effect a free-pivot attachment cannot transmit, so using it as
+            # the hand-tip target reproduces the tail rope's knotting motion.
+            d = np.load(self.replay_file)
+            node_traj = d["rope_traj"][:, self.replay_node, :].astype(np.float64)
+            pos = np.empty((n, 3))
+            m = min(n, len(node_traj))
+            pos[:m] = node_traj[:m]
+            pos[m:] = node_traj[-1]
+            # Keep the settle phase static at the initial node position.
+            pos[t <= t0] = node_traj[0]
+            self.tip_pos_frames = pos
+            return pos
+
         pos = np.zeros((n, 3))
         pos[t <= t0] = start
         mask = (t > t0) & (t <= t1)
         s = (t[mask] - t0) / self.t_throw
-        pos[mask] = centroid + self.throw_scale * (bezier_eval(ctrl, s) - centroid)
-        end_scaled = centroid + self.throw_scale * (end - centroid)
+        if self.command_kind == "lasso":
+            throw = self._lasso_throw(s, start)
+            pos[mask] = throw
+            end_scaled = self._lasso_throw(np.array([1.0]), start)[0]
+        else:
+            pos[mask] = centroid + self.throw_scale * (bezier_eval(ctrl, s) - centroid)
+            end_scaled = centroid + self.throw_scale * (end - centroid)
         pos[(t > t1) & (t <= t2)] = end_scaled
+        # Optional cinch yank: a sharp pull shortly after the throw, timed to
+        # capture the tip while it is threaded through the flying loop.
+        if np.linalg.norm(self.yank_vec) > 0.0:
+            y0 = t1 + self.yank_delay
+            mask = (t > y0) & (t <= t2)
+            u = np.clip((t[mask] - y0) / self.yank_t, 0.0, 1.0)
+            smooth = u * u * (3.0 - 2.0 * u)
+            pos[mask] = pos[mask] + np.outer(smooth, self.yank_vec)
+        base_end = end_scaled + self.yank_vec if np.linalg.norm(self.yank_vec) > 0.0 else end_scaled
         mask = (t > t2) & (t <= t3)
         u = np.clip((t[mask] - t2) / self.t_lift, 0.0, 1.0)
         smooth = u * u * (3.0 - 2.0 * u)
-        pos[mask] = end_scaled + np.outer(smooth, [0.0, 0.0, self.lift_height])
-        pos[t > t3] = end_scaled + np.array([0.0, 0.0, self.lift_height])
+        pos[mask] = base_end + np.outer(smooth, [0.0, 0.0, self.lift_height])
+        pos[t > t3] = base_end + np.array([0.0, 0.0, self.lift_height])
         pos[:, 2] += self.z_offset
         self.tip_pos_frames = pos
         return pos
@@ -825,6 +941,8 @@ class Example:
             flange_weight=self.flange_weight,
             axis_weight=self.axis_weight,
             axis_quats=self._axis_quats(axes) if self.axis_weight > 0.0 else None,
+            max_step=self.ik_max_step,
+            iters=self.ik_iters,
         )
         self.ik_errors = errs
         qd = np.abs(np.diff(q_frames, axis=0)).max() * self.fps
@@ -929,6 +1047,19 @@ class Example:
                 ],
                 outputs=[self.control.joint_target_q, self.control.joint_target_qd],
             )
+            if self.air_drag > 0.0:
+                wp.launch(
+                    apply_rope_air_drag,
+                    dim=len(self.rope_bodies),
+                    inputs=[
+                        self.rope_body_wp,
+                        self.state_0.body_q,
+                        self.state_0.body_qd,
+                        self.drag_k_perp,
+                        self.drag_k_par,
+                    ],
+                    outputs=[self.state_0.body_f],
+                )
             self._drive_root(post_step=False)
             self.model.collide(self.state_0, self.contacts, collision_pipeline=self.collision_pipeline)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
@@ -1047,7 +1178,26 @@ def add_arguments(parser):
     parser.add_argument("--follow-scale", type=float, default=1.0, dest="follow_scale")
     parser.add_argument("--axis-weight", type=float, default=0.0, dest="axis_weight")
     parser.add_argument("--bezier-delta-file", type=str, default=None, dest="bezier_delta_file")
-    parser.add_argument("--command", type=str, default="digitized", choices=["digitized", "searched"])
+    parser.add_argument(
+        "--command", type=str, default="digitized", choices=["digitized", "searched", "lasso", "replay"]
+    )
+    parser.add_argument("--replay-file", type=str, default=None, dest="replay_file")
+    parser.add_argument("--replay-node", type=int, default=3, dest="replay_node")
+    parser.add_argument("--yank-dx", type=float, default=0.0, dest="yank_dx")
+    parser.add_argument("--yank-dy", type=float, default=0.0, dest="yank_dy")
+    parser.add_argument("--yank-dz", type=float, default=0.0, dest="yank_dz")
+    parser.add_argument("--yank-delay", type=float, default=0.2, dest="yank_delay")
+    parser.add_argument("--yank-t", type=float, default=0.2, dest="yank_t")
+    parser.add_argument("--lasso-file", type=str, default=None, dest="lasso_file")
+    parser.add_argument(
+        "--air-drag",
+        type=float,
+        default=0.0,
+        dest="air_drag",
+        help="Aerodynamic drag multiplier for the rope (1.0 = physical cylinder drag).",
+    )
+    parser.add_argument("--ik-max-step", type=float, default=0.02, dest="ik_max_step")
+    parser.add_argument("--ik-iters", type=int, default=12, dest="ik_iters")
     parser.add_argument(
         "--root-drive", type=str, default="attached", choices=["attached", "kinematic", "command"], dest="root_drive"
     )

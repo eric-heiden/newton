@@ -44,6 +44,8 @@ FPS = 60
 
 # Shortened tail phases for search rollouts (retention is still exercised).
 PHASE_ARGS = ["--t-flight", "1.6", "--t-lift", "2.0", "--t-hold", "0.8"]
+# Additional rollout arguments (set from --rollout-args).
+EXTRA_ROLLOUT_ARGS: list[str] = []
 
 
 def unpack(theta):
@@ -58,7 +60,37 @@ def unpack(theta):
     return delta, time_scale, tip_mass, yank
 
 
+N_ROBUST_EVALS = 1
+BASIN_PROBES = 0
+BASIN_SIGMA = 0.008
+_BASIN_RNG = np.random.default_rng(1234)
+
+
 def evaluate(theta, tag, outdir):
+    """Evaluate a candidate; optionally score its basin membership.
+
+    With BASIN_PROBES > 0, knotting candidates are additionally evaluated at
+    small parameter perturbations. Candidates that only knot on a razor-thin
+    manifold (whose neighbors miss) receive no basin bonus, steering the
+    search toward basin interiors that reproduce across environments.
+    """
+    recs = [_evaluate_once(theta, f"{tag}_e{k}" if N_ROBUST_EVALS > 1 else tag, outdir) for k in range(N_ROBUST_EVALS)]
+    rec = min(recs, key=lambda r: r["score"])
+    rec = dict(rec)
+    rec["tag"] = tag
+    rec["knotted"] = all(r.get("knotted", False) for r in recs)
+    if rec["knotted"] and BASIN_PROBES > 0:
+        hits = 0
+        for k in range(BASIN_PROBES):
+            pert = np.array(theta) + BASIN_SIGMA * _BASIN_RNG.standard_normal(len(theta))
+            probe = _evaluate_once(pert, f"{tag}_b{k}", outdir)
+            hits += int(probe.get("knotted", False))
+        rec["basin"] = hits / BASIN_PROBES
+        rec["score"] = round(rec["score"] + 6.0 * rec["basin"], 3)
+    return rec
+
+
+def _evaluate_once(theta, tag, outdir):
     delta, time_scale, tip_mass, yank = unpack(theta)
     delta_file = outdir / f"{tag}_delta.npz"
     npz = outdir / f"{tag}.npz"
@@ -102,7 +134,7 @@ def evaluate(theta, tag, outdir):
     ]
     t0 = time.time()
     proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=1200, check=False)
-    rec = {"tag": tag, "theta": [round(float(v), 4) for v in theta], "score": -10.0}
+    rec = {"tag": tag, "theta": [float(v) for v in theta], "score": -10.0}
     if proc.returncode != 0 or not npz.exists():
         rec["error"] = proc.stderr[-300:]
         return rec
@@ -167,7 +199,23 @@ def main():
     ap.add_argument("--outdir", default="/tmp/fk/cmd_search2")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", type=str, default=None, help="history.json to seed the incumbent from")
+    ap.add_argument("--seed-theta", type=str, default=None, help="JSON list of theta values for the incumbent")
+    ap.add_argument(
+        "--rollout-args", type=str, default="", help="Extra args appended to every rollout, e.g. '--rope-segments 72'"
+    )
+    ap.add_argument("--robust-evals", type=int, default=1, help="Rollouts per candidate; score is the minimum.")
+    ap.add_argument(
+        "--basin-probes",
+        type=int,
+        default=0,
+        help="Perturbed rollouts scoring basin membership of knotting candidates.",
+    )
     args = ap.parse_args()
+    if args.rollout_args:
+        EXTRA_ROLLOUT_ARGS.extend(args.rollout_args.split())
+    global N_ROBUST_EVALS, BASIN_PROBES  # noqa: PLW0603
+    N_ROBUST_EVALS = max(1, args.robust_evals)
+    BASIN_PROBES = max(0, args.basin_probes)
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -181,6 +229,13 @@ def main():
     std_floor = np.concatenate([np.full(N_CTRL * 3, 0.03), [0.02, 0.004], [0.03, 0.03, 0.03, 0.03, 0.02]])
 
     best = None
+    if args.seed_theta:
+        seeded = np.array(json.loads(args.seed_theta), dtype=float)
+        if len(seeded) == 23:
+            seeded = np.concatenate([seeded, [0.0, 0.0, 0.0, 0.2, 0.15]])
+        best = {"theta": [float(v) for v in seeded], "score": -1e9}
+        mean = seeded.copy()
+        print("seeded incumbent from --seed-theta")
     if args.resume:
         prev = json.load(open(args.resume))
         prev_best = prev.get("best")
@@ -212,14 +267,26 @@ def main():
             print(
                 f"  {r['tag']}: score={r['score']} wr_max={r.get('wr_max')} "
                 f"persist={r.get('persistence')} final={r.get('final_writhe')} "
-                f"ratio={r.get('ratio')} knot={r.get('knotted')} track={r.get('track_err')} "
+                f"ratio={r.get('ratio')} knot={r.get('knotted')} basin={r.get('basin')} track={r.get('track_err')} "
                 f"ts={r.get('time_scale')} tip={r.get('tip_mass')}",
                 flush=True,
             )
         recs.sort(key=lambda r: -r["score"])
         history.extend(recs)
         if best is None or recs[0]["score"] > best.get("score", -1e9):
-            best = recs[0]
+            cand = recs[0]
+            if cand.get("knotted"):
+                # Winners must reproduce in a solo re-run: concurrent rollouts
+                # are subject to contact nondeterminism, and near-manifold
+                # flukes must not become the stored incumbent.
+                verify = evaluate(np.array(cand["theta"]), f"{cand['tag']}_verify", outdir)
+                print(f"  verify {cand['tag']}: score={verify['score']} knot={verify.get('knotted')}", flush=True)
+                if verify.get("knotted"):
+                    best = verify
+                elif best is None:
+                    best = cand
+            else:
+                best = cand
         elites = [np.array(r["theta"]) for r in recs[: args.elite]]
         mean = np.mean(elites, axis=0)
         std = np.maximum(0.8 * std + 0.2 * np.std(elites, axis=0), std_floor)

@@ -457,10 +457,16 @@ class Example:
         self.rope_radius = getattr(args, "rope_radius", 0.005)
         self.rope_linear_density = getattr(args, "rope_density", 0.05)
         self.tip_mass = getattr(args, "tip_mass", 0.05)
-        self.stretch_stiffness = getattr(args, "stretch_stiffness", 2.0e5)
-        self.bend_stiffness = getattr(args, "bend_stiffness", 2.0e-3)
-        self.bend_damping = getattr(args, "bend_damping", 1.0e-4)
-        self.stretch_damping = getattr(args, "stretch_damping", 0.5)
+        # Cable joint stiffness/damping are per-joint quantities: for the same
+        # physical rope (fixed EA and EI), the per-joint values scale inversely
+        # with segment length, i.e. linearly with segment count. The CLI values
+        # are defined at the 36-segment reference resolution and rescaled here,
+        # so --rope-segments changes discretization fidelity, not the rope.
+        res_scale = self.rope_segments / 36.0
+        self.stretch_stiffness = getattr(args, "stretch_stiffness", 2.0e5) * res_scale
+        self.bend_stiffness = getattr(args, "bend_stiffness", 2.0e-3) * res_scale
+        self.bend_damping = getattr(args, "bend_damping", 1.0e-4) * res_scale
+        self.stretch_damping = getattr(args, "stretch_damping", 0.5) * res_scale
         self.friction = getattr(args, "friction", 1.0)
         self.save_traj = getattr(args, "save_traj", None)
         self.expect_knot = getattr(args, "expect_knot", False)
@@ -519,6 +525,37 @@ class Example:
             self.tip_mass = 0.0399
             self.ik_max_step = 0.035
             self.ik_iters = 8
+            self.duration = self.t_settle + self.t_throw + self.t_flight + self.t_lift + self.t_hold
+            self.num_frames = int(round(self.duration * self.fps))
+            self.n_sub_total = self.num_frames * self.sim_substeps
+        elif getattr(args, "command", "digitized") == "searched-hires":
+            # High-resolution variant: 72 cable segments (15 mm at 5 mm radius)
+            # for a well-resolved knot bundle. The command was re-derived with
+            # the basin-aware search (the 36-segment command sits on a
+            # razor-thin manifold that does not survive the discretization
+            # change), and the knot cinch at this resolution needs a finer
+            # solve: 48 substeps and 16 VBD iterations. Solver settings, IK
+            # discretization, and the cinch yank are pinned with the command.
+            preset = np.load(Path(newton.examples.get_asset("flying_knot_searched_command_hires.npz")))
+            self._preset_delta = preset["delta"]
+            self.time_scale = float(preset["time_scale"])
+            self.t_throw = T_THROW * self.time_scale
+            self.tip_mass = float(preset["tip_mass"])
+            yank = preset["yank"]
+            self.yank_vec = yank[:3].copy()
+            self.yank_delay = float(yank[3])
+            self.yank_t = float(yank[4])
+            self.rope_segments = 72
+            self.sim_substeps = 48
+            self.sim_dt = self.frame_dt / self.sim_substeps
+            self.vbd_iterations = 16
+            self.ik_max_step = 0.035
+            self.ik_iters = 8
+            res_scale = self.rope_segments / 36.0
+            self.stretch_stiffness = getattr(args, "stretch_stiffness", 2.0e5) * res_scale
+            self.bend_stiffness = getattr(args, "bend_stiffness", 2.0e-3) * res_scale
+            self.bend_damping = getattr(args, "bend_damping", 1.0e-4) * res_scale
+            self.stretch_damping = getattr(args, "stretch_damping", 0.5) * res_scale
             self.duration = self.t_settle + self.t_throw + self.t_flight + self.t_lift + self.t_hold
             self.num_frames = int(round(self.duration * self.fps))
             self.n_sub_total = self.num_frames * self.sim_substeps
@@ -833,7 +870,9 @@ class Example:
         # loop must be driven by the hand path itself, not by prescribing the
         # rope-root orientation as in the kinematic example.
         ctrl = BEZIER_CTRL.copy()
-        if self.bezier_delta_file:
+        if getattr(self, "_preset_delta", None) is not None:
+            ctrl = ctrl + self._preset_delta
+        elif self.bezier_delta_file:
             ctrl = ctrl + np.load(self.bezier_delta_file)["delta"]
         ctrl[5:] = centroid + self.follow_scale * (ctrl[5:] - centroid)
         end = bezier_eval(ctrl, np.array([1.0]))[0]
@@ -1179,7 +1218,10 @@ def add_arguments(parser):
     parser.add_argument("--axis-weight", type=float, default=0.0, dest="axis_weight")
     parser.add_argument("--bezier-delta-file", type=str, default=None, dest="bezier_delta_file")
     parser.add_argument(
-        "--command", type=str, default="digitized", choices=["digitized", "searched", "lasso", "replay"]
+        "--command",
+        type=str,
+        default="digitized",
+        choices=["digitized", "searched", "searched-hires", "lasso", "replay"],
     )
     parser.add_argument("--replay-file", type=str, default=None, dest="replay_file")
     parser.add_argument("--replay-node", type=int, default=3, dest="replay_node")

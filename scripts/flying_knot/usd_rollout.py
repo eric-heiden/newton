@@ -32,10 +32,10 @@ def main():
     ap.add_argument("--sample-every", type=int, default=1, dest="sample_every", help="Log every Nth substep.")
     args, extra = ap.parse_known_args()
 
-    from example_cable_flying_knot_mujoco import Example, add_arguments
+    from example_cable_flying_knot_mujoco import Example, add_arguments  # noqa: PLC0415
 
-    import newton.examples
-    import newton.viewer
+    import newton.examples  # noqa: PLC0415
+    import newton.viewer  # noqa: PLC0415
 
     parser = newton.examples.create_parser()
     add_arguments(parser)

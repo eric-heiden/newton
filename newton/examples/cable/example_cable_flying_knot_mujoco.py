@@ -1073,42 +1073,46 @@ class Example:
 
     def simulate(self):
         for _ in range(self.sim_substeps):
-            self.state_0.clear_forces()
+            self.substep()
+
+    def substep(self):
+        """Advance the coupled simulation by one substep."""
+        self.state_0.clear_forces()
+        wp.launch(
+            apply_joint_targets,
+            dim=self.n_arm_coords,
+            inputs=[
+                self.step_idx,
+                self.n_sub_total,
+                self.q_ref_wp,
+                self.qd_ref_wp,
+                self.n_arm_coords,
+            ],
+            outputs=[self.control.joint_target_q, self.control.joint_target_qd],
+        )
+        if self.air_drag > 0.0:
             wp.launch(
-                apply_joint_targets,
-                dim=self.n_arm_coords,
+                apply_rope_air_drag,
+                dim=len(self.rope_bodies),
                 inputs=[
-                    self.step_idx,
-                    self.n_sub_total,
-                    self.q_ref_wp,
-                    self.qd_ref_wp,
-                    self.n_arm_coords,
+                    self.rope_body_wp,
+                    self.state_0.body_q,
+                    self.state_0.body_qd,
+                    self.drag_k_perp,
+                    self.drag_k_par,
                 ],
-                outputs=[self.control.joint_target_q, self.control.joint_target_qd],
+                outputs=[self.state_0.body_f],
             )
-            if self.air_drag > 0.0:
-                wp.launch(
-                    apply_rope_air_drag,
-                    dim=len(self.rope_bodies),
-                    inputs=[
-                        self.rope_body_wp,
-                        self.state_0.body_q,
-                        self.state_0.body_qd,
-                        self.drag_k_perp,
-                        self.drag_k_par,
-                    ],
-                    outputs=[self.state_0.body_f],
-                )
-            self._drive_root(post_step=False)
-            self.model.collide(self.state_0, self.contacts, collision_pipeline=self.collision_pipeline)
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-            # The coupled solver reconciles entry output states over the parent
-            # output, and prescribed kinematic poses do not survive the entry
-            # solve, so re-apply the root prescription to the output state.
-            self._drive_root(post_step=True)
-            newton.eval_ik(self.model, self.state_1, self.state_1.joint_q, self.state_1.joint_qd)
-            self.state_0, self.state_1 = self.state_1, self.state_0
-            wp.launch(advance_step, dim=1, inputs=[self.step_idx])
+        self._drive_root(post_step=False)
+        self.model.collide(self.state_0, self.contacts, collision_pipeline=self.collision_pipeline)
+        self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+        # The coupled solver reconciles entry output states over the parent
+        # output, and prescribed kinematic poses do not survive the entry
+        # solve, so re-apply the root prescription to the output state.
+        self._drive_root(post_step=True)
+        newton.eval_ik(self.model, self.state_1, self.state_1.joint_q, self.state_1.joint_qd)
+        self.state_0, self.state_1 = self.state_1, self.state_0
+        wp.launch(advance_step, dim=1, inputs=[self.step_idx])
 
     def rope_centerline(self, body_q: np.ndarray) -> np.ndarray:
         n = len(self.rope_bodies)

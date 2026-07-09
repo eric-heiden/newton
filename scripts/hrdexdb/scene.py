@@ -22,6 +22,62 @@ from newton import JointTargetMode
 
 _MESH_CACHE: dict[tuple[Path, int], newton.Mesh] = {}
 
+OBJECT_COLOR = (0.83, 0.48, 0.22)
+
+
+def _coacd_cache_path(mesh_path: Path, max_faces: int) -> Path:
+    return mesh_path.parent / f"{mesh_path.stem}.coacd{max_faces}.npz"
+
+
+def _load_cached_parts(mesh_path: Path, max_faces: int) -> list[tuple[np.ndarray, np.ndarray]] | None:
+    path = _coacd_cache_path(mesh_path, max_faces)
+    if not path.exists():
+        return None
+    npz = np.load(path)
+    return [(npz[f"v{i}"], npz[f"f{i}"]) for i in range(int(npz["n_parts"]))]
+
+
+def _save_cached_parts(mesh_path: Path, max_faces: int, parts: list[tuple[np.ndarray, np.ndarray]]) -> None:
+    arrays = {"n_parts": np.array(len(parts))}
+    for i, (v, f) in enumerate(parts):
+        arrays[f"v{i}"] = v
+        arrays[f"f{i}"] = f
+    np.savez_compressed(_coacd_cache_path(mesh_path, max_faces), **arrays)
+
+
+def _set_object_mass_from_parts(
+    builder: newton.ModelBuilder, body: int, parts: list[tuple[np.ndarray, np.ndarray]], target_mass: float
+) -> None:
+    """Set body mass/com/inertia from the watertight convex parts.
+
+    Each part is a convex hull (watertight by construction), so volume
+    integrals are exact. A uniform density is chosen such that the total mass
+    matches ``target_mass``; overlap between CoACD parts slightly biases the
+    inertia, which is acceptable at the accuracy of the unknown true mass.
+    """
+    import trimesh
+
+    vols, coms, inertias = [], [], []
+    for v, f in parts:
+        hull = trimesh.Trimesh(v, np.asarray(f).reshape(-1, 3), process=False).convex_hull
+        mp = hull.mass_properties  # density = 1
+        vols.append(float(mp["mass"]))
+        coms.append(np.asarray(mp["center_mass"]))
+        inertias.append(np.asarray(mp["inertia"]))
+    total_vol = sum(vols)
+    if total_vol <= 0:
+        raise ValueError(f"Degenerate convex decomposition for body {body}")
+    com = sum(v * c for v, c in zip(vols, coms)) / total_vol
+    inertia = np.zeros((3, 3))
+    for vol, c, i_part in zip(vols, coms, inertias):
+        d = c - com
+        inertia += i_part + vol * (float(d @ d) * np.eye(3) - np.outer(d, d))
+    rho = target_mass / total_vol
+    inertia *= rho
+    builder.body_mass[body] = float(target_mass)
+    builder.body_com[body] = wp.vec3(*com.tolist())
+    builder.body_inertia[body] = wp.mat33(*inertia.flatten().tolist())
+
 
 @dataclass
 class SimParams:
@@ -191,6 +247,11 @@ def build_scene(
         world.joint_q[follower] = mult * float(q0[leader_col]) + off
 
     # Passive object as a free rigid body at the first ground-truth pose.
+    # The scanned OBJ meshes are frequently open shells (non-watertight), so
+    # raw-mesh volume/inertia integrals are unreliable. We collide against a
+    # watertight CoACD convex decomposition (builder.approximate_meshes) and
+    # derive mass properties from the decomposed parts; the original mesh is
+    # kept as a visual-only shape.
     obj_mesh = load_object_mesh(ep.mesh, max_faces=max_faces)
     T0 = ep.obj_poses[0]
     xform0 = _mat44_to_transform(T0)
@@ -198,14 +259,53 @@ def build_scene(
     body = world.add_body(xform=xform0, label="object")
 
     verts = np.asarray(obj_mesh.vertices)
-    vol_est = _mesh_volume(obj_mesh)
-    cfg = newton.ModelBuilder.ShapeConfig(
-        density=params.object_mass / max(vol_est, 1e-6),
+    collide_cfg = newton.ModelBuilder.ShapeConfig(
+        density=0.0,  # mass properties are set explicitly below
         ke=params.contact_ke,
         kd=params.contact_kd,
         mu=params.friction,
     )
-    world.add_shape_mesh(body, mesh=obj_mesh, cfg=cfg, color=(0.83, 0.48, 0.22), label="object_mesh")
+    parts = _load_cached_parts(ep.mesh, max_faces)
+    if parts is None:
+        shape_idx = world.add_shape_mesh(
+            body, mesh=obj_mesh, cfg=collide_cfg, color=OBJECT_COLOR, label="object_mesh"
+        )
+        # Cap the part count: noisy thin-shell scans otherwise explode into
+        # hundreds of slivers that overwhelm the contact pipeline.
+        # merge=True is required for max_convex_hull to take effect; noisy
+        # thin-shell scans otherwise explode into hundreds of sliver hulls
+        # that overwhelm the contact pipeline.
+        world.approximate_meshes(
+            method="coacd",
+            shape_indices=[shape_idx],
+            keep_visual_shapes=True,
+            threshold=0.08,
+            merge=True,
+            max_convex_hull=16,
+        )
+        parts = []
+        for s in range(len(world.shape_type)):
+            if world.shape_body[s] == body and (world.shape_flags[s] & newton.ShapeFlags.COLLIDE_SHAPES):
+                src = world.shape_source[s]
+                parts.append((np.asarray(src.vertices, dtype=np.float32), np.asarray(src.indices, dtype=np.int32)))
+        _save_cached_parts(ep.mesh, max_faces, parts)
+    else:
+        visual_cfg = newton.ModelBuilder.ShapeConfig(
+            density=0.0, has_shape_collision=False, has_particle_collision=False
+        )
+        world.add_shape_mesh(body, mesh=obj_mesh, cfg=visual_cfg, color=OBJECT_COLOR, label="object_mesh_visual")
+        hull_cfg = newton.ModelBuilder.ShapeConfig(
+            density=0.0,
+            ke=params.contact_ke,
+            kd=params.contact_kd,
+            mu=params.friction,
+            is_visible=False,
+        )
+        for i, (v, f) in enumerate(parts):
+            world.add_shape_convex_hull(
+                body, mesh=newton.Mesh(v, f.reshape(-1)), cfg=hull_cfg, label=f"object_convex_{i}"
+            )
+    _set_object_mass_from_parts(world, body, parts, params.object_mass)
 
     # Support plane at the object's initial resting height.
     v0 = verts @ T0[:3, :3].T + T0[:3, 3]

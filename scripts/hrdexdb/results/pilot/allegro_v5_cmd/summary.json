@@ -1,0 +1,24 @@
+{
+ "apple/3": {
+  "add_final": 0.23467012901085704,
+  "add_mean": 0.07532670765592381,
+  "add_rmse": 0.1088653794420667,
+  "gt_grasp_success": true,
+  "gt_lifted": true,
+  "hand": "allegro_v5",
+  "joint_rmse_arm": 0.004315652530371508,
+  "joint_rmse_hand": 0.07599346512330636,
+  "lift_match": true,
+  "object": "apple",
+  "pos_err_final": 0.23796571321121043,
+  "pos_err_max": 0.239089944888559,
+  "pos_rmse": 0.10853157146341892,
+  "rot_err_final_deg": 99.46929049104543,
+  "rot_rmse_deg": 60.91348832647399,
+  "scene": "3",
+  "sim_lifted": true,
+  "target_source": "cmd",
+  "wall_time": 58.568744246382266,
+  "z_peak_err": 0.0709270089155224
+ }
+}

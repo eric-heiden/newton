@@ -15,7 +15,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from scene import SimParams  # noqa: E402
+from scene import SimParams
 
 HERE = Path(__file__).parent
 RESULTS = HERE / "results"
@@ -35,9 +35,7 @@ def pick_episodes(hand: str, tag: str) -> dict[str, tuple[str, str, dict]]:
     if not summary_path.exists():
         return {}
     s = {
-        k: v
-        for k, v in json.loads(summary_path.read_text()).items()
-        if "error" not in v and not v.get("calib_outlier")
+        k: v for k, v in json.loads(summary_path.read_text()).items() if "error" not in v and not v.get("calib_outlier")
     }
     ranked = sorted(s.items(), key=lambda kv: kv[1]["add_rmse"])
     if not ranked:
@@ -68,9 +66,20 @@ def main():
                 # One subprocess per video: ViewerGL contexts don't survive
                 # repeated create/destroy cycles within a process reliably.
                 cmd = [
-                    "uv", "run", "python", str(HERE / "render.py"),
-                    "--hand", hand, "--object", obj, "--scene", scene,
-                    "--camera", args.camera, "--output", str(VIDEOS / fname),
+                    "uv",
+                    "run",
+                    "python",
+                    str(HERE / "render.py"),
+                    "--hand",
+                    hand,
+                    "--object",
+                    obj,
+                    "--scene",
+                    scene,
+                    "--camera",
+                    args.camera,
+                    "--output",
+                    str(VIDEOS / fname),
                 ]
                 params_file = RESULTS / f"tuned_params_{hand}_cmd.json"
                 if params_file.exists():

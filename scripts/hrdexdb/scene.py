@@ -15,13 +15,12 @@ from pathlib import Path
 
 import numpy as np
 import warp as wp
+from dataset import ARM_DOF, Episode
 
 import newton
 from newton import JointTargetMode
 
-from dataset import ARM_DOF, Episode  # noqa: E402  (script-local import)
-
-_MESH_CACHE: dict[tuple[Path, int], "newton.Mesh"] = {}
+_MESH_CACHE: dict[tuple[Path, int], newton.Mesh] = {}
 
 
 @dataclass
@@ -44,7 +43,7 @@ class SimParams:
         )
 
     @classmethod
-    def from_vector(cls, v: np.ndarray) -> "SimParams":
+    def from_vector(cls, v: np.ndarray) -> SimParams:
         return cls(
             arm_ke=float(v[0]),
             arm_kd=float(v[1]),
@@ -58,13 +57,13 @@ class SimParams:
 
 @dataclass
 class SceneInfo:
-    model: "newton.Model"
+    model: newton.Model
     dof_map: np.ndarray
     """Newton coord indices for each data column (arm + actuated hand DOFs)."""
     mimic_dofs: list[tuple[int, int, float, float]]
     """(follower_coord, leader_data_col, multiplier, offset) for mimic joints."""
     object_body: int
-    object_mesh_newton: "newton.Mesh"
+    object_mesh_newton: newton.Mesh
     table_height: float
     robot_body_count: int
     joint_labels: list[str] = field(default_factory=list)
@@ -310,7 +309,9 @@ if __name__ == "__main__":
         ep = load_episode(hand, obj, scene)
         info = build_scene(ep)
         m = info.model
-        print(f"{hand}: bodies={m.body_count} joints={m.joint_count} coords={m.joint_coord_count} shapes={m.shape_count}")
+        print(
+            f"{hand}: bodies={m.body_count} joints={m.joint_count} coords={m.joint_coord_count} shapes={m.shape_count}"
+        )
         print(f"  dof_map={info.dof_map.tolist()}")
         print(f"  mimic={[(f, c, mu) for f, c, mu, _ in info.mimic_dofs]}")
         print(f"  table_height={info.table_height:.4f} object_body={info.object_body}")

@@ -15,8 +15,8 @@ import json
 import math
 from pathlib import Path
 
-from dataset import load_episode  # noqa: E402
-from replay import Replayer  # noqa: E402
+from dataset import load_episode
+from replay import Replayer
 
 RESULTS = Path(__file__).parent / "results"
 

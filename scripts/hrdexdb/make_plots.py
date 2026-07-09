@@ -173,7 +173,12 @@ def fig_default_vs_tuned(out: Path, hand: str, source: str, train_objects: list[
         ("default\nholdout", [sd[k]["add_rmse"] for k in hold], C_SIM),
         ("tuned\nholdout", [st[k]["add_rmse"] for k in hold], C_TUNED),
     ]
-    bp = ax.boxplot([g[1] for g in groups], tick_labels=[f"{g[0]}\n(n={len(g[1])})" for g in groups], showmeans=True, patch_artist=True)
+    bp = ax.boxplot(
+        [g[1] for g in groups],
+        tick_labels=[f"{g[0]}\n(n={len(g[1])})" for g in groups],
+        showmeans=True,
+        patch_artist=True,
+    )
     for patch, g in zip(bp["boxes"], groups):
         patch.set_facecolor(g[2])
         patch.set_alpha(0.35)
@@ -237,7 +242,9 @@ def main():
             npz = RESULTS / tag / f"{hand}_cmd" / f"{obj}_{scene}.npz"
             if npz.exists():
                 fig_episode_trajectory(
-                    npz, out / f"traj_{hand}_{label}.png", f"{HAND_LABEL[hand]} {obj}/{scene} ({label}, ADD RMSE {v['add_rmse'] * 100:.1f} cm)"
+                    npz,
+                    out / f"traj_{hand}_{label}.png",
+                    f"{HAND_LABEL[hand]} {obj}/{scene} ({label}, ADD RMSE {v['add_rmse'] * 100:.1f} cm)",
                 )
     print(f"figures -> {out}")
 

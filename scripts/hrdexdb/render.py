@@ -16,12 +16,11 @@ from pathlib import Path
 
 import numpy as np
 import warp as wp
+from dataset import load_episode
+from replay import Replayer
+from scene import SimParams
 
 import newton
-
-from dataset import load_episode  # noqa: E402
-from replay import Replayer  # noqa: E402
-from scene import SimParams  # noqa: E402
 
 
 def render_episode(
@@ -118,7 +117,11 @@ def main():
     args = parser.parse_args()
 
     ep = load_episode(args.hand, args.object, args.scene)
-    raw = {k: v for k, v in json.loads(Path(args.params).read_text()).items() if not k.startswith("_")} if args.params else {}
+    raw = (
+        {k: v for k, v in json.loads(Path(args.params).read_text()).items() if not k.startswith("_")}
+        if args.params
+        else {}
+    )
     params = SimParams(**raw)
     out = args.output or f"videos/{args.hand}_{args.object}_{args.scene}_{args.target_source}_{args.camera}.mp4"
     render_episode(ep, params, target_source=args.target_source, output=out, camera=args.camera)

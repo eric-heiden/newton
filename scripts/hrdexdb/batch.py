@@ -12,12 +12,11 @@ from __future__ import annotations
 
 import numpy as np
 import warp as wp
+from replay import _advance_step, _record_state_batch, _set_targets, compute_metrics
+from scene import SimParams, build_scene
 
 import newton
 from newton import ModelFlags
-
-from replay import _advance_step, _record_state_batch, _set_targets, compute_metrics  # noqa: E402
-from scene import SimParams, build_scene  # noqa: E402
 
 
 class BatchReplayer:

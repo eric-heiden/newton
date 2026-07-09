@@ -15,11 +15,10 @@ import json
 from pathlib import Path
 
 import numpy as np
-
-from dataset import load_episode  # noqa: E402
-from replay import Replayer  # noqa: E402
-from scene import SimParams  # noqa: E402
-from tune import TRAIN_EPISODES, resolve_train_episodes  # noqa: E402
+from dataset import load_episode
+from replay import Replayer
+from scene import SimParams
+from tune import TRAIN_EPISODES, resolve_train_episodes
 
 RESULTS = Path(__file__).parent / "results"
 

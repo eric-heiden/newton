@@ -18,10 +18,9 @@ import time
 from pathlib import Path
 
 import numpy as np
-
-from batch import BatchReplayer  # noqa: E402
-from dataset import load_episode  # noqa: E402
-from scene import SimParams  # noqa: E402
+from batch import BatchReplayer
+from dataset import load_episode
+from scene import SimParams
 
 RESULTS = Path(__file__).parent / "results"
 
@@ -108,7 +107,9 @@ def main():
     best_path = RESULTS / f"tuned_params_{args.hand}_{args.target_source}.json"
     log_f = open(log_path, "w", newline="")
     writer = csv.writer(log_f)
-    writer.writerow(["gen", "cand", *[n for n, _, _ in PARAM_SPACE], *[f"add_{o}_{s}" for o, s in episodes], "mean_add"])
+    writer.writerow(
+        ["gen", "cand", *[n for n, _, _ in PARAM_SPACE], *[f"add_{o}_{s}" for o, s in episodes], "mean_add"]
+    )
 
     t_start = time.time()
     gen = 0
@@ -131,7 +132,13 @@ def main():
         for c, (x, cost) in enumerate(zip(xs, costs)):
             p = params_from_log(np.asarray(x))
             writer.writerow(
-                [gen, c, *[f"{getattr(p, n):.5g}" for n, _, _ in PARAM_SPACE], *[f"{v:.5f}" for v in per_ep[:, c]], f"{cost:.5f}"]
+                [
+                    gen,
+                    c,
+                    *[f"{getattr(p, n):.5g}" for n, _, _ in PARAM_SPACE],
+                    *[f"{v:.5f}" for v in per_ep[:, c]],
+                    f"{cost:.5f}",
+                ]
             )
         log_f.flush()
         i_best = int(np.argmin(costs))

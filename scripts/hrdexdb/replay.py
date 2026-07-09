@@ -18,24 +18,23 @@ from pathlib import Path
 
 import numpy as np
 import warp as wp
+from dataset import ARM_DOF, load_episode
+from scene import SceneInfo, SimParams, build_scene
 
 import newton
-
-from dataset import ARM_DOF, load_episode  # noqa: E402
-from scene import SceneInfo, SimParams, build_scene  # noqa: E402
 
 RESULTS_ROOT = Path(__file__).parent / "results"
 
 
 @wp.kernel
 def _set_targets(
-    targets: wp.array2d(dtype=wp.float32),
-    dof_map: wp.array(dtype=wp.int32),
-    step: wp.array(dtype=wp.int32),
+    targets: wp.array2d[wp.float32],
+    dof_map: wp.array[wp.int32],
+    step: wp.array[wp.int32],
     coords_per_world: int,
     num_dofs: int,
     # outputs
-    joint_target_q: wp.array(dtype=wp.float32),
+    joint_target_q: wp.array[wp.float32],
 ):
     tid = wp.tid()  # one thread per (world, data dof)
     world = tid // num_dofs
@@ -46,16 +45,16 @@ def _set_targets(
 
 @wp.kernel
 def _record_state(
-    body_q: wp.array(dtype=wp.transform),
-    joint_q: wp.array(dtype=wp.float32),
-    dof_map: wp.array(dtype=wp.int32),
-    step: wp.array(dtype=wp.int32),
+    body_q: wp.array[wp.transform],
+    joint_q: wp.array[wp.float32],
+    dof_map: wp.array[wp.int32],
+    step: wp.array[wp.int32],
     record_every: int,
     object_body: int,
     num_dofs: int,
     # outputs
-    rec_obj: wp.array2d(dtype=wp.float32),
-    rec_q: wp.array2d(dtype=wp.float32),
+    rec_obj: wp.array2d[wp.float32],
+    rec_q: wp.array2d[wp.float32],
 ):
     i = step[0]
     if i % record_every != 0:
@@ -74,18 +73,18 @@ def _record_state(
 
 @wp.kernel
 def _record_state_batch(
-    body_q: wp.array(dtype=wp.transform),
-    joint_q: wp.array(dtype=wp.float32),
-    dof_map: wp.array(dtype=wp.int32),
-    step: wp.array(dtype=wp.int32),
+    body_q: wp.array[wp.transform],
+    joint_q: wp.array[wp.float32],
+    dof_map: wp.array[wp.int32],
+    step: wp.array[wp.int32],
     record_every: int,
     object_body: int,
     bodies_per_world: int,
     coords_per_world: int,
     num_dofs: int,
     # outputs
-    rec_obj: wp.array3d(dtype=wp.float32),
-    rec_q: wp.array3d(dtype=wp.float32),
+    rec_obj: wp.array3d[wp.float32],
+    rec_q: wp.array3d[wp.float32],
 ):
     w = wp.tid()
     i = step[0]
@@ -102,7 +101,7 @@ def _record_state_batch(
 
 
 @wp.kernel
-def _advance_step(step: wp.array(dtype=wp.int32)):
+def _advance_step(step: wp.array[wp.int32]):
     step[0] = step[0] + 1
 
 
@@ -362,7 +361,11 @@ def main():
     args = parser.parse_args()
 
     ep = load_episode(args.hand, args.object, args.scene)
-    raw = {k: v for k, v in json.loads(Path(args.params).read_text()).items() if not k.startswith("_")} if args.params else {}
+    raw = (
+        {k: v for k, v in json.loads(Path(args.params).read_text()).items() if not k.startswith("_")}
+        if args.params
+        else {}
+    )
     params = SimParams(**raw)
     rep = Replayer(ep, params, target_source=args.target_source, substeps=args.substeps)
     res = rep.run()

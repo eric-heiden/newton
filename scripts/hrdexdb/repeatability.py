@@ -15,10 +15,9 @@ import json
 from pathlib import Path
 
 import numpy as np
-
-from dataset import load_episode  # noqa: E402
-from replay import Replayer  # noqa: E402
-from scene import SimParams  # noqa: E402
+from dataset import load_episode
+from replay import Replayer
+from scene import SimParams
 
 RESULTS = Path(__file__).parent / "results"
 
@@ -55,7 +54,9 @@ def main():
     for spec, v in out.items():
         a = np.array(v["add_rmse"])
         a = a[~np.isnan(a)]
-        print(f"{spec}: add {a.mean():.4f} ± {a.std():.4f} (range {a.min():.4f}–{a.max():.4f}), lift rate {np.mean(v['sim_lifted']):.2f}")
+        print(
+            f"{spec}: add {a.mean():.4f} ± {a.std():.4f} (range {a.min():.4f}–{a.max():.4f}), lift rate {np.mean(v['sim_lifted']):.2f}"
+        )
 
 
 if __name__ == "__main__":

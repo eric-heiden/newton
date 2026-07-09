@@ -35,9 +35,7 @@ def load_summary(tag, hand, source):
 
 def agg(summary, key, exclude_outliers=True):
     vals = [
-        v[key]
-        for v in summary.values()
-        if not (exclude_outliers and (v.get("calib_outlier") or v.get("sim_unstable")))
+        v[key] for v in summary.values() if not (exclude_outliers and (v.get("calib_outlier") or v.get("sim_unstable")))
     ]
     vals = [v for v in vals if not (isinstance(v, float) and np.isnan(v))]
     if not vals:

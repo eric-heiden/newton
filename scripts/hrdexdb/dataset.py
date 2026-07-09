@@ -298,7 +298,11 @@ if __name__ == "__main__":
     ep = load_episode(args.hand, args.object, args.scene)
     print(f"{ep.hand}/{ep.object_name}/{ep.scene}: {ep.duration:.2f}s, success={ep.grasp_success}")
     print(f"  q_meas {ep.q_meas.shape}  q_cmd {ep.q_cmd.shape}  obj {ep.obj_poses.shape}")
-    print(f"  obj z [m]: start {ep.obj_poses[0, 2, 3]:.3f} min {ep.obj_poses[:, 2, 3].min():.3f} max {ep.obj_poses[:, 2, 3].max():.3f}")
+    print(
+        f"  obj z [m]: start {ep.obj_poses[0, 2, 3]:.3f} min {ep.obj_poses[:, 2, 3].min():.3f} max {ep.obj_poses[:, 2, 3].max():.3f}"
+    )
     print(f"  obj xy start: {np.round(ep.obj_poses[0, :2, 3], 3)}")
-    print(f"  hand q range: meas [{ep.q_meas[:, ARM_DOF:].min():.2f}, {ep.q_meas[:, ARM_DOF:].max():.2f}]"
-          f" cmd [{ep.q_cmd[:, ARM_DOF:].min():.2f}, {ep.q_cmd[:, ARM_DOF:].max():.2f}]")
+    print(
+        f"  hand q range: meas [{ep.q_meas[:, ARM_DOF:].min():.2f}, {ep.q_meas[:, ARM_DOF:].max():.2f}]"
+        f" cmd [{ep.q_cmd[:, ARM_DOF:].min():.2f}, {ep.q_cmd[:, ARM_DOF:].max():.2f}]"
+    )

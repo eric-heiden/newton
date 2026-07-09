@@ -235,7 +235,43 @@ def main():
     <div class="metric"><span>Control interface</span><strong>joint_target_q</strong><small>PD targets only — object 100% passive</small></div>
   </div>"""
 
+    # Revalidation table (winner's-curse check)
+    reval_path = RESULTS / "revalidation.json"
+    reval_html = "<p>(revalidation pending)</p>"
+    n_evals = "160"
+    if reval_path.exists():
+        reval = json.loads(reval_path.read_text())
+        rt = (
+            "<tr><th>Hand</th><th>CMA-ES reported best [cm]</th>"
+            "<th>Tuned, revalidated [cm]</th><th>Defaults [cm]</th></tr>"
+        )
+        for hand, v in reval.items():
+            rt += (
+                f"<tr><td>{HAND_LABEL[hand]}</td><td>{fmt_cm(v['cma_reported_best'])}</td>"
+                f"<td>{fmt_cm(v['tuned_train_mean'])}</td><td>{fmt_cm(v['default_train_mean'])}</td></tr>"
+            )
+        reval_html = f"<table>{rt}</table>"
+
+    # Repeatability sentence
+    repeat_path = RESULTS / "repeatability.json"
+    repeat_txt = "see repeatability study"
+    if repeat_path.exists():
+        rep = json.loads(repeat_path.read_text())
+        spreads, flip = [], []
+        for v in rep.values():
+            a = np.array([x for x in v["add_rmse"] if not np.isnan(x)])
+            if len(a):
+                spreads.append(a.std())
+            flip.append(0 < np.mean(v["sim_lifted"]) < 1)
+        repeat_txt = (
+            f"{len(rep)} episodes × 8 runs: within-instance ADD std ≤ {max(spreads) * 100:.2f} cm, "
+            f"{sum(flip)} episode(s) with non-deterministic lift outcome"
+        )
+
     html = (HERE / "report_template.html").read_text()
+    html = html.replace("{{REVALIDATION}}", reval_html)
+    html = html.replace("{{N_EVALS}}", n_evals)
+    html = html.replace("{{REPEATABILITY}}", repeat_txt)
     html = html.replace("{{HERO_METRICS}}", hero)
     html = html.replace("{{N_EPISODES}}", str(n_eps))
     html = html.replace("{{N_OBJECTS}}", str(len(objects)))

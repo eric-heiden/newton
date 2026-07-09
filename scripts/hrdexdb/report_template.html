@@ -166,6 +166,21 @@
     <figcaption>CMA-ES convergence per hand: population range (shaded), population mean, and best-so-far
     objective (mean ADD RMSE over the five training episodes).</figcaption>
   </figure>
+  <h3>How much of the improvement is real? Winner's curse on a chaotic objective</h3>
+  <p>
+    Grasp outcomes are contact-chaotic: re-running the <em>same</em> episode with the same parameters in a
+    fresh solver instance shifts ADD RMSE by up to ~10% (and can flip a marginal lift). Selecting the best of
+    ~{{N_EVALS}} noisy evaluations therefore biases the reported optimum low. We revalidate the frozen tuned
+    parameters with fresh rollouts on the training episodes:
+  </p>
+  {{REVALIDATION}}
+  <p>
+    The revalidated tuned parameters perform close to the defaults on the training set — most of the apparent
+    CMA-ES gain is selection noise, and the small holdout improvement below should be read in that light. This
+    is itself a key result: <strong>within this parameter family, Newton's replay fidelity is not limited by
+    poorly chosen gains or friction values</strong>; it is dominated by contact chaos, geometry approximation,
+    and dataset calibration error.
+  </p>
 </section>
 
 <section id="results">
@@ -224,8 +239,9 @@
   <h2>Honest limitations</h2>
   <ul>
     <li><strong>Grasp outcomes are chaotic.</strong> Millimeter-scale differences at contact onset flip
-      episodes between firm grasp and slip; identical configurations can diverge between runs due to
-      contact-solver nondeterminism. Median metrics are the right lens, not single episodes.</li>
+      episodes between firm grasp and slip. Repeated rollouts within one solver instance are nearly
+      bit-stable, but fresh solver instances shift metrics by up to ~10% and can flip marginal lifts
+      ({{REPEATABILITY}}). Median metrics over many episodes are the right lens, not single episodes.</li>
     <li><strong>Geometry gap.</strong> URDF collision meshes of the hands and 2000-face decimations of the
       scanned objects approximate the real contact geometry; fingertip compliance (rubber pads, tactile skins)
       is not modeled.</li>

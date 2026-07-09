@@ -206,7 +206,7 @@ def build_scene(
         kd=params.contact_kd,
         mu=params.friction,
     )
-    world.add_shape_mesh(body, mesh=obj_mesh, cfg=cfg, label="object_mesh")
+    world.add_shape_mesh(body, mesh=obj_mesh, cfg=cfg, color=(0.83, 0.48, 0.22), label="object_mesh")
 
     # Support plane at the object's initial resting height.
     v0 = verts @ T0[:3, :3].T + T0[:3, 3]
@@ -218,6 +218,7 @@ def build_scene(
         width=0.0,
         length=0.0,
         cfg=plane_cfg,
+        color=(0.80, 0.82, 0.86),
         label="table",
     )
 

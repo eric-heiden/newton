@@ -1,0 +1,3 @@
+videos/
+*.npz
+__pycache__/

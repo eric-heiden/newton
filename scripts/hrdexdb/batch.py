@@ -23,7 +23,7 @@ from scene import SimParams, build_scene  # noqa: E402
 class BatchReplayer:
     """Simulates one episode for a population of parameter candidates."""
 
-    def __init__(self, ep, num_worlds: int, target_source: str = "cmd", substeps: int = 4, max_faces: int = 8000):
+    def __init__(self, ep, num_worlds: int, target_source: str = "cmd", substeps: int = 4, max_faces: int = 2000):
         newton.use_coord_layout_targets = True
         self.ep = ep
         self.num_worlds = num_worlds

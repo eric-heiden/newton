@@ -38,9 +38,12 @@ PARAM_SPACE = [
 
 # Training episodes per hand (objects chosen for diversity of size/shape;
 # everything else is held out).
+# blue_plastic_box excluded from training: its large flat contact patches
+# make episodes ~10x more expensive to simulate, dominating tuning wall time
+# (it remains in the held-out evaluation).
 TRAIN_EPISODES = {
-    "allegro_v5": [("banana", None), ("apple", None), ("blue_plastic_box", None), ("baseball", None), ("book", None)],
-    "inspire_f1": [("banana", None), ("apple", None), ("blue_plastic_box", None), ("baseball", None), ("book", None)],
+    "allegro_v5": [("banana", None), ("apple", None), ("baseball", None), ("book", None), ("beige_brush", None)],
+    "inspire_f1": [("banana", None), ("apple", None), ("baseball", None), ("book", None), ("beige_brush", None)],
 }
 
 
@@ -112,9 +115,11 @@ def main():
         xs = es.ask()
         plist = [params_from_log(np.asarray(x)) for x in xs]
         per_ep = []
-        for rep in replayers:
+        for (obj, scene), rep in zip(episodes, replayers):
+            t_ep = time.time()
             res = rep.run(plist)
             per_ep.append([objective_terms(r) for r in res])
+            print(f"  gen {gen} {obj}/{scene}: {time.time() - t_ep:.0f}s", flush=True)
         per_ep = np.array(per_ep)  # (episodes, popsize)
         costs = per_ep.mean(axis=0)
         es.tell(xs, costs.tolist())

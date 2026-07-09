@@ -185,6 +185,92 @@
   "blue_alarm": [
    "0",
    "1"
+  ],
+  "blue_plastic_box": [
+   "0",
+   "1"
+  ],
+  "blue_vase": [
+   "0",
+   "1"
+  ],
+  "book": [],
+  "box_pink": [],
+  "brown_ramen": [
+   "0",
+   "1"
+  ],
+  "cactus": [
+   "0",
+   "1"
+  ],
+  "cactus2": [
+   "0",
+   "1"
+  ],
+  "cactus3": [
+   "0",
+   "1"
+  ],
+  "circular_frying_pan": [
+   "1",
+   "2"
+  ],
+  "clothes_hanger": [
+   "0",
+   "1"
+  ],
+  "coffee_tin": [
+   "0",
+   "1"
+  ],
+  "colander_green": [
+   "2",
+   "3"
+  ],
+  "container_pink": [
+   "0",
+   "1"
+  ],
+  "donut": [
+   "0",
+   "1"
+  ],
+  "frame_oak": [
+   "0",
+   "1"
+  ],
+  "frame_red": [
+   "0",
+   "1"
+  ],
+  "french_mustard": [
+   "3",
+   "4"
+  ],
+  "frog_bowl": [
+   "0",
+   "1"
+  ],
+  "frog_cup": [
+   "0",
+   "1"
+  ],
+  "fruit_cutter_base": [
+   "0",
+   "1"
+  ],
+  "green_attached_container": [
+   "0",
+   "1"
+  ],
+  "green_cactus_vase": [
+   "0",
+   "1"
+  ],
+  "green_soap_dispenser": [
+   "0",
+   "1"
   ]
  }
 }

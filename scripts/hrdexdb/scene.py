@@ -71,7 +71,7 @@ class SceneInfo:
     palm_body: int | None = None
 
 
-def load_object_mesh(path: Path, max_faces: int = 8000) -> newton.Mesh:
+def load_object_mesh(path: Path, max_faces: int = 2000) -> newton.Mesh:
     """Load and (if needed) decimate the scanned object mesh."""
     key = (path, max_faces)
     if key in _MESH_CACHE:
@@ -130,7 +130,7 @@ def build_scene(
     ep: Episode,
     params: SimParams | None = None,
     num_worlds: int = 1,
-    max_faces: int = 8000,
+    max_faces: int = 2000,
 ) -> SceneInfo:
     params = params or SimParams()
 

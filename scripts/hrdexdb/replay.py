@@ -200,7 +200,7 @@ class Replayer:
         params: SimParams | None = None,
         target_source: str = "cmd",
         substeps: int = 4,
-        max_faces: int = 8000,
+        max_faces: int = 2000,
         solver_kwargs: dict | None = None,
     ):
         newton.use_coord_layout_targets = True

@@ -92,12 +92,16 @@ def main():
         summary_path.write_text(json.dumps(summary, indent=1, sort_keys=True))
         gc.collect()
 
-    ok = [m for m in summary.values() if "error" not in m]
+    ok = [
+        m
+        for m in summary.values()
+        if "error" not in m and not m.get("calib_outlier") and not np.isnan(m.get("add_rmse", np.nan))
+    ]
     if ok:
         add = np.array([m["add_rmse"] for m in ok])
         pos = np.array([m["pos_rmse"] for m in ok])
         lift = np.mean([m["lift_match"] for m in ok])
-        print(f"\n=== {args.hand}/{args.target_source}/{args.tag}: {len(ok)} episodes ===")
+        print(f"\n=== {args.hand}/{args.target_source}/{args.tag}: {len(ok)} valid episodes ===")
         print(f"add_rmse mean {add.mean():.4f} median {np.median(add):.4f}")
         print(f"pos_rmse mean {pos.mean():.4f} median {np.median(pos):.4f}")
         print(f"lift match rate {lift:.2%}")

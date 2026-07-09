@@ -194,8 +194,8 @@ def build_scene(
     obj_mesh = load_object_mesh(ep.mesh, max_faces=max_faces)
     T0 = ep.obj_poses[0]
     xform0 = _mat44_to_transform(T0)
+    # add_body creates the free joint automatically — the object is passive.
     body = world.add_body(xform=xform0, label="object")
-    world.add_joint_free(body, label="object_free")
 
     verts = np.asarray(obj_mesh.vertices)
     vol_est = _mesh_volume(obj_mesh)

@@ -73,6 +73,35 @@ def _record_state(
 
 
 @wp.kernel
+def _record_state_batch(
+    body_q: wp.array(dtype=wp.transform),
+    joint_q: wp.array(dtype=wp.float32),
+    dof_map: wp.array(dtype=wp.int32),
+    step: wp.array(dtype=wp.int32),
+    record_every: int,
+    object_body: int,
+    bodies_per_world: int,
+    coords_per_world: int,
+    num_dofs: int,
+    # outputs
+    rec_obj: wp.array3d(dtype=wp.float32),
+    rec_q: wp.array3d(dtype=wp.float32),
+):
+    w = wp.tid()
+    i = step[0]
+    if i % record_every != 0:
+        return
+    r = i / record_every
+    if r >= rec_obj.shape[0]:
+        return
+    tf = body_q[w * bodies_per_world + object_body]
+    for k in range(7):
+        rec_obj[r, w, k] = tf[k]
+    for d in range(num_dofs):
+        rec_q[r, w, d] = joint_q[w * coords_per_world + dof_map[d]]
+
+
+@wp.kernel
 def _advance_step(step: wp.array(dtype=wp.int32)):
     step[0] = step[0] + 1
 

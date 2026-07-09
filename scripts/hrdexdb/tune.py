@@ -123,6 +123,9 @@ def main():
             per_ep.append([objective_terms(r) for r in res])
             print(f"  gen {gen} {obj}/{scene}: {time.time() - t_ep:.0f}s", flush=True)
         per_ep = np.array(per_ep)  # (episodes, popsize)
+        # Rare contact-solver blowups produce NaN states; penalize rather
+        # than poisoning the CMA-ES ranking.
+        per_ep = np.where(np.isnan(per_ep), 1.0, per_ep)
         costs = per_ep.mean(axis=0)
         es.tell(xs, costs.tolist())
         for c, (x, cost) in enumerate(zip(xs, costs)):

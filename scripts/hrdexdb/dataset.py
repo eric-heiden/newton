@@ -224,6 +224,8 @@ def load_episode(hand: str, object_name: str, scene: str | int, control_hz: floa
         hand_meas = _load(ep_dir / "raw" / "hand" / "position.npy")
         hand_cmd = _load(ep_dir / "raw" / "hand" / "action.npy")
         hand_cmd_t = hand_t
+        if hand_cmd.ndim != 2 or len(hand_cmd) < 2:  # a few episodes ship empty logs
+            hand_cmd = hand_meas
     elif hand == "inspire_f1":
         hand_t = _load(ep_dir / "raw" / "hand" / "right_joint_states_time.npy").reshape(-1)
         hand_meas = inspire_f1_counts_to_qpos(_load(ep_dir / "raw" / "hand" / "right_joint_states.npy"))

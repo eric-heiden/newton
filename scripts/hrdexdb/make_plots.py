@@ -44,7 +44,14 @@ def load_summary(tag: str, hand: str, source: str) -> dict:
     p = RESULTS / tag / f"{hand}_{source}" / "summary.json"
     if not p.exists():
         return {}
-    return {k: v for k, v in json.loads(p.read_text()).items() if "error" not in v}
+    return {
+        k: v
+        for k, v in json.loads(p.read_text()).items()
+        if "error" not in v
+        and not v.get("calib_outlier")
+        and not v.get("sim_unstable")
+        and not np.isnan(v.get("add_rmse", np.nan))
+    }
 
 
 def fig_convergence(out: Path, hands=("allegro_v5", "inspire_f1"), source="cmd"):

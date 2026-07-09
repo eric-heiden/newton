@@ -28,8 +28,14 @@ RESULTS = Path(__file__).parent / "results"
 
 def run_episode(hand, obj, scene, params, target_source, substeps, out_path: Path):
     ep = load_episode(hand, obj, scene)
-    rep = Replayer(ep, params, target_source=target_source, substeps=substeps)
-    res = rep.run()
+    for attempt in range(2):
+        rep = Replayer(ep, params, target_source=target_source, substeps=substeps)
+        res = rep.run()
+        if not np.isnan(res.metrics["add_rmse"]):
+            break
+        # Rare stochastic contact-solver blowup (NaN state): retry once.
+        print(f"  {obj}/{scene}: NaN state (attempt {attempt + 1}), retrying")
+    res.metrics["sim_unstable"] = bool(np.isnan(res.metrics["add_rmse"]))
     res.metrics.update(hand=hand, object=obj, scene=scene, target_source=target_source)
     res.save(out_path)
     return res.metrics

@@ -34,7 +34,12 @@ def load_summary(tag, hand, source):
 
 
 def agg(summary, key, exclude_outliers=True):
-    vals = [v[key] for v in summary.values() if not (exclude_outliers and v.get("calib_outlier"))]
+    vals = [
+        v[key]
+        for v in summary.values()
+        if not (exclude_outliers and (v.get("calib_outlier") or v.get("sim_unstable")))
+    ]
+    vals = [v for v in vals if not (isinstance(v, float) and np.isnan(v))]
     if not vals:
         return {}
     a = np.array(vals, dtype=float)
@@ -49,7 +54,11 @@ def stats_row(tag, hand, source, train_objects):
     s = load_summary(tag, hand, source)
     if not s:
         return None
-    valid = {k: v for k, v in s.items() if not v.get("calib_outlier")}
+    valid = {
+        k: v
+        for k, v in s.items()
+        if not v.get("calib_outlier") and not v.get("sim_unstable") and not np.isnan(v.get("add_rmse", np.nan))
+    }
     hold = {k: v for k, v in valid.items() if k.split("/")[0] not in train_objects}
     add = agg(valid, "add_rmse")
     pos = agg(valid, "pos_rmse")

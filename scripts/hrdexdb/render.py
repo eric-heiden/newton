@@ -118,7 +118,8 @@ def main():
     args = parser.parse_args()
 
     ep = load_episode(args.hand, args.object, args.scene)
-    params = SimParams(**json.loads(Path(args.params).read_text())) if args.params else SimParams()
+    raw = {k: v for k, v in json.loads(Path(args.params).read_text()).items() if not k.startswith("_")} if args.params else {}
+    params = SimParams(**raw)
     out = args.output or f"videos/{args.hand}_{args.object}_{args.scene}_{args.target_source}_{args.camera}.mp4"
     render_episode(ep, params, target_source=args.target_source, output=out, camera=args.camera)
 

@@ -362,7 +362,8 @@ def main():
     args = parser.parse_args()
 
     ep = load_episode(args.hand, args.object, args.scene)
-    params = SimParams(**json.loads(Path(args.params).read_text())) if args.params else SimParams()
+    raw = {k: v for k, v in json.loads(Path(args.params).read_text()).items() if not k.startswith("_")} if args.params else {}
+    params = SimParams(**raw)
     rep = Replayer(ep, params, target_source=args.target_source, substeps=args.substeps)
     res = rep.run()
     print(json.dumps(res.metrics, indent=2))

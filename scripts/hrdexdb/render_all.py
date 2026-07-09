@@ -12,10 +12,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from pathlib import Path
 
-from dataset import load_episode  # noqa: E402
-from render import render_episode  # noqa: E402
 from scene import SimParams  # noqa: E402
 
 HERE = Path(__file__).parent
@@ -62,13 +61,24 @@ def main():
     have = {m["file"] for m in meta}
 
     for hand, hand_label in [("allegro_v5", "Allegro V5"), ("inspire_f1", "Inspire F1")]:
-        params = tuned_params(hand)
         for label, (key, metrics) in pick_episodes(hand, args.tag).items():
             obj, scene = key.split("/")
             fname = f"{hand}_{obj}_{scene}_{args.tag}.mp4"
             if fname not in have:
-                ep = load_episode(hand, obj, scene)
-                render_episode(ep, params, target_source="cmd", output=VIDEOS / fname, camera=args.camera)
+                # One subprocess per video: ViewerGL contexts don't survive
+                # repeated create/destroy cycles within a process reliably.
+                cmd = [
+                    "uv", "run", "python", str(HERE / "render.py"),
+                    "--hand", hand, "--object", obj, "--scene", scene,
+                    "--camera", args.camera, "--output", str(VIDEOS / fname),
+                ]
+                params_file = RESULTS / f"tuned_params_{hand}_cmd.json"
+                if params_file.exists():
+                    cmd += ["--params", str(params_file)]
+                r = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True)
+                if r.returncode != 0 or not (VIDEOS / fname).exists():
+                    print(f"render failed for {fname}:\n{r.stderr[-2000:]}")
+                    continue
                 have.add(fname)
             title = f"{hand_label}: {obj.replace('_', ' ')} ({label})"
             caption = (

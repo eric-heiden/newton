@@ -1,0 +1,23 @@
+[
+ {
+  "file": "allegro_v5_french_mustard_1_tuned.mp4",
+  "title": "Allegro V5: french mustard (best)",
+  "caption": "ADD RMSE 2.8 cm, lift matched (sim lifted, real lifted). Green ghost = ground-truth object pose.",
+  "hand": "allegro_v5",
+  "kind": "best"
+ },
+ {
+  "file": "allegro_v5_bamboo_basket_0_tuned.mp4",
+  "title": "Allegro V5: bamboo basket (median)",
+  "caption": "ADD RMSE 12.3 cm, lift matched (sim lifted, real lifted). Green ghost = ground-truth object pose.",
+  "hand": "allegro_v5",
+  "kind": "median"
+ },
+ {
+  "file": "allegro_v5_balloon_whisk_1_tuned.mp4",
+  "title": "Allegro V5: balloon whisk (worst)",
+  "caption": "ADD RMSE 94.0 cm, lift matched (sim lifted, real lifted). Green ghost = ground-truth object pose.",
+  "hand": "allegro_v5",
+  "kind": "worst"
+ }
+]

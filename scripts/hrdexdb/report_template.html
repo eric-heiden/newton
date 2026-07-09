@@ -124,11 +124,14 @@
   <h2>Method: dynamic replay, no cheating</h2>
   <p>
     Each episode is rebuilt as a Newton scene: the fixed-base xArm6+hand articulation imported from the
-    HRDexDB URDFs, the scanned object mesh as a <em>free rigid body</em> at the first ground-truth pose, and a
-    support plane at the object's initial resting height. The simulation runs
-    <code>SolverMuJoCo</code> (implicitfast, Newton solver, elliptic cones) at 400&nbsp;Hz with Newton's
-    non-convex mesh contacts, and a 100&nbsp;Hz control loop that writes the recorded joint trajectory into
-    <code>Control.joint_target_q</code> — nothing else touches the simulation.
+    HRDexDB URDFs, the scanned object as a <em>free rigid body</em> at the first ground-truth pose, and a
+    support plane at the object's initial resting height. The raw scans are frequently open shells
+    (non-watertight), so the object collides as a watertight CoACD convex decomposition
+    (<code>ModelBuilder.approximate_meshes</code>, ≤16 hulls, original scan kept as a visual-only shape) with
+    mass, center of mass, and inertia integrated analytically over the watertight parts. The simulation runs
+    <code>SolverMuJoCo</code> (implicitfast, Newton solver, elliptic cones) at 400&nbsp;Hz, and a 100&nbsp;Hz
+    control loop writes the recorded joint trajectory into <code>Control.joint_target_q</code> — nothing else
+    touches the simulation.
   </p>
   <div class="note">
     <strong>Rules.</strong> The object is never attached, welded, or kinematically driven; its state is set
@@ -242,9 +245,9 @@
       episodes between firm grasp and slip. Repeated rollouts within one solver instance are nearly
       bit-stable, but fresh solver instances shift metrics by up to ~10% and can flip marginal lifts
       ({{REPEATABILITY}}). Median metrics over many episodes are the right lens, not single episodes.</li>
-    <li><strong>Geometry gap.</strong> URDF collision meshes of the hands and 2000-face decimations of the
-      scanned objects approximate the real contact geometry; fingertip compliance (rubber pads, tactile skins)
-      is not modeled.</li>
+    <li><strong>Geometry gap.</strong> URDF collision meshes of the hands and CoACD convex decompositions of
+      the scanned objects approximate the real contact geometry — convexification rounds off concavities that
+      matter for marginal grasps; fingertip compliance (rubber pads, tactile skins) is not modeled.</li>
     <li><strong>Unknown object inertia.</strong> Object masses are not released with the dataset; a single
       tuned mass scale per hand is a crude stand-in for per-object mass.</li>
     <li><strong>Calibration and tracking noise.</strong> Object 6D tracking and camera-to-robot calibration

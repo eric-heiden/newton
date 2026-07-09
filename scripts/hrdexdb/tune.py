@@ -43,7 +43,9 @@ PARAM_SPACE = [
 # (it remains in the held-out evaluation).
 TRAIN_EPISODES = {
     "allegro_v5": [("banana", None), ("apple", None), ("baseball", None), ("book", None), ("beige_brush", None)],
-    "inspire_f1": [("banana", None), ("apple", None), ("baseball", None), ("book", None), ("beige_brush", None)],
+    # banana/book episodes are incomplete for inspire_f1 on the remote;
+    # donut and coffee_tin substitute as diverse small/cylindrical objects.
+    "inspire_f1": [("apple", None), ("baseball", None), ("beige_brush", None), ("donut", None), ("coffee_tin", None)],
 }
 
 

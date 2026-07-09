@@ -503,9 +503,6 @@
   "wall_time": 109.61792948888615,
   "z_peak_err": 0.118391512589676
  },
- "black_kitchen_roll_holder/1": {
-  "error": "too many indices for array: array is 1-dimensional, but 2 were indexed"
- },
  "blue_alarm/0": {
   "add_final": 0.26057452840454015,
   "add_mean": 0.07426872425379206,
@@ -745,30 +742,6 @@
   "target_source": "cmd",
   "wall_time": 46.51550927013159,
   "z_peak_err": 0.08026622875809514
- },
- "brown_ramen/0": {
-  "add_final": NaN,
-  "add_mean": NaN,
-  "add_rmse": NaN,
-  "calib_outlier": false,
-  "gt_grasp_success": true,
-  "gt_lifted": true,
-  "hand": "allegro_v5",
-  "joint_rmse_arm": NaN,
-  "joint_rmse_hand": NaN,
-  "lift_match": true,
-  "object": "brown_ramen",
-  "palm_obj_min_dist": 0.0929830006032538,
-  "pos_err_final": NaN,
-  "pos_err_max": NaN,
-  "pos_rmse": NaN,
-  "rot_err_final_deg": 127.54499485090449,
-  "rot_rmse_deg": 110.72447096825435,
-  "scene": "0",
-  "sim_lifted": true,
-  "target_source": "cmd",
-  "wall_time": 32.80642360588536,
-  "z_peak_err": NaN
  },
  "brown_ramen/1": {
   "add_final": 0.22067399699966708,

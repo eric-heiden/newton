@@ -228,8 +228,13 @@ def build_scene(
 
     model = builder.finalize()
 
+    # The Inspire URDF spells palm as "plam"; fall back to the wrist link.
     palm_body = next(
-        (i for i, label in enumerate(model.body_label[:robot_body_count]) if "palm" in label.lower()),
+        (
+            i
+            for i, label in enumerate(model.body_label[:robot_body_count])
+            if "palm" in label.lower() or "plam" in label.lower()
+        ),
         None,
     )
     if palm_body is None:

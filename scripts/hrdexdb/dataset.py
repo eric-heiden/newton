@@ -227,8 +227,13 @@ def load_episode(hand: str, object_name: str, scene: str | int, control_hz: floa
     elif hand == "inspire_f1":
         hand_t = _load(ep_dir / "raw" / "hand" / "right_joint_states_time.npy").reshape(-1)
         hand_meas = inspire_f1_counts_to_qpos(_load(ep_dir / "raw" / "hand" / "right_joint_states.npy"))
-        hand_cmd_t = _load(ep_dir / "raw" / "hand" / "right_commands_time.npy").reshape(-1)
-        hand_cmd = inspire_f1_counts_to_qpos(_load(ep_dir / "raw" / "hand" / "right_commands.npy"))
+        cmd_raw = _load(ep_dir / "raw" / "hand" / "right_commands.npy")
+        if cmd_raw.ndim == 2 and len(cmd_raw) > 1:
+            hand_cmd_t = _load(ep_dir / "raw" / "hand" / "right_commands_time.npy").reshape(-1)
+            hand_cmd = inspire_f1_counts_to_qpos(cmd_raw)
+        else:  # a few episodes ship empty command logs — fall back to measured
+            hand_cmd_t = hand_t
+            hand_cmd = hand_meas
     else:
         raise ValueError(f"Unsupported hand: {hand}")
 

@@ -64,6 +64,8 @@ class BatchReplayer:
         kd = m.joint_target_kd.numpy().reshape(W, self.dofs_per_world)
         arm_dofs = set(int(d) for d in self.info.dof_map[:6])
         hand_dofs = set(int(d) for d in self.info.dof_map[6:])
+        # Mimic followers get armature (they are real robot DOFs) but no drive.
+        robot_dofs = arm_dofs | hand_dofs | {int(f) for f, _, _, _ in self.info.mimic_dofs}
         armature = m.joint_armature.numpy().reshape(W, self.dofs_per_world)
         mu = m.shape_material_mu.numpy().reshape(W, self.shapes_per_world)
         mass = m.body_mass.numpy().reshape(W, self.bodies_per_world)
@@ -82,7 +84,7 @@ class BatchReplayer:
                     ke[w, d], kd[w, d] = p.arm_ke, p.arm_kd
                 elif d in hand_dofs:
                     ke[w, d], kd[w, d] = p.hand_ke, p.hand_kd
-                if ke[w, d] != 0.0 or d in arm_dofs or d in hand_dofs:
+                if d in robot_dofs:
                     armature[w, d] = p.joint_armature
             mu[w, :] = p.friction
             scale = p.object_mass / base_mass

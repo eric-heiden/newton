@@ -269,6 +269,28 @@ class Replayer:
         )
         wp.launch(_advance_step, dim=1, inputs=[self.step_idx])
 
+    def palm_object_min_dist(self, samples: int = 40) -> float:
+        """Minimum distance between the palm (via FK on the reference
+        trajectory) and the ground-truth object center. Large values indicate
+        a camera-to-robot calibration outlier: the recorded hand never comes
+        near where the object supposedly is."""
+        ep = self.ep
+        idx = np.linspace(0, len(ep.t) - 1, samples).astype(int)
+        state = self.model.state()
+        qbuf = self.model.joint_q.numpy().copy()
+        gt = ep.obj_poses_at(ep.t[idx])
+        dists = []
+        for j, i in enumerate(idx):
+            for col, dof in enumerate(self.info.dof_map):
+                qbuf[dof] = ep.q_meas[i, col]
+            for f, leader_col, mult, off in self.info.mimic_dofs:
+                qbuf[f] = mult * ep.q_meas[i, leader_col] + off
+            q_wp = wp.array(qbuf, dtype=self.model.joint_q.dtype)
+            newton.eval_fk(self.model, q_wp, self.model.joint_qd, state)
+            palm = state.body_q.numpy()[self.info.palm_body][:3]
+            dists.append(np.linalg.norm(palm - gt[j, :3, 3]))
+        return float(min(dists))
+
     def run(self, record_every: int = 3, viewer=None, gt_overlay=None) -> ReplayResult:
         ep = self.ep
         n_steps = len(ep.t)
@@ -323,6 +345,8 @@ class Replayer:
             self.info.table_height,
         )
         metrics["wall_time"] = self.wall_time
+        metrics["palm_obj_min_dist"] = self.palm_object_min_dist()
+        metrics["calib_outlier"] = metrics["palm_obj_min_dist"] > 0.25
         return ReplayResult(t, pos_sim, quat_sim, pos_gt, quat_gt, joint_q_sim, ref, metrics)
 
 

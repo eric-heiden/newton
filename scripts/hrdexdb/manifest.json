@@ -157,6 +157,34 @@
   "balloon_whisk": [
    "0",
    "1"
+  ],
+  "bamboo_basket": [
+   "0",
+   "1"
+  ],
+  "bamboo_box": [
+   "0"
+  ],
+  "banana": [],
+  "baseball": [
+   "0",
+   "1"
+  ],
+  "beige_brush": [
+   "2",
+   "3"
+  ],
+  "black_holder_with_handle": [
+   "2",
+   "3"
+  ],
+  "black_kitchen_roll_holder": [
+   "0",
+   "1"
+  ],
+  "blue_alarm": [
+   "0",
+   "1"
   ]
  }
 }

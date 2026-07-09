@@ -68,6 +68,7 @@ class SceneInfo:
     table_height: float
     robot_body_count: int
     joint_labels: list[str] = field(default_factory=list)
+    palm_body: int | None = None
 
 
 def load_object_mesh(path: Path, max_faces: int = 8000) -> newton.Mesh:
@@ -226,6 +227,13 @@ def build_scene(
         builder.replicate(world, num_worlds)
 
     model = builder.finalize()
+
+    palm_body = next(
+        (i for i, label in enumerate(model.body_label[:robot_body_count]) if "palm" in label.lower()),
+        None,
+    )
+    if palm_body is None:
+        palm_body = next(i for i, label in enumerate(model.body_label[:robot_body_count]) if label.endswith("link6"))
     return SceneInfo(
         model=model,
         dof_map=dof_map,
@@ -235,6 +243,7 @@ def build_scene(
         table_height=table_height,
         robot_body_count=robot_body_count,
         joint_labels=labels,
+        palm_body=palm_body,
     )
 
 

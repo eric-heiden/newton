@@ -148,9 +148,10 @@
   </p>
   {{PILOT_TABLE}}
   <p>
-    Recorded <strong>commands</strong> track the real behavior at least as well and match the lift outcome
-    more reliably — they are what the real controller received, including the intentional squeeze beyond
-    contact that measured joint states hide. All headline results use commands.
+    Both sources track similarly in ADD; recorded <strong>commands</strong> match the lift outcome markedly
+    better on the Allegro (67% vs 42%) and slightly worse on the Inspire. We use commands as the headline —
+    they are what the real controller received, including the intentional squeeze beyond contact that
+    measured joint states hide.
   </p>
 </section>
 
@@ -178,11 +179,12 @@
   </p>
   {{REVALIDATION}}
   <p>
-    The revalidated tuned parameters perform close to the defaults on the training set — most of the apparent
-    CMA-ES gain is selection noise, and the small holdout improvement below should be read in that light. This
-    is itself a key result: <strong>within this parameter family, Newton's replay fidelity is not limited by
-    poorly chosen gains or friction values</strong>; it is dominated by contact chaos, geometry approximation,
-    and dataset calibration error.
+    The two hands behave differently. For the <strong>Inspire F1</strong>, the tuned parameters survive
+    revalidation and transfer to held-out objects — a genuine calibration gain. For the
+    <strong>Allegro V5</strong>, the revalidated optimum is indistinguishable from the defaults: with 16
+    independently driven fingers, grasp outcomes are chaotic enough that the CMA-ES "improvement" is mostly
+    selection noise. Within this parameter family, Allegro replay fidelity is limited by contact chaos,
+    geometry approximation, and dataset calibration error rather than by poorly chosen gains.
   </p>
 </section>
 

@@ -227,3 +227,30 @@ class MetricsRecorder:
         with open(path, "w") as f:
             json.dump({"meta": self.meta, "frames": self.frames}, f)
         print(f"Saved metrics to {path}")
+
+
+def log_tank_outline(viewer, fluid: SolverMACFluid, name: str = "/tank"):
+    """Draw the wireframe outline of the fluid domain box."""
+    o = np.array([fluid.origin[0], fluid.origin[1], fluid.origin[2]])
+    e = o + np.array([fluid.nx, fluid.ny, fluid.nz]) * fluid.dx
+    c = [
+        (o[0], o[1], o[2]),
+        (e[0], o[1], o[2]),
+        (e[0], e[1], o[2]),
+        (o[0], e[1], o[2]),
+        (o[0], o[1], e[2]),
+        (e[0], o[1], e[2]),
+        (e[0], e[1], e[2]),
+        (o[0], e[1], e[2]),
+    ]
+    edges = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
+    starts = np.array([c[a] for a, _ in edges], dtype=np.float32)
+    ends = np.array([c[b] for _, b in edges], dtype=np.float32)
+    device = fluid.model.device
+    colors = wp.full(len(edges), value=wp.vec3(0.6, 0.75, 0.85), dtype=wp.vec3, device=device)
+    viewer.log_lines(
+        name,
+        wp.array(starts, dtype=wp.vec3, device=device),
+        wp.array(ends, dtype=wp.vec3, device=device),
+        colors,
+    )

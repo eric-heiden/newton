@@ -29,6 +29,7 @@ from newton.examples.multiphysics.macfluid_demo_utils import (
     add_macfluid_args,
     capture_frame_graph,
     fluid_body_wrenches,
+    log_tank_outline,
     make_coupled_fluid_solver,
 )
 from newton.solvers import SolverMACFluid, SolverMuJoCo
@@ -183,6 +184,8 @@ class Example:
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
+        if self.fluid is not None:
+            log_tank_outline(self.viewer, self.fluid)
         if self.slice_vis is not None:
             self.slice_vis.log(self.viewer, field="speed", scale=1.5)
         self.viewer.end_frame()

@@ -217,15 +217,23 @@ class Example:
         t = self.sim_time
         ramp = min(t / 1.0, 1.0)
         i = np.arange(1, self.num_links)
-        # optional mid-run turnaround: blend to the reversed traveling wave
-        blend = 0.0
+        # Optional mid-run turnaround: dip the gait amplitude to zero and flip
+        # the traveling-wave direction at the quiet point. Cross-blending the
+        # two waves instead would pass through a standing-wave regime where
+        # all joints load the fluid simultaneously, which can destabilize the
+        # weak coupling.
+        env = 1.0
+        wave_sign = 1.0
         if self.reverse_at is not None:
-            blend = float(np.clip((t - self.reverse_at) / 1.0, 0.0, 1.0))
+            u = (t - self.reverse_at) / 2.0  # 2 s turnaround window
+            if u >= 1.0:
+                wave_sign = -1.0
+            elif u >= 0.0:
+                env = abs(2.0 * u - 1.0)
+                wave_sign = 1.0 if u < 0.5 else -1.0
         for s in range(self.num_swimmers):
             phase = 2.0 * np.pi * self.frequencies[s] * t
-            fwd = np.sin(phase - self.phase_step * i)
-            rev = np.sin(phase + self.phase_step * i)
-            targets = ramp * self.amplitude * ((1.0 - blend) * fwd + blend * rev)
+            targets = ramp * env * self.amplitude * np.sin(phase - wave_sign * self.phase_step * i)
             self._target_q[self._target_indices[s]] = targets.astype(np.float32)
         self.control.joint_target_q.assign(self._target_q)
 

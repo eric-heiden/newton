@@ -1852,6 +1852,18 @@ class SolverCoupled(SolverBase, CouplingInterface):
         """Return coupled sub-solver entry names in stepping order."""
         return tuple(self._solver_order)
 
+    def entry_body_local_to_global(self, name: str) -> wp.array:
+        """Return the entry's dense body local-to-global index map.
+
+        Entry-local body arrays (states from :meth:`entry_state`, sub-solver
+        diagnostics such as per-body wrenches) are indexed by view-local body
+        ids; this map converts them back to parent-model body indices.
+
+        Args:
+            name: Coupled sub-solver entry name.
+        """
+        return self._entries[name].body_local_to_global
+
     def entry_state(self, name: str, phase: Literal["current", "input", "output"] = "current") -> State:
         """Return an entry-local state suitable for visualization.
 

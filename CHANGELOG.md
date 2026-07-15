@@ -11,6 +11,8 @@
 - Add `cloth_stiff_material_hanging` and `cloth_stiff_material_stretch` examples regression-guarding the new Neo-Hookean triangle material (stability under gravity at extreme stiffness, and bulk area-preservation across a Poisson-ratio sweep)
 - Add `ViewerUSD(points_as_spheres=...)` to render `log_points` particles as a `UsdGeom.PointInstancer` of sphere prototypes; enabled by default (opt out with `points_as_spheres=False` for flat `UsdGeom.Points` splats)
 - Add list-of-pattern and explicit-index selectors to `ArticulationView`.
+- Add `SolverMACFluid`, an experimental 3D incompressible fluid solver on a dense staggered MAC grid with semi-Lagrangian advection, explicit viscosity, a fixed-iteration matrix-free pressure projection, moving rigid immersed boundaries, native hydrodynamic wrench collection, and two-way coupling with rigid-body solvers through `SolverCoupledProxy`; includes the `macfluid_settling_sphere`, `macfluid_paddle`, and `macfluid_swimmer` examples.
+- Add `SolverCoupled.entry_body_local_to_global()` to map entry-local body arrays back to parent-model body indices.
 - Add `newton[onnx]` for ONNX policy inference through Warp-NN; `ControllerNeuralMLP`, `ControllerNeuralLSTM`, and RL policy examples can run exported `.onnx` policies without requiring PyTorch for ONNX execution.
 - Add three VBD contact examples — `vbd_rigid_rigid_contact`, `vbd_soft_rigid_contact`, and `vbd_soft_rigid_mix_contact` — demonstrating rigid-rigid, soft (particle-rigid), and mixed cloth-bag contacts
 - Add masked rigid-body reset support to `SolverVBD`; particle resets are not yet supported. (#3256)

@@ -1058,6 +1058,27 @@ add_example_test(
 )
 add_example_test(
     TestMultiphysicsExamples,
+    name="multiphysics.example_macfluid_settling_sphere",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 4, "fluid-res": 24, "pressure-iterations": 30, "rigid-substeps": 2},
+    use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_macfluid_paddle",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 4, "fluid-res": 24, "pressure-iterations": 30, "rigid-substeps": 2},
+    use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_macfluid_swimmer",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 4, "fluid-res": 32, "pressure-iterations": 30, "rigid-substeps": 2},
+    use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
     name="multiphysics.example_mujoco_vbd_coupled_solver",
     devices=test_devices,
     test_options={"num-frames": 2, "proxy-iterations": 1},

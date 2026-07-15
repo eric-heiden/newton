@@ -47,6 +47,8 @@ MuJoCo and Kamino currently have dedicated backend guides:
   MuJoCo or MJCF workflows.
 - :doc:`Kamino <kamino>` — constrained rigid mechanisms with kinematic loops
   and hard frictional contacts; experimental.
+- :doc:`MAC Fluid <mac_fluid>` — incompressible fluid on a staggered MAC grid
+  for two-way fluid–rigid coupling; experimental.
 
 The other solver backends are documented through their linked API references
 and the comparison tables below.
@@ -91,6 +93,14 @@ Supported Features
      - ❌
      - ❌
      - ✅
+     - ❌
+     - ❌
+     - ❌
+   * - :class:`~newton.solvers.SolverMACFluid`
+     - Semi-implicit (pressure projection)
+     - 🟨 immersed boundaries only :sup:`3`
+     - ❌
+     - ❌
      - ❌
      - ❌
      - ❌
@@ -147,6 +157,8 @@ Supported Features
   Set ``use_mujoco_contacts=False`` to use Newton's collision pipeline.
 | :sup:`2` ``basic`` means Newton includes several examples that use these solvers in diffsim workflows,
   see :ref:`Differentiability` for further details.
+| :sup:`3` :class:`~newton.solvers.SolverMACFluid` simulates the fluid only; rigid bodies are treated as
+  moving immersed boundaries owned by another solver, see :doc:`MAC Fluid <mac_fluid>`.
 
 .. experimental::
     :class:`~newton.solvers.SolverKamino`'s public API and behavior may change without prior notice.

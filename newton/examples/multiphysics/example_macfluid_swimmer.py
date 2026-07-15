@@ -12,6 +12,10 @@
 # wave (--reverse) reverses the swimming direction; a dry run (--dry)
 # wiggles in place. Gravity is disabled to isolate propulsion.
 #
+# The tank walls are fluid boundaries only (no rigid collision geometry),
+# so a swimmer that reaches the end of the tank passes out of the fluid
+# and coasts force-free at constant momentum.
+#
 # Command: python -m newton.examples macfluid_swimmer
 #          python -m newton.examples macfluid_swimmer --reverse
 #          python -m newton.examples macfluid_swimmer --dry

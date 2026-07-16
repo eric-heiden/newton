@@ -96,15 +96,17 @@ def advect_u_kernel(
     u: wp.array3d[float],
     v: wp.array3d[float],
     w: wp.array3d[float],
-    u_out: wp.array3d[float],
+    q: wp.array3d[float],
+    q_out: wp.array3d[float],
 ):
+    """Advect x-face quantity ``q`` through the (u, v, w) velocity field."""
     i, j, k = wp.tid()
     if not _is_pure_fluid_face(cell_label, 0, i, j, k):
-        u_out[i, j, k] = u[i, j, k]
+        q_out[i, j, k] = q[i, j, k]
         return
     pos = face_position(origin, dx, 0, i, j, k)
     back = _backtrace(u, v, w, origin, dx, pos, dt)
-    u_out[i, j, k] = sample_u(u, origin, dx, back)
+    q_out[i, j, k] = sample_u(q, origin, dx, back)
 
 
 @wp.kernel(enable_backward=False)
@@ -116,15 +118,17 @@ def advect_v_kernel(
     u: wp.array3d[float],
     v: wp.array3d[float],
     w: wp.array3d[float],
-    v_out: wp.array3d[float],
+    q: wp.array3d[float],
+    q_out: wp.array3d[float],
 ):
+    """Advect y-face quantity ``q`` through the (u, v, w) velocity field."""
     i, j, k = wp.tid()
     if not _is_pure_fluid_face(cell_label, 1, i, j, k):
-        v_out[i, j, k] = v[i, j, k]
+        q_out[i, j, k] = q[i, j, k]
         return
     pos = face_position(origin, dx, 1, i, j, k)
     back = _backtrace(u, v, w, origin, dx, pos, dt)
-    v_out[i, j, k] = sample_v(v, origin, dx, back)
+    q_out[i, j, k] = sample_v(q, origin, dx, back)
 
 
 @wp.kernel(enable_backward=False)
@@ -136,15 +140,146 @@ def advect_w_kernel(
     u: wp.array3d[float],
     v: wp.array3d[float],
     w: wp.array3d[float],
-    w_out: wp.array3d[float],
+    q: wp.array3d[float],
+    q_out: wp.array3d[float],
 ):
+    """Advect z-face quantity ``q`` through the (u, v, w) velocity field."""
     i, j, k = wp.tid()
     if not _is_pure_fluid_face(cell_label, 2, i, j, k):
-        w_out[i, j, k] = w[i, j, k]
+        q_out[i, j, k] = q[i, j, k]
         return
     pos = face_position(origin, dx, 2, i, j, k)
     back = _backtrace(u, v, w, origin, dx, pos, dt)
-    w_out[i, j, k] = sample_w(w, origin, dx, back)
+    q_out[i, j, k] = sample_w(q, origin, dx, back)
+
+
+# MacCormack correction (Selle et al. 2008): after a forward semi-Lagrangian
+# pass (q_hat) and a backward pass of q_hat (q_tilde), the corrected value is
+# q_hat + (q - q_tilde) / 2, clamped to the range of the original field around
+# the backtraced point so the scheme stays unconditionally stable.
+
+
+@wp.func
+def _corner_bounds(field: wp.array3d[float], lx: float, ly: float, lz: float):
+    """Min/max of the 8 interpolation corners at component-space coordinates."""
+    nx = field.shape[0]
+    ny = field.shape[1]
+    nz = field.shape[2]
+    lx = wp.clamp(lx, 0.0, float(nx - 1))
+    ly = wp.clamp(ly, 0.0, float(ny - 1))
+    lz = wp.clamp(lz, 0.0, float(nz - 1))
+    i0 = wp.clamp(int(lx), 0, wp.max(nx - 2, 0))
+    j0 = wp.clamp(int(ly), 0, wp.max(ny - 2, 0))
+    k0 = wp.clamp(int(lz), 0, wp.max(nz - 2, 0))
+    i1 = wp.min(i0 + 1, nx - 1)
+    j1 = wp.min(j0 + 1, ny - 1)
+    k1 = wp.min(k0 + 1, nz - 1)
+
+    lo = field[i0, j0, k0]
+    hi = lo
+    for n in range(1, 8):
+        ii = i1
+        if n & 1 == 0:
+            ii = i0
+        jj = j1
+        if (n >> 1) & 1 == 0:
+            jj = j0
+        kk = k1
+        if (n >> 2) & 1 == 0:
+            kk = k0
+        val = field[ii, jj, kk]
+        lo = wp.min(lo, val)
+        hi = wp.max(hi, val)
+    return lo, hi
+
+
+@wp.func
+def _maccormack_correct(
+    axis: int,
+    i: int,
+    j: int,
+    k: int,
+    origin: wp.vec3,
+    dx: float,
+    dt: float,
+    cell_label: wp.array3d[wp.int32],
+    u: wp.array3d[float],
+    v: wp.array3d[float],
+    w: wp.array3d[float],
+    q: wp.array3d[float],
+    q_hat: wp.array3d[float],
+    q_tilde: wp.array3d[float],
+    q_out: wp.array3d[float],
+):
+    if not _is_pure_fluid_face(cell_label, axis, i, j, k):
+        q_out[i, j, k] = q[i, j, k]
+        return
+
+    corrected = q_hat[i, j, k] + 0.5 * (q[i, j, k] - q_tilde[i, j, k])
+
+    # clamp to the original-field bounds around the backtraced point
+    pos = face_position(origin, dx, axis, i, j, k)
+    back = _backtrace(u, v, w, origin, dx, pos, dt)
+    g = (back - origin) / dx
+    if axis == 0:
+        lo, hi = _corner_bounds(q, g[0], g[1] - 0.5, g[2] - 0.5)
+    elif axis == 1:
+        lo, hi = _corner_bounds(q, g[0] - 0.5, g[1], g[2] - 0.5)
+    else:
+        lo, hi = _corner_bounds(q, g[0] - 0.5, g[1] - 0.5, g[2])
+
+    q_out[i, j, k] = wp.clamp(corrected, lo, hi)
+
+
+@wp.kernel(enable_backward=False)
+def maccormack_correct_u_kernel(
+    origin: wp.vec3,
+    dx: float,
+    dt: float,
+    cell_label: wp.array3d[wp.int32],
+    u: wp.array3d[float],
+    v: wp.array3d[float],
+    w: wp.array3d[float],
+    q_hat: wp.array3d[float],
+    q_tilde: wp.array3d[float],
+    q_out: wp.array3d[float],
+):
+    i, j, k = wp.tid()
+    _maccormack_correct(0, i, j, k, origin, dx, dt, cell_label, u, v, w, u, q_hat, q_tilde, q_out)
+
+
+@wp.kernel(enable_backward=False)
+def maccormack_correct_v_kernel(
+    origin: wp.vec3,
+    dx: float,
+    dt: float,
+    cell_label: wp.array3d[wp.int32],
+    u: wp.array3d[float],
+    v: wp.array3d[float],
+    w: wp.array3d[float],
+    q_hat: wp.array3d[float],
+    q_tilde: wp.array3d[float],
+    q_out: wp.array3d[float],
+):
+    i, j, k = wp.tid()
+    _maccormack_correct(1, i, j, k, origin, dx, dt, cell_label, u, v, w, v, q_hat, q_tilde, q_out)
+
+
+@wp.kernel(enable_backward=False)
+def maccormack_correct_w_kernel(
+    origin: wp.vec3,
+    dx: float,
+    dt: float,
+    cell_label: wp.array3d[wp.int32],
+    u: wp.array3d[float],
+    v: wp.array3d[float],
+    w: wp.array3d[float],
+    q_hat: wp.array3d[float],
+    q_tilde: wp.array3d[float],
+    q_out: wp.array3d[float],
+):
+    i, j, k = wp.tid()
+    _maccormack_correct(2, i, j, k, origin, dx, dt, cell_label, u, v, w, w, q_hat, q_tilde, q_out)
 
 
 # ---------------------------------------------------------------------------

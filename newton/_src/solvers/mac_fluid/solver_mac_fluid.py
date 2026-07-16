@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import warp as wp
 
@@ -123,6 +124,11 @@ class SolverMACFluid(SolverBase, CouplingInterface):
         """Kinematic viscosity [m^2/s]. Integrated explicitly; the step raises
         if ``kinematic_viscosity * dt / cell_size**2 > 1/6`` (stability limit)."""
 
+        advection: Literal["semi_lagrangian", "maccormack"] = "semi_lagrangian"
+        """Velocity advection scheme. ``semi_lagrangian`` is the diffusive
+        first-order default; ``maccormack`` adds a clamped second-order
+        error-correction pass that preserves wakes and vortices much longer."""
+
         pressure_iterations: int = 100
         """Fixed conjugate-gradient iteration count for the pressure solve."""
 
@@ -142,6 +148,8 @@ class SolverMACFluid(SolverBase, CouplingInterface):
         self.config = config or SolverMACFluid.Config()
         cfg = self.config
 
+        if cfg.advection not in ("semi_lagrangian", "maccormack"):
+            raise ValueError(f"Unsupported advection scheme {cfg.advection!r}")
         self.nx, self.ny, self.nz = (int(r) for r in cfg.resolution)
         self.dx = float(cfg.cell_size)
         self.origin = wp.vec3(*(float(o) for o in cfg.origin))
@@ -306,12 +314,34 @@ class SolverMACFluid(SolverBase, CouplingInterface):
                 wp.launch(update_faces_w_kernel, dim=g.w.shape, inputs=[*face_args, g.w, g.w_solid])
                 self.pressure_solver.build(self.dx, g.cell_label)
 
-            # 2. advection (semi-Lagrangian RK2)
+            # 2. advection (semi-Lagrangian RK2, optionally MacCormack-corrected)
             with self._timer("advection"):
                 adv_args = [self.origin, self.dx, dt, g.cell_label, g.u, g.v, g.w]
-                wp.launch(K.advect_u_kernel, dim=g.u.shape, inputs=[*adv_args, g.u_tmp])
-                wp.launch(K.advect_v_kernel, dim=g.v.shape, inputs=[*adv_args, g.v_tmp])
-                wp.launch(K.advect_w_kernel, dim=g.w.shape, inputs=[*adv_args, g.w_tmp])
+                wp.launch(K.advect_u_kernel, dim=g.u.shape, inputs=[*adv_args, g.u, g.u_tmp])
+                wp.launch(K.advect_v_kernel, dim=g.v.shape, inputs=[*adv_args, g.v, g.v_tmp])
+                wp.launch(K.advect_w_kernel, dim=g.w.shape, inputs=[*adv_args, g.w, g.w_tmp])
+                if cfg.advection == "maccormack":
+                    # backward pass of the advected field through the same flow
+                    back_args = [self.origin, self.dx, -dt, g.cell_label, g.u, g.v, g.w]
+                    wp.launch(K.advect_u_kernel, dim=g.u.shape, inputs=[*back_args, g.u_tmp, g.u_tmp2])
+                    wp.launch(K.advect_v_kernel, dim=g.v.shape, inputs=[*back_args, g.v_tmp, g.v_tmp2])
+                    wp.launch(K.advect_w_kernel, dim=g.w.shape, inputs=[*back_args, g.w_tmp, g.w_tmp2])
+                    # clamped error correction, written back over q_hat
+                    wp.launch(
+                        K.maccormack_correct_u_kernel,
+                        dim=g.u.shape,
+                        inputs=[*adv_args, g.u_tmp, g.u_tmp2, g.u_tmp],
+                    )
+                    wp.launch(
+                        K.maccormack_correct_v_kernel,
+                        dim=g.v.shape,
+                        inputs=[*adv_args, g.v_tmp, g.v_tmp2, g.v_tmp],
+                    )
+                    wp.launch(
+                        K.maccormack_correct_w_kernel,
+                        dim=g.w.shape,
+                        inputs=[*adv_args, g.w_tmp, g.w_tmp2, g.w_tmp],
+                    )
                 wp.copy(g.u, g.u_tmp)
                 wp.copy(g.v, g.v_tmp)
                 wp.copy(g.w, g.w_tmp)
@@ -433,6 +463,9 @@ class SolverMACFluid(SolverBase, CouplingInterface):
             g.u_tmp,
             g.v_tmp,
             g.w_tmp,
+            g.u_tmp2,
+            g.v_tmp2,
+            g.w_tmp2,
             g.u_checkpoint,
             g.v_checkpoint,
             g.w_checkpoint,

@@ -177,6 +177,10 @@ class MACGridData:
             self.u_tmp = wp.zeros_like(self.u)
             self.v_tmp = wp.zeros_like(self.v)
             self.w_tmp = wp.zeros_like(self.w)
+            # second temporary set for the MacCormack backward pass
+            self.u_tmp2 = wp.zeros_like(self.u)
+            self.v_tmp2 = wp.zeros_like(self.v)
+            self.w_tmp2 = wp.zeros_like(self.w)
 
             # checkpoint buffers for coupled-iteration restarts
             self.u_checkpoint = wp.zeros_like(self.u)

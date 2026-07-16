@@ -268,6 +268,50 @@ def test_viscosity_dissipates_energy(test: unittest.TestCase, device):
     test.assertLess(ke_viscous, 0.9 * ke_inviscid)
 
 
+def test_maccormack_advection(test: unittest.TestCase, device):
+    """MacCormack advection must stay stable, bounded, and less dissipative.
+
+    A stirred velocity field is evolved through the full inviscid pipeline
+    with both schemes; the clamped MacCormack corrector must preserve more
+    kinetic energy than plain semi-Lagrangian advection while keeping the
+    field bounded (limiter) and the projection effective.
+    """
+
+    def run(scheme):
+        model, _ = _make_tank_model(device, gravity=0.0)
+        solver = _make_solver(model, res=24, iters=100, advection=scheme)
+        g = solver.grid
+        rng = np.random.default_rng(13)
+        # smooth random field: random coefficients on a few low modes
+        nx, ny, nz = 24, 24, 24
+        x, y, z = np.meshgrid(np.arange(nx + 1), np.arange(ny) + 0.5, np.arange(nz) + 0.5, indexing="ij")
+        u0 = np.sin(2 * np.pi * y / ny) * np.cos(2 * np.pi * z / nz)
+        g.u.assign((u0 * 1.0).astype(np.float32))
+        v0 = np.meshgrid(np.arange(nx) + 0.5, np.arange(ny + 1), np.arange(nz) + 0.5, indexing="ij")[2]
+        g.v.assign(np.sin(2 * np.pi * v0 / nz).astype(np.float32))
+        del rng
+        s0, s1 = model.state(), model.state()
+        for _ in range(30):
+            solver.step(s0, s1, None, None, 1.0 / 60.0)
+        u = solver.velocity_u.numpy()
+        v = solver.velocity_v.numpy()
+        w = solver.velocity_w.numpy()
+        ke = (u**2).sum() + (v**2).sum() + (w**2).sum()
+        d = solver.read_diagnostics()
+        return ke, float(np.abs(u).max()), d
+
+    ke_sl, _, _ = run("semi_lagrangian")
+    ke_mc, umax_mc, d_mc = run("maccormack")
+
+    test.assertTrue(np.isfinite(ke_mc))
+    # the limiter keeps velocities bounded near the initial amplitude
+    test.assertLess(umax_mc, 2.0)
+    # second-order correction retains measurably more kinetic energy
+    test.assertGreater(ke_mc, 1.1 * ke_sl, f"MacCormack must dissipate less: {ke_mc} vs {ke_sl}")
+    # the pipeline invariants hold under the corrected advection
+    test.assertLess(d_mc["div_l2_post"], 1.0e-2)
+
+
 def test_stationary_body_buoyancy(test: unittest.TestCase, device):
     """A stationary submerged sphere must feel the discrete buoyancy force.
 
@@ -614,6 +658,7 @@ add_function_test(
 add_function_test(
     TestSolverMACFluid, "test_viscosity_dissipates_energy", test_viscosity_dissipates_energy, devices=devices
 )
+add_function_test(TestSolverMACFluid, "test_maccormack_advection", test_maccormack_advection, devices=devices)
 add_function_test(TestSolverMACFluid, "test_stationary_body_buoyancy", test_stationary_body_buoyancy, devices=devices)
 add_function_test(TestSolverMACFluid, "test_translating_body_drag", test_translating_body_drag, devices=devices)
 add_function_test(TestSolverMACFluid, "test_rotating_body_torque", test_rotating_body_torque, devices=devices)

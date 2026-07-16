@@ -22,6 +22,13 @@ def add_macfluid_args(parser) -> None:
     parser.add_argument("--fluid-res", type=int, default=48, help="Fluid grid cells along the longest tank axis.")
     parser.add_argument("--pressure-iterations", type=int, default=120, help="Fixed CG iterations per pressure solve.")
     parser.add_argument("--viscosity", type=float, default=1.0e-4, help="Kinematic viscosity [m^2/s].")
+    parser.add_argument(
+        "--advection",
+        type=str,
+        choices=["semi_lagrangian", "maccormack"],
+        default="semi_lagrangian",
+        help="Fluid advection scheme; maccormack preserves wakes and vortices much longer.",
+    )
     parser.add_argument("--proxy-iterations", type=int, default=1, help="Proxy coupling passes per step.")
     parser.add_argument(
         "--proxy-relaxation",
@@ -176,12 +183,36 @@ class FluidSliceVisualizer:
         )
         self._colors = wp.zeros(pts.shape[0], dtype=wp.vec3, device=fluid.model.device)
 
+    def _vorticity_slice(self):
+        """In-plane vorticity component normal to the slice, at cell centers."""
+        f = self.fluid
+        u = f.velocity_u.numpy()
+        v = f.velocity_v.numpy()
+        w = f.velocity_w.numpy()
+        uc = 0.5 * (u[:-1] + u[1:])
+        vc = 0.5 * (v[:, :-1] + v[:, 1:])
+        wc = 0.5 * (w[:, :, :-1] + w[:, :, 1:])
+        if self.axis == 2:
+            us, vs = uc[:, :, self.index], vc[:, :, self.index]
+            omega = np.gradient(vs, f.dx, axis=0) - np.gradient(us, f.dx, axis=1)
+        elif self.axis == 1:
+            us, ws = uc[:, self.index, :], wc[:, self.index, :]
+            omega = np.gradient(us, f.dx, axis=1) - np.gradient(ws, f.dx, axis=0)
+        else:
+            vs, ws = vc[self.index, :, :], wc[self.index, :, :]
+            omega = np.gradient(ws, f.dx, axis=0) - np.gradient(vs, f.dx, axis=1)
+        return omega.reshape(-1)
+
     def log(self, viewer, name: str = "/fluid_slice", field: str = "speed", scale: float | None = None):
         f = self.fluid
         i, j, k = self._slice_index
         labels = f.cell_label.numpy()[i, j, k]
         if field == "pressure":
             values = f.pressure.numpy()[i, j, k]
+            vmax = scale if scale is not None else max(np.abs(values).max(), 1.0e-6)
+            colors = colormap(values, -vmax, vmax)
+        elif field == "vorticity":
+            values = self._vorticity_slice()
             vmax = scale if scale is not None else max(np.abs(values).max(), 1.0e-6)
             colors = colormap(values, -vmax, vmax)
         else:

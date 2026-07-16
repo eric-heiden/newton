@@ -86,6 +86,7 @@ class Example:
             origin=(-0.5 * TANK, -0.5 * TANK, 0.0),
             density=FLUID_DENSITY,
             kinematic_viscosity=args.viscosity,
+            advection=args.advection,
             pressure_iterations=args.pressure_iterations,
         )
 

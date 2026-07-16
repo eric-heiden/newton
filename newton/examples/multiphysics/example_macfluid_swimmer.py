@@ -50,6 +50,7 @@ from newton.examples.multiphysics.macfluid_demo_utils import (
 )
 from newton.solvers import SolverMACFluid, SolverMuJoCo
 
+# base link geometry (scaled by --swimmer-scale)
 LINK_HX = 0.085  # link half length [m]
 LINK_HY = 0.025  # link half width [m]
 LINK_HZ = 0.05  # link half height [m]
@@ -66,6 +67,11 @@ class Example:
         self.sim_time = 0.0
 
         self.tank = (args.tank_length, args.tank_width, args.tank_depth)
+        self.scale = float(args.swimmer_scale)
+        self.link_hx = LINK_HX * self.scale
+        self.link_hy = LINK_HY * self.scale
+        self.link_hz = LINK_HZ * self.scale
+        self.link_pitch = LINK_PITCH * self.scale
         self.num_links = int(args.num_links)
         self.num_swimmers = int(args.num_swimmers)
         self.amplitude = args.amplitude
@@ -96,16 +102,16 @@ class Example:
             links = []
             joints = []
             for i in range(self.num_links):
-                x = x_offset + (0.5 * (self.num_links - 1) - i) * LINK_PITCH
+                x = x_offset + (0.5 * (self.num_links - 1) - i) * self.link_pitch
                 body = builder.add_link(xform=wp.transform(wp.vec3(x, y, z0), wp.quat_identity()))
                 builder.add_shape_box(
                     body,
-                    hx=LINK_HX,
-                    hy=LINK_HY,
-                    hz=LINK_HZ,
+                    hx=self.link_hx,
+                    hy=self.link_hy,
+                    hz=self.link_hz,
                     # dense links keep body inertia above hydrodynamic added
                     # inertia (stability requirement of staggered weak coupling)
-                    cfg=newton.ModelBuilder.ShapeConfig(density=2500.0),
+                    cfg=newton.ModelBuilder.ShapeConfig(density=args.link_density),
                 )
                 links.append(body)
 
@@ -115,8 +121,8 @@ class Example:
                     parent=links[i - 1],
                     child=links[i],
                     axis=wp.vec3(0.0, 0.0, 1.0),
-                    parent_xform=wp.transform(wp.vec3(-0.5 * LINK_PITCH, 0.0, 0.0), wp.quat_identity()),
-                    child_xform=wp.transform(wp.vec3(0.5 * LINK_PITCH, 0.0, 0.0), wp.quat_identity()),
+                    parent_xform=wp.transform(wp.vec3(-0.5 * self.link_pitch, 0.0, 0.0), wp.quat_identity()),
+                    child_xform=wp.transform(wp.vec3(0.5 * self.link_pitch, 0.0, 0.0), wp.quat_identity()),
                 )
                 builder.joint_target_mode[-1] = int(JointTargetMode.POSITION)
                 builder.joint_target_ke[-1] = args.joint_ke
@@ -143,6 +149,7 @@ class Example:
             origin=(-0.5 * self.tank[0], -0.5 * self.tank[1], 0.0),
             density=FLUID_DENSITY,
             kinematic_viscosity=args.viscosity,
+            advection=args.advection,
             pressure_iterations=args.pressure_iterations,
         )
 
@@ -187,6 +194,9 @@ class Example:
             "reverse": bool(args.reverse),
             "reverse_at": self.reverse_at,
             "num_links": self.num_links,
+            "swimmer_scale": self.scale,
+            "link_density": args.link_density,
+            "advection": args.advection,
             "num_swimmers": self.num_swimmers,
             "tank": list(self.tank),
             "fluid_res": res,
@@ -291,7 +301,7 @@ class Example:
         if self.fluid is not None:
             log_tank_outline(self.viewer, self.fluid)
         if self.slice_vis is not None:
-            self.slice_vis.log(self.viewer, field="speed", scale=0.8)
+            self.slice_vis.log(self.viewer, field=self.args.slice_field, scale=self.args.slice_scale)
         self.viewer.end_frame()
 
     def test_final(self):
@@ -342,6 +352,21 @@ class Example:
         parser.add_argument("--tank-width", type=float, default=0.8, help="Tank extent along y [m].")
         parser.add_argument("--tank-depth", type=float, default=0.6, help="Tank extent along z [m].")
         parser.add_argument("--start-x", type=float, default=None, help="Initial swimmer center x [m].")
+        parser.add_argument("--swimmer-scale", type=float, default=1.0, help="Scale factor for link geometry.")
+        parser.add_argument(
+            "--link-density",
+            type=float,
+            default=2500.0,
+            help="Link density [kg/m^3]; must keep body inertia above hydrodynamic added inertia.",
+        )
+        parser.add_argument(
+            "--slice-field",
+            type=str,
+            choices=["speed", "vorticity", "pressure"],
+            default="speed",
+            help="Fluid slice visualization field.",
+        )
+        parser.add_argument("--slice-scale", type=float, default=0.8, help="Color scale of the slice field.")
         return parser
 
 

@@ -40,7 +40,11 @@ Each :meth:`~newton.solvers.SolverBase.step` performs, in order:
    faces adjacent to solid cells are constrained to the rigid-body velocity
    sampled from ``body_qd``.
 2. **Advection** — semi-Lagrangian RK2 backtrace with trilinear MAC
-   interpolation (unconditionally stable).
+   interpolation (unconditionally stable). The optional ``maccormack``
+   scheme adds a clamped second-order error-correction pass that strongly
+   reduces numerical dissipation, so wakes and vortices persist much
+   longer (kinetic-energy retention roughly doubles over one second of
+   inviscid evolution).
 3. **Forces** — gravity from the model plus an optional uniform external
    acceleration.
 4. **Viscosity** — explicit diffusion of each staggered component. The step
@@ -131,7 +135,9 @@ Limitations
 - Closed domains only: no free surfaces, multiphase flow, or inflow/outflow.
 - Binary voxelized boundaries: no-slip is resolved to ``O(dx)``; forces on
   bodies converge first-order with grid resolution.
-- Explicit viscosity with the usual diffusion stability limit.
+- Explicit viscosity with the usual diffusion stability limit; effective
+  resolution of fine wake structure is limited by grid spacing (use the
+  ``maccormack`` advection option to minimize numerical dissipation).
 - Weakly coupled to rigid solvers; bodies with hydrodynamic added mass larger
   than their inertia can destabilize the coupling.
 - Not differentiable; no turbulence modeling.

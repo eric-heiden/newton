@@ -281,15 +281,13 @@ def test_maccormack_advection(test: unittest.TestCase, device):
         model, _ = _make_tank_model(device, gravity=0.0)
         solver = _make_solver(model, res=24, iters=100, advection=scheme)
         g = solver.grid
-        rng = np.random.default_rng(13)
-        # smooth random field: random coefficients on a few low modes
+        # smooth shear field on a few low modes (divergence-free per component)
         nx, ny, nz = 24, 24, 24
-        x, y, z = np.meshgrid(np.arange(nx + 1), np.arange(ny) + 0.5, np.arange(nz) + 0.5, indexing="ij")
+        _, y, z = np.meshgrid(np.arange(nx + 1), np.arange(ny) + 0.5, np.arange(nz) + 0.5, indexing="ij")
         u0 = np.sin(2 * np.pi * y / ny) * np.cos(2 * np.pi * z / nz)
-        g.u.assign((u0 * 1.0).astype(np.float32))
+        g.u.assign(u0.astype(np.float32))
         v0 = np.meshgrid(np.arange(nx) + 0.5, np.arange(ny + 1), np.arange(nz) + 0.5, indexing="ij")[2]
         g.v.assign(np.sin(2 * np.pi * v0 / nz).astype(np.float32))
-        del rng
         s0, s1 = model.state(), model.state()
         for _ in range(30):
             solver.step(s0, s1, None, None, 1.0 / 60.0)

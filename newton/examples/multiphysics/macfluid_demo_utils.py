@@ -156,6 +156,23 @@ def colormap(values: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
     return np.stack([r, g * 0.9, b], axis=-1).astype(np.float32)
 
 
+def colormap_diverging_blue(values: np.ndarray, vmax: float) -> np.ndarray:
+    """Diverging colormap on a saturated water-blue base, shape (n, 3).
+
+    Unsaturated dark albedo washes out to white under the viewer lighting at
+    shallow angles, so the zero color must stay saturated. Negative values
+    blend to cyan-green, positive to orange-red.
+    """
+    t = np.clip(values / max(vmax, 1.0e-12), -1.0, 1.0)
+    pos = np.clip(t, 0.0, 1.0)
+    neg = np.clip(-t, 0.0, 1.0)
+    zero = np.array([0.0, 0.05, 1.0], dtype=np.float32)
+    hot = np.array([1.0, 0.2, 0.0], dtype=np.float32)
+    cold = np.array([0.0, 1.0, 0.5], dtype=np.float32)
+    out = zero[None, :] * (1.0 - pos - neg)[:, None] + hot[None, :] * pos[:, None] + cold[None, :] * neg[:, None]
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
 class FluidSliceVisualizer:
     """Renders one grid slice of the fluid as colored points in the viewer.
 
@@ -214,7 +231,7 @@ class FluidSliceVisualizer:
         elif field == "vorticity":
             values = self._vorticity_slice()
             vmax = scale if scale is not None else max(np.abs(values).max(), 1.0e-6)
-            colors = colormap(values, -vmax, vmax)
+            colors = colormap_diverging_blue(values, vmax)
         else:
             u = f.velocity_u.numpy()
             v = f.velocity_v.numpy()
@@ -228,7 +245,9 @@ class FluidSliceVisualizer:
             colors = colormap(speed, 0.0, vmax)
         colors[labels != -2] = (0.15, 0.15, 0.15)
         self._colors.assign(colors)
-        viewer.log_points(name, points=self._points, radii=0.45 * f.dx, colors=self._colors)
+        # overlapping radii render the slice as a continuous sheet; sub-pixel
+        # points would otherwise alias into specular sparkle at fine grids
+        viewer.log_points(name, points=self._points, radii=0.95 * f.dx, colors=self._colors)
 
 
 class MetricsRecorder:

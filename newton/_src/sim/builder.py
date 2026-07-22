@@ -3448,6 +3448,7 @@ class ModelBuilder:
         start_triangle_idx = self.tri_count
         start_tetrahedron_idx = self.tet_count
         start_spring_idx = self.spring_count
+        start_camera_idx = self.camera_count
 
         if builder.particle_count:
             self.particle_max_velocity = builder.particle_max_velocity
@@ -3717,6 +3718,7 @@ class ModelBuilder:
             "triangle": start_triangle_idx,
             "tetrahedron": start_tetrahedron_idx,
             "spring": start_spring_idx,
+            "camera": start_camera_idx,
         }
 
         # Snapshot custom frequency counts BEFORE iteration (they get updated during merge)

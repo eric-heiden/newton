@@ -155,6 +155,29 @@ class TestAddCamera(unittest.TestCase):
         self.assertAlmostEqual(float(vals[0]), 2.5)
         self.assertAlmostEqual(float(vals[1]), 1.0)
 
+    def test_add_builder_camera_frequency_custom_attribute(self):
+        """Merge two sub-builders that each have a camera with a CAMERA-frequency custom attribute."""
+        sub = ModelBuilder()
+        sub.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="exposure",
+                dtype=wp.float32,
+                frequency=Model.AttributeFrequency.CAMERA,
+                default=1.0,
+            )
+        )
+        sub.add_camera(custom_attributes={"exposure": 2.5})
+
+        main = ModelBuilder()
+        main.add_builder(sub)
+        main.add_builder(sub)
+        model = main.finalize()
+
+        self.assertEqual(model.camera_count, 2)
+        vals = model.exposure.numpy()
+        self.assertAlmostEqual(float(vals[0]), 2.5)
+        self.assertAlmostEqual(float(vals[1]), 2.5)
+
 
 class TestEvalCameraWorldXforms(unittest.TestCase):
     def test_body_attached_camera_follows_body(self):

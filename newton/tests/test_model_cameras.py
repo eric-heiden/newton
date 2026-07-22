@@ -157,37 +157,5 @@ class TestAddCamera(unittest.TestCase):
         self.assertAlmostEqual(float(vals[1]), 1.0)
 
 
-class TestEvalCameraWorldXforms(unittest.TestCase):
-    def test_body_attached_camera_follows_body(self):
-        """Verify eval_camera_world_xforms composes body pose with the camera offset."""
-        builder = ModelBuilder()
-        body = builder.add_body(xform=wp.transform((1.0, 2.0, 3.0), wp.quat_identity()))
-        builder.add_camera(body=body, xform=wp.transform((0.0, 0.0, 0.5), wp.quat_identity()))
-        builder.add_camera(xform=wp.transform((9.0, 0.0, 0.0), wp.quat_identity()))
-        model = builder.finalize()
-        state = model.state()
-        xforms = newton.eval_camera_world_xforms(model, state).numpy()
-        self.assertAlmostEqual(float(xforms[0][2]), 3.5, places=5)  # body z + offset
-        self.assertAlmostEqual(float(xforms[1][0]), 9.0, places=5)  # world-fixed unchanged
-
-    def test_world_fixed_camera_no_bodies(self):
-        """Verify eval_camera_world_xforms works when the model has no bodies (world-fixed cameras only)."""
-        builder = ModelBuilder()
-        builder.add_camera(xform=wp.transform((5.0, 6.0, 7.0), wp.quat_identity()))
-        model = builder.finalize()
-        # model has no bodies; body_q may be None or empty — must not crash
-        xforms = newton.eval_camera_world_xforms(model).numpy()
-        self.assertEqual(xforms.shape[0], 1)
-        self.assertAlmostEqual(float(xforms[0][0]), 5.0, places=5)
-        self.assertAlmostEqual(float(xforms[0][1]), 6.0, places=5)
-        self.assertAlmostEqual(float(xforms[0][2]), 7.0, places=5)
-
-    def test_zero_cameras_returns_empty(self):
-        """Verify eval_camera_world_xforms returns an empty array when camera_count is 0."""
-        model = ModelBuilder().finalize()
-        out = newton.eval_camera_world_xforms(model)
-        self.assertEqual(out.shape[0], 0)
-
-
 if __name__ == "__main__":
     unittest.main()

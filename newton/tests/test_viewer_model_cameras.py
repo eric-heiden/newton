@@ -64,6 +64,24 @@ class TestCameraFrustums(unittest.TestCase):
         viewer.end_frame()
         self.assertEqual(viewer._camera_frustums.depth, 1.5)
 
+    def test_frustum_body_attached_camera_composed(self):
+        """Verify a body-attached camera's frustum sits at body_q * camera_transform."""
+        builder = ModelBuilder()
+        body = builder.add_body(xform=wp.transform((1.0, 2.0, 3.0), wp.quat_identity()))
+        builder.add_camera(
+            body=body,
+            xform=wp.transform((0.0, 0.0, 0.5), wp.quat_identity()),
+            projection=CameraPinhole.from_fov(math.radians(60.0), aspect=1.0),
+        )
+        model = builder.finalize()
+        frustums = CameraFrustums(model)
+        frustums.update(model.state(), world_offsets=None)
+        starts = frustums.starts.numpy()
+        # Camera world z = body z (3.0) + offset (0.5) = 3.5; every endpoint hugs
+        # it. Without the body composition the frustum would sit at z ~ 0.5.
+        self.assertGreater(float(starts[:, 2].min()), 2.9)
+        self.assertLess(float(starts[:, 2].max()), 3.6)
+
     def test_fisheye_frustum_finite_segments(self):
         """Verify the generic 30° non-pinhole frustum path produces 12 finite segments."""
         builder = ModelBuilder()
@@ -143,6 +161,26 @@ class TestViewFromCamera(unittest.TestCase):
         """Verify set_camera_from_model is a no-op when no model is set."""
         viewer = newton.viewer.ViewerNull()
         viewer.set_camera_from_model(0)  # must not raise
+
+    def test_set_camera_from_model_body_attached(self):
+        """Verify set_camera_from_model composes the body pose for an attached camera."""
+        captured = {}
+
+        class _CapturingViewer(newton.viewer.ViewerNull):
+            def set_camera(self, pos, pitch, yaw):
+                captured["pos"] = (float(pos[0]), float(pos[1]), float(pos[2]))
+
+        builder = ModelBuilder()
+        body = builder.add_body(xform=wp.transform((1.0, 2.0, 3.0), wp.quat_identity()))
+        builder.add_camera(body=body, xform=wp.transform((0.0, 0.0, 0.5), wp.quat_identity()))
+        builder.add_camera(xform=wp.transform((9.0, 0.0, 0.0), wp.quat_identity()))
+        model = builder.finalize()
+        viewer = _CapturingViewer()
+        viewer.set_model(model)
+        viewer.set_camera_from_model(0)  # body-attached: body z (3.0) + offset (0.5)
+        self.assertAlmostEqual(captured["pos"][2], 3.5, places=4)
+        viewer.set_camera_from_model(1)  # world-fixed: unchanged
+        self.assertAlmostEqual(captured["pos"][0], 9.0, places=4)
 
     def test_xform_to_pitch_yaw_exported(self):
         """Verify xform_to_pitch_yaw is accessible from newton._src.core.cameras."""

@@ -62,7 +62,6 @@ newton
    :signatures: long
 
    AxisType
-   eval_camera_world_xforms
    eval_fk
    eval_ik
    eval_inverse_dynamics_force

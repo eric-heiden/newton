@@ -577,12 +577,6 @@ class ViewerBase(ABC):
         layer.camera_frustum_depth: float = 0.5
         layer._camera_frustums = None
 
-        # Per-model camera lookup caches, invalidated on model switch.
-        # _camera_proj_index_cache: host numpy array of camera_projection_index (static after finalize).
-        # _camera_xforms_buffer: preallocated GPU transform array reused by eval_camera_world_xforms.
-        layer._camera_proj_index_cache: np.ndarray | None = None
-        layer._camera_xforms_buffer: wp.array | None = None
-
         layer.gaussians_max_points = 100_000  # Max number of points to visualize per gaussian
 
         # Hydroelastic contact surface line cache
@@ -808,25 +802,27 @@ class ViewerBase(ABC):
                 raise KeyError(f"No camera labeled {camera!r}") from None
         else:
             index = int(camera)
-        from ..core.cameras import eval_camera_world_xforms, xform_to_pitch_yaw  # noqa: PLC0415
+        from ..core.cameras import xform_to_pitch_yaw  # noqa: PLC0415
 
-        # Cache camera_projection_index host array: it is static after model.finalize()
-        # so we only transfer it once per model instead of every frame in follow mode.
-        if self._camera_proj_index_cache is None:
-            self._camera_proj_index_cache = self.model.camera_projection_index.numpy()
-
-        # Reuse a preallocated GPU transform buffer to avoid a fresh allocation each call.
-        if self._camera_xforms_buffer is None or len(self._camera_xforms_buffer) != self.model.camera_count:
-            self._camera_xforms_buffer = wp.empty(self.model.camera_count, dtype=wp.transform, device=self.device)
-
+        # Compose this one camera's world transform live, reading only its own
+        # rows via slicing rather than materializing every camera's transform --
+        # this matters when a scene holds hundreds of cameras.
         resolved_state = state if state is not None else getattr(self, "_last_state", None)
-        xf = wp.transform(
-            *eval_camera_world_xforms(self.model, resolved_state, out=self._camera_xforms_buffer).numpy()[index]
-        )
+        cam_xf = wp.transform(*self.model.camera_transform[index : index + 1].numpy()[0])
+        body = int(self.model.camera_body[index : index + 1].numpy()[0])
+        if body >= 0:
+            if resolved_state is not None and resolved_state.body_q is not None:
+                body_q = resolved_state.body_q
+            else:
+                body_q = self.model.body_q
+            xf = wp.transform(*body_q[body : body + 1].numpy()[0]) * cam_xf
+        else:
+            xf = cam_xf
         pos, pitch, yaw = xform_to_pitch_yaw(xf, int(self.model.up_axis))
         self.set_camera(wp.vec3(*pos), pitch, yaw)
         # Adopt the camera fov when the viewer exposes a viewport camera.
-        proj = self.model.camera_projections[int(self._camera_proj_index_cache[index])]
+        proj_index = int(self.model.camera_projection_index[index : index + 1].numpy()[0])
+        proj = self.model.camera_projections[proj_index]
         viewport_camera = getattr(self, "camera", None)
         if viewport_camera is not None and hasattr(proj, "fov"):
             # viewport Camera.fov is in degrees; projection fov is in radians

@@ -78,20 +78,13 @@ After finalization, cameras are accessible through these arrays on
 World Transforms
 ----------------
 
-:func:`~newton.eval_camera_world_xforms` computes the current world-space
-camera-to-world transform for all cameras in one GPU kernel launch:
-
-.. code-block:: python
-
-   import newton
-
-   # model and state from your simulation loop
-   world_xforms = newton.eval_camera_world_xforms(model, state)
-   # world_xforms: wp.array[wp.transform], shape [camera_count]
-
-When ``state`` is ``None``, the model rest body transforms are used. Passing a
-live :class:`~newton.State` is required for body-attached cameras to reflect
-articulation motion.
+A camera's transform (:attr:`~newton.Model.camera_transform`) is stored relative
+to its parent: the attached rigid body's frame when
+:attr:`~newton.Model.camera_body` is ``>= 0``, or the world frame otherwise. The
+world-space pose is therefore ``body_q[camera_body] * camera_transform`` for
+body-attached cameras and ``camera_transform`` directly for world-fixed ones.
+Newton composes this live where it is needed (frustum drawing, adopting a
+camera's viewpoint) rather than storing a separate array of world transforms.
 
 Projection Descriptors
 -----------------------
@@ -314,9 +307,8 @@ Sensor-side Consumption
 Per-world ray bundles, lazy projection-keyed caching, and the
 ``SensorBatchedCamera`` integration that feeds Newton cameras into a rendering
 pipeline ship as a separate plan after ``SensorBatchedCamera`` lands on this
-branch. The model-side schema (``Model.camera_*`` arrays,
-:func:`~newton.eval_camera_world_xforms`, descriptor equality/dedup) is stable
-and forms the interface guarantee for that work.
+branch. The model-side schema (``Model.camera_*`` arrays, descriptor
+equality/dedup) is stable and forms the interface guarantee for that work.
 
 See Also
 --------
@@ -325,5 +317,5 @@ See Also
 * :doc:`../api/newton` -- ``newton`` top-level API reference
   (``CameraProjection``, ``CameraPinhole``, ``CameraFisheyeOpenCV``,
   ``CameraFisheyeFTheta``, ``CameraFisheyeKannalaBrandt``,
-  ``CameraCustomRays``, ``CameraFlags``, ``eval_camera_world_xforms``)
+  ``CameraCustomRays``, ``CameraFlags``)
 * :meth:`~newton.ModelBuilder.add_camera` -- full parameter reference

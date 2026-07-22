@@ -22,7 +22,6 @@ __all__ = [
     "compute_camera_rays_fisheye_kannala_brandt_kernel",
     "compute_camera_rays_fisheye_opencv_kernel",
     "compute_camera_rays_pinhole_from_aperture_kernel",
-    "eval_camera_world_xforms",
     "fov_to_focal_length",
     "pitch_yaw_to_basis",
     "pitch_yaw_to_basis_f64",
@@ -617,63 +616,6 @@ def compute_camera_rays(
         wp.copy(out, rays)
         return out
     return rays
-
-
-# ---------------------------------------------------------------------------
-# World-transform evaluation
-# ---------------------------------------------------------------------------
-
-
-@wp.kernel(enable_backward=False)
-def _eval_camera_world_xforms_kernel(
-    camera_transform: wp.array[wp.transform],
-    camera_body: wp.array[wp.int32],
-    body_q: wp.array[wp.transform],
-    out_xforms: wp.array[wp.transform],
-):
-    tid = wp.tid()
-    body = camera_body[tid]
-    if body >= 0:
-        out_xforms[tid] = body_q[body] * camera_transform[tid]
-    else:
-        out_xforms[tid] = camera_transform[tid]
-
-
-def eval_camera_world_xforms(model, state=None, out: wp.array | None = None) -> wp.array:
-    """Evaluates the current world transform of every camera.
-
-    Args:
-        model: The :class:`~newton.Model` holding the cameras.
-        state: Optional :class:`~newton.State`; its ``body_q`` is used for
-            body-attached cameras. Falls back to ``model.body_q``.
-        out: Optional preallocated output, shape [camera_count].
-
-    Returns:
-        Camera-to-world transforms [m, unit quaternion], shape [camera_count].
-    """
-    # Early return for zero cameras to avoid allocating when unnecessary.
-    if model.camera_count == 0:
-        if out is None:
-            return wp.empty(0, dtype=wp.transform, device=model.device)
-        else:
-            return out
-
-    if out is None:
-        out = wp.empty(model.camera_count, dtype=wp.transform, device=model.device)
-    # state.body_q is None when the model has no bodies; fall back to model.body_q
-    # (an empty array) so the kernel still has a valid array to bind.
-    if state is not None and state.body_q is not None:
-        body_q = state.body_q
-    else:
-        body_q = model.body_q
-    wp.launch(
-        _eval_camera_world_xforms_kernel,
-        dim=model.camera_count,
-        inputs=[model.camera_transform, model.camera_body, body_q],
-        outputs=[out],
-        device=model.device,
-    )
-    return out
 
 
 def pitch_yaw_to_basis_f64(

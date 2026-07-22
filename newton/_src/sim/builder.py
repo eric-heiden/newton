@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 import numpy as np
 import warp as wp
 
+from ..core.cameras import CameraPinhole, CameraProjection
 from ..core.types import (
     MAXVAL,
     Axis,
@@ -34,7 +35,6 @@ from ..core.types import (
     axis_to_vec3,
     flag_to_int,
 )
-from ..core.cameras import CameraPinhole, CameraProjection
 from ..geometry import (
     Gaussian,
     GeoType,
@@ -11973,9 +11973,7 @@ class ModelBuilder:
             m.camera_projection_index = wp.array(projection_index, dtype=wp.int32)
             m.camera_projections = projections
             if self.camera_count > 0:
-                m.camera_resolution = wp.array(
-                    [list(r) for r in self.camera_resolution], dtype=wp.int32, ndim=2
-                )
+                m.camera_resolution = wp.array([list(r) for r in self.camera_resolution], dtype=wp.int32, ndim=2)
             else:
                 m.camera_resolution = wp.zeros((0, 2), dtype=wp.int32)
 

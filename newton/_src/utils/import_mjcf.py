@@ -1292,7 +1292,13 @@ def parse_mjcf(
         )
         _camera_mode_attr_registered[0] = True
 
-    def _parse_cameras_impl(parent_element, body: int, incoming_defaults: dict, label_prefix: str = ""):
+    def _parse_cameras_impl(
+        parent_element,
+        body: int,
+        incoming_defaults: dict,
+        label_prefix: str = "",
+        incoming_xform: wp.transform | None = None,
+    ):
         """Parse <camera> child elements of parent_element and add them to the builder.
 
         Args:
@@ -1300,6 +1306,7 @@ def parse_mjcf(
             body: Body index to attach cameras to (-1 for world-fixed).
             incoming_defaults: Current defaults dict for class attribute resolution.
             label_prefix: Hierarchical label prefix (XPath-style) for camera labels.
+            incoming_xform: Accumulated transform from enclosing frame elements, or None for identity.
         """
         for camera in parent_element.findall("camera"):
             camera_defaults = incoming_defaults
@@ -1320,6 +1327,10 @@ def parse_mjcf(
 
             pos = parse_vec(camera_attrib, "pos", (0.0, 0.0, 0.0)) * scale
             rot = parse_orientation(camera_attrib)
+            camera_xform = wp.transform(pos, rot)
+
+            if incoming_xform is not None:
+                camera_xform = incoming_xform * camera_xform
 
             mode = camera_attrib.get("mode", "fixed")
             if mode != "fixed":
@@ -1359,7 +1370,7 @@ def parse_mjcf(
 
             builder.add_camera(
                 body=body,
-                xform=wp.transform(pos, rot),
+                xform=camera_xform,
                 projection=projection,
                 resolution=resolution,
                 label=camera_label,
@@ -1576,6 +1587,17 @@ def parse_mjcf(
                         incoming_xform=composed_body_rel,
                         label_prefix=label_prefix,
                     )
+
+            # Process child cameras (need body-relative transform, same as sites)
+            child_cameras = frame.findall("camera")
+            if child_cameras:
+                _parse_cameras_impl(
+                    frame,
+                    parent_body,
+                    _defaults,
+                    label_prefix=label_prefix,
+                    incoming_xform=composed_body_rel,
+                )
 
             # Add nested frames to stack with current defaults and childclass (in reverse to maintain order)
             frame_stack.extend(

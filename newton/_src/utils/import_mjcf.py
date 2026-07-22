@@ -2505,7 +2505,7 @@ def parse_mjcf(
             )
 
         # Parse world-fixed cameras (body=-1)
-        _parse_cameras_impl(world, -1, world_defaults, label_prefix=root_label_path)
+        _parse_cameras_impl(world, -1, world_defaults, label_prefix=root_label_path, incoming_xform=xform)
 
         # -----------------
         # process frame elements at worldbody level

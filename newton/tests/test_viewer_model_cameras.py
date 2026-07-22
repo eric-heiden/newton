@@ -64,6 +64,23 @@ class TestCameraFrustums(unittest.TestCase):
         viewer.end_frame()
         self.assertEqual(viewer._camera_frustums.depth, 1.5)
 
+    def test_fisheye_frustum_finite_segments(self):
+        """Verify the generic 30° non-pinhole frustum path produces 12 finite segments."""
+        builder = ModelBuilder()
+        builder.add_camera(
+            xform=wp.transform((0.0, 0.0, 0.0), wp.quat_identity()),
+            projection=newton.CameraFisheyeOpenCV(fx=100.0, fy=100.0, cx=32.0, cy=32.0),
+        )
+        model = builder.finalize()
+        frustums = CameraFrustums(model)
+        frustums.update(model.state(), world_offsets=None)
+        self.assertEqual(frustums.starts.shape[0], 12)
+        self.assertEqual(frustums.ends.shape[0], 12)
+        starts = frustums.starts.numpy()
+        ends = frustums.ends.numpy()
+        self.assertTrue(np.all(np.isfinite(starts)))
+        self.assertTrue(np.all(np.isfinite(ends)))
+
 
 class TestViewFromCamera(unittest.TestCase):
     def test_xform_to_pitch_yaw_identity_z_up(self):

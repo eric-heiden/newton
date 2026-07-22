@@ -829,6 +829,7 @@ class ViewerBase(ABC):
         proj = self.model.camera_projections[int(self._camera_proj_index_cache[index])]
         viewport_camera = getattr(self, "camera", None)
         if viewport_camera is not None and hasattr(proj, "fov"):
+            # viewport Camera.fov is in degrees; projection fov is in radians
             viewport_camera.fov = math.degrees(proj.fov)
 
     def set_world_offsets(self, spacing: tuple[float, float, float] | list[float] | wp.vec3):

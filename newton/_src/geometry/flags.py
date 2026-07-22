@@ -45,6 +45,18 @@ class ShapeFlags(IntEnum):
     """Indicates that the shape uses hydroelastic collision."""
 
 
+class CameraFlags(IntEnum):
+    """
+    Flags for camera properties.
+    """
+
+    ENABLED = 1 << 0
+    """Indicates that the camera is available for rendering by camera sensors."""
+
+    VISIBLE = 1 << 1
+    """Indicates that the camera frustum may be drawn by viewers."""
+
+
 class MeshSignMethod(IntEnum):
     """Method used to determine the inside/outside sign of a mesh point query."""
 
@@ -62,6 +74,7 @@ class MeshProperties(IntFlag):
 
 
 __all__ = [
+    "CameraFlags",
     "MeshProperties",
     "MeshSignMethod",
     "ParticleFlags",

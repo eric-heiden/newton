@@ -24,7 +24,7 @@ from .collision_primitive import (
     collide_sphere_cylinder,
     collide_sphere_sphere,
 )
-from .flags import ParticleFlags, ShapeFlags
+from .flags import CameraFlags, ParticleFlags, ShapeFlags
 from .inertia import compute_inertia_shape, compute_inertia_sphere, transform_inertia
 from .raycast import intersect_ray as intersect_ray
 from .sdf_utils import SDF
@@ -43,6 +43,7 @@ __all__ = [
     "BroadPhaseAllPairs",
     "BroadPhaseExplicit",
     "BroadPhaseSAP",
+    "CameraFlags",
     "Gaussian",
     "GeoType",
     "Heightfield",

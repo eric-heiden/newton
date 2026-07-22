@@ -993,7 +993,7 @@ class ViewerBase(ABC):
         self._log_non_shape_state(state)
 
         if self.show_cameras and self.model.camera_count:
-            if self._camera_frustums is None or self._camera_frustums.model is not self.model:
+            if self._camera_frustums is None or self._camera_frustums.model is not self.model or self._camera_frustums.depth != self.camera_frustum_depth:
                 from .camera_frustums import CameraFrustums  # noqa: PLC0415
 
                 self._camera_frustums = CameraFrustums(self.model, depth=self.camera_frustum_depth)

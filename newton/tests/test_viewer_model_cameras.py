@@ -9,7 +9,7 @@ import warp as wp
 
 import newton
 from newton import CameraPinhole, ModelBuilder
-from newton._src.core.cameras import xform_to_pitch_yaw
+from newton._src.core.cameras import fov_to_focal_length, pitch_yaw_to_basis, xform_to_pitch_yaw
 from newton._src.viewer.camera import Camera
 from newton._src.viewer.camera_frustums import CameraFrustums
 
@@ -159,8 +159,6 @@ class TestViewFromCamera(unittest.TestCase):
 class TestCameraMathUnification(unittest.TestCase):
     def test_basis_matches_viewport_camera(self):
         """Verify pitch_yaw_to_basis reproduces the viewport Camera vectors for all up axes."""
-        from newton._src.core.cameras import pitch_yaw_to_basis
-
         for up_axis in (0, 1, 2):
             for pitch, yaw in [(0.0, 0.0), (-30.0, 45.0), (60.0, -120.0), (-89.0, 179.0)]:
                 cam = Camera(up_axis=up_axis)
@@ -192,16 +190,12 @@ class TestCameraMathUnification(unittest.TestCase):
 
     def test_fov_to_focal_length_roundtrip(self):
         """Verify fov/focal conversion inverts CameraPinhole.from_fov."""
-        from newton._src.core.cameras import fov_to_focal_length
-
         fov = math.radians(50.0)
         proj = newton.CameraPinhole.from_fov(fov)
         self.assertAlmostEqual(fov_to_focal_length(fov, proj.vertical_aperture), proj.focal_length, places=5)
 
     def test_basis_right_up_orthonormal(self):
         """Verify pitch_yaw_to_basis returns orthonormal (front, right, up) for all axes."""
-        from newton._src.core.cameras import pitch_yaw_to_basis
-
         for up_axis in (0, 1, 2):
             for pitch, yaw in [(0.0, 0.0), (-30.0, 45.0), (60.0, -120.0), (-89.0, 179.0)]:
                 front, right, up = pitch_yaw_to_basis(pitch, yaw, up_axis)

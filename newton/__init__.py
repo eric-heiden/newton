@@ -8,6 +8,12 @@ from ._src.core import (
     MAXVAL,
     Axis,
     AxisType,
+    CameraCustomRays,
+    CameraFisheyeFTheta,
+    CameraFisheyeKannalaBrandt,
+    CameraFisheyeOpenCV,
+    CameraPinhole,
+    CameraProjection,
 )
 from ._version import __version__
 
@@ -40,6 +46,12 @@ __all__ = [
     "MAXVAL",
     "Axis",
     "AxisType",
+    "CameraCustomRays",
+    "CameraFisheyeFTheta",
+    "CameraFisheyeKannalaBrandt",
+    "CameraFisheyeOpenCV",
+    "CameraPinhole",
+    "CameraProjection",
     "__version__",
     "use_coord_layout_targets",
 ]

@@ -11,6 +11,7 @@ from .cameras import (
     CameraFisheyeOpenCV,
     CameraPinhole,
     CameraProjection,
+    eval_camera_world_xforms,
 )
 from .types import (
     MAXVAL,
@@ -28,5 +29,6 @@ __all__ = [
     "CameraFisheyeOpenCV",
     "CameraPinhole",
     "CameraProjection",
+    "eval_camera_world_xforms",
     "quat_between_axes",
 ]

@@ -14,6 +14,7 @@ from ._src.core import (
     CameraFisheyeOpenCV,
     CameraPinhole,
     CameraProjection,
+    eval_camera_world_xforms,
 )
 from ._version import __version__
 
@@ -53,6 +54,7 @@ __all__ = [
     "CameraPinhole",
     "CameraProjection",
     "__version__",
+    "eval_camera_world_xforms",
     "use_coord_layout_targets",
 ]
 

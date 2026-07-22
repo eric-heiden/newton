@@ -9,7 +9,7 @@ import math
 
 import warp as wp
 
-from ..core.cameras import CameraPinhole, eval_camera_world_xforms
+from ..core.cameras import CameraPinhole
 from ..geometry.flags import CameraFlags
 
 # segment topology: near rect (4), far rect (4), connecting edges (4)
@@ -18,7 +18,9 @@ _SEGMENTS_PER_CAMERA = 12
 
 @wp.kernel(enable_backward=False)
 def _frustum_lines_kernel(
-    xforms: wp.array[wp.transform],
+    camera_transform: wp.array[wp.transform],
+    camera_body: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
     half_extents: wp.array[wp.vec4],  # (near_hw, near_hh, far_hw, far_hh)
     depths: wp.array[wp.vec2],  # (near, depth)
     visible: wp.array[wp.int32],
@@ -28,7 +30,13 @@ def _frustum_lines_kernel(
     ends: wp.array[wp.vec3],
 ):
     cam = wp.tid()
-    xf = xforms[cam]
+    # Camera-to-world live: through the attached body when body >= 0, else the
+    # stored transform is already world-space.
+    body = camera_body[cam]
+    if body >= 0:
+        xf = body_q[body] * camera_transform[cam]
+    else:
+        xf = camera_transform[cam]
     offset = wp.vec3(0.0, 0.0, 0.0)
     world = camera_world[cam]
     if world >= 0 and world < world_offsets.shape[0]:
@@ -66,8 +74,10 @@ class CameraFrustums:
         device = model.device
         self.starts = wp.zeros(n * _SEGMENTS_PER_CAMERA, dtype=wp.vec3, device=device)
         self.ends = wp.zeros(n * _SEGMENTS_PER_CAMERA, dtype=wp.vec3, device=device)
-        self._xforms = wp.empty(n, dtype=wp.transform, device=device)
         self._empty_offsets = wp.zeros(0, dtype=wp.vec3, device=device)
+        # Bindable placeholder when the model has no bodies; the kernel only
+        # reads body_q for body-attached cameras, which cannot exist then.
+        self._empty_body_q = wp.zeros(0, dtype=wp.transform, device=device)
         # host-precomputed per-camera params (projections are static)
         half_extents = []
         depths = []
@@ -91,14 +101,26 @@ class CameraFrustums:
         self._visible = wp.array(visible, dtype=wp.int32, device=device)
 
     def update(self, state, world_offsets: wp.array | None):
-        """Recomputes frustum lines from the current camera world transforms."""
-        eval_camera_world_xforms(self.model, state, out=self._xforms)
+        """Recomputes frustum lines from the current camera poses.
+
+        Body-attached cameras are composed with ``state.body_q`` (falling back
+        to ``model.body_q``) live inside the kernel; no world transforms are
+        stored.
+        """
+        if state is not None and state.body_q is not None:
+            body_q = state.body_q
+        elif self.model.body_q is not None:
+            body_q = self.model.body_q
+        else:
+            body_q = self._empty_body_q
         offsets = world_offsets if world_offsets is not None else self._empty_offsets
         wp.launch(
             _frustum_lines_kernel,
             dim=self.model.camera_count,
             inputs=[
-                self._xforms,
+                self.model.camera_transform,
+                self.model.camera_body,
+                body_q,
                 self._half_extents,
                 self._depths,
                 self._visible,

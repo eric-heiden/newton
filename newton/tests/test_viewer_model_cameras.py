@@ -182,6 +182,34 @@ class TestViewFromCamera(unittest.TestCase):
         viewer.set_camera_from_model(1)  # world-fixed: unchanged
         self.assertAlmostEqual(captured["pos"][0], 9.0, places=4)
 
+    def test_set_camera_from_model_applies_world_offset(self):
+        """Verify set_camera_from_model applies the selected camera's world offset."""
+        captured = {}
+
+        class _CapturingViewer(newton.viewer.ViewerNull):
+            def set_camera(self, pos, pitch, yaw):
+                captured["pos"] = np.array(pos, dtype=np.float32)
+
+        environment = ModelBuilder()
+        body = environment.add_body(xform=wp.transform((4.0, 5.0, 6.0), wp.quat_identity()))
+        environment.add_camera(xform=wp.transform((1.0, 2.0, 3.0), wp.quat_identity()))
+        environment.add_camera(body=body, xform=wp.transform((0.25, 0.5, 0.75), wp.quat_identity()))
+        builder = ModelBuilder()
+        builder.replicate(environment, world_count=2)
+        model = builder.finalize()
+        viewer = _CapturingViewer()
+        viewer.set_model(model)
+        viewer.set_world_offsets((10.0, 0.0, 0.0))
+
+        world_offset = viewer.world_offsets.numpy()[1]
+        viewer.set_camera_from_model(2)
+        expected = np.array((1.0, 2.0, 3.0), dtype=np.float32) + world_offset
+        np.testing.assert_allclose(captured["pos"], expected, atol=1.0e-5)
+
+        viewer.set_camera_from_model(3)
+        expected = np.array((4.25, 5.5, 6.75), dtype=np.float32) + world_offset
+        np.testing.assert_allclose(captured["pos"], expected, atol=1.0e-5)
+
     def test_xform_to_pitch_yaw_exported(self):
         """Verify xform_to_pitch_yaw is accessible from newton._src.core.cameras."""
         self.assertTrue(callable(xform_to_pitch_yaw))

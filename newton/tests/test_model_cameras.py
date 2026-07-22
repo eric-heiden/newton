@@ -110,6 +110,17 @@ class TestAddCamera(unittest.TestCase):
         with self.assertRaises(ValueError):
             ModelBuilder().add_camera(body=5)  # invalid body index
 
+    def test_add_camera_rejects_body_from_different_world(self):
+        """Verify body-attached cameras must belong to the body's world."""
+        builder = ModelBuilder()
+        builder.begin_world()
+        body = builder.add_body()
+        builder.end_world()
+        builder.begin_world()
+        with self.assertRaisesRegex(ValueError, "body 0 belongs to world 0, but current world is 1"):
+            builder.add_camera(body=body)
+        builder.end_world()
+
     def test_projection_dedup(self):
         """Verify equal projections collapse to one entry in camera_projections."""
         builder = ModelBuilder()

@@ -6999,7 +6999,8 @@ class ModelBuilder:
 
         Args:
             body: Index of the rigid body the camera is attached to. Use -1
-                for world-fixed cameras.
+                for world-fixed cameras. A body-attached camera must be added
+                in the same world context as its body.
             xform: Transform of the camera in the parent body's local frame
                 (world frame when ``body`` is -1). If ``None``, the identity
                 transform is used.
@@ -7020,6 +7021,11 @@ class ModelBuilder:
         """
         if body < -1 or body >= self.body_count:
             raise ValueError(f"Invalid body index {body} for camera (body_count={self.body_count})")
+        if body >= 0 and self.body_world[body] != self.current_world:
+            raise ValueError(
+                f"Cannot create camera: body {body} belongs to world {self.body_world[body]}, "
+                f"but current world is {self.current_world}"
+            )
         camera = self.camera_count
         if xform is None:
             xform = wp.transform()

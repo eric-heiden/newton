@@ -1395,6 +1395,8 @@ void main() {
             self._init_ovrtx()
 
         with wp.ScopedTimer("ViewerRTX::end_frame", active=PROFILE_ENABLED, use_nvtx=True):
+            if self.gui:
+                self.gui.apply_camera_follow()
             self._update_ovrtx_camera()
             self._update_ovrtx_transforms()
             self._update_ovrtx_instance_visibility()

@@ -813,6 +813,13 @@ class ViewerBase(ABC):
             xf = wp.transform(*body_q[body : body + 1].numpy()[0]) * cam_xf
         else:
             xf = cam_xf
+        world = int(self.model.camera_world[index : index + 1].numpy()[0])
+        if self.world_offsets is not None and 0 <= world < self.world_offsets.shape[0]:
+            offset = self.world_offsets[world : world + 1].numpy()[0]
+            xf = wp.transform(
+                wp.vec3(xf.p[0] + offset[0], xf.p[1] + offset[1], xf.p[2] + offset[2]),
+                xf.q,
+            )
         pos, pitch, yaw = xform_to_pitch_yaw(xf, int(self.model.up_axis))
         self.set_camera(wp.vec3(*pos), pitch, yaw)
         # Adopt the camera fov when the viewer exposes a viewport camera.

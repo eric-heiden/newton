@@ -57,9 +57,8 @@ class ViewerGui:
         # Gizmo active-frame tracking (handles snap_to on release)
         self._gizmo_active = {}
 
-        # Model-camera snap / follow state.
+        # A selected model camera is followed until manual camera input detaches it.
         self._selected_model_camera: int = -1
-        self._follow_model_camera: bool = False
 
         # FPS tracking
         self._fps_history: list[float] = []
@@ -126,10 +125,29 @@ class ViewerGui:
             return False
         return bool(picking.is_picking())
 
+    def _select_model_camera(self, index: int) -> None:
+        """Select and snap to a model camera, or detach when index is negative."""
+        self._selected_model_camera = int(index)
+        self._cam_vel[:] = 0.0
+        if self._selected_model_camera < 0:
+            return
+        viewer = self._viewer
+        model = getattr(viewer, "model", None)
+        if model is None or self._selected_model_camera >= model.camera_count:
+            self._selected_model_camera = -1
+            return
+        viewer.set_camera_from_model(self._selected_model_camera)
+
+    def _detach_model_camera(self) -> None:
+        """Detach the viewport from its selected model camera."""
+        self._selected_model_camera = -1
+
     def rotate_camera_from_drag(self, dx: float, dy: float, sensitivity: float = 0.1):
         camera = getattr(self._viewer, "camera", None)
         if camera is None:
             return
+        if dx != 0.0 or dy != 0.0:
+            self._detach_model_camera()
         camera.yaw -= dx * sensitivity
         camera.pitch += dy * sensitivity
         camera.pitch = max(-89.0, min(89.0, camera.pitch))
@@ -140,6 +158,8 @@ class ViewerGui:
         camera = getattr(self._viewer, "camera", None)
         if camera is None:
             return
+        if scroll_y != 0.0:
+            self._detach_model_camera()
         camera.fov = max(15.0, min(90.0, camera.fov - scroll_y * scale))
         if hasattr(self._viewer, "_camera_dirty"):
             self._viewer._camera_dirty = True
@@ -185,6 +205,7 @@ class ViewerGui:
 
         dn = float(np.linalg.norm(desired))
         if dn > 1.0e-6:
+            self._detach_model_camera()
             desired = desired / dn * self._cam_speed
         else:
             desired[:] = 0.0
@@ -209,6 +230,7 @@ class ViewerGui:
         camera = getattr(viewer, "camera", None)
         if camera is None:
             return
+        self._detach_model_camera()
 
         min_bounds = np.array([float("inf")] * 3)
         max_bounds = np.array([float("-inf")] * 3)
@@ -306,8 +328,10 @@ class ViewerGui:
         if camera is None:
             return
         if is_ctrl_down:
-            camera.fov = max(15.0, min(90.0, camera.fov - scroll_y * 2.0))
+            self.adjust_camera_fov_from_scroll(scroll_y)
         else:
+            if scroll_y != 0.0:
+                self._detach_model_camera()
             camera.dolly(scroll_y * self._camera_dolly_scroll_sensitivity)
         if hasattr(self._viewer, "_camera_dirty"):
             self._viewer._camera_dirty = True
@@ -373,6 +397,8 @@ class ViewerGui:
         camera = getattr(viewer, "camera", None)
 
         if buttons & pyglet.window.mouse.MIDDLE and camera is not None:
+            if dx != 0.0 or dy != 0.0:
+                self._detach_model_camera()
             if modifiers & pyglet.window.key.MOD_CTRL:
                 camera.dolly(dy * self._camera_dolly_drag_sensitivity)
             elif modifiers & pyglet.window.key.MOD_SHIFT:
@@ -433,16 +459,19 @@ class ViewerGui:
             self._fps_frame_count = 0
 
     def apply_camera_follow(self):
-        """Re-apply the selected model camera pose when follow mode is active.
+        """Re-apply the selected model camera pose.
 
         Called once per frame *before* the scene render so the updated camera
-        position is consumed by the current frame rather than the next one.
-        This is a no-op when follow mode is disabled or no camera is selected.
+        position is consumed by the current frame rather than the next one. A
+        manual camera input clears the selection and stops following.
         """
-        if self._follow_model_camera and self._selected_model_camera >= 0:
-            viewer = self._viewer
-            if viewer.model is not None and viewer.model.camera_count > 0:
-                viewer.set_camera_from_model(self._selected_model_camera)
+        if self._selected_model_camera < 0:
+            return
+        viewer = self._viewer
+        if viewer.model is None or self._selected_model_camera >= viewer.model.camera_count:
+            self._detach_model_camera()
+            return
+        viewer.set_camera_from_model(self._selected_model_camera)
 
     def render_frame(self, update_fps: bool = True):
         """Render GUI into the active OpenGL framebuffer."""
@@ -856,13 +885,7 @@ class ViewerGui:
                     combo_idx = self._selected_model_camera + 1
                     _changed, new_combo_idx = imgui.combo("##model_camera", combo_idx, combo_labels)
                     if _changed:
-                        self._selected_model_camera = new_combo_idx - 1
-                        if self._selected_model_camera >= 0:
-                            viewer.set_camera_from_model(self._selected_model_camera)
-                        else:
-                            self._follow_model_camera = False
-                    imgui.same_line()
-                    _follow_changed, self._follow_model_camera = imgui.checkbox("Follow", self._follow_model_camera)
+                        self._select_model_camera(new_combo_idx - 1)
 
             imgui.set_next_item_open(True, imgui.Cond_.appearing)
             if imgui.collapsing_header("Example Options"):

@@ -183,27 +183,27 @@ class Camera:
         """Get the camera front direction vector (read-only)."""
         from pyglet.math import Vec3 as PyVec3
 
-        from ..core.cameras import _pitch_yaw_to_basis_f64
+        from ..core.cameras import pitch_yaw_to_basis_f64
 
-        front, _right, _up = _pitch_yaw_to_basis_f64(self.pitch, self.yaw, self.up_axis)
+        front, _right, _up = pitch_yaw_to_basis_f64(self.pitch, self.yaw, self.up_axis)
         return PyVec3(*front)
 
     def get_right(self):
         """Get the camera right direction vector (read-only)."""
         from pyglet.math import Vec3 as PyVec3
 
-        from ..core.cameras import _pitch_yaw_to_basis_f64
+        from ..core.cameras import pitch_yaw_to_basis_f64
 
-        _front, right, _up = _pitch_yaw_to_basis_f64(self.pitch, self.yaw, self.up_axis)
+        _front, right, _up = pitch_yaw_to_basis_f64(self.pitch, self.yaw, self.up_axis)
         return PyVec3(*right)
 
     def get_up(self):
         """Get the camera up direction vector (read-only)."""
         from pyglet.math import Vec3 as PyVec3
 
-        from ..core.cameras import _pitch_yaw_to_basis_f64
+        from ..core.cameras import pitch_yaw_to_basis_f64
 
-        _front, _right, up = _pitch_yaw_to_basis_f64(self.pitch, self.yaw, self.up_axis)
+        _front, _right, up = pitch_yaw_to_basis_f64(self.pitch, self.yaw, self.up_axis)
         return PyVec3(*up)
 
     def get_view_matrix(self, scaling: float = 1.0) -> np.ndarray:

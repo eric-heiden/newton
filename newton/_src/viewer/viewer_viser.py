@@ -459,10 +459,10 @@ class ViewerViser(ViewerBase):
 
     def _compute_camera_front_up(self, pitch: float, yaw: float) -> tuple[np.ndarray, np.ndarray]:
         """Compute camera front and up vectors from pitch/yaw angles."""
-        from ..core.cameras import _pitch_yaw_to_basis_f64
+        from ..core.cameras import pitch_yaw_to_basis_f64
 
         up_axis = self._get_camera_up_axis()
-        front_f64, _right_f64, _up_f64 = _pitch_yaw_to_basis_f64(pitch, yaw, up_axis)
+        front_f64, _right_f64, _up_f64 = pitch_yaw_to_basis_f64(pitch, yaw, up_axis)
         front = np.array(front_f64, dtype=np.float64)
 
         # World-up vectors indexed by up_axis (0=X, 1=Y, 2=Z).
@@ -477,6 +477,7 @@ class ViewerViser(ViewerBase):
         # cross product degenerates; fall back to an alternative up vector.
         # This matches the pre-existing Viser behaviour and is intentionally
         # NOT delegated to pitch_yaw_to_basis (see task-11 report, concern #1).
+        # TODO: migrate right/up derivation to pitch_yaw_to_basis once the pitch clamp makes the fallback provably dead.
         right = np.cross(front, world_up)
         right_norm = np.linalg.norm(right)
         if right_norm < 1.0e-8:

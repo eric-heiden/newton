@@ -25,6 +25,7 @@ __all__ = [
     "eval_camera_world_xforms",
     "fov_to_focal_length",
     "pitch_yaw_to_basis",
+    "pitch_yaw_to_basis_f64",
     "xform_to_pitch_yaw",
 ]
 
@@ -675,10 +676,14 @@ def eval_camera_world_xforms(model, state=None, out: wp.array | None = None) -> 
     return out
 
 
-def _pitch_yaw_to_basis_f64(
+def pitch_yaw_to_basis_f64(
     pitch_deg: float, yaw_deg: float, up_axis: int
 ) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
-    """Internal float64 implementation used by :func:`pitch_yaw_to_basis` and ``Camera``."""
+    """Float64 camera basis helper used by :func:`pitch_yaw_to_basis` and internal viewer code.
+
+    Returns plain Python float tuples ``(front, right, up)`` in float64 precision.
+    Use :func:`pitch_yaw_to_basis` instead when :class:`wp.vec3` outputs are required.
+    """
     pitch = max(-89.0, min(89.0, float(pitch_deg)))
     yaw = float(yaw_deg)
     p = math.radians(pitch)
@@ -718,9 +723,7 @@ def _pitch_yaw_to_basis_f64(
     return (fx, fy, fz), (rx, ry, rz), (vx, vy, vz)
 
 
-def pitch_yaw_to_basis(
-    pitch_deg: float, yaw_deg: float, up_axis: int
-) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
+def pitch_yaw_to_basis(pitch_deg: float, yaw_deg: float, up_axis: int) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
     """Converts pitch/yaw angles to an orthonormal camera basis.
 
     Mirrors the orientation convention used by the viewer
@@ -736,7 +739,7 @@ def pitch_yaw_to_basis(
     Returns:
         Tuple of (front, right, up) unit vectors as :class:`wp.vec3`.
     """
-    f, r, u = _pitch_yaw_to_basis_f64(pitch_deg, yaw_deg, up_axis)
+    f, r, u = pitch_yaw_to_basis_f64(pitch_deg, yaw_deg, up_axis)
     return wp.vec3(*f), wp.vec3(*r), wp.vec3(*u)
 
 

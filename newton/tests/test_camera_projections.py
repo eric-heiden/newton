@@ -33,7 +33,7 @@ class TestCameraProjections(unittest.TestCase):
     def test_projection_immutable(self):
         """Verify projection descriptors are frozen."""
         proj = newton.CameraPinhole.from_fov(math.radians(60.0))
-        with self.assertRaises(Exception):
+        with self.assertRaises(AttributeError):
             proj.focal_length = 1.0
 
     def test_custom_rays_identity_equality(self):
@@ -55,6 +55,10 @@ class TestCameraProjections(unittest.TestCase):
         """Verify fisheye projection descriptors construct and are hashable."""
         f = newton.CameraFisheyeOpenCV(fx=300.0, fy=300.0, cx=320.0, cy=240.0)
         self.assertIsInstance(hash(f), int)
+        g = newton.CameraFisheyeFTheta(optical_center_x=320.0, optical_center_y=240.0)
+        self.assertIsInstance(hash(g), int)
+        h = newton.CameraFisheyeKannalaBrandt(optical_center_x=320.0, optical_center_y=240.0)
+        self.assertIsInstance(hash(h), int)
 
 
 if __name__ == "__main__":

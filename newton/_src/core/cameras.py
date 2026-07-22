@@ -97,14 +97,18 @@ class CameraFisheyeOpenCV(CameraProjection):
     """
 
     fx: float
+    """Horizontal focal length [px]."""
     fy: float
+    """Vertical focal length [px]."""
     cx: float
+    """Principal point x-coordinate [px]."""
     cy: float
+    """Principal point y-coordinate [px]."""
     k1: float = 0.0
     k2: float = 0.0
     k3: float = 0.0
     k4: float = 0.0
-    max_fov: float = math.pi
+    max_fov: float = 2.0 * math.pi
     """Maximum field of view [rad]; rays beyond it are marked invalid."""
 
 
@@ -115,11 +119,12 @@ class CameraFisheyeFTheta(CameraProjection):
     optical_center_x: float
     optical_center_y: float
     k0: float = 0.0
-    k1: float = 0.0
+    k1: float = 1.0
     k2: float = 0.0
     k3: float = 0.0
     k4: float = 0.0
-    max_fov: float = math.pi
+    max_fov: float = 2.0 * math.pi
+    """Maximum field of view [rad]; rays beyond it are marked invalid."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -132,7 +137,8 @@ class CameraFisheyeKannalaBrandt(CameraProjection):
     k1: float = 0.0
     k2: float = 0.0
     k3: float = 0.0
-    max_fov: float = math.pi
+    max_fov: float = 2.0 * math.pi
+    """Maximum field of view [rad]; rays beyond it are marked invalid."""
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)

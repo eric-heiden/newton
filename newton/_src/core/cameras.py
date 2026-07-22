@@ -647,13 +647,21 @@ def eval_camera_world_xforms(model, state=None, out: wp.array | None = None) -> 
     Returns:
         Camera-to-world transforms [m, unit quaternion], shape [camera_count].
     """
+    # Early return for zero cameras to avoid allocating when unnecessary.
+    if model.camera_count == 0:
+        if out is None:
+            return wp.empty(0, dtype=wp.transform, device=model.device)
+        else:
+            return out
+
     if out is None:
         out = wp.empty(model.camera_count, dtype=wp.transform, device=model.device)
-    if model.camera_count == 0:
-        return out
     # state.body_q is None when the model has no bodies; fall back to model.body_q
     # (an empty array) so the kernel still has a valid array to bind.
-    body_q = (state.body_q if state is not None else None) or model.body_q
+    if state is not None and state.body_q is not None:
+        body_q = state.body_q
+    else:
+        body_q = model.body_q
     wp.launch(
         _eval_camera_world_xforms_kernel,
         dim=model.camera_count,

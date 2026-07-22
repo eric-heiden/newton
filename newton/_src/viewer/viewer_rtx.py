@@ -479,11 +479,13 @@ void main() {
         # ---- Camera ----------------------------------------------------------
         cam = UsdGeom.Camera.Define(self.stage, self._camera_prim_path)
 
+        from ..core.cameras import fov_to_focal_length
+
         aspect = self.camera.width / max(self.camera.height, 1)
         # camera.fov is vertical FOV, so derive focal length from the vertical aperture.
         v_aperture = 20.955
         h_aperture = v_aperture * aspect
-        focal_length = v_aperture / (2.0 * math.tan(math.radians(self.camera.fov) / 2.0))
+        focal_length = fov_to_focal_length(math.radians(self.camera.fov), v_aperture)
 
         cam.GetFocalLengthAttr().Set(focal_length)
         cam.GetHorizontalApertureAttr().Set(h_aperture)

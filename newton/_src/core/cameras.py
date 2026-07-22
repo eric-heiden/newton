@@ -23,6 +23,8 @@ __all__ = [
     "compute_camera_rays_fisheye_opencv_kernel",
     "compute_camera_rays_pinhole_from_aperture_kernel",
     "eval_camera_world_xforms",
+    "fov_to_focal_length",
+    "pitch_yaw_to_basis",
     "xform_to_pitch_yaw",
 ]
 
@@ -671,6 +673,87 @@ def eval_camera_world_xforms(model, state=None, out: wp.array | None = None) -> 
         device=model.device,
     )
     return out
+
+
+def _pitch_yaw_to_basis_f64(
+    pitch_deg: float, yaw_deg: float, up_axis: int
+) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
+    """Internal float64 implementation used by :func:`pitch_yaw_to_basis` and ``Camera``."""
+    pitch = max(-89.0, min(89.0, float(pitch_deg)))
+    yaw = float(yaw_deg)
+    p = math.radians(pitch)
+    y = math.radians(yaw)
+    cp = math.cos(p)
+    sp = math.sin(p)
+    cy = math.cos(y)
+    sy = math.sin(y)
+
+    if up_axis == 0:  # X up
+        fx, fy, fz = sp, cy * cp, sy * cp
+        ux, uy, uz = 1.0, 0.0, 0.0
+    elif up_axis == 2:  # Z up
+        fx, fy, fz = cy * cp, sy * cp, sp
+        ux, uy, uz = 0.0, 0.0, 1.0
+    else:  # Y up
+        fx, fy, fz = cy * cp, sp, sy * cp
+        ux, uy, uz = 0.0, 1.0, 0.0
+
+    fn = math.sqrt(fx * fx + fy * fy + fz * fz)
+    fx, fy, fz = fx / fn, fy / fn, fz / fn
+
+    # right = cross(front, world_up), then normalise
+    rx = fy * uz - fz * uy
+    ry = fz * ux - fx * uz
+    rz = fx * uy - fy * ux
+    rn = math.sqrt(rx * rx + ry * ry + rz * rz)
+    rx, ry, rz = rx / rn, ry / rn, rz / rn
+
+    # up = cross(right, front), then normalise
+    vx = ry * fz - rz * fy
+    vy = rz * fx - rx * fz
+    vz = rx * fy - ry * fx
+    vn = math.sqrt(vx * vx + vy * vy + vz * vz)
+    vx, vy, vz = vx / vn, vy / vn, vz / vn
+
+    return (fx, fy, fz), (rx, ry, rz), (vx, vy, vz)
+
+
+def pitch_yaw_to_basis(
+    pitch_deg: float, yaw_deg: float, up_axis: int
+) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
+    """Converts pitch/yaw angles to an orthonormal camera basis.
+
+    Mirrors the orientation convention used by the viewer
+    :class:`~newton._src.viewer.camera.Camera`: pitch clamps to ±89°,
+    yaw rotates around the world-up axis, and the returned vectors are the
+    same as ``Camera.get_front``, ``Camera.get_right``, and ``Camera.get_up``.
+
+    Args:
+        pitch_deg: Camera pitch angle [deg], clamped to [-89, 89].
+        yaw_deg: Camera yaw angle [deg].
+        up_axis: World up axis (0=X, 1=Y, 2=Z).
+
+    Returns:
+        Tuple of (front, right, up) unit vectors as :class:`wp.vec3`.
+    """
+    f, r, u = _pitch_yaw_to_basis_f64(pitch_deg, yaw_deg, up_axis)
+    return wp.vec3(*f), wp.vec3(*r), wp.vec3(*u)
+
+
+def fov_to_focal_length(fov: float, aperture: float) -> float:
+    """Converts a field of view to a focal length in aperture units.
+
+    Inverse of ``0.5 * aperture / focal_length = tan(0.5 * fov)``, matching
+    :meth:`CameraPinhole.from_fov`.
+
+    Args:
+        fov: Field of view [rad].
+        aperture: Film aperture (vertical or horizontal) in aperture units.
+
+    Returns:
+        Focal length in the same units as ``aperture``.
+    """
+    return 0.5 * aperture / math.tan(0.5 * fov)
 
 
 def xform_to_pitch_yaw(xform: wp.transform, up_axis: int) -> tuple[wp.vec3, float, float]:

@@ -183,55 +183,28 @@ class Camera:
         """Get the camera front direction vector (read-only)."""
         from pyglet.math import Vec3 as PyVec3
 
-        # Clamp pitch to avoid gimbal lock
-        pitch = self._clamp_pitch(self.pitch)
+        from ..core.cameras import _pitch_yaw_to_basis_f64
 
-        # Calculate front vector directly in the coordinate system based on up_axis
-        # This ensures yaw/pitch work correctly for each coordinate system
-
-        if self.up_axis == 0:  # X up
-            # Yaw rotates around X (vertical), pitch is elevation
-            front_x = np.sin(np.deg2rad(pitch))
-            front_y = np.cos(np.deg2rad(self.yaw)) * np.cos(np.deg2rad(pitch))
-            front_z = np.sin(np.deg2rad(self.yaw)) * np.cos(np.deg2rad(pitch))
-            return PyVec3(front_x, front_y, front_z).normalize()
-
-        elif self.up_axis == 2:  # Z up
-            # Yaw rotates around Z (vertical), pitch is elevation
-            front_x = np.cos(np.deg2rad(self.yaw)) * np.cos(np.deg2rad(pitch))
-            front_y = np.sin(np.deg2rad(self.yaw)) * np.cos(np.deg2rad(pitch))
-            front_z = np.sin(np.deg2rad(pitch))
-            return PyVec3(front_x, front_y, front_z).normalize()
-
-        else:  # Y up (default)
-            # Yaw rotates around Y (vertical), pitch is elevation
-            front_x = np.cos(np.deg2rad(self.yaw)) * np.cos(np.deg2rad(pitch))
-            front_y = np.sin(np.deg2rad(pitch))
-            front_z = np.sin(np.deg2rad(self.yaw)) * np.cos(np.deg2rad(pitch))
-            return PyVec3(front_x, front_y, front_z).normalize()
+        front, _right, _up = _pitch_yaw_to_basis_f64(self.pitch, self.yaw, self.up_axis)
+        return PyVec3(*front)
 
     def get_right(self):
         """Get the camera right direction vector (read-only)."""
         from pyglet.math import Vec3 as PyVec3
 
-        return PyVec3.cross(self.get_front(), self.get_up()).normalize()
+        from ..core.cameras import _pitch_yaw_to_basis_f64
+
+        _front, right, _up = _pitch_yaw_to_basis_f64(self.pitch, self.yaw, self.up_axis)
+        return PyVec3(*right)
 
     def get_up(self):
         """Get the camera up direction vector (read-only)."""
         from pyglet.math import Vec3 as PyVec3
 
-        # World up vector based on up axis
-        if self.up_axis == 0:  # X up
-            world_up = PyVec3(1.0, 0.0, 0.0)
-        elif self.up_axis == 2:  # Z up
-            world_up = PyVec3(0.0, 0.0, 1.0)
-        else:  # Y up (default)
-            world_up = PyVec3(0.0, 1.0, 0.0)
+        from ..core.cameras import _pitch_yaw_to_basis_f64
 
-        # Compute right vector and use it to get proper up vector
-        front = self.get_front()
-        right = PyVec3.cross(front, world_up).normalize()
-        return PyVec3.cross(right, front).normalize()
+        _front, _right, up = _pitch_yaw_to_basis_f64(self.pitch, self.yaw, self.up_axis)
+        return PyVec3(*up)
 
     def get_view_matrix(self, scaling: float = 1.0) -> np.ndarray:
         """

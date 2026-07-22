@@ -156,5 +156,57 @@ class TestViewFromCamera(unittest.TestCase):
         self.assertAlmostEqual(viewer.camera.fov, math.degrees(fov_rad), places=3)
 
 
+class TestCameraMathUnification(unittest.TestCase):
+    def test_basis_matches_viewport_camera(self):
+        """Verify pitch_yaw_to_basis reproduces the viewport Camera vectors for all up axes."""
+        from newton._src.core.cameras import pitch_yaw_to_basis
+
+        for up_axis in (0, 1, 2):
+            for pitch, yaw in [(0.0, 0.0), (-30.0, 45.0), (60.0, -120.0), (-89.0, 179.0)]:
+                cam = Camera(up_axis=up_axis)
+                cam.pitch = pitch
+                cam.yaw = yaw
+                front, right, up = pitch_yaw_to_basis(pitch, yaw, up_axis)
+                expected_front = cam.get_front()
+                for k in range(3):
+                    self.assertAlmostEqual(
+                        float(front[k]), float(expected_front[k]), places=5,
+                        msg=f"up_axis={up_axis} pitch={pitch} yaw={yaw}",
+                    )
+
+    def test_fov_to_focal_length_roundtrip(self):
+        """Verify fov/focal conversion inverts CameraPinhole.from_fov."""
+        from newton._src.core.cameras import fov_to_focal_length
+
+        fov = math.radians(50.0)
+        proj = newton.CameraPinhole.from_fov(fov)
+        self.assertAlmostEqual(
+            fov_to_focal_length(fov, proj.vertical_aperture), proj.focal_length, places=5
+        )
+
+    def test_basis_right_up_orthonormal(self):
+        """Verify pitch_yaw_to_basis returns orthonormal (front, right, up) for all axes."""
+        from newton._src.core.cameras import pitch_yaw_to_basis
+
+        for up_axis in (0, 1, 2):
+            for pitch, yaw in [(0.0, 0.0), (-30.0, 45.0), (60.0, -120.0), (-89.0, 179.0)]:
+                front, right, up = pitch_yaw_to_basis(pitch, yaw, up_axis)
+                # Each vector should be unit length.
+                for name, v in [("front", front), ("right", right), ("up", up)]:
+                    length = math.sqrt(sum(float(v[k]) ** 2 for k in range(3)))
+                    self.assertAlmostEqual(length, 1.0, places=5,
+                                          msg=f"{name} not unit: up_axis={up_axis} pitch={pitch} yaw={yaw}")
+                # Vectors should be mutually orthogonal.
+                dot_fr = sum(float(front[k]) * float(right[k]) for k in range(3))
+                dot_fu = sum(float(front[k]) * float(up[k]) for k in range(3))
+                dot_ru = sum(float(right[k]) * float(up[k]) for k in range(3))
+                self.assertAlmostEqual(dot_fr, 0.0, places=5,
+                                       msg=f"front·right non-zero: up_axis={up_axis} pitch={pitch} yaw={yaw}")
+                self.assertAlmostEqual(dot_fu, 0.0, places=5,
+                                       msg=f"front·up non-zero: up_axis={up_axis} pitch={pitch} yaw={yaw}")
+                self.assertAlmostEqual(dot_ru, 0.0, places=5,
+                                       msg=f"right·up non-zero: up_axis={up_axis} pitch={pitch} yaw={yaw}")
+
+
 if __name__ == "__main__":
     unittest.main()

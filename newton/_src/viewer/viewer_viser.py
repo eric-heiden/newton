@@ -459,44 +459,24 @@ class ViewerViser(ViewerBase):
 
     def _compute_camera_front_up(self, pitch: float, yaw: float) -> tuple[np.ndarray, np.ndarray]:
         """Compute camera front and up vectors from pitch/yaw angles."""
-        pitch = float(np.clip(pitch, -89.0, 89.0))
-        yaw = float(yaw)
-        pitch_rad = np.deg2rad(pitch)
-        yaw_rad = np.deg2rad(yaw)
+        from ..core.cameras import _pitch_yaw_to_basis_f64
+
         up_axis = self._get_camera_up_axis()
+        front_f64, _right_f64, _up_f64 = _pitch_yaw_to_basis_f64(pitch, yaw, up_axis)
+        front = np.array(front_f64, dtype=np.float64)
 
-        if up_axis == 0:  # X up
-            front = np.array(
-                [
-                    np.sin(pitch_rad),
-                    np.cos(yaw_rad) * np.cos(pitch_rad),
-                    np.sin(yaw_rad) * np.cos(pitch_rad),
-                ],
-                dtype=np.float64,
-            )
-            world_up = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-        elif up_axis == 2:  # Z up
-            front = np.array(
-                [
-                    np.cos(yaw_rad) * np.cos(pitch_rad),
-                    np.sin(yaw_rad) * np.cos(pitch_rad),
-                    np.sin(pitch_rad),
-                ],
-                dtype=np.float64,
-            )
-            world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        else:  # Y up
-            front = np.array(
-                [
-                    np.cos(yaw_rad) * np.cos(pitch_rad),
-                    np.sin(pitch_rad),
-                    np.sin(yaw_rad) * np.cos(pitch_rad),
-                ],
-                dtype=np.float64,
-            )
-            world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        # World-up vectors indexed by up_axis (0=X, 1=Y, 2=Z).
+        _world_ups = [
+            np.array([1.0, 0.0, 0.0], dtype=np.float64),
+            np.array([0.0, 1.0, 0.0], dtype=np.float64),
+            np.array([0.0, 0.0, 1.0], dtype=np.float64),
+        ]
+        world_up = _world_ups[up_axis]
 
-        front /= np.linalg.norm(front)
+        # Gimbal-lock guard: when front is nearly parallel to world_up the
+        # cross product degenerates; fall back to an alternative up vector.
+        # This matches the pre-existing Viser behaviour and is intentionally
+        # NOT delegated to pitch_yaw_to_basis (see task-11 report, concern #1).
         right = np.cross(front, world_up)
         right_norm = np.linalg.norm(right)
         if right_norm < 1.0e-8:

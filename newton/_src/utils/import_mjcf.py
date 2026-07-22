@@ -309,6 +309,11 @@ def parse_mjcf(
             actuators use :attr:`~newton.solvers.SolverMuJoCo.CtrlSource.JOINT_TARGET` mode where control comes
             from :attr:`newton.Control.joint_target_q` and :attr:`newton.Control.joint_target_qd`.
         path_resolver: Callback to resolve file paths. Takes (base_dir, file_path) and returns a resolved path. For <include> elements, can return either a file path or XML content directly. For asset elements (mesh, texture, etc.), must return an absolute file path. The default resolver joins paths and returns absolute file paths.
+
+    Note:
+        Non-fixed camera modes (e.g. ``trackcom``, ``targetbody``) are imported as fixed
+        cameras; the original mode string is preserved in the ``mjcf:camera_mode`` custom
+        attribute so downstream code can apply tracking logic.
     """
     # Early validation of base joint parameters
     builder._validate_base_joint_params(floating, base_joint, parent_body)
@@ -1301,6 +1306,10 @@ def parse_mjcf(
     ):
         """Parse <camera> child elements of parent_element and add them to the builder.
 
+        Non-fixed camera modes (e.g. ``trackcom``, ``targetbody``) are imported as fixed
+        cameras; the original mode string is preserved in the ``mjcf:camera_mode`` custom
+        attribute so downstream code can apply tracking logic.
+
         Args:
             parent_element: The XML element whose <camera> children are parsed.
             body: Body index to attach cameras to (-1 for world-fixed).
@@ -1333,13 +1342,6 @@ def parse_mjcf(
                 camera_xform = incoming_xform * camera_xform
 
             mode = camera_attrib.get("mode", "fixed")
-            if mode != "fixed":
-                warnings.warn(
-                    f"MJCF camera '{name}' uses mode='{mode}', which has no runtime tracking "
-                    f"support in Newton; importing as a fixed camera.",
-                    UserWarning,
-                    stacklevel=2,
-                )
 
             resolution = None
             if camera_attrib.get("resolution") is not None:

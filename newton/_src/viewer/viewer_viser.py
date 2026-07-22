@@ -16,6 +16,7 @@ import warp as wp
 
 import newton
 
+from ..core.cameras import pitch_yaw_to_basis_f64
 from ..core.types import override
 from ..utils.texture import load_texture, normalize_texture
 from .viewer import ViewerBase, is_jupyter_notebook
@@ -459,8 +460,6 @@ class ViewerViser(ViewerBase):
 
     def _compute_camera_front_up(self, pitch: float, yaw: float) -> tuple[np.ndarray, np.ndarray]:
         """Compute camera front and up vectors from pitch/yaw angles."""
-        from ..core.cameras import pitch_yaw_to_basis_f64
-
         up_axis = self._get_camera_up_axis()
         front_f64, _right_f64, _up_f64 = pitch_yaw_to_basis_f64(pitch, yaw, up_axis)
         front = np.array(front_f64, dtype=np.float64)

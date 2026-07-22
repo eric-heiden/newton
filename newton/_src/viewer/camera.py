@@ -3,6 +3,7 @@
 
 import numpy as np
 
+from ..core.cameras import pitch_yaw_to_basis_f64
 from ..core.types import Vec3
 
 
@@ -183,8 +184,6 @@ class Camera:
         """Get the camera front direction vector (read-only)."""
         from pyglet.math import Vec3 as PyVec3
 
-        from ..core.cameras import pitch_yaw_to_basis_f64
-
         front, _right, _up = pitch_yaw_to_basis_f64(self.pitch, self.yaw, self.up_axis)
         return PyVec3(*front)
 
@@ -192,16 +191,12 @@ class Camera:
         """Get the camera right direction vector (read-only)."""
         from pyglet.math import Vec3 as PyVec3
 
-        from ..core.cameras import pitch_yaw_to_basis_f64
-
         _front, right, _up = pitch_yaw_to_basis_f64(self.pitch, self.yaw, self.up_axis)
         return PyVec3(*right)
 
     def get_up(self):
         """Get the camera up direction vector (read-only)."""
         from pyglet.math import Vec3 as PyVec3
-
-        from ..core.cameras import pitch_yaw_to_basis_f64
 
         _front, _right, up = pitch_yaw_to_basis_f64(self.pitch, self.yaw, self.up_axis)
         return PyVec3(*up)

@@ -3915,6 +3915,29 @@ class ModelBuilder:
             entry.delay_args.extend(sub_entry.delay_args)
             entry.clamping_args.extend(sub_entry.clamping_args)
 
+        # Cameras: remap parent body indices and apply the world offset transform to
+        # world-fixed cameras (mirrors the shape handling above).
+        if builder.camera_count:
+            for c in range(builder.camera_count):
+                b = builder.camera_body[c]
+                if b > -1:
+                    self.camera_body.append(b + start_body_idx)
+                    self.camera_transform.append(builder.camera_transform[c])
+                else:
+                    self.camera_body.append(-1)
+                    if xform is not None:
+                        self.camera_transform.append(transform_mul(xform, builder.camera_transform[c]))
+                    else:
+                        self.camera_transform.append(builder.camera_transform[c])
+                self.camera_world.append(self.current_world)
+                self.camera_projection.append(builder.camera_projection[c])
+                self.camera_resolution.append(builder.camera_resolution[c])
+                self.camera_flags.append(builder.camera_flags[c])
+                label = builder.camera_label[c]
+                if label_prefix and label:
+                    label = f"{label_prefix}/{label}"
+                self.camera_label.append(label)
+
     @staticmethod
     def _coerce_mat33(value: Any) -> wp.mat33:
         """Coerce a mat33-like value into a wp.mat33 without triggering Warp row-vector constructor warnings."""

@@ -56,6 +56,10 @@ class ViewerGui:
         # Gizmo active-frame tracking (handles snap_to on release)
         self._gizmo_active = {}
 
+        # Model-camera snap / follow state.
+        self._selected_model_camera: int = -1
+        self._follow_model_camera: bool = False
+
         # FPS tracking
         self._fps_history: list[float] = []
         self._last_fps_time: float = perf_counter()
@@ -431,6 +435,11 @@ class ViewerGui:
         """Render GUI into the active OpenGL framebuffer."""
         if update_fps:
             self._update_fps()
+        # Re-apply the selected model camera every frame when follow is active.
+        if self._follow_model_camera and self._selected_model_camera >= 0:
+            viewer = self._viewer
+            if viewer.model is not None and viewer.model.camera_count > 0:
+                viewer.set_camera_from_model(self._selected_model_camera)
         if not self.is_available:
             return
         if not self.show_ui and not self._loading_splash_active:
@@ -829,6 +838,23 @@ class ViewerGui:
                     _changed, viewer.show_inertia_boxes = imgui.checkbox(
                         "Show Inertia Boxes", viewer.show_inertia_boxes
                     )
+
+                if viewer.model is not None and viewer.model.camera_count > 0:
+                    imgui.separator()
+                    imgui.text("Model Cameras")
+                    camera_labels = viewer.model.camera_label
+                    combo_labels = ["(none)", *camera_labels]
+                    # _selected_model_camera == -1 maps to index 0 ("(none)").
+                    combo_idx = self._selected_model_camera + 1
+                    _changed, new_combo_idx = imgui.combo("##model_camera", combo_idx, combo_labels)
+                    if _changed:
+                        self._selected_model_camera = new_combo_idx - 1
+                        if self._selected_model_camera >= 0:
+                            viewer.set_camera_from_model(self._selected_model_camera)
+                        else:
+                            self._follow_model_camera = False
+                    imgui.same_line()
+                    _follow_changed, self._follow_model_camera = imgui.checkbox("Follow", self._follow_model_camera)
 
             imgui.set_next_item_open(True, imgui.Cond_.appearing)
             if imgui.collapsing_header("Example Options"):

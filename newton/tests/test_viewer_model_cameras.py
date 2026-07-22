@@ -4,10 +4,13 @@
 import math
 import unittest
 
+import numpy as np
 import warp as wp
 
 import newton
 from newton import CameraPinhole, ModelBuilder
+from newton._src.core.cameras import xform_to_pitch_yaw
+from newton._src.viewer.camera import Camera
 from newton._src.viewer.camera_frustums import CameraFrustums
 
 
@@ -60,6 +63,73 @@ class TestCameraFrustums(unittest.TestCase):
         viewer.log_state(model.state())
         viewer.end_frame()
         self.assertEqual(viewer._camera_frustums.depth, 1.5)
+
+
+class TestViewFromCamera(unittest.TestCase):
+    def test_xform_to_pitch_yaw_identity_z_up(self):
+        """Verify a camera looking along -Z world (straight down, Z-up) yields pitch -90."""
+        xf = wp.transform((1.0, 2.0, 3.0), wp.quat_identity())
+        pos, pitch, _yaw = xform_to_pitch_yaw(xf, up_axis=2)
+        self.assertAlmostEqual(float(pos[2]), 3.0, places=5)
+        self.assertAlmostEqual(pitch, -90.0, places=3)
+
+    def test_xform_to_pitch_yaw_round_trip_y_up(self):
+        """Verify xform_to_pitch_yaw pitch/yaw agree with viewer Camera.look_at for Y-up."""
+        # Camera at (0, 2, 5) looking at (1, 0, 0) with Y-up.
+        cam_pos = (0.0, 2.0, 5.0)
+        target = (1.0, 0.0, 0.0)
+        cam = Camera(up_axis=1)
+        cam.pos = cam._as_vec3(cam_pos)
+        cam.look_at(target)
+        expected_pitch = cam.pitch
+        expected_yaw = cam.yaw
+
+        # Build a warp transform whose -Z forward points at the same target.
+        direction = np.array(target, dtype=np.float64) - np.array(cam_pos, dtype=np.float64)
+        direction /= np.linalg.norm(direction)
+        # Compute quaternion that rotates (0,0,-1) to direction.
+        z_neg = np.array([0.0, 0.0, -1.0])
+        axis = np.cross(z_neg, direction)
+        axis_len = np.linalg.norm(axis)
+        if axis_len < 1e-8:
+            q = wp.quat_identity()
+        else:
+            axis /= axis_len
+            angle = math.acos(float(np.clip(np.dot(z_neg, direction), -1.0, 1.0)))
+            q = wp.quat_from_axis_angle(wp.vec3(*axis.tolist()), angle)
+        xf = wp.transform(cam_pos, q)
+        _pos, pitch, yaw = xform_to_pitch_yaw(xf, up_axis=1)
+        self.assertAlmostEqual(pitch, expected_pitch, places=3)
+        self.assertAlmostEqual(yaw, expected_yaw, places=3)
+
+    def test_set_camera_from_model_by_label(self):
+        """Verify set_camera_from_model resolves labels and positions the viewport camera."""
+        builder = ModelBuilder()
+        builder.add_camera(xform=wp.transform((5.0, 0.0, 1.0), wp.quat_identity()), label="cam_a")
+        model = builder.finalize()
+        viewer = newton.viewer.ViewerNull()
+        viewer.set_model(model)
+        viewer.set_camera_from_model("cam_a")  # must not raise
+        with self.assertRaises(KeyError):
+            viewer.set_camera_from_model("missing")
+
+    def test_set_camera_from_model_by_index(self):
+        """Verify set_camera_from_model accepts integer camera index."""
+        builder = ModelBuilder()
+        builder.add_camera(xform=wp.transform((3.0, 1.0, 2.0), wp.quat_identity()), label="cam0")
+        model = builder.finalize()
+        viewer = newton.viewer.ViewerNull()
+        viewer.set_model(model)
+        viewer.set_camera_from_model(0)  # must not raise
+
+    def test_set_camera_from_model_no_model(self):
+        """Verify set_camera_from_model is a no-op when no model is set."""
+        viewer = newton.viewer.ViewerNull()
+        viewer.set_camera_from_model(0)  # must not raise
+
+    def test_xform_to_pitch_yaw_exported(self):
+        """Verify xform_to_pitch_yaw is accessible from newton._src.core.cameras."""
+        self.assertTrue(callable(xform_to_pitch_yaw))
 
 
 if __name__ == "__main__":

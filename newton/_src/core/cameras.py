@@ -17,6 +17,11 @@ __all__ = [
     "CameraFisheyeOpenCV",
     "CameraPinhole",
     "CameraProjection",
+    "compute_camera_rays",
+    "compute_camera_rays_fisheye_ftheta_kernel",
+    "compute_camera_rays_fisheye_kannala_brandt_kernel",
+    "compute_camera_rays_fisheye_opencv_kernel",
+    "compute_camera_rays_pinhole_from_aperture_kernel",
 ]
 
 # Defaults match UsdGeom.Camera fallback values (35mm film back).
@@ -173,3 +178,421 @@ class CameraCustomRays(CameraProjection):
     def resolution(self) -> tuple[int, int]:
         """Image resolution as (width, height)."""
         return (self.rays.shape[1], self.rays.shape[0])
+
+
+# ---------------------------------------------------------------------------
+# Warp helper functions shared by ray-generation kernels
+# ---------------------------------------------------------------------------
+
+
+@wp.func
+def _opencv_fisheye_radius(theta: wp.float32, k0: wp.float32, k1: wp.float32, k2: wp.float32, k3: wp.float32):
+    theta2 = theta * theta
+    theta4 = theta2 * theta2
+    theta6 = theta4 * theta2
+    theta8 = theta4 * theta4
+    return theta * (1.0 + k0 * theta2 + k1 * theta4 + k2 * theta6 + k3 * theta8)
+
+
+@wp.func
+def _ftheta_radius(
+    theta: wp.float32,
+    k0: wp.float32,
+    k1: wp.float32,
+    k2: wp.float32,
+    k3: wp.float32,
+    k4: wp.float32,
+):
+    theta2 = theta * theta
+    theta3 = theta2 * theta
+    theta4 = theta2 * theta2
+    return k0 + k1 * theta + k2 * theta2 + k3 * theta3 + k4 * theta4
+
+
+@wp.func
+def _kannala_brandt_k3_radius(
+    theta: wp.float32,
+    k0: wp.float32,
+    k1: wp.float32,
+    k2: wp.float32,
+    k3: wp.float32,
+):
+    theta2 = theta * theta
+    theta3 = theta2 * theta
+    theta5 = theta3 * theta2
+    theta7 = theta5 * theta2
+    return k0 * theta + k1 * theta3 + k2 * theta5 + k3 * theta7
+
+
+@wp.func
+def _solve_opencv_fisheye_theta(
+    radius: wp.float32,
+    k0: wp.float32,
+    k1: wp.float32,
+    k2: wp.float32,
+    k3: wp.float32,
+    max_theta: wp.float32,
+):
+    if radius <= 1.0e-7:
+        return wp.float32(0.0)
+
+    # This endpoint check and the binary search assume r(theta) is monotonic.
+    max_radius = _opencv_fisheye_radius(max_theta, k0, k1, k2, k3)
+    if radius > max_radius + 1.0e-5:
+        return wp.float32(-1.0)
+
+    lo = wp.float32(0.0)
+    hi = max_theta
+    for _i in range(24):
+        mid = (lo + hi) * 0.5
+        if _opencv_fisheye_radius(mid, k0, k1, k2, k3) < radius:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) * 0.5
+
+
+@wp.func
+def _solve_ftheta_theta(
+    radius: wp.float32,
+    k0: wp.float32,
+    k1: wp.float32,
+    k2: wp.float32,
+    k3: wp.float32,
+    k4: wp.float32,
+    max_theta: wp.float32,
+):
+    if radius <= 1.0e-7:
+        return wp.float32(0.0)
+
+    # When k0 != 0 the polynomial has a nonzero floor at theta=0 (r(0) = k0).
+    # Pixels inside that central circle are undefined by the model; return theta=0 (forward).
+    min_radius = _ftheta_radius(0.0, k0, k1, k2, k3, k4)
+    if radius <= min_radius:
+        return wp.float32(0.0)
+
+    # This endpoint check and the binary search assume r(theta) is monotonic.
+    max_radius = _ftheta_radius(max_theta, k0, k1, k2, k3, k4)
+    if radius > max_radius + 1.0e-5:
+        return wp.float32(-1.0)
+
+    lo = wp.float32(0.0)
+    hi = max_theta
+    for _i in range(24):
+        mid = (lo + hi) * 0.5
+        if _ftheta_radius(mid, k0, k1, k2, k3, k4) < radius:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) * 0.5
+
+
+@wp.func
+def _solve_kannala_brandt_k3_theta(
+    radius: wp.float32,
+    k0: wp.float32,
+    k1: wp.float32,
+    k2: wp.float32,
+    k3: wp.float32,
+    max_theta: wp.float32,
+):
+    if radius <= 1.0e-7:
+        return wp.float32(0.0)
+
+    # This endpoint check and the binary search assume r(theta) is monotonic.
+    max_radius = _kannala_brandt_k3_radius(max_theta, k0, k1, k2, k3)
+    if radius > max_radius + 1.0e-5:
+        return wp.float32(-1.0)
+
+    lo = wp.float32(0.0)
+    hi = max_theta
+    for _i in range(24):
+        mid = (lo + hi) * 0.5
+        if _kannala_brandt_k3_radius(mid, k0, k1, k2, k3) < radius:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) * 0.5
+
+
+@wp.func
+def _fisheye_direction_from_theta(x: wp.float32, y: wp.float32, radius: wp.float32, theta: wp.float32):
+    # Valid fisheye rays are unit-length by construction; zero is reserved for invalid rays.
+    if theta < 0.0:
+        return wp.vec3f(0.0)
+    if radius <= 1.0e-7:
+        return wp.vec3f(0.0, 0.0, -1.0)
+
+    sin_theta = wp.sin(theta)
+    return wp.vec3f((x / radius) * sin_theta, (y / radius) * sin_theta, -wp.cos(theta))
+
+
+# ---------------------------------------------------------------------------
+# Ray-generation warp kernels
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel(enable_backward=False)
+def compute_camera_rays_pinhole_from_aperture_kernel(
+    width: int,
+    height: int,
+    focal_lengths: wp.array[wp.float32],
+    horizontal_apertures: wp.array[wp.float32],
+    vertical_apertures: wp.array[wp.float32],
+    horizontal_aperture_offsets: wp.array[wp.float32],
+    vertical_aperture_offsets: wp.array[wp.float32],
+    camera_index_start: int,
+    out_rays: wp.array4d[wp.vec3f],
+):
+    camera_index, py, px = wp.tid()
+    output_camera_index = camera_index_start + camera_index
+    u = (float(px) + 0.5) / float(width)
+    v = (float(py) + 0.5) / float(height)
+    film_x = (u - 0.5) * horizontal_apertures[camera_index] + horizontal_aperture_offsets[camera_index]
+    film_y = (0.5 - v) * vertical_apertures[camera_index] + vertical_aperture_offsets[camera_index]
+    focal_length = focal_lengths[camera_index]
+    ray_direction_camera_space = wp.vec3f(film_x / focal_length, film_y / focal_length, -1.0)
+    out_rays[output_camera_index, py, px, 0] = wp.vec3f(0.0)
+    out_rays[output_camera_index, py, px, 1] = wp.normalize(ray_direction_camera_space)
+
+
+@wp.kernel(enable_backward=False)
+def compute_camera_rays_fisheye_opencv_kernel(
+    width: int,
+    height: int,
+    image_width: wp.float32,
+    image_height: wp.float32,
+    fx: wp.float32,
+    fy: wp.float32,
+    cx: wp.float32,
+    cy: wp.float32,
+    k1: wp.float32,
+    k2: wp.float32,
+    k3: wp.float32,
+    k4: wp.float32,
+    max_fov: wp.float32,
+    camera_index: int,
+    out_rays: wp.array4d[wp.vec3f],
+):
+    py, px = wp.tid()
+    u = ((float(px) + 0.5) / float(width)) * image_width
+    v = ((float(py) + 0.5) / float(height)) * image_height
+    x = (u - cx) / fx
+    y = -(v - cy) / fy
+    radius = wp.sqrt(x * x + y * y)
+    theta = _solve_opencv_fisheye_theta(
+        radius,
+        k1,
+        k2,
+        k3,
+        k4,
+        wp.min(max_fov * wp.float32(0.5), wp.float32(math.pi)),
+    )
+    ray_direction_camera_space = _fisheye_direction_from_theta(x, y, radius, theta)
+
+    out_rays[camera_index, py, px, 0] = wp.vec3f(0.0)
+    out_rays[camera_index, py, px, 1] = ray_direction_camera_space
+
+
+@wp.kernel(enable_backward=False)
+def compute_camera_rays_fisheye_ftheta_kernel(
+    width: int,
+    height: int,
+    nominal_width: wp.float32,
+    nominal_height: wp.float32,
+    optical_center_x: wp.float32,
+    optical_center_y: wp.float32,
+    k0: wp.float32,
+    k1: wp.float32,
+    k2: wp.float32,
+    k3: wp.float32,
+    k4: wp.float32,
+    max_fov: wp.float32,
+    camera_index: int,
+    out_rays: wp.array4d[wp.vec3f],
+):
+    py, px = wp.tid()
+    u = ((float(px) + 0.5) / float(width)) * nominal_width
+    v = ((float(py) + 0.5) / float(height)) * nominal_height
+    x = u - optical_center_x
+    y = -(v - optical_center_y)
+    radius = wp.sqrt(x * x + y * y)
+    max_theta = wp.min(max_fov * 0.5, wp.float32(math.pi))
+    theta = _solve_ftheta_theta(
+        radius,
+        k0,
+        k1,
+        k2,
+        k3,
+        k4,
+        max_theta,
+    )
+    ray_direction_camera_space = _fisheye_direction_from_theta(x, y, radius, theta)
+
+    out_rays[camera_index, py, px, 0] = wp.vec3f(0.0)
+    out_rays[camera_index, py, px, 1] = ray_direction_camera_space
+
+
+@wp.kernel(enable_backward=False)
+def compute_camera_rays_fisheye_kannala_brandt_kernel(
+    width: int,
+    height: int,
+    nominal_width: wp.float32,
+    nominal_height: wp.float32,
+    optical_center_x: wp.float32,
+    optical_center_y: wp.float32,
+    k0: wp.float32,
+    k1: wp.float32,
+    k2: wp.float32,
+    k3: wp.float32,
+    max_fov: wp.float32,
+    camera_index: int,
+    out_rays: wp.array4d[wp.vec3f],
+):
+    py, px = wp.tid()
+    u = ((float(px) + 0.5) / float(width)) * nominal_width
+    v = ((float(py) + 0.5) / float(height)) * nominal_height
+    x = u - optical_center_x
+    y = -(v - optical_center_y)
+    radius = wp.sqrt(x * x + y * y)
+    max_theta = wp.min(max_fov * 0.5, wp.float32(math.pi))
+    theta = _solve_kannala_brandt_k3_theta(
+        radius,
+        k0,
+        k1,
+        k2,
+        k3,
+        max_theta,
+    )
+    ray_direction_camera_space = _fisheye_direction_from_theta(x, y, radius, theta)
+
+    out_rays[camera_index, py, px, 0] = wp.vec3f(0.0)
+    out_rays[camera_index, py, px, 1] = ray_direction_camera_space
+
+
+# ---------------------------------------------------------------------------
+# Public dispatcher
+# ---------------------------------------------------------------------------
+
+
+def compute_camera_rays(
+    projection: CameraProjection,
+    width: int,
+    height: int,
+    out: wp.array | None = None,
+    device=None,
+) -> wp.array:
+    """Generates a camera-space ray bundle for a projection descriptor.
+
+    Args:
+        projection: The projection descriptor.
+        width: Image width [px].
+        height: Image height [px].
+        out: Optional preallocated output of shape [height, width, 2], dtype ``wp.vec3f``.
+        device: Warp device for the output array.
+
+    Returns:
+        Rays of shape [height, width, 2]: index 0 origins [m], index 1 normalized directions.
+    """
+    if isinstance(projection, CameraCustomRays):
+        if (width, height) != projection.resolution:
+            raise ValueError(
+                f"CameraCustomRays has fixed resolution {projection.resolution}, requested ({width}, {height})"
+            )
+        return projection.rays
+
+    if isinstance(projection, CameraPinhole):
+        bundle4d = wp.zeros((1, height, width, 2), dtype=wp.vec3f, device=device)
+        wp.launch(
+            kernel=compute_camera_rays_pinhole_from_aperture_kernel,
+            dim=(1, height, width),
+            inputs=[
+                width,
+                height,
+                wp.array([projection.focal_length], dtype=wp.float32, device=device),
+                wp.array([projection.horizontal_aperture], dtype=wp.float32, device=device),
+                wp.array([projection.vertical_aperture], dtype=wp.float32, device=device),
+                wp.array([projection.horizontal_aperture_offset], dtype=wp.float32, device=device),
+                wp.array([projection.vertical_aperture_offset], dtype=wp.float32, device=device),
+                0,
+                bundle4d,
+            ],
+            device=device,
+        )
+    elif isinstance(projection, CameraFisheyeOpenCV):
+        bundle4d = wp.zeros((1, height, width, 2), dtype=wp.vec3f, device=device)
+        wp.launch(
+            kernel=compute_camera_rays_fisheye_opencv_kernel,
+            dim=(height, width),
+            inputs=[
+                width,
+                height,
+                wp.float32(width),
+                wp.float32(height),
+                wp.float32(projection.fx),
+                wp.float32(projection.fy),
+                wp.float32(projection.cx),
+                wp.float32(projection.cy),
+                wp.float32(projection.k1),
+                wp.float32(projection.k2),
+                wp.float32(projection.k3),
+                wp.float32(projection.k4),
+                wp.float32(projection.max_fov),
+                0,
+                bundle4d,
+            ],
+            device=device,
+        )
+    elif isinstance(projection, CameraFisheyeFTheta):
+        bundle4d = wp.zeros((1, height, width, 2), dtype=wp.vec3f, device=device)
+        wp.launch(
+            kernel=compute_camera_rays_fisheye_ftheta_kernel,
+            dim=(height, width),
+            inputs=[
+                width,
+                height,
+                wp.float32(width),
+                wp.float32(height),
+                wp.float32(projection.optical_center_x),
+                wp.float32(projection.optical_center_y),
+                wp.float32(projection.k0),
+                wp.float32(projection.k1),
+                wp.float32(projection.k2),
+                wp.float32(projection.k3),
+                wp.float32(projection.k4),
+                wp.float32(projection.max_fov),
+                0,
+                bundle4d,
+            ],
+            device=device,
+        )
+    elif isinstance(projection, CameraFisheyeKannalaBrandt):
+        bundle4d = wp.zeros((1, height, width, 2), dtype=wp.vec3f, device=device)
+        wp.launch(
+            kernel=compute_camera_rays_fisheye_kannala_brandt_kernel,
+            dim=(height, width),
+            inputs=[
+                width,
+                height,
+                wp.float32(width),
+                wp.float32(height),
+                wp.float32(projection.optical_center_x),
+                wp.float32(projection.optical_center_y),
+                wp.float32(projection.k0),
+                wp.float32(projection.k1),
+                wp.float32(projection.k2),
+                wp.float32(projection.k3),
+                wp.float32(projection.max_fov),
+                0,
+                bundle4d,
+            ],
+            device=device,
+        )
+    else:
+        raise TypeError(f"Unsupported projection type: {type(projection).__name__}")
+
+    rays = bundle4d.reshape((height, width, 2))
+    if out is not None:
+        wp.copy(out, rays)
+        return out
+    return rays

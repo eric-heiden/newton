@@ -67,7 +67,7 @@ class TestCameraFrustums(unittest.TestCase):
 
 class TestViewFromCamera(unittest.TestCase):
     def test_xform_to_pitch_yaw_identity_z_up(self):
-        """Verify a camera looking along -Z world (straight down, Z-up) yields pitch -90."""
+        """Verify camera forward pointing along world -Z (downward in Z-up space) yields pitch -90."""
         xf = wp.transform((1.0, 2.0, 3.0), wp.quat_identity())
         pos, pitch, _yaw = xform_to_pitch_yaw(xf, up_axis=2)
         self.assertAlmostEqual(float(pos[2]), 3.0, places=5)
@@ -130,6 +130,30 @@ class TestViewFromCamera(unittest.TestCase):
     def test_xform_to_pitch_yaw_exported(self):
         """Verify xform_to_pitch_yaw is accessible from newton._src.core.cameras."""
         self.assertTrue(callable(xform_to_pitch_yaw))
+
+    def test_set_camera_from_model_adopts_fov(self):
+        """Verify set_camera_from_model sets camera.fov to degrees(projection.fov)."""
+
+        class _FakeViewport:
+            def __init__(self):
+                self.fov = 45.0
+
+        class _ViewerWithCamera(newton.viewer.ViewerNull):
+            def __init__(self):
+                super().__init__()
+                self.camera = _FakeViewport()
+
+        fov_rad = math.radians(60.0)
+        builder = ModelBuilder()
+        builder.add_camera(
+            xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()),
+            projection=newton.CameraPinhole.from_fov(fov_rad, aspect=1.0),
+        )
+        model = builder.finalize()
+        viewer = _ViewerWithCamera()
+        viewer.set_model(model)
+        viewer.set_camera_from_model(0)
+        self.assertAlmostEqual(viewer.camera.fov, math.degrees(fov_rad), places=3)
 
 
 if __name__ == "__main__":

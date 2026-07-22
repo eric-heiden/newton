@@ -431,15 +431,22 @@ class ViewerGui:
             self._last_fps_time = current_time
             self._fps_frame_count = 0
 
-    def render_frame(self, update_fps: bool = True):
-        """Render GUI into the active OpenGL framebuffer."""
-        if update_fps:
-            self._update_fps()
-        # Re-apply the selected model camera every frame when follow is active.
+    def apply_camera_follow(self):
+        """Re-apply the selected model camera pose when follow mode is active.
+
+        Called once per frame *before* the scene render so the updated camera
+        position is consumed by the current frame rather than the next one.
+        This is a no-op when follow mode is disabled or no camera is selected.
+        """
         if self._follow_model_camera and self._selected_model_camera >= 0:
             viewer = self._viewer
             if viewer.model is not None and viewer.model.camera_count > 0:
                 viewer.set_camera_from_model(self._selected_model_camera)
+
+    def render_frame(self, update_fps: bool = True):
+        """Render GUI into the active OpenGL framebuffer."""
+        if update_fps:
+            self._update_fps()
         if not self.is_available:
             return
         if not self.show_ui and not self._loading_splash_active:

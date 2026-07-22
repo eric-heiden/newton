@@ -1728,6 +1728,11 @@ class ViewerGL(ViewerBase):
         if self.renderer.has_exit():
             return
 
+        # Re-apply model-camera follow *before* rendering so the updated pose
+        # is consumed by this frame rather than the next one.
+        if self.gui:
+            self.gui.apply_camera_follow()
+
         # Render the scene and present it
         self.renderer.render(self.camera, self.objects, self.lines, self.wireframe_shapes, self.arrows)
 

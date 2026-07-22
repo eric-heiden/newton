@@ -22,6 +22,7 @@ __all__ = [
     "compute_camera_rays_fisheye_kannala_brandt_kernel",
     "compute_camera_rays_fisheye_opencv_kernel",
     "compute_camera_rays_pinhole_from_aperture_kernel",
+    "eval_camera_world_xforms",
 ]
 
 # Defaults match UsdGeom.Camera fallback values (35mm film back).
@@ -612,3 +613,52 @@ def compute_camera_rays(
         wp.copy(out, rays)
         return out
     return rays
+
+
+# ---------------------------------------------------------------------------
+# World-transform evaluation
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel(enable_backward=False)
+def _eval_camera_world_xforms_kernel(
+    camera_transform: wp.array[wp.transform],
+    camera_body: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    out_xforms: wp.array[wp.transform],
+):
+    tid = wp.tid()
+    body = camera_body[tid]
+    if body >= 0:
+        out_xforms[tid] = body_q[body] * camera_transform[tid]
+    else:
+        out_xforms[tid] = camera_transform[tid]
+
+
+def eval_camera_world_xforms(model, state=None, out: wp.array | None = None) -> wp.array:
+    """Evaluates the current world transform of every camera.
+
+    Args:
+        model: The :class:`~newton.Model` holding the cameras.
+        state: Optional :class:`~newton.State`; its ``body_q`` is used for
+            body-attached cameras. Falls back to ``model.body_q``.
+        out: Optional preallocated output, shape [camera_count].
+
+    Returns:
+        Camera-to-world transforms [m, unit quaternion], shape [camera_count].
+    """
+    if out is None:
+        out = wp.empty(model.camera_count, dtype=wp.transform, device=model.device)
+    if model.camera_count == 0:
+        return out
+    # state.body_q is None when the model has no bodies; fall back to model.body_q
+    # (an empty array) so the kernel still has a valid array to bind.
+    body_q = (state.body_q if state is not None else None) or model.body_q
+    wp.launch(
+        _eval_camera_world_xforms_kernel,
+        dim=model.camera_count,
+        inputs=[model.camera_transform, model.camera_body, body_q],
+        outputs=[out],
+        device=model.device,
+    )
+    return out

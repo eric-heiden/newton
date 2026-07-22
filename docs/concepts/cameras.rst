@@ -73,7 +73,7 @@ After finalization, cameras are accessible through these arrays on
    * - ``camera_projections``
      - Deduplicated list of :class:`~newton.CameraProjection` descriptors.
    * - ``camera_world_start``
-     - Per-world start index into the camera arrays, shape ``[world_count + 1]``, dtype ``wp.int32``.
+     - Per-world start index into the camera arrays, shape ``[world_count + 2]``, dtype ``wp.int32``.
 
 World Transforms
 ----------------
@@ -121,8 +121,8 @@ Pinhole
    # From a vertical field of view (most common)
    proj = newton.CameraPinhole.from_fov(math.radians(60.0), aspect=16.0 / 9.0)
 
-   # Read the resolved FoV back
-   print(proj.fov)   # vertical FoV in radians
+   # Read the resolved FOV back
+   print(proj.fov)   # vertical FOV in radians
 
    # Direct construction with USD physical parameters
    proj = newton.CameraPinhole(
@@ -256,7 +256,7 @@ MJCF Import
 
 Each ``<camera>`` element maps to one model camera:
 
-- ``fovy`` (degrees) is converted to the vertical FoV of a
+- ``fovy`` (degrees) is converted to the vertical FOV of a
   :class:`~newton.CameraPinhole`.
 - If both ``focal`` and ``sensorsize`` are present they are used directly as
   the physical aperture parameters.

@@ -16,7 +16,7 @@ from ..geometry.flags import CameraFlags
 _SEGMENTS_PER_CAMERA = 12
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _frustum_lines_kernel(
     xforms: wp.array[wp.transform],
     half_extents: wp.array[wp.vec4],  # (near_hw, near_hh, far_hw, far_hh)

@@ -48,6 +48,19 @@ class TestCameraFrustums(unittest.TestCase):
         viewer.log_state(model.state())
         viewer.end_frame()
 
+    def test_viewer_null_camera_frustum_depth_rebuild(self):
+        """Changing camera_frustum_depth between log_state calls must rebuild frustums."""
+        model = self._model()
+        viewer = newton.viewer.ViewerNull()
+        viewer.set_model(model)
+        viewer.show_cameras = True
+        viewer.begin_frame(0.0)
+        viewer.log_state(model.state())
+        viewer.camera_frustum_depth = 1.5
+        viewer.log_state(model.state())
+        viewer.end_frame()
+        self.assertEqual(viewer._camera_frustums.depth, 1.5)
+
 
 if __name__ == "__main__":
     unittest.main()

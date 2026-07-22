@@ -3,7 +3,6 @@
 
 import unittest
 
-import newton
 from newton import ModelBuilder
 
 try:

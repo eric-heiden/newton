@@ -18,14 +18,14 @@ _SEGMENTS_PER_CAMERA = 12
 
 @wp.kernel
 def _frustum_lines_kernel(
-    xforms: wp.array(dtype=wp.transform),
-    half_extents: wp.array(dtype=wp.vec4),  # (near_hw, near_hh, far_hw, far_hh)
-    depths: wp.array(dtype=wp.vec2),  # (near, depth)
-    visible: wp.array(dtype=wp.int32),
-    camera_world: wp.array(dtype=wp.int32),
-    world_offsets: wp.array(dtype=wp.vec3),
-    starts: wp.array(dtype=wp.vec3),
-    ends: wp.array(dtype=wp.vec3),
+    xforms: wp.array[wp.transform],
+    half_extents: wp.array[wp.vec4],  # (near_hw, near_hh, far_hw, far_hh)
+    depths: wp.array[wp.vec2],  # (near, depth)
+    visible: wp.array[wp.int32],
+    camera_world: wp.array[wp.int32],
+    world_offsets: wp.array[wp.vec3],
+    starts: wp.array[wp.vec3],
+    ends: wp.array[wp.vec3],
 ):
     cam = wp.tid()
     xf = xforms[cam]

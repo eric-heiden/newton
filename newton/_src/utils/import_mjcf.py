@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import warnings
@@ -14,6 +15,7 @@ import numpy as np
 import warp as wp
 
 from ..core import quat_between_axes
+from ..core.cameras import CameraPinhole
 from ..core.types import Axis, AxisType, Sequence, Transform, vec10
 from ..geometry import Mesh, ShapeFlags
 from ..geometry.types import Heightfield
@@ -1271,6 +1273,99 @@ def parse_mjcf(
 
         return site_shapes
 
+    # Track whether the mjcf:camera_mode custom attribute has been registered.
+    # Registration is lazy (on first <camera> encountered) and idempotent.
+    _camera_mode_attr_registered: list[bool] = [False]
+
+    def _ensure_camera_mode_attr_registered():
+        """Register the mjcf:camera_mode CAMERA-frequency string attribute (idempotent)."""
+        if _camera_mode_attr_registered[0]:
+            return
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="camera_mode",
+                dtype=str,
+                frequency=AttributeFrequency.CAMERA,
+                default="fixed",
+                namespace="mjcf",
+            )
+        )
+        _camera_mode_attr_registered[0] = True
+
+    def _parse_cameras_impl(parent_element, body: int, incoming_defaults: dict, label_prefix: str = ""):
+        """Parse <camera> child elements of parent_element and add them to the builder.
+
+        Args:
+            parent_element: The XML element whose <camera> children are parsed.
+            body: Body index to attach cameras to (-1 for world-fixed).
+            incoming_defaults: Current defaults dict for class attribute resolution.
+            label_prefix: Hierarchical label prefix (XPath-style) for camera labels.
+        """
+        for camera in parent_element.findall("camera"):
+            camera_defaults = incoming_defaults
+            if "class" in camera.attrib:
+                camera_class = camera.attrib["class"]
+                if any(re.match(pattern, camera_class) for pattern in ignore_classes):
+                    continue
+                if camera_class in class_defaults:
+                    camera_defaults = merge_attrib(incoming_defaults, class_defaults[camera_class])
+            if "camera" in camera_defaults:
+                camera_attrib = merge_attrib(camera_defaults["camera"], camera.attrib)
+            else:
+                camera_attrib = camera.attrib
+            name = camera_attrib.get("name", "")
+
+            # Build hierarchical label matching the importer's body/site label convention.
+            camera_label = f"{label_prefix}/{name}" if label_prefix and name else name or None
+
+            pos = parse_vec(camera_attrib, "pos", (0.0, 0.0, 0.0)) * scale
+            rot = parse_orientation(camera_attrib)
+
+            mode = camera_attrib.get("mode", "fixed")
+            if mode != "fixed":
+                warnings.warn(
+                    f"MJCF camera '{name}' uses mode='{mode}', which has no runtime tracking "
+                    f"support in Newton; importing as a fixed camera.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+            resolution = None
+            if camera_attrib.get("resolution") is not None:
+                res = [int(float(v)) for v in camera_attrib["resolution"].split()]
+                resolution = (res[0], res[1])
+
+            # Build projection: physical form (focal+sensorsize) takes precedence over fovy.
+            if camera_attrib.get("focal") is not None and camera_attrib.get("sensorsize") is not None:
+                focal = [float(v) for v in camera_attrib["focal"].split()]
+                sensorsize = [float(v) for v in camera_attrib["sensorsize"].split()]
+                principal = [float(v) for v in camera_attrib.get("principal", "0 0").split()]
+                projection = CameraPinhole(
+                    focal_length=focal[1],
+                    horizontal_aperture=sensorsize[0],
+                    vertical_aperture=sensorsize[1],
+                    horizontal_aperture_offset=principal[0],
+                    vertical_aperture_offset=principal[1],
+                )
+            else:
+                fovy = math.radians(float(camera_attrib.get("fovy", "45")))
+                projection = CameraPinhole.from_fov(fovy)
+
+            # Lazily register the mjcf:camera_mode custom attribute on first camera.
+            _ensure_camera_mode_attr_registered()
+
+            # Only pass custom_attributes for non-default modes to keep the dict sparse.
+            custom_attributes = {"mjcf:camera_mode": mode} if mode != "fixed" else None
+
+            builder.add_camera(
+                body=body,
+                xform=wp.transform(pos, rot),
+                projection=projection,
+                resolution=resolution,
+                label=camera_label,
+                custom_attributes=custom_attributes,
+            )
+
     def get_frame_xform(frame_element, incoming_xform: wp.transform) -> wp.transform:
         """Compute composed transform for a frame element."""
         frame_pos = parse_vec(frame_element.attrib, "pos", (0.0, 0.0, 0.0)) * scale
@@ -1936,6 +2031,9 @@ def parse_mjcf(
                     label_prefix=body_label_path,
                 )
 
+        # Parse cameras attached to this body
+        _parse_cameras_impl(body, link, defaults, label_prefix=body_label_path)
+
         m = builder.body_mass[link]
         if not ignore_inertial_definitions and body.find("inertial") is not None:
             inertial = body.find("inertial")
@@ -2404,6 +2502,9 @@ def parse_mjcf(
                 incoming_xform=xform,
                 label_prefix=root_label_path,
             )
+
+        # Parse world-fixed cameras (body=-1)
+        _parse_cameras_impl(world, -1, world_defaults, label_prefix=root_label_path)
 
         # -----------------
         # process frame elements at worldbody level

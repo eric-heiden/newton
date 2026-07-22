@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import enum
+import math
 import os
 import sys
 from abc import ABC, abstractmethod
@@ -776,6 +777,38 @@ class ViewerBase(ABC):
         """
         return
 
+    def set_camera_from_model(self, camera: int | str, state: newton.State | None = None):
+        """Positions the viewport camera at a model camera's current pose.
+
+        Args:
+            camera: Camera index or label (see :attr:`~newton.Model.camera_label`).
+            state: Optional state used to resolve body-attached camera poses;
+                falls back to the last logged state, then to model rest poses.
+
+        Raises:
+            KeyError: If ``camera`` is a string label not present in the model.
+        """
+        if self.model is None or self.model.camera_count == 0:
+            return
+        if isinstance(camera, str):
+            try:
+                index = self.model.camera_label.index(camera)
+            except ValueError:
+                raise KeyError(f"No camera labeled {camera!r}") from None
+        else:
+            index = int(camera)
+        from ..core.cameras import eval_camera_world_xforms, xform_to_pitch_yaw  # noqa: PLC0415
+
+        resolved_state = state if state is not None else getattr(self, "_last_state", None)
+        xf = wp.transform(*eval_camera_world_xforms(self.model, resolved_state).numpy()[index])
+        pos, pitch, yaw = xform_to_pitch_yaw(xf, int(self.model.up_axis))
+        self.set_camera(wp.vec3(*pos), pitch, yaw)
+        # Adopt the camera fov when the viewer exposes a viewport camera.
+        proj = self.model.camera_projections[int(self.model.camera_projection_index.numpy()[index])]
+        viewport_camera = getattr(self, "camera", None)
+        if viewport_camera is not None and hasattr(proj, "fov"):
+            viewport_camera.fov = math.degrees(proj.fov)
+
     def set_world_offsets(self, spacing: tuple[float, float, float] | list[float] | wp.vec3):
         """Set world offsets for visual separation of multiple worlds.
 
@@ -987,7 +1020,11 @@ class ViewerBase(ABC):
         self._log_non_shape_state(state)
 
         if self.show_cameras and self.model.camera_count:
-            if self._camera_frustums is None or self._camera_frustums.model is not self.model or self._camera_frustums.depth != self.camera_frustum_depth:
+            if (
+                self._camera_frustums is None
+                or self._camera_frustums.model is not self.model
+                or self._camera_frustums.depth != self.camera_frustum_depth
+            ):
                 from .camera_frustums import CameraFrustums  # noqa: PLC0415
 
                 self._camera_frustums = CameraFrustums(self.model, depth=self.camera_frustum_depth)

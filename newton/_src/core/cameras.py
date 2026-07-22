@@ -23,6 +23,7 @@ __all__ = [
     "compute_camera_rays_fisheye_opencv_kernel",
     "compute_camera_rays_pinhole_from_aperture_kernel",
     "eval_camera_world_xforms",
+    "xform_to_pitch_yaw",
 ]
 
 # Defaults match UsdGeom.Camera fallback values (35mm film back).
@@ -670,3 +671,33 @@ def eval_camera_world_xforms(model, state=None, out: wp.array | None = None) -> 
         device=model.device,
     )
     return out
+
+
+def xform_to_pitch_yaw(xform: wp.transform, up_axis: int) -> tuple[wp.vec3, float, float]:
+    """Converts a camera world transform to viewport position, pitch, and yaw.
+
+    This is the inverse of the viewer :class:`~newton._src.viewer.camera.Camera`
+    orientation convention: given a camera-to-world transform whose camera
+    space is -Z forward / +Y up, returns the position and the pitch/yaw angles
+    used by the viewport camera.
+
+    Args:
+        xform: Camera-to-world transform (-Z forward, +Y up camera space).
+        up_axis: World up axis (0=X, 1=Y, 2=Z).
+
+    Returns:
+        Tuple of (position [m], pitch [deg], yaw [deg]).
+    """
+    q = wp.transform_get_rotation(xform)
+    forward = wp.quat_rotate(q, wp.vec3(0.0, 0.0, -1.0))
+    fx, fy, fz = float(forward[0]), float(forward[1]), float(forward[2])
+    if up_axis == 0:  # X up
+        pitch = math.asin(max(-1.0, min(1.0, fx)))
+        yaw = math.atan2(fz, fy)
+    elif up_axis == 1:  # Y up
+        pitch = math.asin(max(-1.0, min(1.0, fy)))
+        yaw = math.atan2(fz, fx)
+    else:  # Z up
+        pitch = math.asin(max(-1.0, min(1.0, fz)))
+        yaw = math.atan2(fy, fx)
+    return wp.transform_get_translation(xform), math.degrees(pitch), math.degrees(yaw)

@@ -3567,11 +3567,12 @@ class ModelBuilder:
                 returned mapping (``path_cable_map`` / ``path_cloth_map`` / ``path_soft_map`` /
                 ``path_attachment_map`` and the matching ``path_*_attrs``). Off by default, so the
                 default return shape carries no deformable additions.
-            load_cameras: If True (default), import :class:`UsdGeom.Camera` prims with a
-                perspective projection as Newton cameras. The result dict gains
-                ``"path_camera_map"`` mapping prim path to camera index.
+            load_cameras: If True (default), traverse the stage for :class:`UsdGeom.Camera` prims
+                with a perspective projection and import each as a
+                :class:`~newton.CameraPinhole` via :meth:`ModelBuilder.add_camera`.
                 Orthographic cameras emit a :class:`UserWarning` and are skipped.
-                Set to False to skip all camera prims.
+                The result dict gains a ``"path_camera_map"`` entry mapping prim path to
+                camera index. Set to False to skip all camera prims.
 
         Returns:
             .. experimental::
@@ -3647,6 +3648,8 @@ class ModelBuilder:
                   - Mapping from prim path to original body index before ``collapse_fixed_joints``
                 * - ``"actuator_count"``
                   - Number of external actuators parsed from the USD stage
+                * - ``"path_camera_map"``
+                  - Mapping from prim path (str) of a :class:`UsdGeom.Camera` prim to its camera index in :class:`~newton.ModelBuilder`. Always present; empty when ``load_cameras=False`` or no perspective cameras were found.
         """
         from ..utils.import_usd import parse_usd  # noqa: PLC0415
 

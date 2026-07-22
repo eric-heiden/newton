@@ -121,6 +121,8 @@ class Model:
         """Attribute frequency follows the number of mimic constraints (see :attr:`~newton.Model.constraint_mimic_count`)."""
         WORLD = 15
         """Attribute frequency follows the number of worlds (see :attr:`~newton.Model.world_count`)."""
+        CAMERA = 16
+        """Attribute frequency follows the number of cameras (see :attr:`~newton.Model.camera_count`)."""
 
     class AttributeNamespace:
         """
@@ -323,6 +325,27 @@ class Model:
 
             num_global_shapes = shape_world_start[-1] - shape_world_start[-2] + shape_world_start[0]
         """
+
+        self.camera_count: int = 0
+        """Number of cameras."""
+        self.camera_label: list[str] = []
+        """Camera labels, shape [camera_count]."""
+        self.camera_transform: wp.array[wp.transform] | None = None
+        """Camera-to-parent transforms [m, unit quaternion], shape [camera_count]. Parent is the attached body frame, or the world frame when :attr:`camera_body` is -1."""
+        self.camera_body: wp.array[wp.int32] | None = None
+        """Index of the rigid body each camera is attached to (-1 for world-fixed cameras), shape [camera_count]."""
+        self.camera_world: wp.array[wp.int32] | None = None
+        """World index of each camera (-1 for global cameras), shape [camera_count]."""
+        self.camera_flags: wp.array[wp.int32] | None = None
+        """Camera flags (see :class:`~newton.CameraFlags`), shape [camera_count]."""
+        self.camera_projection_index: wp.array[wp.int32] | None = None
+        """Index into :attr:`camera_projections` for each camera, shape [camera_count]."""
+        self.camera_projections: list = []
+        """Deduplicated camera projection descriptors (see :class:`~newton.CameraProjection`)."""
+        self.camera_resolution: wp.array2d[wp.int32] | None = None
+        """Preferred image resolution hints [px] as (width, height) rows (-1 when unset), shape [camera_count, 2]."""
+        self.camera_world_start: wp.array[wp.int32] | None = None
+        """Per-world camera start indices (same layout as :attr:`shape_world_start`), shape [world_count + 2]."""
 
         # Gaussians
         self.gaussians_count = 0
@@ -878,6 +901,16 @@ class Model:
         self.attribute_frequency["shape_source_ptr"] = Model.AttributeFrequency.SHAPE
         self.attribute_frequency["shape_scale"] = Model.AttributeFrequency.SHAPE
         self.attribute_frequency["shape_filter"] = Model.AttributeFrequency.SHAPE
+
+        # cameras
+        self.attribute_frequency["camera_label"] = Model.AttributeFrequency.CAMERA
+        self.attribute_frequency["camera_transform"] = Model.AttributeFrequency.CAMERA
+        self.attribute_frequency["camera_body"] = Model.AttributeFrequency.CAMERA
+        self.attribute_frequency["camera_world"] = Model.AttributeFrequency.CAMERA
+        self.attribute_frequency["camera_flags"] = Model.AttributeFrequency.CAMERA
+        self.attribute_frequency["camera_projection_index"] = Model.AttributeFrequency.CAMERA
+        self.attribute_frequency["camera_projections"] = Model.AttributeFrequency.ONCE
+        self.attribute_frequency["camera_resolution"] = Model.AttributeFrequency.CAMERA
 
         self.actuators: list[Actuator] = []
         """List of actuator instances for this model."""

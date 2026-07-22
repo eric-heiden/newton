@@ -61,6 +61,7 @@ __all__ = [
 # ==================================================================================
 from ._src.geometry import (  # noqa: E402
     SDF,
+    CameraFlags,
     Gaussian,
     GeoType,
     Heightfield,
@@ -73,6 +74,7 @@ from ._src.geometry import (  # noqa: E402
 
 __all__ += [
     "SDF",
+    "CameraFlags",
     "Gaussian",
     "GeoType",
     "Heightfield",

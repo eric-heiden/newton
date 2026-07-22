@@ -28,6 +28,13 @@ newton
 
    Axis
    BodyFlags
+   CameraCustomRays
+   CameraFisheyeFTheta
+   CameraFisheyeKannalaBrandt
+   CameraFisheyeOpenCV
+   CameraFlags
+   CameraPinhole
+   CameraProjection
    CollisionPipeline
    Contacts
    Control
@@ -55,6 +62,7 @@ newton
    :signatures: long
 
    AxisType
+   eval_camera_world_xforms
    eval_fk
    eval_ik
    eval_inverse_dynamics_force

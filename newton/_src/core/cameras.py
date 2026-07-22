@@ -95,11 +95,7 @@ class CameraPinhole(CameraProjection):
 
 @dataclass(frozen=True, kw_only=True)
 class CameraFisheyeOpenCV(CameraProjection):
-    """OpenCV fisheye model: r = theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8).
-
-    Pixel-unit intrinsics are interpreted at the render resolution, matching
-    the existing ``compute_camera_rays_fisheye_opencv`` helper semantics.
-    """
+    """OpenCV fisheye model: r = theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8)."""
 
     fx: float
     """Horizontal focal length [px]."""
@@ -115,6 +111,10 @@ class CameraFisheyeOpenCV(CameraProjection):
     k4: float = 0.0
     max_fov: float = 2.0 * math.pi
     """Maximum field of view [rad]; rays beyond it are marked invalid."""
+    image_width: float | None = None
+    """Calibration image width [px]; None means the render width."""
+    image_height: float | None = None
+    """Calibration image height [px]; None means the render height."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -130,6 +130,10 @@ class CameraFisheyeFTheta(CameraProjection):
     k4: float = 0.0
     max_fov: float = 2.0 * math.pi
     """Maximum field of view [rad]; rays beyond it are marked invalid."""
+    nominal_width: float | None = None
+    """Calibration image width [px]; None means the render width."""
+    nominal_height: float | None = None
+    """Calibration image height [px]; None means the render height."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -144,6 +148,10 @@ class CameraFisheyeKannalaBrandt(CameraProjection):
     k3: float = 0.0
     max_fov: float = 2.0 * math.pi
     """Maximum field of view [rad]; rays beyond it are marked invalid."""
+    nominal_width: float | None = None
+    """Calibration image width [px]; None means the render width."""
+    nominal_height: float | None = None
+    """Calibration image height [px]; None means the render height."""
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)
@@ -501,8 +509,10 @@ def compute_camera_rays(
             )
         return projection.rays
 
+    # Single allocation shared by all parametric branches below.
+    bundle4d = wp.zeros((1, height, width, 2), dtype=wp.vec3f, device=device)
+
     if isinstance(projection, CameraPinhole):
-        bundle4d = wp.zeros((1, height, width, 2), dtype=wp.vec3f, device=device)
         wp.launch(
             kernel=compute_camera_rays_pinhole_from_aperture_kernel,
             dim=(1, height, width),
@@ -520,15 +530,17 @@ def compute_camera_rays(
             device=device,
         )
     elif isinstance(projection, CameraFisheyeOpenCV):
-        bundle4d = wp.zeros((1, height, width, 2), dtype=wp.vec3f, device=device)
+        # Calibration size falls back to render size when None.
+        calib_w = wp.float32(width if projection.image_width is None else projection.image_width)
+        calib_h = wp.float32(height if projection.image_height is None else projection.image_height)
         wp.launch(
             kernel=compute_camera_rays_fisheye_opencv_kernel,
             dim=(height, width),
             inputs=[
                 width,
                 height,
-                wp.float32(width),
-                wp.float32(height),
+                calib_w,
+                calib_h,
                 wp.float32(projection.fx),
                 wp.float32(projection.fy),
                 wp.float32(projection.cx),
@@ -544,15 +556,17 @@ def compute_camera_rays(
             device=device,
         )
     elif isinstance(projection, CameraFisheyeFTheta):
-        bundle4d = wp.zeros((1, height, width, 2), dtype=wp.vec3f, device=device)
+        # Calibration size falls back to render size when None.
+        calib_w = wp.float32(width if projection.nominal_width is None else projection.nominal_width)
+        calib_h = wp.float32(height if projection.nominal_height is None else projection.nominal_height)
         wp.launch(
             kernel=compute_camera_rays_fisheye_ftheta_kernel,
             dim=(height, width),
             inputs=[
                 width,
                 height,
-                wp.float32(width),
-                wp.float32(height),
+                calib_w,
+                calib_h,
                 wp.float32(projection.optical_center_x),
                 wp.float32(projection.optical_center_y),
                 wp.float32(projection.k0),
@@ -567,15 +581,17 @@ def compute_camera_rays(
             device=device,
         )
     elif isinstance(projection, CameraFisheyeKannalaBrandt):
-        bundle4d = wp.zeros((1, height, width, 2), dtype=wp.vec3f, device=device)
+        # Calibration size falls back to render size when None.
+        calib_w = wp.float32(width if projection.nominal_width is None else projection.nominal_width)
+        calib_h = wp.float32(height if projection.nominal_height is None else projection.nominal_height)
         wp.launch(
             kernel=compute_camera_rays_fisheye_kannala_brandt_kernel,
             dim=(height, width),
             inputs=[
                 width,
                 height,
-                wp.float32(width),
-                wp.float32(height),
+                calib_w,
+                calib_h,
                 wp.float32(projection.optical_center_x),
                 wp.float32(projection.optical_center_y),
                 wp.float32(projection.k0),

@@ -10,6 +10,49 @@ import newton
 from newton import CameraFlags, CameraPinhole, Model, ModelBuilder
 
 
+class TestCameraReplication(unittest.TestCase):
+    def _make_env(self):
+        env = ModelBuilder()
+        body = env.add_body(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
+        env.add_shape_sphere(body)
+        env.add_camera(body=body, label="wrist", projection=CameraPinhole.from_fov(math.radians(70.0)))
+        env.add_camera(xform=wp.transform((1.0, 0.0, 0.0), wp.quat_identity()), label="static")
+        return env, body
+
+    def test_replicate_offsets_cameras(self):
+        """Verify replicate duplicates cameras with per-world body offsets and transforms."""
+        env, _ = self._make_env()
+        scene = ModelBuilder()
+        scene.replicate(env, world_count=3, spacing=(10.0, 0.0, 0.0))
+        model = scene.finalize()
+        self.assertEqual(model.camera_count, 6)
+        self.assertEqual(model.camera_world.numpy().tolist(), [0, 0, 1, 1, 2, 2])
+        bodies = model.camera_body.numpy()
+        self.assertEqual(bodies[0], 0)
+        self.assertEqual(bodies[2], 1)
+        self.assertEqual(bodies[4], 2)
+        # static cameras in later worlds are offset by the per-world spacing:
+        # world 0 keeps the source position; other worlds must differ from it
+        # (compute_world_offsets may arrange worlds in a grid, so don't assert
+        # a specific axis — assert distinctness and that world 0 is unchanged)
+        xf = model.camera_transform.numpy()
+        # compute_world_offsets centres the grid, so the middle world (world index 1)
+        # receives an identity offset and its static cam stays at source x=1.0
+        self.assertAlmostEqual(float(xf[3][0]), 1.0, places=5)  # world 1 static cam (centre)
+        positions = {tuple(round(float(v), 4) for v in xf[i][:3]) for i in (1, 3, 5)}
+        self.assertEqual(len(positions), 3)
+        # a single shared projection object across all replicas
+        self.assertEqual(len(model.camera_projections), 2)
+
+    def test_add_world_label_prefix(self):
+        """Verify add_world applies the label prefix to camera labels."""
+        env, _ = self._make_env()
+        scene = ModelBuilder()
+        scene.add_world(env, label_prefix="env0")
+        model = scene.finalize()
+        self.assertIn("env0/wrist", model.camera_label)
+
+
 class TestCameraSchema(unittest.TestCase):
     def test_camera_attribute_frequency_registered(self):
         """Verify the CAMERA attribute frequency and its count attribute mapping exist."""

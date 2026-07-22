@@ -2778,6 +2778,19 @@ class ModelBuilder:
                     target = shape_transform_start + world_index * counts["shape"] + shape
                     self.shape_transform[target] = transform_mul(xform, source)
 
+        attribute_specs.pop("camera_transform")
+        camera_transform_start = len(self.camera_transform)
+        self.camera_transform.extend(source_list("camera_transform") * world_count)
+        if counts.get("camera"):
+            static_cameras = np.flatnonzero(np.asarray(builder.camera_body, dtype=np.int64) == -1)
+            for world_index, xform in enumerate(xforms):
+                if xform is None:
+                    continue
+                for camera in static_cameras.tolist():
+                    source = wp.transform(*builder.camera_transform[camera])
+                    target = camera_transform_start + world_index * counts["camera"] + camera
+                    self.camera_transform[target] = transform_mul(xform, source)
+
         for body_start, shape_start in zip(body_starts, shape_starts, strict=True):
             for body, shapes in builder.body_shapes.items():
                 translated_shapes = [shape + int(shape_start) for shape in shapes]

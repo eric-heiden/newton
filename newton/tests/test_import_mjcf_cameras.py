@@ -4,6 +4,8 @@
 import math
 import unittest
 
+import warp as wp
+
 from newton import ModelBuilder
 
 MJCF = """
@@ -86,6 +88,25 @@ class TestImportMjcfFrameCameras(unittest.TestCase):
         i = next(i for i, label in enumerate(labels) if label.endswith("framed"))
         # frame pos=(0,0,1) + camera pos=(0,0,0.5) → z == 1.5
         self.assertAlmostEqual(float(model.camera_transform.numpy()[i][2]), 1.5, places=5)
+
+
+class TestWorldbodyCameraSceneXform(unittest.TestCase):
+    def test_worldbody_camera_respects_scene_xform(self):
+        """Verify worldbody cameras are offset by the scene root xform passed to add_mjcf."""
+        builder_base = ModelBuilder()
+        builder_base.add_mjcf(MJCF)
+        model_base = builder_base.finalize()
+        i = next(i for i, label in enumerate(model_base.camera_label) if label.endswith("overview"))
+        base_z = float(model_base.camera_transform.numpy()[i][2])
+
+        builder_shifted = ModelBuilder()
+        with self.assertWarns(UserWarning):
+            builder_shifted.add_mjcf(MJCF, xform=wp.transform((0.0, 0.0, 10.0), wp.quat_identity()))
+        model_shifted = builder_shifted.finalize()
+        i2 = next(i for i, label in enumerate(model_shifted.camera_label) if label.endswith("overview"))
+        shifted_z = float(model_shifted.camera_transform.numpy()[i2][2])
+
+        self.assertAlmostEqual(shifted_z, base_z + 10.0, places=5)
 
 
 if __name__ == "__main__":

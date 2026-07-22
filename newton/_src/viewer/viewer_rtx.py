@@ -29,6 +29,7 @@ import warp as wp
 
 import newton
 
+from ..core.cameras import fov_to_focal_length
 from ..core.types import Axis, override
 
 try:
@@ -478,8 +479,6 @@ void main() {
 
         # ---- Camera ----------------------------------------------------------
         cam = UsdGeom.Camera.Define(self.stage, self._camera_prim_path)
-
-        from ..core.cameras import fov_to_focal_length
 
         aspect = self.camera.width / max(self.camera.height, 1)
         # camera.fov is vertical FOV, so derive focal length from the vertical aperture.

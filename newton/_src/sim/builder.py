@@ -34,6 +34,7 @@ from ..core.types import (
     axis_to_vec3,
     flag_to_int,
 )
+from ..core.cameras import CameraPinhole, CameraProjection
 from ..geometry import (
     Gaussian,
     GeoType,
@@ -44,7 +45,7 @@ from ..geometry import (
     compute_shape_radius,
     transform_inertia,
 )
-from ..geometry.flags import MeshProperties
+from ..geometry.flags import CameraFlags, MeshProperties
 from ..geometry.inertia import validate_and_correct_inertia_kernel, verify_and_correct_inertia
 from ..geometry.types import Heightfield
 from ..geometry.utils import RemeshingMethod, compute_inertia_obb, remesh_mesh
@@ -1096,6 +1097,9 @@ class ModelBuilder:
         self.default_joint_cfg = ModelBuilder.JointDofConfig()
         """Default joint DoF configuration used when joint DoF configuration is omitted."""
 
+        self.default_camera_projection: CameraProjection = CameraPinhole.from_fov(math.radians(45.0))
+        """Projection used by :meth:`add_camera` when none is given."""
+
         self.default_particle_radius = 0.1
         """Default particle radius used when particle radius is not provided explicitly."""
 
@@ -1257,6 +1261,24 @@ class ModelBuilder:
         """Optional contact attributes requested via :meth:`request_contact_attributes`."""
         self._requested_state_attributes: set[str] = set()
         """Optional state attributes requested via :meth:`request_state_attributes`."""
+
+        # cameras
+        self.camera_label: list[str] = []
+        """Camera labels accumulated for :attr:`Model.camera_label`."""
+        self.camera_transform: list[Transform] = []
+        """Camera-to-parent transforms accumulated for :attr:`Model.camera_transform`."""
+        self.camera_body: list[int] = []
+        """Parent body indices accumulated for :attr:`Model.camera_body`."""
+        self.camera_world: list[int] = []
+        """World indices accumulated for :attr:`Model.camera_world`."""
+        self.camera_projection: list = []
+        """Per-camera projection descriptors, deduplicated into :attr:`Model.camera_projections` at finalize."""
+        self.camera_resolution: list[tuple[int, int]] = []
+        """Per-camera resolution hints (width, height) [px]; (-1, -1) when unset."""
+        self.camera_flags: list[int] = []
+        """Camera flags accumulated for :attr:`Model.camera_flags`."""
+        self.camera_world_start: list[int] = []
+        """Per-world camera starts accumulated for :attr:`Model.camera_world_start`."""
 
         # springs
         self.spring_indices: list[int] = []
@@ -2423,6 +2445,11 @@ class ModelBuilder:
         The number of articulations in the model.
         """
         return len(self.articulation_start)
+
+    @property
+    def camera_count(self):
+        """Number of cameras in the model (before finalization)."""
+        return len(self.camera_transform)
 
     @property
     def joint_target_pos(self) -> list[float]:
@@ -7167,6 +7194,74 @@ class ModelBuilder:
             custom_attributes=custom_attributes,
         )
 
+    def add_camera(
+        self,
+        body: int = -1,
+        *,
+        xform: Transform | None = None,
+        projection: CameraProjection | None = None,
+        resolution: tuple[int, int] | None = None,
+        enabled: bool = True,
+        label: str | None = None,
+        custom_attributes: dict[str, Any] | None = None,
+    ) -> int:
+        """Adds a camera to the model.
+
+        Cameras are first-class entities with world semantics: rays are
+        generated at render time from ``projection`` (see
+        :class:`~newton.CameraProjection`); cameras never store per-pixel data
+        on the model. Camera space is -Z forward, +Y up.
+
+        Args:
+            body: Index of the rigid body the camera is attached to. Use -1
+                for world-fixed cameras.
+            xform: Transform of the camera in the parent body's local frame
+                (world frame when ``body`` is -1). If ``None``, the identity
+                transform is used.
+            projection: Projection descriptor. If ``None``, uses
+                :attr:`default_camera_projection`. Cameras with equal
+                projections share the deduplicated descriptor after
+                :meth:`finalize`.
+            resolution: Optional preferred image resolution (width, height)
+                [px]. A renderer-side resolution always takes precedence.
+            enabled: If ``True``, sets :attr:`~newton.CameraFlags.ENABLED`.
+            label: Optional label for identifying the camera. If ``None``,
+                ``"camera_{index}"`` is used.
+            custom_attributes: Dictionary of custom attribute names to values
+                (frequency :attr:`~newton.Model.AttributeFrequency.CAMERA`).
+
+        Returns:
+            Index of the newly added camera.
+        """
+        if body < -1 or body >= self.body_count:
+            raise ValueError(f"Invalid body index {body} for camera (body_count={self.body_count})")
+        camera = self.camera_count
+        if xform is None:
+            xform = wp.transform()
+        else:
+            xform = wp.transform(*xform)
+        if projection is None:
+            projection = self.default_camera_projection
+        if not isinstance(projection, CameraProjection):
+            raise TypeError(f"projection must be a CameraProjection, got {type(projection).__name__}")
+        flags = int(CameraFlags.VISIBLE)
+        if enabled:
+            flags |= int(CameraFlags.ENABLED)
+        self.camera_label.append(label or f"camera_{camera}")
+        self.camera_transform.append(xform)
+        self.camera_body.append(body)
+        self.camera_world.append(self.current_world)
+        self.camera_projection.append(projection)
+        self.camera_resolution.append(tuple(int(v) for v in resolution) if resolution is not None else (-1, -1))
+        self.camera_flags.append(flags)
+        if custom_attributes:
+            self._process_custom_attributes(
+                entity_index=camera,
+                custom_attrs=custom_attributes,
+                expected_frequency=Model.AttributeFrequency.CAMERA,
+            )
+        return camera
+
     def approximate_meshes(
         self,
         method: Literal["coacd", "vhacd", "bounding_sphere", "bounding_box"] | RemeshingMethod = "convex_hull",
@@ -10571,6 +10666,7 @@ class ModelBuilder:
                 self._eq_list("equality_constraint_world"),
                 "equality constraint",
             ),
+            (self.camera_world_start, self.camera_count, self.camera_world, "camera"),
         ]
 
         def build_entity_start_array(
@@ -11843,6 +11939,32 @@ class ModelBuilder:
             m.joint_dof_world_start = wp.array(self.joint_dof_world_start, dtype=wp.int32)
             m.joint_coord_world_start = wp.array(self.joint_coord_world_start, dtype=wp.int32)
             m.joint_constraint_world_start = wp.array(self.joint_constraint_world_start, dtype=wp.int32)
+            m.camera_world_start = wp.array(self.camera_world_start, dtype=wp.int32)
+
+            # ---------------------
+            # cameras
+            projections: list = []
+            projection_index: list[int] = []
+            for proj in self.camera_projection:
+                try:
+                    idx = projections.index(proj)
+                except ValueError:
+                    idx = len(projections)
+                    projections.append(proj)
+                projection_index.append(idx)
+            m.camera_label = list(self.camera_label)
+            m.camera_transform = wp.array(self.camera_transform, dtype=wp.transform, requires_grad=requires_grad)
+            m.camera_body = wp.array(self.camera_body, dtype=wp.int32)
+            m.camera_world = wp.array(self.camera_world, dtype=wp.int32)
+            m.camera_flags = wp.array(self.camera_flags, dtype=wp.int32)
+            m.camera_projection_index = wp.array(projection_index, dtype=wp.int32)
+            m.camera_projections = projections
+            if self.camera_count > 0:
+                m.camera_resolution = wp.array(
+                    [list(r) for r in self.camera_resolution], dtype=wp.int32, ndim=2
+                )
+            else:
+                m.camera_resolution = wp.zeros((0, 2), dtype=wp.int32)
 
             # ---------------------
             # counts
@@ -11853,6 +11975,7 @@ class ModelBuilder:
             m.particle_count = len(self.particle_q)
             m.body_count = self.body_count
             m.shape_count = len(self.shape_type)
+            m.camera_count = self.camera_count
             m.tri_count = len(self.tri_poses)
             m.tet_count = len(self.tet_poses)
             m.edge_count = len(self.edge_rest_angle)
@@ -12026,6 +12149,8 @@ class ModelBuilder:
                     count = m.tet_count
                 elif freq_key == Model.AttributeFrequency.SPRING:
                     count = m.spring_count
+                elif freq_key == Model.AttributeFrequency.CAMERA:
+                    count = m.camera_count
                 else:
                     continue
 

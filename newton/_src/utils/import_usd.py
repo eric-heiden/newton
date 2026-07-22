@@ -31,6 +31,7 @@ import numpy as np
 import warp as wp
 
 from ..core import quat_between_axes
+from ..core.cameras import CameraPinhole
 from ..core.types import Axis, Transform
 from ..geometry import GeoType, Mesh, ShapeFlags, compute_inertia_shape, compute_inertia_sphere
 from ..sim.builder import ModelBuilder
@@ -100,6 +101,7 @@ def parse_usd(
     force_position_velocity_actuation: bool = False,
     convert_mjc_equality_constraints: bool = True,
     override_root_xform: bool = False,
+    load_cameras: bool = True,
 ) -> dict[str, Any]:
     """Parses a Universal Scene Description (USD) stage and adds rigid bodies, soft bodies, shapes, and joints to the given ModelBuilder.
 
@@ -229,6 +231,12 @@ def parse_usd(
             :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
             damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
             (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
+        load_cameras: If True (default), traverse the stage for :class:`UsdGeom.Camera` prims
+            with a perspective projection and import each as a
+            :class:`~newton.CameraPinhole` via :meth:`ModelBuilder.add_camera`.
+            Orthographic cameras emit a :class:`UserWarning` and are skipped.
+            The result dict gains a ``"path_camera_map"`` entry mapping prim path to
+            camera index. Set to False to skip all camera prims.
 
     Returns:
         The returned mapping has the following entries:
@@ -270,6 +278,8 @@ def parse_usd(
               - Mapping from prim path to original body index before ``collapse_fixed_joints``
             * - ``"actuator_count"``
               - Number of external actuators parsed from the USD stage
+            * - ``"path_camera_map"``
+              - Mapping from prim path (str) of a :class:`UsdGeom.Camera` prim to its camera index in :class:`~newton.ModelBuilder`. Always present; empty when ``load_cameras=False`` or no perspective cameras were found.
     """
     # Early validation of base joint parameters
     builder._validate_base_joint_params(floating, base_joint, parent_body)
@@ -4141,6 +4151,55 @@ def parse_usd(
     if verbose and actuator_count > 0:
         print(f"Added {actuator_count} actuator(s) from USD")
 
+    # Import UsdGeom.Camera prims as Newton cameras.  This pass runs after body
+    # parsing so path_body_map is fully populated for ancestor lookups.
+    path_camera_map: dict[str, int] = {}
+    if load_cameras:
+        for prim in stage.Traverse():
+            if not prim.IsA(UsdGeom.Camera):
+                continue
+            path = str(prim.GetPath())
+            if any(re.match(pattern, path) for pattern in ignore_paths):
+                continue
+            usd_camera = UsdGeom.Camera(prim)
+            tc = Usd.TimeCode.Default()
+            if usd_camera.GetProjectionAttr().Get(tc) == UsdGeom.Tokens.orthographic:
+                warnings.warn(
+                    f"Skipping orthographic USD camera {path}",
+                    UserWarning,
+                    stacklevel=_external_stacklevel(),
+                )
+                continue
+            clipping = usd_camera.GetClippingRangeAttr().Get(tc)
+            projection = CameraPinhole(
+                focal_length=usd_camera.GetFocalLengthAttr().Get(tc),
+                horizontal_aperture=usd_camera.GetHorizontalApertureAttr().Get(tc),
+                vertical_aperture=usd_camera.GetVerticalApertureAttr().Get(tc),
+                horizontal_aperture_offset=usd_camera.GetHorizontalApertureOffsetAttr().Get(tc),
+                vertical_aperture_offset=usd_camera.GetVerticalApertureOffsetAttr().Get(tc),
+                near=float(clipping[0]),
+                far=float(clipping[1]),
+            )
+            # World transform in builder space: apply the same axis correction used for bodies.
+            cam_world_xform = incoming_world_xform * usd.get_transform(prim, local=False, xform_cache=xform_cache)
+            # Find the nearest rigid-body ancestor and compute a body-relative transform.
+            body = -1
+            ancestor = prim.GetParent()
+            while ancestor and ancestor.GetPath() != stage.GetPseudoRoot().GetPath():
+                ancestor_path = str(ancestor.GetPath())
+                if ancestor_path in path_body_map:
+                    body = path_body_map[ancestor_path]
+                    break
+                ancestor = ancestor.GetParent()
+            if body >= 0:
+                body_xform = wp.transform(*builder.body_q[body])
+                xform_cam = wp.transform_inverse(body_xform) * cam_world_xform
+            else:
+                xform_cam = cam_world_xform
+            path_camera_map[path] = builder.add_camera(body=body, xform=xform_cam, projection=projection, label=path)
+    # TODO(camera-api plan 2): collect newton:* custom attributes from camera prims
+    # (AttributeFrequency.CAMERA) via the schema resolver, mirroring the body/shape pass.
+
     result = {
         "fps": stage.GetFramesPerSecond(),
         "duration": stage.GetEndTimeCode() - stage.GetStartTimeCode(),
@@ -4160,6 +4219,7 @@ def parse_usd(
         "path_body_relative_transform": path_body_relative_transform,
         "max_solver_iterations": max_solver_iters,
         "actuator_count": actuator_count,
+        "path_camera_map": path_camera_map,
     }
 
     # Process custom frequencies with USD prim filters

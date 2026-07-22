@@ -2815,6 +2815,7 @@ class ModelBuilder:
         force_position_velocity_actuation: bool = False,
         convert_mjc_equality_constraints: bool = True,
         override_root_xform: bool = False,
+        load_cameras: bool = True,
     ) -> dict[str, Any]:
         """Parses a Universal Scene Description (USD) stage and adds rigid bodies, soft bodies, shapes, and joints to the given ModelBuilder.
 
@@ -2943,6 +2944,11 @@ class ModelBuilder:
                 :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
                 damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
                 (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
+            load_cameras: If True (default), import :class:`UsdGeom.Camera` prims with a
+                perspective projection as Newton cameras. The result dict gains
+                ``"path_camera_map"`` mapping prim path to camera index.
+                Orthographic cameras emit a :class:`UserWarning` and are skipped.
+                Set to False to skip all camera prims.
 
         Returns:
             The returned mapping has the following entries:
@@ -3016,6 +3022,7 @@ class ModelBuilder:
             force_position_velocity_actuation=force_position_velocity_actuation,
             convert_mjc_equality_constraints=convert_mjc_equality_constraints,
             override_root_xform=override_root_xform,
+            load_cameras=load_cameras,
         )
 
     def add_mjcf(

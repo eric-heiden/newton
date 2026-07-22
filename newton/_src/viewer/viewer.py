@@ -572,6 +572,11 @@ class ViewerBase(ABC):
         layer.show_hydro_contact_surface = False
         layer.sdf_margin_mode: ViewerBase.SDFMarginMode = ViewerBase.SDFMarginMode.OFF
 
+        # Camera frustum visualization
+        layer.show_cameras = False
+        layer.camera_frustum_depth: float = 0.5
+        layer._camera_frustums = None
+
         layer.gaussians_max_points = 100_000  # Max number of points to visualize per gaussian
 
         # Hydroelastic contact surface line cache
@@ -986,6 +991,20 @@ class ViewerBase(ABC):
 
         self._log_gaussian_shapes(state)
         self._log_non_shape_state(state)
+
+        if self.show_cameras and self.model.camera_count:
+            if self._camera_frustums is None or self._camera_frustums.model is not self.model:
+                from .camera_frustums import CameraFrustums  # noqa: PLC0415
+
+                self._camera_frustums = CameraFrustums(self.model, depth=self.camera_frustum_depth)
+            self._camera_frustums.update(state, self.world_offsets)
+            self.log_lines(
+                "model/cameras",
+                self._camera_frustums.starts,
+                self._camera_frustums.ends,
+                (0.9, 0.8, 0.1),
+            )
+
         self.model_changed = False
 
     def _sync_shape_colors_from_model(self):

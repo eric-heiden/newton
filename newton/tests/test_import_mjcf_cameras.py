@@ -3,6 +3,7 @@
 
 import math
 import unittest
+import warnings
 
 import warp as wp
 
@@ -50,11 +51,19 @@ class TestImportMjcfCameras(unittest.TestCase):
         self.assertGreaterEqual(int(model.camera_body.numpy()[i]), 0)
         self.assertAlmostEqual(float(model.camera_transform.numpy()[i][2]), 0.3, places=5)
 
-    def test_tracking_mode_warns_and_imports_fixed(self):
-        """Verify non-fixed camera modes import as fixed cameras with a warning."""
-        with self.assertWarns(UserWarning):
+    def test_tracking_mode_imports_fixed(self):
+        """Verify non-fixed camera modes import as fixed cameras without emitting a warning."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             _, model = self._parse()
+        camera_warnings = [
+            w for w in caught if issubclass(w.category, UserWarning) and "camera" in str(w.message).lower()
+        ]
+        self.assertEqual(camera_warnings, [], msg="No UserWarning about cameras should be emitted")
         self.assertEqual(model.camera_count, 3)
+        i = next(i for i, label in enumerate(model.camera_label) if label.endswith("tracker"))
+        modes = model.mjcf.camera_mode
+        self.assertEqual(modes[i], "trackcom")
 
     def test_camera_mode_preserved_as_custom_attribute(self):
         """Verify the original MJCF camera mode string is preserved on the model."""
@@ -100,8 +109,7 @@ class TestWorldbodyCameraSceneXform(unittest.TestCase):
         base_z = float(model_base.camera_transform.numpy()[i][2])
 
         builder_shifted = ModelBuilder()
-        with self.assertWarns(UserWarning):
-            builder_shifted.add_mjcf(MJCF, xform=wp.transform((0.0, 0.0, 10.0), wp.quat_identity()))
+        builder_shifted.add_mjcf(MJCF, xform=wp.transform((0.0, 0.0, 10.0), wp.quat_identity()))
         model_shifted = builder_shifted.finalize()
         i2 = next(i for i, label in enumerate(model_shifted.camera_label) if label.endswith("overview"))
         shifted_z = float(model_shifted.camera_transform.numpy()[i2][2])

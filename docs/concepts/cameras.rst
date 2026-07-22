@@ -266,9 +266,9 @@ Each ``<camera>`` element maps to one model camera:
 
 Newton does not support the MJCF runtime tracking modes (``trackbody``,
 ``trackcom``, ``targetbody``, ``targetbodycom``). Cameras using any non-fixed
-``mode`` are imported as fixed cameras with a :class:`UserWarning`, and the
-original mode string is preserved on the model as the custom attribute
-``mjcf:camera_mode`` so downstream code can apply tracking logic.
+``mode`` are imported as fixed cameras; the original mode string is preserved
+on the model as the custom attribute ``mjcf:camera_mode`` so downstream code
+can apply tracking logic.
 
 Camera Flags
 ------------

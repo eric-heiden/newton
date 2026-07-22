@@ -3840,6 +3840,11 @@ class ModelBuilder:
                 where ``shape_margin`` is computed as ``mj_margin - mj_gap``.
                 Use for MJCF files authored against MuJoCo <= 3.8. Defaults
                 to False (identity translation matching MuJoCo 3.9 semantics).
+
+        Note:
+            Non-fixed camera modes (e.g. ``trackcom``, ``targetbody``) are imported as fixed
+            cameras; the original mode string is preserved in the ``mjcf:camera_mode`` custom
+            attribute so downstream code can apply tracking logic.
         """
         from ..solvers.mujoco.solver_mujoco import SolverMuJoCo  # noqa: PLC0415
         from ..utils.import_mjcf import parse_mjcf  # noqa: PLC0415

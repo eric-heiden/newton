@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import warp as wp
 
+from ..core import CameraProjection
 from ..core.types import Devicelike
 from .contacts import Contacts
 from .control import Control
@@ -340,7 +341,7 @@ class Model:
         """Camera flags (see :class:`~newton.CameraFlags`), shape [camera_count]."""
         self.camera_projection_index: wp.array[wp.int32] | None = None
         """Index into :attr:`camera_projections` for each camera, shape [camera_count]."""
-        self.camera_projections: list = []
+        self.camera_projections: list[CameraProjection] = []
         """Deduplicated camera projection descriptors (see :class:`~newton.CameraProjection`)."""
         self.camera_resolution: wp.array2d[wp.int32] | None = None
         """Preferred image resolution hints [px] as (width, height) rows (-1 when unset), shape [camera_count, 2]."""

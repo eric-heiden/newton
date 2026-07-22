@@ -36,6 +36,7 @@ class ShapeFlags(IntEnum):
     """Indicates that the shape uses hydroelastic collision."""
 
 
+# Camera flags
 class CameraFlags(IntEnum):
     """
     Flags for camera properties.

@@ -4,9 +4,7 @@
 import math
 import unittest
 
-import newton
 from newton import ModelBuilder
-
 
 MJCF = """
 <mujoco>
@@ -63,6 +61,31 @@ class TestImportMjcfCameras(unittest.TestCase):
         # attribute is namespaced under mjcf; registered lazily by the importer
         modes = model.mjcf.camera_mode
         self.assertEqual(modes[i], "trackcom")
+
+
+MJCF_FRAME_CAMERA = """
+<mujoco>
+  <worldbody>
+    <frame pos="0 0 1">
+      <camera name="framed" pos="0 0 0.5"/>
+    </frame>
+  </worldbody>
+</mujoco>
+"""
+
+
+class TestImportMjcfFrameCameras(unittest.TestCase):
+    def test_frame_nested_camera_composed_transform(self):
+        """Import a camera inside a frame and verify its transform is composed with the frame offset."""
+        builder = ModelBuilder()
+        builder.add_mjcf(MJCF_FRAME_CAMERA)
+        model = builder.finalize()
+        self.assertEqual(model.camera_count, 1)
+        labels = model.camera_label
+        self.assertTrue(any(label.endswith("framed") for label in labels))
+        i = next(i for i, label in enumerate(labels) if label.endswith("framed"))
+        # frame pos=(0,0,1) + camera pos=(0,0,0.5) → z == 1.5
+        self.assertAlmostEqual(float(model.camera_transform.numpy()[i][2]), 1.5, places=5)
 
 
 if __name__ == "__main__":

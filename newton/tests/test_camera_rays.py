@@ -59,6 +59,25 @@ class TestComputeCameraRays(unittest.TestCase):
         d = rays.numpy()[32, 32, 1]
         self.assertLess(float(d[2]), -0.99)
 
+    def test_fisheye_opencv_calibration_size_produces_different_rays(self):
+        """Assert that a 2x calibration size yields rays distinct from the default (None) calibration."""
+        width, height = 32, 32
+        proj_default = newton.CameraFisheyeOpenCV(fx=100.0, fy=100.0, cx=16.0, cy=16.0)
+        proj_calib = newton.CameraFisheyeOpenCV(
+            fx=100.0,
+            fy=100.0,
+            cx=16.0,
+            cy=16.0,
+            image_width=float(width * 2),
+            image_height=float(height * 2),
+        )
+        rays_default = compute_camera_rays(proj_default, width, height).numpy()
+        rays_calib = compute_camera_rays(proj_calib, width, height).numpy()
+        self.assertFalse(
+            (rays_default == rays_calib).all(),
+            "Expected rays to differ when calibration size is 2x the render size",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

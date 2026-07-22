@@ -3431,6 +3431,7 @@ class ModelBuilder:
         override_root_xform: bool = False,
         legacy_margin_gap: bool = False,
         return_deformable_results: bool = False,
+        load_cameras: bool = True,
     ) -> dict[str, Any]:
         """Parses a Universal Scene Description (USD) stage and adds rigid bodies, soft bodies, shapes, and joints to the given ModelBuilder.
 
@@ -3566,6 +3567,11 @@ class ModelBuilder:
                 returned mapping (``path_cable_map`` / ``path_cloth_map`` / ``path_soft_map`` /
                 ``path_attachment_map`` and the matching ``path_*_attrs``). Off by default, so the
                 default return shape carries no deformable additions.
+            load_cameras: If True (default), import :class:`UsdGeom.Camera` prims with a
+                perspective projection as Newton cameras. The result dict gains
+                ``"path_camera_map"`` mapping prim path to camera index.
+                Orthographic cameras emit a :class:`UserWarning` and are skipped.
+                Set to False to skip all camera prims.
 
         Returns:
             .. experimental::
@@ -3675,6 +3681,7 @@ class ModelBuilder:
             override_root_xform=override_root_xform,
             legacy_margin_gap=legacy_margin_gap,
             return_deformable_results=return_deformable_results,
+            load_cameras=load_cameras,
         )
 
     def add_mjcf(

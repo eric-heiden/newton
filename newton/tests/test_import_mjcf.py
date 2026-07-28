@@ -1157,6 +1157,161 @@ class TestImportMjcfBasic(unittest.TestCase):
         np.testing.assert_allclose(joint_x_p.q, [0, 0, 0.7071068, 0.7071068], atol=1e-6)
 
 
+class TestImportMjcfSlideBallFloatingBase(unittest.TestCase):
+    """Tests for MJCF bodies that author a floating base as three slide joints plus a ball joint."""
+
+    # Canonical MJCF idiom for an actuated floating base: one <joint> per DOF so that damping,
+    # armature, friction and actuators can be authored individually.
+    SLIDE_BALL_JOINTS = """<joint name="tx" type="slide" axis="1 0 0" damping="5" armature="0.2" frictionloss="0.3"/>
+            <joint name="ty" type="slide" axis="0 1 0" damping="5" armature="0.2" frictionloss="0.3"/>
+            <joint name="tz" type="slide" axis="0 0 1" damping="5" armature="0.2" frictionloss="0.3"/>
+            <joint name="rot" type="ball" damping="7" armature="0.01" frictionloss="0.25"/>"""
+
+    TIP_BODY = """<body name="tip" pos="0 0 0.5">
+                <geom type="sphere" size="0.05" mass="0.1"/>
+            </body>"""
+
+    @staticmethod
+    def _mjcf(joints: str, actuators: str = "", child_body: str = "") -> str:
+        """Return an MJCF model with a single root body carrying the given joints and child body."""
+        return f"""<?xml version="1.0" encoding="utf-8"?>
+<mujoco model="floating_base">
+    <worldbody>
+        <body name="root" pos="0.3 -0.2 1.1">
+            {joints}
+            <geom type="box" size="0.1 0.2 0.3" mass="1.0"/>
+            {child_body}
+        </body>
+    </worldbody>
+    {actuators}
+</mujoco>"""
+
+    def test_slide_xyz_and_ball_import_as_single_free_joint(self):
+        """Three slide joints plus a ball joint in one body import as a single free joint."""
+        builder = newton.ModelBuilder()
+        builder.add_mjcf(self._mjcf(self.SLIDE_BALL_JOINTS))
+
+        self.assertEqual(builder.joint_count, 1)
+        self.assertEqual(builder.joint_type[0], newton.JointType.FREE)
+        self.assertEqual(builder.joint_dof_dim[0], (3, 3))
+        self.assertEqual(builder.joint_dof_count, 6)
+        self.assertEqual(builder.joint_coord_count, 7)
+        # the free joint spans the joint frame's X, Y and Z axes, linear DOFs first
+        np.testing.assert_allclose(builder.joint_axis, np.vstack((np.eye(3), np.eye(3))), atol=1e-6)
+
+    def test_slide_xyz_and_ball_preserve_per_dof_properties(self):
+        """Preserve the per-DOF properties authored on the merged slide and ball joints.
+
+        The three linear DOFs take their damping, armature and friction from the slide joints,
+        the three angular DOFs from the ball joint.
+        """
+        builder = newton.ModelBuilder()
+        builder.add_mjcf(self._mjcf(self.SLIDE_BALL_JOINTS))
+
+        np.testing.assert_allclose(builder.joint_damping, [5.0, 5.0, 5.0, 7.0, 7.0, 7.0], atol=1e-6)
+        np.testing.assert_allclose(builder.joint_armature, [0.2, 0.2, 0.2, 0.01, 0.01, 0.01], atol=1e-6)
+        np.testing.assert_allclose(builder.joint_friction, [0.3, 0.3, 0.3, 0.25, 0.25, 0.25], atol=1e-6)
+
+    def test_slide_xyz_and_ball_actuators_resolve_to_individual_dofs(self):
+        """Actuators naming a merged MJCF joint drive only the DOFs of that joint.
+
+        The slide joints contribute one DOF each while the ball joint contributes the three
+        angular DOFs, so a ``<position>`` actuator on the ball sets its gain on all of them.
+        """
+        actuators = """<actuator>
+        <position joint="tx" kp="300"/>
+        <position joint="rot" gear="1 0 0" kp="50"/>
+        <position joint="rot" gear="0 1 0" kp="50"/>
+        <position joint="rot" gear="0 0 1" kp="50"/>
+    </actuator>"""
+        builder = newton.ModelBuilder()
+        builder.add_mjcf(self._mjcf(self.SLIDE_BALL_JOINTS, actuators))
+
+        np.testing.assert_allclose(builder.joint_target_ke, [300.0, 0.0, 0.0, 50.0, 50.0, 50.0], atol=1e-6)
+        position = int(newton.JointTargetMode.POSITION)
+        undriven = int(newton.JointTargetMode.NONE)
+        self.assertEqual(builder.joint_target_mode, [position, undriven, undriven, position, position, position])
+
+    def test_slide_xyz_and_ball_match_freejoint_kinematics(self):
+        """Match the body poses of an equivalent <freejoint/> model under forward kinematics."""
+        merged = newton.ModelBuilder()
+        merged.add_mjcf(self._mjcf(self.SLIDE_BALL_JOINTS, child_body=self.TIP_BODY))
+        reference = newton.ModelBuilder()
+        reference.add_mjcf(self._mjcf('<freejoint name="root_free"/>', child_body=self.TIP_BODY))
+
+        self.assertEqual(merged.joint_coord_count, reference.joint_coord_count)
+        self.assertEqual(merged.joint_dof_count, reference.joint_dof_count)
+
+        # non-trivial pose: translation combined with a 60 degree rotation about a diagonal axis
+        pose = wp.transform(
+            wp.vec3(0.5, -0.25, 2.0), wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 2.0, 3.0)), np.pi / 3.0)
+        )
+        joint_q = np.array(list(pose), dtype=np.float32)
+
+        body_q = []
+        for builder in (merged, reference):
+            model = builder.finalize()
+            state = model.state()
+            model.joint_q.assign(joint_q)
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+            body_q.append(state.body_q.numpy())
+
+        np.testing.assert_allclose(body_q[0], body_q[1], atol=1e-6)
+        # the root body follows the joint coordinates and carries the tip along its local z axis
+        np.testing.assert_allclose(body_q[0][0], joint_q, atol=1e-6)
+        expected_tip = wp.transform_multiply(pose, wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()))
+        np.testing.assert_allclose(body_q[0][1], list(expected_tip), atol=1e-6)
+
+    def test_lone_ball_joint_imports_as_ball_joint(self):
+        """Import a body whose only joint is <joint type="ball"/> as a native ball joint."""
+        builder = newton.ModelBuilder()
+        builder.add_mjcf(self._mjcf('<joint name="rot" type="ball" armature="0.01" frictionloss="0.25"/>'))
+
+        self.assertEqual(builder.joint_count, 1)
+        self.assertEqual(builder.joint_type[0], newton.JointType.BALL)
+        self.assertEqual(builder.joint_dof_dim[0], (0, 3))
+        self.assertEqual(builder.joint_dof_count, 3)
+        self.assertEqual(builder.joint_coord_count, 4)
+        np.testing.assert_allclose(builder.joint_armature, [0.01] * 3, atol=1e-6)
+        np.testing.assert_allclose(builder.joint_friction, [0.25] * 3, atol=1e-6)
+
+    def test_unsupported_ball_joint_combinations_raise(self):
+        """Reject ball joint combinations that are not equivalent to a free joint."""
+        slide_x = '<joint name="tx" type="slide" axis="1 0 0"/>'
+        slide_y = '<joint name="ty" type="slide" axis="0 1 0"/>'
+        slide_z = '<joint name="tz" type="slide" axis="0 0 1"/>'
+        ball = '<joint name="rot" type="ball"/>'
+        cases = {
+            "ball with two slide joints": slide_x + slide_y + ball,
+            "ball with a hinge joint": '<joint name="h" type="hinge" axis="0 0 1"/>' + ball,
+            "two ball joints": '<joint name="rot1" type="ball"/><joint name="rot2" type="ball"/>',
+            "slide joints not in x, y, z order": slide_z + slide_y + slide_x + ball,
+            "slide axes that are not the canonical basis": (
+                slide_x + slide_y + '<joint name="td" type="slide" axis="1 1 0"/>' + ball
+            ),
+        }
+        for description, joints in cases.items():
+            with self.subTest(case=description):
+                builder = newton.ModelBuilder()
+                with self.assertRaisesRegex(NotImplementedError, "ball joint"):
+                    builder.add_mjcf(self._mjcf(joints))
+
+    def test_slide_xyz_and_ball_with_mujoco_custom_attributes(self):
+        """Import a merged floating base after the MuJoCo custom attributes were registered.
+
+        The per-DOF attributes of the ball joint used to be recorded at DOF indices 3 to 5 of a
+        three-DOF ball joint, which the builder rejected as out of range.
+        """
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_mjcf(self._mjcf(self.SLIDE_BALL_JOINTS))
+        model = builder.finalize()
+
+        self.assertEqual(model.joint_dof_count, 6)
+        self.assertEqual(model.joint_coord_count, 7)
+        np.testing.assert_allclose(model.joint_damping.numpy(), [5.0, 5.0, 5.0, 7.0, 7.0, 7.0], atol=1e-6)
+
+
 class TestImportMjcfMeshScale(unittest.TestCase):
     """Tests for MJCF mesh scale resolution from default classes."""
 

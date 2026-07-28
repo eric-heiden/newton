@@ -2033,6 +2033,7 @@ def parse_mjcf(
                     child_xform=wp.transform(joint_pos, wp.quat_identity()),
                     armature=joint_armature[-1] if joint_armature else None,
                     friction=ball_friction,
+                    damping=ball_axes[0].damping if ball_axes else None,
                     label=joint_label,
                     custom_attributes=joint_custom_attributes | dof_custom_attributes,
                 )
@@ -2988,6 +2989,16 @@ def parse_mjcf(
                     if verbose:
                         print(f"Warning: {actuator_type} actuator references unknown joint '{joint_name}'")
                     continue
+                if builder.joint_type[joint_name_to_idx[joint_name]] == JointType.FREE:
+                    # SolverMuJoCo maps a free joint to mjJNT_FREE, which MuJoCo does not
+                    # let actuators target, so the gains below would be silently inert.
+                    warnings.warn(
+                        f"MJCF {actuator_type} actuator '{merged_attrib.get('name', joint_name)}' targets joint "
+                        f"'{joint_name}', which Newton represents as a free joint. Free joints cannot be "
+                        "actuated; apply a wrench through Control.joint_f instead.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
             elif body_name:
                 # Body transmission (trntype=4)
                 body_idx = body_name_to_idx.get(body_name)

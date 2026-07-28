@@ -22,6 +22,7 @@
 - Add masked rigid-body reset support to `SolverVBD`; particle resets are not yet supported. (#3256)
 - Add viewer layer system to overlay multiple solvers/models in supported rendering viewers; call `ViewerBase.activate(layer_id)` to route subsequent `set_model` / `log_state` / `log_*` calls into a named layer, `ViewerBase.set_layer_visible()` to toggle layers independently, and `ViewerBase.set_layer_transform()` to position layers side-by-side. See `example_basic_multi_solver_overlay.py`
 - Add `Heightfield.create_from_mesh()` and `newton.utils.rasterize_mesh_to_heightfield()` to build a heightfield collider by ray-casting a `wp.Mesh`, replacing a large static terrain mesh with an equivalent heightfield.
+- Warn when an MJCF actuator targets a joint that Newton represents as a free joint; MuJoCo cannot actuate `mjJNT_FREE`, so those gains would otherwise be imported but never produce force. Apply a wrench through `Control.joint_f` instead.
 - Add `ViewerBase.camera_speed` to configure keyboard translation speed for interactive viewers. (#3439)
 - Add a "Show Ground" visualization toggle (`ViewerBase.show_ground`, default on) to hide or show ground-plane shapes in the viewer.
 - Add opt-in DVI forward dynamics to `SolverKamino` through `SolverKamino.Config(dynamics_solver="dvi")`, with sparse and dense execution, DVI-specific diagnostics, and warm-starting. PADMM remains the default.
@@ -32,6 +33,7 @@
 - Add `sign_method` argument to `Mesh.build_sdf` and `SDF.create_from_mesh` support for a `"normal"` (angle-weighted pseudo-normal) sign strategy, for selecting the inside/outside sign of the baked SDF (`"auto"`, `"parity"`, `"winding"`, or `"normal"`).
 - Add `forward_depth_image` output support to `SensorTiledCamera.update()` and `SensorTiledCamera.utils.create_forward_depth_image_output()` for native forward-depth rendering without post-processing `depth_image`.
 - Add optional `shear_stiffness`/`shear_damping` and `twist_stiffness`/`twist_damping` controls to `ModelBuilder.add_joint_cable()`, `ModelBuilder.add_rod()`, and `ModelBuilder.add_rod_graph()`; omitted shear defaults to stretch and omitted twist defaults to bend for compatibility.
+- Add optional `linear_axes` and `angular_axes` arguments to `ModelBuilder.add_joint_free()` so importers can preserve authored per-DOF damping, armature, friction and drive gains on a free joint.
 - Add `newton.utils.CableStiffness` and extend `newton.utils.create_cable_stiffness_from_elastic_moduli()` with `poissons_ratio`/`shear_modulus` inputs that include torsional `GJ/L` stiffness.
 - Add VBD cable validation examples covering bend stiffness, analytical bend/twist response, torsion material mapping, routed twist transfer, twist-buckling link verification, Michell/Zajac threshold behavior, and Dahl hysteresis.
 - Add a cable plectoneme example demonstrating twist-driven supercoiling with self-contact.
@@ -86,6 +88,7 @@
 - Fix panel-parallel RCM-blocked LLT factorization hanging when a matrix ends in a partial tile.
 - Fix USD capsule, cylinder, and cone visual and site scaling to follow the authored primitive axis.
 - Fix USD plane visual width and length to scale along the axes defined by the `UsdGeomPlane` schema, and orient X- and Y-axis plane visuals along the authored axis.
+- Set drive gains from an MJCF actuator on every DOF of the joint it targets. A `<position>` actuator on a `ball` joint inside a multi-joint body previously set `joint_target_ke`/`kd` on only the joint's first DOF.
 - Validate `ArticulationView` mask shapes and devices before launching selection kernels. (#3448)
 - Exclude active particles with non-finite positions from rebuildable `SolverImplicitMPM` sparse-grid packing.
 - Fix masked `SolverCoupledProxy.reset()` calls clearing proxy feedback history for unselected worlds.
@@ -97,6 +100,7 @@
 - Fix loading of textures packaged inside `.usdz` archives; package-relative asset paths such as `scene.usdz[tex.png]` are resolved through USD's asset resolver instead of being treated as filesystem paths.
 - Fix `ModelBuilder.add_usd()` raising `ValueError` when importing a mesh whose material subset binds a texture that decodes to an image array.
 - Fix textured USD visual meshes rendering tinted by the default per-shape palette color; a textured mesh without an authored scalar color now imports with a white base color so its texture is shown untinted.
+- Apply the authored `damping` of an MJCF `<joint type="ball"/>` when importing it; it was parsed and then dropped, so ball joints silently fell back to `ModelBuilder.default_joint_cfg.damping`.
 - Fix `ModelBuilder.add_usd()` selecting a non-color map (e.g. a roughness, metallic, or normal map) as a mesh's base-color texture. A connected `UsdUVTexture` is now accepted only when it feeds a base-color input by name through its multi-channel color output, and a shader's direct-asset color parameter (e.g. an MDL `diffuse_texture`) is likewise identified by name.
 - Fix scrambled textures on USD meshes whose texture-coordinate primvar is not named `st` (e.g. `st_0`). The texcoord set is now resolved from the bound material's shader network (the `UsdPreviewSurface` texture reader's `varname` or an MDL/OmniPBR `uv_space_index`), and textured material subsets slice real per-corner UVs and authored normals instead of collapsing faceVarying data per vertex.
 - Fix builder merging (`ModelBuilder.add_builder()`, `add_world()`, `replicate()`) offsetting negative reference sentinels in custom attribute values stored as NumPy or Warp integer scalars.
@@ -120,11 +124,10 @@
 - Fix `SolverKamino` CG/CR solves silently under-iterating on CPU graph capture; the capture-safe loop path now runs on any capturing device, not only CUDA, so CPU captures no longer record a stale host-readback convergence decision at record time.
 - Reject incompatible custom attribute and frequency definitions before composing `ModelBuilder` instances.
 - Fix `cloth_franka` example rendering particles at simulation scale (cm) instead of viewer scale (m)
+- Import a body whose MJCF joints are three `slide` joints along X, Y and Z followed by a `ball` joint as a single free joint carrying the authored per-DOF properties. The `ball` joint previously discarded the slide axes, producing either a DOF-index error or, with no DOF custom attributes registered, a model silently missing three translational degrees of freedom. Other combinations involving a ball joint now raise `NotImplementedError` with an actionable message.
 - Fix `ModelBuilder` merges to accept array-valued transform fields and plain-list particle color groups.
 - Fix `SensorTiledCamera` tiled rendering for image sizes that are not exact multiples of the configured tile dimensions.
 - Fix `SensorTiledCamera` deformable triangle rendering to respect per-particle world indices.
-
-## [1.4.0] - 2026-07-16
 
 ### Added
 

@@ -4984,6 +4984,8 @@ class ModelBuilder:
         parent_xform: Transform | None = None,
         child_xform: Transform | None = None,
         parent: int = -1,
+        linear_axes: list[JointDofConfig] | None = None,
+        angular_axes: list[JointDofConfig] | None = None,
         label: str | None = None,
         collision_filter_parent: bool | None = None,
         enabled: bool = True,
@@ -4998,6 +5000,14 @@ class ModelBuilder:
             parent_xform: The transform of the joint in the parent body's local frame.
             child_xform: The transform of the joint in the child body's local frame.
             parent: The index of the parent body (-1 by default to use the world frame, e.g. to make the child body and its children a floating-base mechanism).
+            linear_axes: The three linear axes (see :class:`JointDofConfig`) of the joint. Only the
+                per-DOF properties (damping, armature, friction, drive gains) are used; the axes
+                themselves are always the joint frame's X, Y and Z. If ``None``, unlimited undamped
+                axes are used.
+            angular_axes: The three angular axes (see :class:`JointDofConfig`) of the joint. Only the
+                per-DOF properties (damping, armature, friction, drive gains) are used; the axes
+                themselves are always the joint frame's X, Y and Z. If ``None``, unlimited undamped
+                axes are used.
             label: The label of the joint.
             collision_filter_parent: Whether to filter collisions between shapes of the parent and child bodies. Defaults to ``False`` for joints to world, ``True`` otherwise.
             enabled: Whether the joint is enabled.
@@ -5007,6 +5017,14 @@ class ModelBuilder:
             The index of the added joint.
 
         """
+        if linear_axes is None:
+            linear_axes = [ModelBuilder.JointDofConfig.create_unlimited(ax) for ax in (Axis.X, Axis.Y, Axis.Z)]
+        elif len(linear_axes) != 3:
+            raise ValueError(f"A free joint requires exactly 3 linear axes, got {len(linear_axes)}.")
+        if angular_axes is None:
+            angular_axes = [ModelBuilder.JointDofConfig.create_unlimited(ax) for ax in (Axis.X, Axis.Y, Axis.Z)]
+        elif len(angular_axes) != 3:
+            raise ValueError(f"A free joint requires exactly 3 angular axes, got {len(angular_axes)}.")
 
         joint_id = self.add_joint(
             JointType.FREE,
@@ -5017,16 +5035,8 @@ class ModelBuilder:
             label=label,
             collision_filter_parent=collision_filter_parent,
             enabled=enabled,
-            linear_axes=[
-                ModelBuilder.JointDofConfig.create_unlimited(Axis.X),
-                ModelBuilder.JointDofConfig.create_unlimited(Axis.Y),
-                ModelBuilder.JointDofConfig.create_unlimited(Axis.Z),
-            ],
-            angular_axes=[
-                ModelBuilder.JointDofConfig.create_unlimited(Axis.X),
-                ModelBuilder.JointDofConfig.create_unlimited(Axis.Y),
-                ModelBuilder.JointDofConfig.create_unlimited(Axis.Z),
-            ],
+            linear_axes=linear_axes,
+            angular_axes=angular_axes,
             custom_attributes=custom_attributes,
         )
         q_start = self.joint_q_start[joint_id]

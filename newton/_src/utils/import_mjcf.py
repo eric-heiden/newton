@@ -1664,6 +1664,8 @@ def parse_mjcf(
         joint_pos = []
         joint_custom_attributes: dict[str, Any] = {}
         dof_custom_attributes: dict[str, dict[int, Any]] = {}
+        # Track MJCF joint names with their DOF offset and DOF count within the combined Newton joint
+        mjcf_joint_dof_offsets: list[tuple[str, int, int]] = []
 
         linear_axes = []
         angular_axes = []
@@ -1681,11 +1683,12 @@ def parse_mjcf(
         else:
             # DOF index relative to the joint being created (multiple MJCF joints in a body are combined into one Newton joint)
             current_dof_index = 0
-            # Track MJCF joint names and their DOF offsets within the combined Newton joint
-            mjcf_joint_dof_offsets: list[tuple[str, int]] = []
             # frictionloss for a native <joint type="ball"/>; captured in the ball branch
             # and read by the add_joint_ball call. Default 0.0 matches MJCF.
             ball_friction = 0.0
+            # Per-DOF properties of every native <joint type="ball"/> in this body, kept so a
+            # ball combined with sibling slide joints can be rebuilt as a free joint below.
+            ball_axes: list[ModelBuilder.JointDofConfig] = []
             joints = body.findall("joint")
             for i, joint in enumerate(joints):
                 joint_attrib = resolve_element_attrib(joint, "joint", defaults)
@@ -1734,9 +1737,18 @@ def parse_mjcf(
                     # Lift frictionloss into the builder's per-DOF friction array so it
                     # reaches the MuJoCo spec (joint_friction[qd_start]) on export.
                     ball_friction = parse_float(joint_attrib, "frictionloss", 0.0)
-                    mjcf_joint_dof_offsets.append((joint_name[-1], current_dof_index))
+                    # axis is replaced with X/Y/Z if the ball is expanded into a free joint below
+                    ball_axis = ModelBuilder.JointDofConfig.create_unlimited(Axis.X)
+                    ball_axis.target_ke = default_joint_target_ke
+                    ball_axis.target_kd = default_joint_target_kd
+                    ball_axis.damping = parse_float(joint_attrib, "damping", default_joint_damping)
+                    ball_axis.armature = joint_armature[-1]
+                    ball_axis.friction = ball_friction
+                    ball_axis.actuator_mode = JointTargetMode.NONE  # set by parse_actuators
+                    ball_axes.append(ball_axis)
+                    mjcf_joint_dof_offsets.append((joint_name[-1], current_dof_index, 3))
                     current_dof_index += 3
-                    break
+                    continue
                 is_angular = joint_type_str == "hinge"
                 axis_vec = parse_vec(joint_attrib, "axis", (0.0, 0.0, 1.0))
                 # Only convert deg->rad when an explicit range is given; the default
@@ -1851,8 +1863,42 @@ def parse_mjcf(
                     dof_custom_attributes.setdefault(solreflimit_mode_key, {})[current_dof_index] = solreflimit_mode
 
                 # Track this MJCF joint's name and DOF offset within the combined Newton joint
-                mjcf_joint_dof_offsets.append((joint_name[-1], current_dof_index))
+                mjcf_joint_dof_offsets.append((joint_name[-1], current_dof_index, 1))
                 current_dof_index += 1
+
+            if ball_axes:
+                # A <joint type="ball"/> on its own maps to a native ball joint. MJCF also
+                # allows several joints per body, and three slide joints plus a ball is the
+                # canonical way to author a floating base whose DOFs each carry their own
+                # damping, armature and actuator. That combination is kinematically a free
+                # joint, so rebuild it as one and keep the authored per-DOF properties.
+                if len(ball_axes) == 1 and not linear_axes and not angular_axes:
+                    pass  # native ball joint, handled by the JointType.BALL branch below
+                elif (
+                    len(ball_axes) == 1
+                    and len(linear_axes) == 3
+                    and not angular_axes
+                    and np.allclose([np.asarray(ax.axis, dtype=float) for ax in linear_axes], np.eye(3))
+                ):
+                    joint_type = JointType.FREE
+                    template = ball_axes[0]
+                    angular_axes = []
+                    for axis in (Axis.X, Axis.Y, Axis.Z):
+                        ax = ModelBuilder.JointDofConfig.create_unlimited(axis)
+                        ax.target_ke = template.target_ke
+                        ax.target_kd = template.target_kd
+                        ax.damping = template.damping
+                        ax.armature = template.armature
+                        ax.friction = template.friction
+                        ax.actuator_mode = template.actuator_mode
+                        angular_axes.append(ax)
+                else:
+                    raise NotImplementedError(
+                        f"MJCF body '{body_name}' combines {len(ball_axes)} ball joint(s) with "
+                        f"{len(linear_axes)} slide and {len(angular_axes)} hinge joint(s). Newton supports a "
+                        "ball joint on its own, or a single ball joint together with three slide joints "
+                        "along the body frame's X, Y and Z axes in that order (equivalent to a free joint)."
+                    )
 
         body_custom_attributes = parse_custom_attributes(body_attrib, builder_custom_attr_body, parsing_mode="mjcf")
         link = builder.add_link(
@@ -1955,10 +2001,20 @@ def parse_mjcf(
                     )
                 joint_idx = builder.add_joint_free(
                     link,
+                    # non-empty when the free joint came from slide joints plus a ball rather
+                    # than from <freejoint/>, in which case the authored per-DOF properties
+                    # (damping, armature, friction) are carried over
+                    linear_axes=linear_axes or None,
+                    angular_axes=angular_axes or None,
                     label=joint_label,
-                    custom_attributes=joint_custom_attributes,
+                    custom_attributes=joint_custom_attributes | dof_custom_attributes,
                 )
                 joint_indices.append(joint_idx)
+                # Let actuators resolve the DOFs of the individual MJCF joints that were merged
+                if mjcf_joint_dof_offsets:
+                    qd_start = builder.joint_qd_start[joint_idx]
+                    for mjcf_name, dof_offset, dof_count in mjcf_joint_dof_offsets:
+                        mjcf_joint_name_to_dof[mjcf_name] = (qd_start + dof_offset, dof_count)
                 # Map free joint names so actuators can target them
                 for jn in joint_name:
                     joint_name_to_idx[jn] = joint_idx
@@ -2009,8 +2065,8 @@ def parse_mjcf(
                 # This allows actuators to target specific DOFs when multiple MJCF joints are combined
                 if mjcf_joint_dof_offsets:
                     qd_start = builder.joint_qd_start[joint_idx]
-                    for mjcf_name, dof_offset in mjcf_joint_dof_offsets:
-                        mjcf_joint_name_to_dof[mjcf_name] = qd_start + dof_offset
+                    for mjcf_name, dof_offset, dof_count in mjcf_joint_dof_offsets:
+                        mjcf_joint_name_to_dof[mjcf_name] = (qd_start + dof_offset, dof_count)
 
                 # Map raw MJCF joint names to Newton joint index for tendon/actuator resolution
                 for jn in joint_name:
@@ -2444,7 +2500,9 @@ def parse_mjcf(
     # This allows actuators to target specific DOFs when multiple MJCF joints are combined into one Newton joint
     # Maps individual MJCF joint names to their specific DOF index.
     # Used to resolve actuators targeting specific joints within combined Newton joints.
-    mjcf_joint_name_to_dof: dict[str, int] = {}
+    # Maps an MJCF joint name to the (first DOF index, DOF count) it occupies inside the
+    # Newton joint that merged it, so actuators can target just that joint's DOFs.
+    mjcf_joint_name_to_dof: dict[str, tuple[int, int]] = {}
     # Maps tendon names to their index in the tendon custom attributes.
     # Used to resolve actuators targeting tendons.
     tendon_name_to_idx: dict[str, int] = {}
@@ -2913,8 +2971,7 @@ def parse_mjcf(
                 # Joint transmission (trntype=0)
                 # First check per-MJCF-joint mapping (for targeting specific DOFs in combined joints)
                 if joint_name in mjcf_joint_name_to_dof:
-                    qd_start = mjcf_joint_name_to_dof[joint_name]
-                    total_dofs = 1  # Individual MJCF joints always map to exactly 1 DOF
+                    qd_start, total_dofs = mjcf_joint_name_to_dof[joint_name]
                     target_idx = qd_start  # DOF index for joint actuators
                     target_name_for_log = joint_name
                     trntype = 0  # TrnType.JOINT

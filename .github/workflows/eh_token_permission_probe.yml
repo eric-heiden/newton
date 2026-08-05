@@ -1,0 +1,52 @@
+name: Token permission probe
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  issues-write:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8.0.0
+        with:
+          script: |
+            const n = context.issue.number;
+            const repo = { owner: context.repo.owner, repo: context.repo.repo };
+            const issue = { ...repo, issue_number: n };
+            const out = {};
+            const call = async (name, fn) => {
+              try { const r = await fn(); out[name] = `OK ${r.status}`; return r; }
+              catch (e) { out[name] = `ERR ${e.status} ${String(e.message).slice(0, 90)}`; return null; }
+            };
+            await call('addLabels', () => github.rest.issues.addLabels({ ...issue, labels: ['token-probe'] }));
+            const c = await call('createComment', () => github.rest.issues.createComment({ ...issue, body: 'token probe' }));
+            await call('removeLabel', () => github.rest.issues.removeLabel({ ...issue, name: 'token-probe' }));
+            if (c) await call('deleteComment', () => github.rest.issues.deleteComment({ ...repo, comment_id: c.data.id }));
+            console.log('PROBE_RESULT ' + JSON.stringify(out));
+
+  contents-read-only:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8.0.0
+        with:
+          script: |
+            const n = context.issue.number;
+            const repo = { owner: context.repo.owner, repo: context.repo.repo };
+            const issue = { ...repo, issue_number: n };
+            const out = {};
+            const call = async (name, fn) => {
+              try { const r = await fn(); out[name] = `OK ${r.status}`; return r; }
+              catch (e) { out[name] = `ERR ${e.status} ${String(e.message).slice(0, 90)}`; return null; }
+            };
+            await call('addLabels', () => github.rest.issues.addLabels({ ...issue, labels: ['token-probe'] }));
+            const c = await call('createComment', () => github.rest.issues.createComment({ ...issue, body: 'token probe' }));
+            await call('removeLabel', () => github.rest.issues.removeLabel({ ...issue, name: 'token-probe' }));
+            if (c) await call('deleteComment', () => github.rest.issues.deleteComment({ ...repo, comment_id: c.data.id }));
+            console.log('PROBE_RESULT ' + JSON.stringify(out));
+

@@ -7,6 +7,7 @@
 ### Added
 
 - Import MuJoCo DC-motor actuators from MJCF and compiled `MjcActuator` USD for `SolverMuJoCo`. (#3950)
+- Add `newton.solvers.mujoco` helpers for programmatically authoring MuJoCo actuators, contact pairs, tendons, and equality constraints.
 
 ## [1.5.0] - 2026-08-11
 

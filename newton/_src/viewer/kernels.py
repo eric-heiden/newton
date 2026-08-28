@@ -22,6 +22,9 @@ class PickingState:
     pick_stiffness: float
     pick_damping: float
     pick_max_acceleration: float
+    particle_pick_stiffness: float
+    particle_pick_damping: float
+    particle_pick_max_acceleration: float
 
 
 @wp.kernel
@@ -125,6 +128,151 @@ def apply_picking_force_kernel(
             pick_torque = pick_torque * (max_acceleration / wp.sqrt(rotational_acceleration_sq))
 
     wp.atomic_add(body_f, pick_body, wp.spatial_vector(pick_force, pick_torque))
+
+
+@wp.func
+def _picking_spinlock_acquire(lock: wp.array[wp.int32]):
+    while wp.atomic_cas(lock, 0, 0, 1) == 1:
+        pass
+
+
+@wp.func
+def _picking_spinlock_release(lock: wp.array[wp.int32]):
+    wp.atomic_exch(lock, 0, 0)
+
+
+@wp.kernel
+def raycast_particle_triangles_kernel(
+    particle_q: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    particle_world: wp.array[wp.int32],
+    world_offsets: wp.array[wp.vec3],
+    visible_worlds_mask: wp.array[int],
+    ray_origin: wp.vec3,
+    ray_direction: wp.vec3,
+    lock: wp.array[wp.int32],
+    # outputs
+    min_dist: wp.array[float],
+    min_triangle: wp.array[int],
+):
+    """Raycast the current particle triangle surface."""
+    triangle = wp.tid()
+    i = tri_indices[triangle, 0]
+    j = tri_indices[triangle, 1]
+    k = tri_indices[triangle, 2]
+
+    world = -1
+    if particle_world:
+        world = particle_world[i]
+        if visible_worlds_mask and world >= 0 and visible_worlds_mask[world] == 0:
+            return
+
+    offset = wp.vec3(0.0)
+    if world_offsets and world >= 0 and world < world_offsets.shape[0]:
+        offset = world_offsets[world]
+
+    a = particle_q[i] + offset
+    b = particle_q[j] + offset
+    c = particle_q[k] + offset
+
+    # Two-sided Moller-Trumbore intersection. Cloth has no preferred pick side.
+    edge_ab = b - a
+    edge_ac = c - a
+    pvec = wp.cross(ray_direction, edge_ac)
+    det = wp.dot(edge_ab, pvec)
+    if wp.abs(det) < 1.0e-8:
+        return
+
+    inv_det = 1.0 / det
+    tvec = ray_origin - a
+    u = wp.dot(tvec, pvec) * inv_det
+    if u < 0.0 or u > 1.0:
+        return
+
+    qvec = wp.cross(tvec, edge_ab)
+    v = wp.dot(ray_direction, qvec) * inv_det
+    if v < 0.0 or u + v > 1.0:
+        return
+
+    distance = wp.dot(edge_ac, qvec) * inv_det
+    if distance < 0.0 or distance >= min_dist[0]:
+        return
+
+    _picking_spinlock_acquire(lock)
+    old_min = wp.atomic_min(min_dist, 0, distance)
+    if distance <= old_min:
+        min_triangle[0] = triangle
+    _picking_spinlock_release(lock)
+
+
+@wp.kernel
+def compute_particle_pick_anchor_kernel(
+    particle_q: wp.array[wp.vec3],
+    particle_qd: wp.array[wp.vec3],
+    particle_pick_weights: wp.array[float],
+    pick_triangle: wp.array[int],
+    # outputs
+    pick_anchor: wp.array[wp.vec3],
+    pick_velocity: wp.array[wp.vec3],
+):
+    """Accumulate the weighted particle-patch position and velocity."""
+    particle = wp.tid()
+    if pick_triangle[0] < 0:
+        return
+
+    weight = particle_pick_weights[particle]
+    if weight <= 0.0:
+        return
+
+    wp.atomic_add(pick_anchor, 0, weight * particle_q[particle])
+    wp.atomic_add(pick_velocity, 0, weight * particle_qd[particle])
+
+
+@wp.kernel
+def apply_particle_picking_force_kernel(
+    particle_q: wp.array[wp.vec3],
+    particle_f: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
+    particle_flags: wp.array[int],
+    particle_pick_weights: wp.array[float],
+    particle_pick_weight_square_sum: wp.array[float],
+    pick_triangle: wp.array[int],
+    pick_state: wp.array[PickingState],
+    pick_anchor: wp.array[wp.vec3],
+    pick_velocity: wp.array[wp.vec3],
+):
+    """Apply a smooth, mass-aware acceleration to a picked particle patch."""
+    particle = wp.tid()
+    if pick_triangle[0] < 0:
+        return
+
+    anchor = pick_anchor[0]
+    if particle == 0:
+        pick_state[0].picked_point_world = anchor
+
+    weight = particle_pick_weights[particle]
+    mass = particle_mass[particle]
+    weight_square_sum = particle_pick_weight_square_sum[0]
+    if (
+        weight <= 0.0
+        or mass <= 0.0
+        or weight_square_sum <= 0.0
+        or (particle_flags[particle] & newton.ParticleFlags.ACTIVE) == 0
+    ):
+        return
+
+    acceleration = pick_state[0].particle_pick_stiffness * (pick_state[0].picking_target_world - anchor)
+    acceleration -= pick_state[0].particle_pick_damping * pick_velocity[0]
+
+    max_acceleration = pick_state[0].particle_pick_max_acceleration * 9.81
+    acceleration_magnitude = wp.length(acceleration)
+    if acceleration_magnitude > max_acceleration:
+        acceleration *= max_acceleration / acceleration_magnitude
+
+    # This normalization makes the weighted patch anchor respond with the
+    # requested acceleration while tapering individual particle loads.
+    force = mass * weight / weight_square_sum * acceleration
+    wp.atomic_add(particle_f, particle, force)
 
 
 @wp.kernel

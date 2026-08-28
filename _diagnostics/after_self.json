@@ -1,0 +1,70 @@
+{
+ "example": "cloth_xpbd_self_contact",
+ "particles": 2401,
+ "triangles": 4608,
+ "substeps": 4,
+ "ms_per_frame_median": 8.851,
+ "ms_per_frame_p95": 12.816,
+ "samples": [
+  {
+   "frame": 0,
+   "time": 0.0167,
+   "intersections": 0,
+   "speed_p50": 0.1635,
+   "speed_p99": 0.20269,
+   "speed_max": 0.35872,
+   "z_min": 0.79579,
+   "finite": true
+  },
+  {
+   "frame": 60,
+   "time": 1.0167,
+   "intersections": 0,
+   "speed_p50": 0.0037,
+   "speed_p99": 0.01205,
+   "speed_max": 0.02095,
+   "z_min": 0.01478,
+   "finite": true
+  },
+  {
+   "frame": 120,
+   "time": 2.0167,
+   "intersections": 0,
+   "speed_p50": 0.00336,
+   "speed_p99": 0.0112,
+   "speed_max": 0.04416,
+   "z_min": 0.01471,
+   "finite": true
+  },
+  {
+   "frame": 180,
+   "time": 3.0167,
+   "intersections": 0,
+   "speed_p50": 0.00314,
+   "speed_p99": 0.01152,
+   "speed_max": 0.02019,
+   "z_min": 0.01478,
+   "finite": true
+  },
+  {
+   "frame": 240,
+   "time": 4.0167,
+   "intersections": 0,
+   "speed_p50": 0.00284,
+   "speed_p99": 0.01165,
+   "speed_max": 0.02191,
+   "z_min": 0.01478,
+   "finite": true
+  },
+  {
+   "frame": 299,
+   "time": 5.0,
+   "intersections": 0,
+   "speed_p50": 0.00265,
+   "speed_p99": 0.01178,
+   "speed_max": 0.02267,
+   "z_min": 0.01478,
+   "finite": true
+  }
+ ]
+}

@@ -1663,12 +1663,6 @@ class ViewerGL(ViewerBase):
             self.log_lines("picking_line", None, None, None)
             return
 
-        # Get the picked body index
-        pick_body_idx = self.picking.pick_body.numpy()[0]
-        if pick_body_idx < 0:
-            self.log_lines("picking_line", None, None, None)
-            return
-
         # Get the pick target and current picked point on geometry (in physics space)
         pick_state = self.picking.pick_state.numpy()
 
@@ -1677,12 +1671,11 @@ class ViewerGL(ViewerBase):
 
         # Apply world offset to convert from physics space to visual space
         if self.world_offsets is not None and self.world_offsets.shape[0] > 0:
-            if self.model.body_world is not None:
-                body_world_idx = self.model.body_world.numpy()[pick_body_idx]
-                if body_world_idx >= 0 and body_world_idx < self.world_offsets.shape[0]:
-                    world_offset = self.world_offsets.numpy()[body_world_idx]
-                    pick_target = pick_target + world_offset
-                    picked_point = picked_point + world_offset
+            world = self.picking.get_picked_world_index()
+            if 0 <= world < self.world_offsets.shape[0]:
+                world_offset = self.world_offsets.numpy()[world]
+                pick_target = pick_target + world_offset
+                picked_point = picked_point + world_offset
 
         # Create line data
         starts = wp.array(

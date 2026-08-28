@@ -1997,6 +1997,48 @@ class ViewerBase(ABC):
         """
         pass
 
+    def configure_picking(
+        self,
+        *,
+        pick_stiffness: float | None = None,
+        pick_damping: float | None = None,
+        pick_max_acceleration: float | None = None,
+        particle_pick_radius: float | None = None,
+        particle_pick_stiffness: float | None = None,
+        particle_pick_damping: float | None = None,
+        particle_pick_max_acceleration: float | None = None,
+    ) -> None:
+        """Configure right-mouse dragging for rigid bodies and particle surfaces.
+
+        Particle picking distributes a spring-damper acceleration over a compact,
+        smoothly weighted patch measured along the rest triangle surface. This
+        avoids point-load artifacts and does not select nearby disconnected or
+        overlapping layers.
+
+        Call this after :meth:`set_model`. Viewers without interactive picking
+        ignore the configuration.
+
+        Args:
+            pick_stiffness: Position-error gain [1/s²].
+            pick_damping: Velocity damping gain [1/s].
+            pick_max_acceleration: Maximum acceleration in multiples of g [9.81 m/s²].
+            particle_pick_radius: Rest-surface geodesic radius of the particle patch [m].
+            particle_pick_stiffness: Particle-patch position-error gain [1/s²].
+            particle_pick_damping: Particle-patch velocity damping gain [1/s].
+            particle_pick_max_acceleration: Maximum particle-patch acceleration in multiples of g [9.81 m/s²].
+        """
+        picking = getattr(self, "picking", None)
+        if picking is not None:
+            picking.configure(
+                pick_stiffness=pick_stiffness,
+                pick_damping=pick_damping,
+                pick_max_acceleration=pick_max_acceleration,
+                particle_pick_radius=particle_pick_radius,
+                particle_pick_stiffness=particle_pick_stiffness,
+                particle_pick_damping=particle_pick_damping,
+                particle_pick_max_acceleration=particle_pick_max_acceleration,
+            )
+
     @abstractmethod
     def apply_forces(self, state: newton.State):
         """

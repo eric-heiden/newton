@@ -401,6 +401,58 @@ If you run the examples from a source checkout with uv, use
     </td>
   </tr>
   <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_xpbd_hanging.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_xpbd_hanging.jpg" alt="XPBD Cloth Hanging">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_xpbd_self_contact.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_xpbd_self_contact.jpg" alt="XPBD Cloth Self Contact">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_xpbd_rigid_contact.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_xpbd_rigid_contact.jpg" alt="XPBD Cloth Rigid Contact">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples cloth_xpbd_hanging</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples cloth_xpbd_self_contact</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples cloth_xpbd_rigid_contact</code>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_xpbd_gripper.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_xpbd_gripper.jpg" alt="XPBD Cloth Gripper">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_xpbd_picking.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_xpbd_picking.jpg" alt="XPBD Cloth Picking">
+      </a>
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples cloth_xpbd_gripper</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples cloth_xpbd_picking</code>
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
     <td colspan="3"><h3>Inverse Kinematics Examples</h3></td>
   </tr>
   <tr>

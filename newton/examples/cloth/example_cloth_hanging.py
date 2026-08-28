@@ -91,9 +91,9 @@ class Example:
 
         elif self.solver_type == "xpbd":
             solver_params = {
-                "add_springs": True,
-                "spring_ke": 1.0e3,
-                "spring_kd": 1.0e0,
+                "tri_ke": 1.0e3,
+                "tri_ka": 1.0e3,
+                "tri_kd": 1.0,
             }
 
         else:  # self.solver_type == "vbd"
@@ -127,6 +127,11 @@ class Example:
             self.solver = newton.solvers.SolverXPBD(
                 model=self.model,
                 iterations=self.iterations,
+                particle_enable_self_contact=True,
+                particle_enable_triangle_intersection_recovery=True,
+                particle_self_contact_relaxation=0.5,
+                particle_self_contact_radius=0.05,
+                particle_self_contact_margin=0.08,
             )
         else:  # self.solver_type == "vbd"
             self.solver = newton.solvers.SolverVBD(
@@ -158,6 +163,8 @@ class Example:
         self.graph = capture.graph
 
     def simulate(self):
+        if self.solver_type in ("xpbd", "vbd"):
+            self.solver.rebuild_bvh(self.state_0)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
 
@@ -209,7 +216,7 @@ class Example:
             help="Type of solver",
             type=str,
             choices=["semi_implicit", "style3d", "xpbd", "vbd"],
-            default="vbd",
+            default="xpbd",
         )
         parser.add_argument("--width", type=int, default=64, help="Cloth resolution in x.")
         parser.add_argument("--height", type=int, default=32, help="Cloth resolution in y.")

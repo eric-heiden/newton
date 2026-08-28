@@ -4,8 +4,8 @@
 ###########################################################################
 # Example Cloth Twist
 #
-# This simulation demonstrates twisting an FEM cloth model using the VBD
-# solver, showcasing its ability to handle complex self-contacts while
+# This simulation demonstrates twisting an FEM cloth model using XPBD or VBD,
+# showcasing their ability to handle complex self-contacts while
 # ensuring it remains intersection-free.
 #
 # Command: python -m newton.examples cloth_twist
@@ -113,6 +113,7 @@ def apply_rotation(
 
 class Example:
     def __init__(self, viewer, args):
+        self.solver_type = args.solver
         # setup simulation parameters first
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -122,7 +123,7 @@ class Example:
         self.sim_substeps = 10  # must be an even number when using CUDA Graph
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        self.iterations = 4
+        self.iterations = 8 if self.solver_type == "xpbd" else 4
         # the BVH used by SolverVBD will be rebuilt every self.bvh_rebuild_frames
         # When the simulated object deforms significantly, simply refitting the BVH can lead to deterioration of the BVH's
         # quality, in this case we need to completely rebuild the tree to achieve better query efficiency.
@@ -177,12 +178,22 @@ class Example:
 
             self.model.particle_flags = wp.array(flags)
 
-        self.solver = newton.solvers.SolverVBD(
+        solver_cls = newton.solvers.SolverXPBD if self.solver_type == "xpbd" else newton.solvers.SolverVBD
+        solver_kwargs = (
+            {
+                "particle_enable_triangle_intersection_recovery": True,
+                "particle_self_contact_relaxation": 0.5,
+            }
+            if self.solver_type == "xpbd"
+            else {}
+        )
+        self.solver = solver_cls(
             self.model,
             iterations=self.iterations,
             particle_enable_self_contact=True,
             particle_self_contact_radius=0.002,
             particle_self_contact_margin=0.0035,
+            **solver_kwargs,
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -299,6 +310,7 @@ class Example:
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=["xpbd", "vbd"], default="xpbd", help="Cloth solver to use.")
     parser.set_defaults(num_frames=300)
 
     viewer, args = newton.examples.init(parser)

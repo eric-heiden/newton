@@ -4,8 +4,8 @@
 ###########################################################################
 # Example Sim Cloth Bending
 #
-# This simulation demonstrates cloth bending behavior using the Vertex Block
-# Descent (VBD) integrator. A cloth mesh, initially curved, is dropped on
+# This simulation demonstrates cloth bending behavior using XPBD or the Vertex
+# Block Descent (VBD) integrator. A cloth mesh, initially curved, is dropped on
 # the ground. The cloth maintains its curved shape due to bending stiffness,
 # controlled by edge_ke and edge_kd parameters.
 #
@@ -22,6 +22,7 @@ import newton.usd
 
 class Example:
     def __init__(self, viewer, args):
+        self.solver_type = args.solver
         # setup simulation parameters first
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -66,6 +67,7 @@ class Example:
             tri_kd=5.0e0,
             edge_ke=1.0e1,
             edge_kd=1.0e1,
+            particle_radius=0.1,
         )
 
         builder.color(include_bending=True)
@@ -76,12 +78,15 @@ class Example:
         self.model.soft_contact_kd = contact_kd
         self.model.soft_contact_mu = contact_mu
 
-        self.solver = newton.solvers.SolverVBD(
+        solver_cls = newton.solvers.SolverXPBD if self.solver_type == "xpbd" else newton.solvers.SolverVBD
+        solver_kwargs = {"particle_enable_triangle_intersection_recovery": True} if self.solver_type == "xpbd" else {}
+        self.solver = solver_cls(
             self.model,
             iterations=self.iterations,
             particle_enable_self_contact=True,
             particle_self_contact_radius=0.2,
             particle_self_contact_margin=0.35,
+            **solver_kwargs,
         )
 
         # Use collision pipeline for particle-shape contacts
@@ -106,6 +111,7 @@ class Example:
         self.graph = capture.graph
 
     def simulate(self):
+        self.solver.rebuild_bvh(self.state_0)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
 
@@ -166,7 +172,12 @@ class Example:
 
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    # The sheet is released from ten metres up, so it is still falling at the
+    # default frame count and cannot yet satisfy the at-rest checks.
+    parser.set_defaults(num_frames=300)
+    parser.add_argument("--solver", choices=["xpbd", "vbd"], default="xpbd", help="Cloth solver to use.")
+    viewer, args = newton.examples.init(parser)
 
     # Create viewer and run
     newton.examples.run(Example(viewer, args), args)

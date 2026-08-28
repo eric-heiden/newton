@@ -644,7 +644,11 @@ class TriMeshCollisionDetector:
         self.bvh_edges.refit()
 
     def vertex_triangle_collision_detection(
-        self, max_query_radius, min_query_radius=0.0, min_distance_filtering_ref_pos=None
+        self,
+        max_query_radius,
+        min_query_radius=0.0,
+        min_distance_filtering_ref_pos=None,
+        use_topological_filter: bool = True,
     ):
         self.vertex_colliding_triangles.fill_(-1)
 
@@ -680,8 +684,8 @@ class TriMeshCollisionDetector:
                 self.vertex_colliding_triangles_buffer_sizes,
                 self.triangle_colliding_vertices_offsets,
                 self.triangle_colliding_vertices_buffer_sizes,
-                self.vertex_triangle_filtering_list,
-                self.vertex_triangle_filtering_list_offsets,
+                self.vertex_triangle_filtering_list if use_topological_filter else None,
+                self.vertex_triangle_filtering_list_offsets if use_topological_filter else None,
                 min_distance_filtering_ref_pos if min_distance_filtering_ref_pos is not None else self.vertex_positions,
             ],
             outputs=[
@@ -699,7 +703,11 @@ class TriMeshCollisionDetector:
         )
 
     def edge_edge_collision_detection(
-        self, max_query_radius, min_query_radius=0.0, min_distance_filtering_ref_pos=None
+        self,
+        max_query_radius,
+        min_query_radius=0.0,
+        min_distance_filtering_ref_pos=None,
+        use_topological_filter: bool = True,
     ):
         self.edge_colliding_edges.fill_(-1)
         wp.launch(
@@ -716,8 +724,8 @@ class TriMeshCollisionDetector:
                 self.edge_colliding_edges_offsets,
                 self.edge_colliding_edges_buffer_sizes,
                 self.edge_edge_parallel_epsilon,
-                self.edge_filtering_list,
-                self.edge_filtering_list_offsets,
+                self.edge_filtering_list if use_topological_filter else None,
+                self.edge_filtering_list_offsets if use_topological_filter else None,
                 min_distance_filtering_ref_pos if min_distance_filtering_ref_pos is not None else self.vertex_positions,
             ],
             outputs=[

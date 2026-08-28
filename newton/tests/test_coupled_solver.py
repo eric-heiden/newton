@@ -2838,6 +2838,69 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
         expected = 0.25 * np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
         np.testing.assert_allclose(src_solver.input_body_f[1][0], expected, atol=1.0e-6)
 
+    def test_xpbd_cloth_contact_harvests_proxy_body_friction(self):
+        """Transfer cloth friction through an XPBD body proxy and feed it back."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis="Y")
+        body = builder.add_body(mass=10.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_shape_box(body, hx=0.5, hy=0.5, hz=0.5)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.6, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0),
+            vertices=[wp.vec3(-0.1, 0.0, -0.1), wp.vec3(0.1, 0.0, -0.1), wp.vec3(0.0, 0.0, 0.1)],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=1.0e4,
+            tri_ka=1.0e4,
+            edge_ke=0.0,
+            particle_radius=0.2,
+        )
+        model = builder.finalize(device="cpu")
+        model.particle_mu = 1.0
+
+        coupled = SolverCoupledProxy(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="rigid",
+                    solver=lambda view: SolverXPBD(view, iterations=5),
+                    bodies=[body],
+                ),
+                SolverCoupled.Entry(
+                    name="cloth",
+                    solver=lambda view: SolverXPBD(view, iterations=5),
+                    particles=list(range(model.particle_count)),
+                ),
+            ],
+            coupling=SolverCoupledProxy.Config(
+                proxies=[
+                    SolverCoupledProxy.Proxy(
+                        source="rigid",
+                        destination="cloth",
+                        bodies=[body],
+                        collision_pipeline=newton.CollisionPipeline,
+                        collide_interval=1,
+                    )
+                ]
+            ),
+        )
+
+        state_0 = model.state()
+        state_1 = model.state()
+        body_qd = state_0.body_qd.numpy()
+        body_qd[body, 0] = 1.0
+        state_0.body_qd.assign(body_qd)
+
+        coupled.step(state_0, state_1, control=None, contacts=None, dt=1.0 / 60.0)
+        cloth_velocity = np.mean(state_1.particle_qd.numpy(), axis=0)
+        self.assertGreater(float(cloth_velocity[0]), 0.5)
+        feedback = coupled._proxy_mappings[0].coupling_forces.numpy()[body]
+        self.assertLess(float(feedback[0]), 0.0)
+
+        coupled.step(state_1, state_0, control=None, contacts=None, dt=1.0 / 60.0)
+        self.assertLess(float(state_0.body_qd.numpy()[body, 0]), 1.0)
+
 
 class TestSolverCoupledParticleProxy(unittest.TestCase):
     """Particle proxy mappings keep proxy particles dynamic in the destination view."""

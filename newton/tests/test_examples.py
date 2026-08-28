@@ -538,7 +538,16 @@ add_example_test(
     TestClothExamples,
     name="cloth.example_cloth_hanging",
     devices=test_devices,
-    test_options={},
+    test_options={"solver": "xpbd"},
+    test_options_cpu={"width": 32, "height": 16, "num-frames": 10},
+    use_viewer=True,
+    test_suffix="xpbd",
+)
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_cloth_hanging",
+    devices=test_devices,
+    test_options={"solver": "vbd"},
     test_options_cpu={"width": 32, "height": 16, "num-frames": 10},
     use_viewer=True,
     test_suffix="vbd",
@@ -556,23 +565,42 @@ add_example_test(
     TestClothExamples,
     name="cloth.example_cloth_style3d",
     devices=cuda_test_devices,
-    test_options={},
+    test_options={"solver": "style3d"},
     test_options_cuda={"num-frames": 32},
     use_viewer=True,
+    test_suffix="style3d",
+)
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_cloth_style3d",
+    devices=cuda_test_devices,
+    test_options={"solver": "xpbd"},
+    test_options_cuda={"num-frames": 32},
+    use_viewer=True,
+    test_suffix="xpbd",
 )
 add_example_test(
     TestClothExamples,
     name="cloth.example_cloth_h1",
     devices=cuda_test_devices,
-    test_options={},
+    test_options={"solver": "xpbd"},
     test_options_cuda={"num-frames": 32},
     use_viewer=True,
+    test_suffix="xpbd",
+)
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_cloth_h1",
+    devices=cuda_test_devices,
+    test_options={"solver": "style3d", "num-frames": 2},
+    use_viewer=True,
+    test_suffix="style3d",
 )
 add_example_test(
     TestClothExamples,
     name="cloth.example_cloth_franka",
     devices=cuda_test_devices,
-    test_options={"num-frames": 50},
+    test_options={"num-frames": 1500},
     use_viewer=True,
 )
 add_example_test(
@@ -587,6 +615,41 @@ add_example_test(
     name="cloth.example_cloth_rollers",
     devices=cuda_test_devices,
     test_options={"num-frames": 200},
+    use_viewer=True,
+)
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_cloth_xpbd_hanging",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 240},
+    use_viewer=True,
+)
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_cloth_xpbd_self_contact",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 3600},
+    use_viewer=True,
+)
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_cloth_xpbd_rigid_contact",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 240},
+    use_viewer=True,
+)
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_cloth_xpbd_gripper",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 300},
+    use_viewer=True,
+)
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_cloth_xpbd_picking",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 300},
     use_viewer=True,
 )
 add_example_test(

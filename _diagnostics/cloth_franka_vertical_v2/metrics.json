@@ -1,0 +1,282 @@
+[
+  {
+    "frame": 240,
+    "time": 3.9999999999999907,
+    "label": "04_high",
+    "target": [
+      0.44999998807907104,
+      -0.6000000238418579,
+      0.3400000035762787
+    ],
+    "tip": [
+      0.4501952528953552,
+      -0.6006643772125244,
+      0.34648755192756653
+    ],
+    "left_particles": 0,
+    "right_particles": 0,
+    "bilateral": 0,
+    "left": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "right": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "patch": 0,
+    "patch_count": 0,
+    "min_z": 0.3119935691356659
+  },
+  {
+    "frame": 420,
+    "time": 6.9999999999999805,
+    "label": "07_outside_low",
+    "target": [
+      0.44999998807907104,
+      -0.6000000238418579,
+      0.2680000066757202
+    ],
+    "tip": [
+      0.44057697057724,
+      -0.6168606281280518,
+      0.2498302310705185
+    ],
+    "left_particles": 0,
+    "right_particles": 0,
+    "bilateral": 0,
+    "left": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "right": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "patch": 0,
+    "patch_count": 0,
+    "min_z": 0.21010607481002808
+  },
+  {
+    "frame": 480,
+    "time": 7.999999999999977,
+    "label": "08_inserting",
+    "target": [
+      0.36500000953674316,
+      -0.6000000238418579,
+      0.2680000066757202
+    ],
+    "tip": [
+      0.3990471363067627,
+      -0.6066491603851318,
+      0.26125404238700867
+    ],
+    "left_particles": 0,
+    "right_particles": 0,
+    "bilateral": 0,
+    "left": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "right": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "patch": 0,
+    "patch_count": 0,
+    "min_z": 0.21807895600795746
+  },
+  {
+    "frame": 540,
+    "time": 9.000000000000027,
+    "label": "09_inserted_open",
+    "target": [
+      0.36500000953674316,
+      -0.6000000238418579,
+      0.2680000066757202
+    ],
+    "tip": [
+      0.37706947326660156,
+      -0.6025943160057068,
+      0.265508770942688
+    ],
+    "left_particles": 0,
+    "right_particles": 0,
+    "bilateral": 0,
+    "left": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "right": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "patch": 0,
+    "patch_count": 0,
+    "min_z": 0.22046543657779694
+  },
+  {
+    "frame": 600,
+    "time": 10.000000000000076,
+    "label": "10_closing",
+    "target": [
+      0.36500000953674316,
+      -0.6000000238418579,
+      0.2680000066757202
+    ],
+    "tip": [
+      0.37108489871025085,
+      -0.6017201542854309,
+      0.26642027497291565
+    ],
+    "left_particles": 0,
+    "right_particles": 0,
+    "bilateral": 0,
+    "left": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "right": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "patch": 0,
+    "patch_count": 0,
+    "min_z": 0.24323925375938416
+  },
+  {
+    "frame": 660,
+    "time": 11.000000000000126,
+    "label": "11_closed",
+    "target": [
+      0.36500000953674316,
+      -0.6000000238418579,
+      0.2680000066757202
+    ],
+    "tip": [
+      0.36752021312713623,
+      -0.6011855602264404,
+      0.2669876515865326
+    ],
+    "left_particles": 0,
+    "right_particles": 0,
+    "bilateral": 0,
+    "left": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "right": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "patch": 0,
+    "patch_count": 0,
+    "min_z": 0.2429378479719162
+  },
+  {
+    "frame": 720,
+    "time": 12.000000000000176,
+    "label": "12_lifting",
+    "target": [
+      0.36500000953674316,
+      -0.6000000238418579,
+      0.3400000035762787
+    ],
+    "tip": [
+      0.36830762028694153,
+      -0.6054853200912476,
+      0.2884441316127777
+    ],
+    "left_particles": 0,
+    "right_particles": 0,
+    "bilateral": 0,
+    "left": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "right": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "patch": 0,
+    "patch_count": 0,
+    "min_z": 0.2650414705276489
+  },
+  {
+    "frame": 840,
+    "time": 14.000000000000275,
+    "label": "14_lifted",
+    "target": [
+      0.36500000953674316,
+      -0.6000000238418579,
+      0.3400000035762787
+    ],
+    "tip": [
+      0.3700059652328491,
+      -0.6110336184501648,
+      0.30825090408325195
+    ],
+    "left_particles": 0,
+    "right_particles": 0,
+    "bilateral": 0,
+    "left": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "right": {
+      "active": 0,
+      "min_gap": null,
+      "p10_gap": null,
+      "inside": 0,
+      "inside_1mm": 0
+    },
+    "patch": 0,
+    "patch_count": 0,
+    "min_z": 0.28558942675590515
+  }
+]

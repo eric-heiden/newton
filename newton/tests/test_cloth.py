@@ -340,7 +340,7 @@ class ClothSim:
             tri_ka=stretching_stiffness,
             tri_kd=kd,
             edge_ke=bending_ke,
-            add_springs=self.solver_name == "xpbd",
+            add_springs=False,
             spring_ke=spring_ke,
             spring_kd=0.0,
         )
@@ -394,7 +394,7 @@ class ClothSim:
             tri_kd=stretching_damping,
             edge_ke=10,
             edge_kd=bending_damping_10,
-            add_springs=self.solver_name == "xpbd",
+            add_springs=False,
             spring_ke=1.0e3,
             spring_kd=0.0,
         )
@@ -412,7 +412,7 @@ class ClothSim:
             tri_kd=stretching_damping,
             edge_ke=100,
             edge_kd=bending_damping_100,
-            add_springs=self.solver_name == "xpbd",
+            add_springs=False,
             spring_ke=1.0e3,
             spring_kd=0.0,
         )
@@ -430,7 +430,7 @@ class ClothSim:
             tri_kd=stretching_damping,
             edge_ke=1000,
             edge_kd=bending_damping_1000,
-            add_springs=self.solver_name == "xpbd",
+            add_springs=False,
             spring_ke=1.0e3,
             spring_kd=0.0,
         )
@@ -457,7 +457,7 @@ class ClothSim:
             tri_ke=elasticity_ke,
             tri_ka=elasticity_ke,
             tri_kd=elasticity_kd,
-            add_springs=self.solver_name == "xpbd",
+            add_springs=False,
             spring_ke=1.0e3,
             spring_kd=0.0,
         )
@@ -476,7 +476,7 @@ class ClothSim:
             tri_ke=elasticity_ke,
             tri_ka=elasticity_ke,
             tri_kd=elasticity_kd,
-            add_springs=self.solver_name == "xpbd",
+            add_springs=False,
             spring_ke=1.0e3,
             spring_kd=0.0,
         )
@@ -553,7 +553,7 @@ class ClothSim:
             tri_kd=stretching_damping,
             edge_ke=edge_ke,
             edge_kd=bending_damping,
-            add_springs=self.solver_name == "xpbd",
+            add_springs=False,
             spring_ke=1.0e3,
             spring_kd=0.0,
         )
@@ -611,7 +611,7 @@ class ClothSim:
             tri_kd=tri_kd,
             edge_ke=edge_ke,
             edge_kd=edge_kd,
-            add_springs=self.solver_name == "xpbd",
+            add_springs=False,
             spring_ke=1.0e3,
             spring_kd=0.0,
         )
@@ -648,7 +648,7 @@ class ClothSim:
             tri_ke=stretching_stiffness,
             tri_ka=stretching_stiffness,
             tri_kd=0.0,
-            add_springs=self.solver_name == "xpbd",
+            add_springs=False,
             spring_ke=spring_ke,
             spring_kd=0.0,
         )
@@ -694,7 +694,7 @@ class ClothSim:
             tri_ke=stretching_stiffness,
             tri_ka=stretching_stiffness,
             tri_kd=0.0,
-            add_springs=self.solver_name == "xpbd",
+            add_springs=False,
             spring_ke=spring_ke,
             spring_kd=0.0,
             particle_radius=particle_radius,
@@ -761,7 +761,7 @@ class ClothSim:
             tri_ke=stretching_stiffness,
             tri_ka=stretching_stiffness,
             tri_kd=0.0,
-            add_springs=self.solver_name == "xpbd",
+            add_springs=False,
             spring_ke=spring_ke,
             spring_kd=0.0,
             particle_radius=particle_radius,
@@ -814,7 +814,7 @@ class ClothSim:
             tri_ke=stretching_stiffness,
             tri_ka=stretching_stiffness,
             tri_kd=0.0,
-            add_springs=self.solver_name == "xpbd",
+            add_springs=False,
             spring_ke=spring_ke,
             spring_kd=0.0,
             particle_radius=particle_radius,
@@ -861,6 +861,9 @@ class ClothSim:
             self.solver = newton.solvers.SolverXPBD(
                 model=self.model,
                 iterations=self.iterations,
+                particle_enable_self_contact=particle_enable_self_contact,
+                particle_self_contact_radius=self.particle_self_contact_radius,
+                particle_self_contact_margin=self.particle_self_contact_margin,
             )
         elif self.solver_name == "semi_implicit":
             self.solver = newton.solvers.SolverSemiImplicit(self.model)
@@ -1207,6 +1210,7 @@ tests_to_run = {
         test_cloth_free_fall,
         test_cloth_sagging,
         test_cloth_bending,
+        test_cloth_collision,
         test_cloth_bending_consistent_angle_computation,
         test_cloth_bending_non_zero_rest_angle_bending,
         test_cloth_bending_with_complex_rest_angles,

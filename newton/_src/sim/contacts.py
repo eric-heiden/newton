@@ -367,8 +367,8 @@ class Contacts:
             Particle contact ``(p, -1, -1)``, edge contact ``(v0, v1, -1)``, face contact
             ``(v0, v1, v2)``. Pair with :attr:`soft_contact_barycentric` to recover the contact
             point over the non-negative slots."""
-            # Particle-only view kept for solvers that consume particle contacts exclusively (XPBD,
-            # semi-implicit, Style3D). Holds the particle id for particle contacts; -1 for edge/face.
+            # Particle-only view kept for solvers that consume particle contacts exclusively
+            # (semi-implicit and Style3D). Holds the particle id for particle contacts; -1 for edge/face.
             self.soft_contact_particle = wp.full(soft_contact_max, -1, dtype=int)
             """Particle id per particle contact, -1 for edge/face records [dimensionless], shape (soft_contact_max,), dtype int.
 
@@ -395,7 +395,7 @@ class Contacts:
 
             # Private capability flag: set by the collision pipeline when full-surface (edge/face)
             # soft contacts are enabled, so soft_contact_indices may hold edge/face records. Solvers
-            # that only consume particle contacts (everything but VBD) raise on this rather than
+            # that only consume particle contacts raise on this rather than
             # silently misreading edge/face records -- the pipeline is solver-agnostic, so the check
             # lives at the consuming solver. Kept private to avoid a public API/deprecation surface.
             self._enable_rigid_soft_full_surface_contact = False
@@ -578,5 +578,5 @@ class Contacts:
             raise NotImplementedError(
                 f"{solver_name} does not support full-surface soft contacts "
                 "(CollisionPipeline was built with enable_rigid_soft_full_surface_contact=True); "
-                "only SolverVBD consumes edge/face soft contacts. Disable the flag or use SolverVBD."
+                "this solver mode consumes particle contacts only. Disable the flag or use SolverVBD or SolverXPBD."
             )

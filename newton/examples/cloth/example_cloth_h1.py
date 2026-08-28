@@ -4,13 +4,13 @@
 ###########################################################################
 # Example cloth H1 (cloth-robot interaction)
 #
-# The H1 robot in a jacket waves hello to us, powered by the Style3D solver
-# for cloth and driven by an IkSolver for robot kinematics.
+# The H1 robot in a jacket waves hello to us. The cloth can be simulated by
+# XPBD or Style3D while an IkSolver drives the robot kinematics.
 #
 # Demonstrates how to leverage interpolated robot kinematics within the
 # collision processing pipeline and feed the results to the cloth solver.
 #
-# Command: python -m newton.examples cloth_h1
+# Command: python -m newton.examples cloth_h1 --solver xpbd
 #
 ###########################################################################
 
@@ -28,6 +28,7 @@ from newton.solvers import style3d
 
 class Example:
     def __init__(self, viewer, args):
+        self.solver_type = args.solver
         # frame timing
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -58,7 +59,8 @@ class Example:
         garment_usd_name = "h1_jacket"
         # garment_usd_name = "h1_cake_skirt"
         cloth_builder = newton.ModelBuilder()
-        newton.solvers.SolverStyle3D.register_custom_attributes(cloth_builder)
+        if self.solver_type == "style3d":
+            newton.solvers.SolverStyle3D.register_custom_attributes(cloth_builder)
         asset_path = newton.utils.download_asset("style3d")
         usd_stage = Usd.Stage.Open(f"{asset_path}/garments/{garment_usd_name}.usd")
         usd_prim_garment = usd_stage.GetPrimAtPath(f"/Root/{garment_usd_name}/Root_Garment")
@@ -67,35 +69,52 @@ class Example:
         self.garment_mesh_indices = garment_mesh.indices
         self.garment_mesh_points = garment_mesh.vertices[:, [2, 0, 1]]  # y-up to z-up
 
-        # Load raw UV values and indices directly from the primvar
-        # (get_mesh expands indexed UVs, but style3d needs raw values + indices)
-        uv_primvar = UsdGeom.PrimvarsAPI(usd_prim_garment).GetPrimvar("st")
-        self.garment_mesh_uv = np.array(uv_primvar.Get()) * 1e-3
-        self.garment_mesh_uv_indices = np.array(uv_primvar.GetIndices())
-
-        style3d.add_cloth_mesh(
-            cloth_builder,
-            pos=wp.vec3(0, 0, 0),
-            rot=wp.quat_identity(),
-            vel=wp.vec3(0.0, 0.0, 0.0),
-            panel_verts=self.garment_mesh_uv.tolist(),
-            panel_indices=self.garment_mesh_uv_indices.tolist(),
-            vertices=self.garment_mesh_points.tolist(),
-            indices=self.garment_mesh_indices.tolist(),
-            density=0.5,
-            scale=1.0,
-            particle_radius=3.0e-3,
-            tri_aniso_ke=wp.vec3(1.0e2, 1.0e2, 1.0e2) * 10.0,
-            edge_aniso_ke=wp.vec3(1.0e-6, 1.0e-6, 1.0e-6) * 40.0,
-        )
+        if self.solver_type == "style3d":
+            # Style3D consumes the garment's unexpanded panel-space UV mesh.
+            uv_primvar = UsdGeom.PrimvarsAPI(usd_prim_garment).GetPrimvar("st")
+            self.garment_mesh_uv = np.array(uv_primvar.Get()) * 1e-3
+            self.garment_mesh_uv_indices = np.array(uv_primvar.GetIndices())
+            style3d.add_cloth_mesh(
+                cloth_builder,
+                pos=wp.vec3(0, 0, 0),
+                rot=wp.quat_identity(),
+                vel=wp.vec3(0.0, 0.0, 0.0),
+                panel_verts=self.garment_mesh_uv.tolist(),
+                panel_indices=self.garment_mesh_uv_indices.tolist(),
+                vertices=self.garment_mesh_points.tolist(),
+                indices=self.garment_mesh_indices.tolist(),
+                density=0.5,
+                scale=1.0,
+                particle_radius=3.0e-3,
+                tri_aniso_ke=wp.vec3(1.0e2, 1.0e2, 1.0e2) * 10.0,
+                edge_aniso_ke=wp.vec3(1.0e-6, 1.0e-6, 1.0e-6) * 40.0,
+            )
+        else:
+            cloth_builder.add_cloth_mesh(
+                pos=wp.vec3(0.0),
+                rot=wp.quat_identity(),
+                vel=wp.vec3(0.0),
+                vertices=self.garment_mesh_points.tolist(),
+                indices=self.garment_mesh_indices.tolist(),
+                density=0.5,
+                scale=1.0,
+                particle_radius=3.0e-3,
+                tri_ke=1.0e4,
+                tri_ka=1.0e4,
+                tri_kd=1.0,
+                edge_ke=0.5,
+                edge_kd=0.01,
+            )
         h1.add_world(cloth_builder)
 
         self.graph = None
         self.model = h1.finalize()
         self.model.soft_contact_ke = 5e3
-        # no friction
-        self.model.soft_contact_mu = 0.0
-        self.model.shape_material_mu.fill_(0.0)
+        contact_friction = 0.0 if self.solver_type == "style3d" else 0.2
+        self.model.soft_contact_mu = contact_friction
+        self.model.particle_mu = contact_friction
+        self.model.shape_material_mu.fill_(contact_friction)
+        self.model.shape_material_ka.zero_()
         self.viewer.set_model(self.model)
         self.viewer.set_camera(wp.vec3(2.5, 0.0, 1.5), 0.0, 180.0)
 
@@ -173,14 +192,30 @@ class Example:
         # ------------------------------------------------------------------
         # Cloth solver
         # ------------------------------------------------------------------
-        self.cloth_solver = newton.solvers.SolverStyle3D(
-            model=self.model,
-            iterations=self.iterations,
-        )
-        self.cloth_solver.collision.radius = 3.5e-3
+        if self.solver_type == "style3d":
+            self.cloth_solver = newton.solvers.SolverStyle3D(
+                model=self.model,
+                iterations=self.iterations,
+            )
+            self.cloth_solver.collision.radius = 3.5e-3
+        else:
+            self.cloth_solver = newton.solvers.SolverXPBD(
+                model=self.model,
+                iterations=self.iterations,
+                integrate_with_external_rigid_solver=True,
+                particle_enable_self_contact=True,
+                particle_enable_triangle_intersection_recovery=True,
+                particle_self_contact_relaxation=0.4,
+                particle_self_contact_radius=4.0e-3,
+                particle_self_contact_margin=7.0e-3,
+                particle_vertex_contact_buffer_size=64,
+                particle_edge_contact_buffer_size=128,
+                particle_triangle_contact_buffer_size=64,
+                particle_topological_contact_filter_threshold=2,
+            )
         self.control = self.model.control()
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.collision_pipeline = newton.CollisionPipeline(self.model, soft_contact_margin=4.0e-3)
         self.contacts = self.collision_pipeline.contacts()
         self.shape_flags = self.model.shape_flags.numpy()
 
@@ -189,8 +224,8 @@ class Example:
     # ----------------------------------------------------------------------
     def capture(self):
         self.graph = None
-        # SolverStyle3D makes host calls (PCG dot products, BVH refit) that CPU graph capture cannot record
-        if wp.get_device().is_cpu:
+        # SolverStyle3D makes host calls (PCG dot products, BVH refit) that CPU graph capture cannot record.
+        if self.solver_type == "style3d" and wp.get_device().is_cpu:
             return
         with wp.ScopedCapture() as cap:
             self.simulate()
@@ -230,6 +265,8 @@ class Example:
                 device=self.model.device,
             )
             self.state.body_q.assign(self.state1.body_q)
+            self.state.clear_forces()
+            self.viewer.apply_forces(self.state)
             self.collision_pipeline.collide(self.state, self.contacts)
             self.cloth_solver.step(self.state, self.state1, self.control, self.contacts, self.sim_dt)
             (self.state, self.state1) = (self.state1, self.state)
@@ -306,7 +343,7 @@ class Example:
         self.frame_index += 1
 
     def test_final(self):
-        p_lower = wp.vec3(-0.3, -0.8, 0.8)
+        p_lower = wp.vec3(-0.3, -0.8, 0.65)
         p_upper = wp.vec3(0.5, 0.8, 1.8)
         newton.examples.test_particle_state(
             self.state,
@@ -324,6 +361,12 @@ class Example:
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
     parser = newton.examples.create_parser()
+    parser.add_argument(
+        "--solver",
+        choices=["xpbd", "style3d"],
+        default="xpbd",
+        help="Cloth solver to use.",
+    )
     parser.set_defaults(num_frames=601)
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

@@ -1163,10 +1163,11 @@ class CollisionPipeline:
                 (e.g. a thin box edge through a coarse cloth cell), which the per-particle path misses.
                 Requires an SDF on every participating rigid mesh/convex shape (provision via
                 :meth:`ModelBuilder.ShapeConfig.configure_sdf`, e.g. ``configure_sdf(force_sdf=True)`` on
-                the builder's ``default_shape_cfg``), and is consumed only by
-                :class:`~newton.solvers.SolverVBD`; other solvers raise on such contacts. Records are
-                emitted into :attr:`Contacts.soft_contact_indices`. Defaults to False. Fixed at
-                construction because it sizes the soft-contact buffer headroom.
+                the builder's ``default_shape_cfg``). The full records are consumed by
+                :class:`~newton.solvers.SolverVBD` and :class:`~newton.solvers.SolverXPBD`;
+                particle-only solvers raise on such contacts. Records are emitted into
+                :attr:`Contacts.soft_contact_indices`. Defaults to False. Fixed at construction
+                because it sizes the soft-contact buffer headroom.
             requires_grad: Whether pipeline-generated soft contacts and the
                 deprecated automatic rigid-contact outputs require gradients.
                 If None, uses ``model.requires_grad``. Explicit calls to

@@ -1582,6 +1582,11 @@ and is consumed by the solver :meth:`~solvers.SolverBase.step` method for contac
 
 **Soft contacts (particle-shape):**
 
+Set ``enable_rigid_soft_full_surface_contact=True`` on :class:`~CollisionPipeline`
+to add edge and face records that prevent rigid features from passing between
+cloth vertices. :class:`~solvers.SolverVBD` and :class:`~solvers.SolverXPBD`
+consume these distributed records; particle-only solvers reject the buffer.
+
 .. list-table::
    :header-rows: 1
    :widths: 35 65

@@ -4,6 +4,7 @@
 import warp as wp
 
 from ...geometry import ParticleFlags
+from ...geometry.kernels import triangle_closest_point
 from ...math import (
     vec_abs,
     vec_leaky_max,
@@ -14,6 +15,93 @@ from ...math import (
 )
 from ...sim import BodyFlags, JointType
 from ...sim.contacts import contact_surface_point, contact_surface_separation
+from ..vbd.tri_mesh_collision import (
+    TriMeshCollisionInfo,
+    get_edge_colliding_edges,
+    get_edge_colliding_edges_count,
+    get_vertex_colliding_triangles,
+    get_vertex_colliding_triangles_count,
+)
+
+
+@wp.kernel
+def eval_triangle_aerodynamics(
+    particle_x: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
+    particle_invmass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    tri_indices: wp.array2d[int],
+    air_velocity: wp.vec3,
+    air_density: float,
+    drag_coefficient: float,
+    lift_coefficient: float,
+    dt: float,
+    particle_f: wp.array[wp.vec3],
+):
+    """Accumulate flat-plate aerodynamic drag and lift on each cloth triangle."""
+    triangle = wp.tid()
+    i = tri_indices[triangle, 0]
+    j = tri_indices[triangle, 1]
+    k = tri_indices[triangle, 2]
+
+    normal = wp.cross(particle_x[j] - particle_x[i], particle_x[k] - particle_x[i])
+    normal_length = wp.length(normal)
+    if normal_length < 1.0e-12:
+        return
+    area = 0.5 * normal_length
+    normal = normal / normal_length
+
+    # Velocity of the triangle through the surrounding air.
+    relative_velocity = (particle_v[i] + particle_v[j] + particle_v[k]) / 3.0 - air_velocity
+    speed = wp.length(relative_velocity)
+    if speed < 1.0e-6:
+        return
+    flow = relative_velocity / speed
+
+    # Only the projected frontal area of an inclined plate meets the flow, so a
+    # triangle moving edge-on produces almost no force.
+    cos_theta = wp.dot(normal, flow)
+    dynamic_pressure = 0.5 * air_density * speed * speed
+    force = -drag_coefficient * dynamic_pressure * area * wp.abs(cos_theta) * flow
+    if lift_coefficient != 0.0:
+        # Component of the face normal perpendicular to the flow; the extra
+        # cos_theta gives the flat-plate sin(a)cos(a) angle-of-attack response.
+        perpendicular = normal - cos_theta * flow
+        force -= lift_coefficient * dynamic_pressure * area * cos_theta * perpendicular
+
+    share = force / 3.0
+    share_magnitude = wp.length(share)
+    indices = wp.vec3i(i, j, k)
+    for local_index in range(3):
+        particle = indices[local_index]
+        if (particle_flags[particle] & ParticleFlags.ACTIVE) == 0:
+            continue
+        applied = share
+        # Aerodynamic drag can only bring the cloth to rest relative to the
+        # air. Letting a large coefficient or time step overshoot that would
+        # turn drag into an energy source.
+        velocity_change = share_magnitude * particle_invmass[particle] * dt
+        if velocity_change > speed and velocity_change > 0.0:
+            applied = share * (speed / velocity_change)
+        wp.atomic_add(particle_f, particle, applied)
+
+
+@wp.kernel
+def damp_particle_velocities(
+    particle_x_prev: wp.array[wp.vec3],
+    particle_flags: wp.array[wp.int32],
+    damping: float,
+    dt: float,
+    particle_x: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
+):
+    """Apply exponential particle drag while keeping prediction consistent."""
+    particle = wp.tid()
+    if (particle_flags[particle] & ParticleFlags.ACTIVE) == 0:
+        return
+    velocity = particle_v[particle] * wp.exp(-damping * dt)
+    particle_v[particle] = velocity
+    particle_x[particle] = particle_x_prev[particle] + velocity * dt
 
 
 @wp.kernel
@@ -113,13 +201,85 @@ def apply_particle_shape_restitution(
 
 
 @wp.kernel
+def count_particle_shape_contact_bodies(
+    particle_x: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_m_inv: wp.array[float],
+    body_flags: wp.array[wp.int32],
+    shape_body: wp.array[int],
+    shape_material_ka: wp.array[float],
+    shape_margin: wp.array[float],
+    particle_ka: float,
+    contact_count: wp.array[int],
+    contact_indices: wp.array[wp.vec3i],
+    contact_barycentric: wp.array[wp.vec3],
+    contact_shape: wp.array[int],
+    contact_body_pos: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_max: int,
+    particle_contact_counts: wp.array[int],
+    body_contact_counts: wp.array[int],
+):
+    """Count active soft-feature contacts incident on each particle and body."""
+    contact = wp.tid()
+    if contact >= min(contact_count[0], contact_max):
+        return
+
+    corners = contact_indices[contact]
+    bary = contact_barycentric[contact]
+    soft_position = wp.vec3(0.0)
+    soft_radius = float(0.0)
+    has_active_particle = False
+    has_proxy_particle = False
+    for local_index in range(3):
+        particle = corners[local_index]
+        if particle >= 0:
+            soft_position += bary[local_index] * particle_x[particle]
+            soft_radius = wp.max(soft_radius, particle_radius[particle])
+            particle_flag = particle_flags[particle]
+            if (particle_flag & ParticleFlags.ACTIVE) != 0:
+                has_active_particle = True
+            if (particle_flag & ParticleFlags.PROXY) != 0:
+                has_proxy_particle = True
+    if not has_active_particle:
+        return
+
+    shape = contact_shape[contact]
+    body = shape_body[shape]
+    if has_proxy_particle:
+        if body < 0:
+            return
+        if (body_flags[body] & int(BodyFlags.PROXY)) != 0 or body_m_inv[body] == 0.0:
+            return
+
+    X_wb = wp.transform_identity()
+    if body >= 0:
+        X_wb = body_q[body]
+    body_position = wp.transform_point(X_wb, contact_body_pos[contact])
+    gap = wp.dot(contact_normal[contact], soft_position - body_position) - soft_radius - shape_margin[shape]
+    adhesion = particle_ka + shape_material_ka[shape]
+    if gap > adhesion:
+        return
+
+    for local_index in range(3):
+        particle = corners[local_index]
+        if particle >= 0 and bary[local_index] != 0.0:
+            wp.atomic_add(particle_contact_counts, particle, 1)
+    if body >= 0:
+        wp.atomic_add(body_contact_counts, body, 1)
+
+
+@wp.kernel
 def solve_particle_shape_contacts(
     particle_x: wp.array[wp.vec3],
-    particle_v: wp.array[wp.vec3],
+    particle_x_prev: wp.array[wp.vec3],
     particle_invmass: wp.array[float],
     particle_radius: wp.array[float],
     particle_flags: wp.array[wp.int32],
     body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
     body_m_inv: wp.array[float],
@@ -127,20 +287,32 @@ def solve_particle_shape_contacts(
     body_flags: wp.array[wp.int32],
     shape_body: wp.array[int],
     shape_material_mu: wp.array[float],
+    shape_margin: wp.array[float],
+    shape_material_ka: wp.array[float],
     particle_mu: float,
     particle_ka: float,
     contact_count: wp.array[int],
-    contact_particle: wp.array[int],
+    contact_indices: wp.array[wp.vec3i],
+    contact_barycentric: wp.array[wp.vec3],
     contact_shape: wp.array[int],
     contact_body_pos: wp.array[wp.vec3],
     contact_body_vel: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
     contact_max: int,
+    particle_contact_counts: wp.array[int],
+    body_contact_counts: wp.array[int],
+    integrate_with_external_rigid_solver: bool,
+    max_depenetration_velocity: float,
     dt: float,
     relaxation: float,
+    lambdas: wp.array[float],
+    split_lambdas: wp.array[float],
+    friction_lambdas: wp.array[float],
     # outputs
     delta: wp.array[wp.vec3],
     body_delta: wp.array[wp.spatial_vector],
+    particle_split_delta: wp.array[wp.vec3],
+    body_split_velocity_delta: wp.array[wp.spatial_vector],
 ):
     tid = wp.tid()
 
@@ -150,21 +322,37 @@ def solve_particle_shape_contacts(
 
     shape_index = contact_shape[tid]
     body_index = shape_body[shape_index]
-    particle_index = contact_particle[tid]
+    corners = contact_indices[tid]
+    bary = contact_barycentric[tid]
 
-    particle_flag = particle_flags[particle_index]
-    if (particle_flag & ParticleFlags.ACTIVE) == 0:
+    px = wp.vec3(0.0)
+    px_prev = wp.vec3(0.0)
+    soft_radius = float(0.0)
+    w1 = float(0.0)
+    has_active_particle = False
+    has_proxy_particle = False
+    for local_index in range(3):
+        particle = corners[local_index]
+        if particle >= 0:
+            weight = bary[local_index]
+            px += weight * particle_x[particle]
+            px_prev += weight * particle_x_prev[particle]
+            soft_radius = wp.max(soft_radius, particle_radius[particle])
+            particle_flag = particle_flags[particle]
+            if (particle_flag & ParticleFlags.ACTIVE) != 0:
+                has_active_particle = True
+                w1 += particle_invmass[particle] * weight * weight
+            if (particle_flag & ParticleFlags.PROXY) != 0:
+                has_proxy_particle = True
+    if not has_active_particle:
         return
-    if (particle_flag & ParticleFlags.PROXY) != 0:
+    if has_proxy_particle:
         if body_index < 0:
             return
         if (body_flags[body_index] & int(BodyFlags.PROXY)) != 0:
             return
         if body_m_inv[body_index] == 0.0:
             return
-
-    px = particle_x[particle_index]
-    pv = particle_v[particle_index]
 
     X_wb = wp.transform_identity()
     X_com = wp.vec3()
@@ -178,40 +366,49 @@ def solve_particle_shape_contacts(
     r = bx - wp.transform_point(X_wb, X_com)
 
     n = contact_normal[tid]
-    c = wp.dot(n, px - bx) - particle_radius[particle_index]
+    contact_radius = soft_radius + shape_margin[shape_index]
+    c = wp.dot(n, px - bx) - contact_radius
 
-    if c > particle_ka:
+    adhesion = particle_ka + shape_material_ka[shape_index]
+    if c > adhesion:
         return
 
-    # take average material properties of shape and particle parameters
-    mu = 0.5 * (particle_mu + shape_material_mu[shape_index])
-
-    # body velocity
-    body_v_s = wp.spatial_vector()
+    # Limit the positional target for contacts that were already penetrating at
+    # the beginning of the step. This avoids converting a large initial overlap
+    # into a single, explosive separating velocity.
+    X_wb_prev = wp.transform_identity()
     if body_index >= 0:
+        X_wb_prev = body_q_prev[body_index]
+    bx_prev = wp.transform_point(X_wb_prev, contact_body_pos[tid])
+    c_prev = wp.dot(n, px_prev - bx_prev) - contact_radius
+    min_separation = 0.0
+    if c_prev < 0.0:
+        if max_depenetration_velocity >= 0.0:
+            min_separation = wp.min(0.0, c_prev + max_depenetration_velocity * dt)
+        else:
+            max_correction = 0.25 * contact_radius
+            min_separation = wp.min(0.0, c_prev + max_correction)
+    c -= min_separation
+
+    # Use the realized contact-point motion so externally integrated and proxy
+    # bodies transfer tangential motion to particles. Fall back to body_qd when
+    # the poses are unchanged but a prescribed velocity is available.
+    bv = (bx - bx_prev) / dt
+    if body_index >= 0 and wp.length_sq(bx - bx_prev) < 1.0e-16:
         body_v_s = body_qd[body_index]
-
-    body_w = wp.spatial_bottom(body_v_s)
-    body_v = wp.spatial_top(body_v_s)
-
-    # compute the body velocity at the particle position
-    bv = body_v + wp.cross(body_w, r) + wp.transform_vector(X_wb, contact_body_vel[tid])
-
-    # relative velocity
-    v = pv - bv
-
-    # normal
-    lambda_n = c
-    delta_n = n * lambda_n
-
-    # friction
-    vn = wp.dot(n, v)
-    vt = v - n * vn
+        body_w = wp.spatial_bottom(body_v_s)
+        body_v = wp.spatial_top(body_v_s)
+        bv = body_v + wp.cross(body_w, r)
+    bv += wp.transform_vector(X_wb, contact_body_vel[tid])
+    # Evaluate tangential slip from the current contact displacement rather
+    # than the pre-solve velocity. Position iterations update ``px`` and the
+    # body pose, so this measure converges toward a no-slip state instead of
+    # reapplying the same stale friction correction on every iteration.
+    v = (px - px_prev) / dt - bv
 
     # compute inverse masses
-    w1 = particle_invmass[particle_index]
     w2 = 0.0
-    if body_index >= 0:
+    if body_index >= 0 and not integrate_with_external_rigid_solver:
         angular = wp.cross(r, n)
         q = wp.transform_get_rotation(X_wb)
         rot_angular = wp.quat_rotate_inv(q, angular)
@@ -221,26 +418,290 @@ def solve_particle_shape_contacts(
     if denom == 0.0:
         return
 
-    lambda_f = wp.max(mu * lambda_n, -wp.length(vt) * dt)
-    delta_f = wp.normalize(vt) * lambda_f
-    delta_total = (delta_f - delta_n) / denom * relaxation
+    # Hard XPBD contact. A positive material adhesion distance makes the
+    # constraint bilateral while the contact remains inside that distance.
+    # Keeping the multiplier across iterations avoids repeatedly treating the
+    # full penetration or separation as a new impulse.
+    lambda_old = lambdas[tid]
+    if adhesion <= 0.0 and c >= 0.0 and lambda_old <= 0.0:
+        return
+    dlambda = -c / denom
+    lambda_new = lambda_old + dlambda
+    if adhesion <= 0.0:
+        lambda_new = wp.max(lambda_new, 0.0)
+    dlambda = (lambda_new - lambda_old) * relaxation
+    lambda_new = lambda_old + dlambda
+    lambdas[tid] = lambda_new
 
-    wp.atomic_add(delta, particle_index, w1 * delta_total)
+    # Only the part of the correction that repairs overlap present at the
+    # beginning of the step is non-physical split depenetration. Corrections
+    # that arrest this step's incoming motion must remain in the velocity so a
+    # resting contact can balance gravity without a separate support impulse.
+    split_dlambda = 0.0
+    if c_prev < 0.0:
+        recovery_distance = wp.max(min_separation - c_prev, 0.0)
+        split_lambda_new = wp.min(lambda_new, recovery_distance / denom)
+        split_dlambda = split_lambda_new - split_lambdas[tid]
+        split_lambdas[tid] = split_lambda_new
 
-    if body_index >= 0:
+    mu = 0.5 * (particle_mu + shape_material_mu[shape_index])
+    vn = wp.dot(n, v)
+    vt = v - n * vn
+    tangent_speed = wp.length(vt)
+    delta_f = wp.vec3(0.0)
+    if tangent_speed > 1.0e-8 and mu > 0.0:
+        # Accumulate the tangential multiplier over the step and apply only its
+        # increment, mirroring the normal direction. Re-applying the full
+        # Coulomb-bounded impulse every iteration would make the friction force
+        # scale with the iteration count rather than with mu.
+        friction_lambda_old = friction_lambdas[tid]
+        friction_lambda_new = wp.min(
+            friction_lambda_old + tangent_speed * dt / denom * relaxation,
+            mu * wp.abs(lambda_new),
+        )
+        # A shrinking normal impulse must not drive the tangential correction
+        # backwards; that would inject energy instead of removing slip.
+        friction_lambda_new = wp.max(friction_lambda_new, friction_lambda_old)
+        friction_lambdas[tid] = friction_lambda_new
+        delta_f = -vt / tangent_speed * (friction_lambda_new - friction_lambda_old)
+    delta_total = n * dlambda + delta_f
+
+    for local_index in range(3):
+        particle = corners[local_index]
+        if particle >= 0:
+            weight = bary[local_index]
+            inverse_mass = particle_invmass[particle]
+            particle_contact_count = float(wp.max(particle_contact_counts[particle], 1))
+            wp.atomic_add(delta, particle, inverse_mass * weight * delta_total / particle_contact_count)
+            if split_dlambda != 0.0:
+                wp.atomic_add(
+                    particle_split_delta,
+                    particle,
+                    inverse_mass * weight * n * split_dlambda / particle_contact_count,
+                )
+
+    if body_index >= 0 and not integrate_with_external_rigid_solver:
         # apply_body_deltas() treats body_delta as a velocity-like correction:
         # it multiplies by inverse mass/inertia and dt to update the body pose.
         # delta_total is a positional contact correction, matching the particle
         # path above, so convert it to the body-delta convention here.
-        delta_v = delta_total / dt
+        body_contact_count = float(wp.max(body_contact_counts[body_index], 1))
+        delta_v = delta_total / (dt * body_contact_count)
         delta_w = wp.cross(r, delta_v)
         wp.atomic_sub(body_delta, body_index, wp.spatial_vector(delta_v, delta_w))
+        if split_dlambda != 0.0:
+            normal_velocity_impulse = n * split_dlambda / (dt * body_contact_count)
+            q = wp.transform_get_rotation(X_wb)
+            torque = wp.cross(r, -normal_velocity_impulse)
+            angular_delta = wp.quat_rotate(q, body_I_inv[body_index] * wp.quat_rotate_inv(q, torque))
+            wp.atomic_add(
+                body_split_velocity_delta,
+                body_index,
+                wp.spatial_vector(-body_m_inv[body_index] * normal_velocity_impulse, angular_delta),
+            )
+
+
+@wp.kernel
+def solve_particle_shape_contact_velocities(
+    particle_x: wp.array[wp.vec3],
+    particle_x_prev: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
+    particle_v_prev: wp.array[wp.vec3],
+    particle_invmass: wp.array[float],
+    particle_radius: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    body_m_inv: wp.array[float],
+    body_I_inv: wp.array[wp.mat33],
+    body_flags: wp.array[wp.int32],
+    shape_body: wp.array[int],
+    shape_material_mu: wp.array[float],
+    shape_margin: wp.array[float],
+    particle_mu: float,
+    restitution: float,
+    contact_count: wp.array[int],
+    contact_indices: wp.array[wp.vec3i],
+    contact_barycentric: wp.array[wp.vec3],
+    contact_shape: wp.array[int],
+    contact_body_pos: wp.array[wp.vec3],
+    contact_body_vel: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_max: int,
+    particle_contact_counts: wp.array[int],
+    body_contact_counts: wp.array[int],
+    integrate_with_external_rigid_solver: bool,
+    dt: float,
+    relaxation: float,
+    lambdas: wp.array[float],
+    friction_lambdas: wp.array[float],
+    particle_velocity_delta: wp.array[wp.vec3],
+    body_velocity_delta: wp.array[wp.spatial_vector],
+    particle_static_friction_limit: wp.array[wp.vec4],
+):
+    """Remove artificial separating velocity and enforce Coulomb friction."""
+    tid = wp.tid()
+    count = min(contact_max, contact_count[0])
+    if tid >= count or wp.abs(lambdas[tid]) <= 1.0e-12:
+        return
+
+    shape_index = contact_shape[tid]
+    body_index = shape_body[shape_index]
+    corners = contact_indices[tid]
+    bary = contact_barycentric[tid]
+    soft_position_prev = wp.vec3(0.0)
+    soft_velocity = wp.vec3(0.0)
+    soft_velocity_prev = wp.vec3(0.0)
+    soft_radius = float(0.0)
+    w1 = float(0.0)
+    has_active_particle = False
+    has_proxy_particle = False
+    for local_index in range(3):
+        particle = corners[local_index]
+        if particle >= 0:
+            weight = bary[local_index]
+            soft_position_prev += weight * particle_x_prev[particle]
+            soft_velocity += weight * particle_v[particle]
+            soft_velocity_prev += weight * particle_v_prev[particle]
+            soft_radius = wp.max(soft_radius, particle_radius[particle])
+            particle_flag = particle_flags[particle]
+            if (particle_flag & ParticleFlags.ACTIVE) != 0:
+                has_active_particle = True
+                w1 += particle_invmass[particle] * weight * weight
+            if (particle_flag & ParticleFlags.PROXY) != 0:
+                has_proxy_particle = True
+    if not has_active_particle:
+        return
+    if has_proxy_particle:
+        if body_index < 0:
+            return
+        if (body_flags[body_index] & int(BodyFlags.PROXY)) != 0 or body_m_inv[body_index] == 0.0:
+            return
+
+    X_wb = wp.transform_identity()
+    X_wb_prev = wp.transform_identity()
+    X_com = wp.vec3(0.0)
+    if body_index >= 0:
+        X_wb = body_q[body_index]
+        X_wb_prev = body_q_prev[body_index]
+        X_com = body_com[body_index]
+
+    bx = wp.transform_point(X_wb, contact_body_pos[tid])
+    bx_prev = wp.transform_point(X_wb_prev, contact_body_pos[tid])
+    r = bx - wp.transform_point(X_wb, X_com)
+    n = contact_normal[tid]
+
+    # Prescribed and externally integrated bodies are best represented by the
+    # realized pose delta. Dynamic XPBD bodies use their solved velocity so an
+    # equal-and-opposite velocity impulse can be harvested by proxy coupling.
+    local_velocity = wp.transform_vector(X_wb, contact_body_vel[tid])
+    body_motion_velocity = (bx - bx_prev) / dt + local_velocity
+    if body_index >= 0 and wp.length_sq(bx - bx_prev) < 1.0e-16:
+        body_v_s = body_qd[body_index]
+        body_motion_velocity = wp.spatial_top(body_v_s) + wp.cross(wp.spatial_bottom(body_v_s), r) + local_velocity
+    body_current_velocity = body_motion_velocity
+    if body_index >= 0 and not integrate_with_external_rigid_solver and body_m_inv[body_index] > 0.0:
+        body_v_s = body_qd[body_index]
+        body_current_velocity = wp.spatial_top(body_v_s) + wp.cross(wp.spatial_bottom(body_v_s), r) + local_velocity
+
+    v_current = soft_velocity - body_current_velocity
+    v_previous = soft_velocity_prev - body_motion_velocity
+    vn_current = wp.dot(n, v_current)
+    vn_previous = wp.dot(n, v_previous)
+
+    w2 = 0.0
+    if body_index >= 0 and not integrate_with_external_rigid_solver:
+        angular = wp.cross(r, n)
+        q = wp.transform_get_rotation(X_wb)
+        rot_angular = wp.quat_rotate_inv(q, angular)
+        w2 = body_m_inv[body_index] + wp.dot(rot_angular, body_I_inv[body_index] * rot_angular)
+    denominator = w1 + w2
+    if denominator <= 0.0:
+        return
+
+    contact_radius = soft_radius + shape_margin[shape_index]
+    previous_gap = wp.dot(n, soft_position_prev - bx_prev) - contact_radius
+    desired_vn = wp.max(vn_previous, 0.0)
+    if lambdas[tid] < 0.0:
+        desired_vn = 0.0
+    # Treat only material overlap as pre-existing penetration. Contact points
+    # generated exactly on the surface can have a tiny negative gap from
+    # floating-point roundoff; those are new impacts and must retain their
+    # restitution response.
+    overlap_epsilon = 1.0e-4 * contact_radius
+    if previous_gap < -overlap_epsilon:
+        desired_vn = 0.0
+    elif vn_previous < 0.0:
+        desired_vn = -restitution * vn_previous
+    normal_impulse_scalar = (desired_vn - vn_current) / denominator * relaxation
+    impulse = n * normal_impulse_scalar
+
+    mu = 0.5 * (particle_mu + shape_material_mu[shape_index])
+    # The Coulomb budget is per step, not per pass. The positional solve
+    # already spent ``friction_lambdas``; spending the full budget again here
+    # would double the friction force a material coefficient can produce.
+    friction_budget = wp.max(mu * wp.abs(lambdas[tid]) - friction_lambdas[tid], 0.0) / dt
+    tangent_velocity = v_current - n * vn_current
+    tangent_speed = wp.length(tangent_velocity)
+    if tangent_speed > 1.0e-8:
+        tangent = tangent_velocity / tangent_speed
+        tangent_denominator = w1
+        if body_index >= 0 and not integrate_with_external_rigid_solver:
+            angular_tangent = wp.cross(r, tangent)
+            q = wp.transform_get_rotation(X_wb)
+            rot_angular_tangent = wp.quat_rotate_inv(q, angular_tangent)
+            tangent_denominator += body_m_inv[body_index] + wp.dot(
+                rot_angular_tangent, body_I_inv[body_index] * rot_angular_tangent
+            )
+        if tangent_denominator > 0.0:
+            tangent_impulse = wp.min(
+                tangent_speed / tangent_denominator * relaxation,
+                friction_budget,
+            )
+            impulse -= tangent * tangent_impulse
+
+    for local_index in range(3):
+        particle = corners[local_index]
+        if particle >= 0:
+            weight = bary[local_index]
+            particle_contact_count = float(wp.max(particle_contact_counts[particle], 1))
+            wp.atomic_add(
+                particle_velocity_delta,
+                particle,
+                particle_invmass[particle] * weight * impulse / particle_contact_count,
+            )
+            if body_index < 0 and mu > 0.0:
+                # A Jacobi contact pass can leave a small tangential residual
+                # when several redundant edge/face records support one cloth
+                # vertex. Accumulate the actual Coulomb velocity budget so the
+                # final per-particle application can resolve the static branch
+                # exactly without damping unconstrained motion.
+                static_limit = particle_invmass[particle] * wp.abs(weight) * friction_budget / particle_contact_count
+                wp.atomic_add(
+                    particle_static_friction_limit,
+                    particle,
+                    wp.vec4(n[0] * static_limit, n[1] * static_limit, n[2] * static_limit, static_limit),
+                )
+    if body_index >= 0 and not integrate_with_external_rigid_solver:
+        impulse /= float(wp.max(body_contact_counts[body_index], 1))
+        q = wp.transform_get_rotation(X_wb)
+        torque = wp.cross(r, -impulse)
+        angular_delta = wp.quat_rotate(q, body_I_inv[body_index] * wp.quat_rotate_inv(q, torque))
+        wp.atomic_add(
+            body_velocity_delta,
+            body_index,
+            wp.spatial_vector(-body_m_inv[body_index] * impulse, angular_delta),
+        )
 
 
 @wp.kernel
 def solve_particle_particle_contacts(
     grid: wp.uint64,
     particle_x: wp.array[wp.vec3],
+    particle_x_rest: wp.array[wp.vec3],
+    particle_in_mesh: wp.array[int],
     particle_v: wp.array[wp.vec3],
     particle_invmass: wp.array[float],
     particle_radius: wp.array[float],
@@ -283,6 +744,16 @@ def solve_particle_particle_contacts(
             and (is_proxy == 0 or ((neighbor_flag & ParticleFlags.PROXY) == 0 and particle_invmass[index] > 0.0))
             and index != i
         ):
+            # Two mesh vertices that already overlap in the rest pose are
+            # neighbors on the same surface, not a colliding pair. A cloth
+            # spaced closer than its own particle diameter would otherwise have
+            # every vertex repel its neighbors and tear itself apart. Free
+            # particles keep colliding even when they start overlapped.
+            if particle_in_mesh[i] != 0 and particle_in_mesh[index] != 0:
+                rest_separation = wp.length(particle_x_rest[i] - particle_x_rest[index])
+                if rest_separation < radius + particle_radius[index]:
+                    continue
+
             # compute distance to point
             n = x - particle_x[index]
             d = wp.length(n)
@@ -309,6 +780,1001 @@ def solve_particle_particle_contacts(
                 delta += (delta_f - delta_n) / denom
 
     wp.atomic_add(deltas, i, delta * w1 * relaxation)
+
+
+@wp.kernel
+def count_vertex_triangle_self_contacts(
+    particle_x: wp.array[wp.vec3],
+    tri_indices: wp.array2d[int],
+    collision_info_array: wp.array[TriMeshCollisionInfo],
+    collision_radius: float,
+    counts: wp.array[int],
+):
+    """Count active vertex-triangle contact incidence per particle."""
+    vertex = wp.tid()
+    collision_info = collision_info_array[0]
+    collision_count = get_vertex_colliding_triangles_count(collision_info, vertex)
+    for collision_index in range(collision_count):
+        triangle = get_vertex_colliding_triangles(collision_info, vertex, collision_index)
+        t0 = tri_indices[triangle, 0]
+        t1 = tri_indices[triangle, 1]
+        t2 = tri_indices[triangle, 2]
+        closest, _bary, _feature = triangle_closest_point(
+            particle_x[t0], particle_x[t1], particle_x[t2], particle_x[vertex]
+        )
+        if wp.length_sq(particle_x[vertex] - closest) >= collision_radius * collision_radius:
+            continue
+        wp.atomic_add(counts, vertex, 1)
+        wp.atomic_add(counts, t0, 1)
+        wp.atomic_add(counts, t1, 1)
+        wp.atomic_add(counts, t2, 1)
+
+
+@wp.kernel
+def count_edge_edge_self_contacts(
+    particle_x: wp.array[wp.vec3],
+    edge_indices: wp.array2d[int],
+    collision_info_array: wp.array[TriMeshCollisionInfo],
+    collision_radius: float,
+    edge_parallel_epsilon: float,
+    counts: wp.array[int],
+):
+    """Count unique active edge-edge contact incidence per particle."""
+    edge0 = wp.tid()
+    collision_info = collision_info_array[0]
+    collision_count = get_edge_colliding_edges_count(collision_info, edge0)
+    for collision_index in range(collision_count):
+        edge1 = get_edge_colliding_edges(collision_info, edge0, collision_index)
+        if edge1 > edge0:
+            e00 = edge_indices[edge0, 2]
+            e01 = edge_indices[edge0, 3]
+            e10 = edge_indices[edge1, 2]
+            e11 = edge_indices[edge1, 3]
+            closest_parameters = wp.closest_point_edge_edge(
+                particle_x[e00],
+                particle_x[e01],
+                particle_x[e10],
+                particle_x[e11],
+                edge_parallel_epsilon,
+            )
+            s = closest_parameters[0]
+            t = closest_parameters[1]
+            point0 = particle_x[e00] + (particle_x[e01] - particle_x[e00]) * s
+            point1 = particle_x[e10] + (particle_x[e11] - particle_x[e10]) * t
+            if wp.length_sq(point0 - point1) >= collision_radius * collision_radius:
+                continue
+            wp.atomic_add(counts, e00, 1)
+            wp.atomic_add(counts, e01, 1)
+            wp.atomic_add(counts, e10, 1)
+            wp.atomic_add(counts, e11, 1)
+
+
+@wp.func
+def triangle_pair_is_rest_filtered(
+    particle_x_rest: wp.array[wp.vec3],
+    tri_indices: wp.array2d[int],
+    triangle0: int,
+    triangle1: int,
+    exclusion_radius: float,
+):
+    """Return whether two triangles belong to the same local rest-pose patch."""
+    if exclusion_radius <= 0.0:
+        return False
+
+    a0 = particle_x_rest[tri_indices[triangle0, 0]]
+    a1 = particle_x_rest[tri_indices[triangle0, 1]]
+    a2 = particle_x_rest[tri_indices[triangle0, 2]]
+    b0 = particle_x_rest[tri_indices[triangle1, 0]]
+    b1 = particle_x_rest[tri_indices[triangle1, 1]]
+    b2 = particle_x_rest[tri_indices[triangle1, 2]]
+    exclusion_radius_sq = exclusion_radius * exclusion_radius
+
+    closest, _bary, _feature = triangle_closest_point(b0, b1, b2, a0)
+    if wp.length_sq(a0 - closest) < exclusion_radius_sq:
+        return True
+    closest, _bary, _feature = triangle_closest_point(b0, b1, b2, a1)
+    if wp.length_sq(a1 - closest) < exclusion_radius_sq:
+        return True
+    closest, _bary, _feature = triangle_closest_point(b0, b1, b2, a2)
+    if wp.length_sq(a2 - closest) < exclusion_radius_sq:
+        return True
+    closest, _bary, _feature = triangle_closest_point(a0, a1, a2, b0)
+    if wp.length_sq(b0 - closest) < exclusion_radius_sq:
+        return True
+    closest, _bary, _feature = triangle_closest_point(a0, a1, a2, b1)
+    if wp.length_sq(b1 - closest) < exclusion_radius_sq:
+        return True
+    closest, _bary, _feature = triangle_closest_point(a0, a1, a2, b2)
+    return wp.length_sq(b2 - closest) < exclusion_radius_sq
+
+
+@wp.kernel
+def count_triangle_intersection_self_contacts(
+    particle_x: wp.array[wp.vec3],
+    particle_world: wp.array[int],
+    tri_indices: wp.array2d[int],
+    intersecting_triangles: wp.array[int],
+    intersecting_triangle_counts: wp.array[int],
+    intersecting_triangle_offsets: wp.array[int],
+    counts: wp.array[int],
+):
+    """Count exact triangle intersections used for self-contact recovery."""
+    triangle0 = wp.tid()
+    offset = intersecting_triangle_offsets[triangle0]
+    capacity = intersecting_triangle_offsets[triangle0 + 1] - offset
+    intersection_count = wp.min(intersecting_triangle_counts[triangle0], capacity)
+    for intersection_index in range(intersection_count):
+        triangle1 = intersecting_triangles[offset + intersection_index]
+        if triangle1 <= triangle0:
+            continue
+
+        a0 = tri_indices[triangle0, 0]
+        a1 = tri_indices[triangle0, 1]
+        a2 = tri_indices[triangle0, 2]
+        b0 = tri_indices[triangle1, 0]
+        b1 = tri_indices[triangle1, 1]
+        b2 = tri_indices[triangle1, 2]
+        if particle_world[a0] != particle_world[b0]:
+            continue
+        if not wp.intersect_tri_tri(
+            particle_x[a0],
+            particle_x[a1],
+            particle_x[a2],
+            particle_x[b0],
+            particle_x[b1],
+            particle_x[b2],
+        ):
+            continue
+
+        wp.atomic_add(counts, a0, 1)
+        wp.atomic_add(counts, a1, 1)
+        wp.atomic_add(counts, a2, 1)
+        wp.atomic_add(counts, b0, 1)
+        wp.atomic_add(counts, b1, 1)
+        wp.atomic_add(counts, b2, 1)
+
+
+@wp.kernel
+def solve_triangle_intersection_self_contacts(
+    particle_x: wp.array[wp.vec3],
+    particle_x_prev: wp.array[wp.vec3],
+    particle_x_rest: wp.array[wp.vec3],
+    particle_invmass: wp.array[float],
+    particle_world: wp.array[int],
+    tri_indices: wp.array2d[int],
+    intersecting_triangles: wp.array[int],
+    intersecting_triangle_counts: wp.array[int],
+    intersecting_triangle_offsets: wp.array[int],
+    collision_radius: float,
+    rest_shape_exclusion_radius: float,
+    max_depenetration_velocity: float,
+    dt: float,
+    relaxation: float,
+    prefer_shortest_local_exit: bool,
+    contact_counts: wp.array[int],
+    contact_normals: wp.array[wp.vec3],
+    contact_zero_normal_velocity: wp.array[int],
+    deltas: wp.array[wp.vec3],
+    split_deltas: wp.array[wp.vec3],
+):
+    """Recover exact triangle intersections missed by discrete feature proximity."""
+    triangle0 = wp.tid()
+    offset = intersecting_triangle_offsets[triangle0]
+    capacity = intersecting_triangle_offsets[triangle0 + 1] - offset
+    intersection_count = wp.min(intersecting_triangle_counts[triangle0], capacity)
+    for intersection_index in range(intersection_count):
+        triangle1 = intersecting_triangles[offset + intersection_index]
+        if triangle1 <= triangle0:
+            continue
+
+        a0_index = tri_indices[triangle0, 0]
+        a1_index = tri_indices[triangle0, 1]
+        a2_index = tri_indices[triangle0, 2]
+        b0_index = tri_indices[triangle1, 0]
+        b1_index = tri_indices[triangle1, 1]
+        b2_index = tri_indices[triangle1, 2]
+        if particle_world[a0_index] != particle_world[b0_index]:
+            continue
+        is_local_rest_pair = triangle_pair_is_rest_filtered(
+            particle_x_rest,
+            tri_indices,
+            triangle0,
+            triangle1,
+            rest_shape_exclusion_radius,
+        )
+        target_radius = collision_radius
+        if is_local_rest_pair:
+            # Nearby material triangles need inversion protection, but applying
+            # the full cloth thickness would inflate an undeformed local patch.
+            target_radius = 0.05 * collision_radius
+
+        a0 = particle_x[a0_index]
+        a1 = particle_x[a1_index]
+        a2 = particle_x[a2_index]
+        b0 = particle_x[b0_index]
+        b1 = particle_x[b1_index]
+        b2 = particle_x[b2_index]
+        a0_prev = particle_x_prev[a0_index]
+        a1_prev = particle_x_prev[a1_index]
+        a2_prev = particle_x_prev[a2_index]
+        b0_prev = particle_x_prev[b0_index]
+        b1_prev = particle_x_prev[b1_index]
+        b2_prev = particle_x_prev[b2_index]
+
+        if not wp.intersect_tri_tri(a0, a1, a2, b0, b1, b2):
+            continue
+
+        normal_a = wp.cross(a1 - a0, a2 - a0)
+        normal_b = wp.cross(b1 - b0, b2 - b0)
+        normal_a_prev = wp.cross(a1_prev - a0_prev, a2_prev - a0_prev)
+        normal_b_prev = wp.cross(b1_prev - b0_prev, b2_prev - b0_prev)
+        length_a = wp.length(normal_a)
+        length_b = wp.length(normal_b)
+        length_a_prev = wp.length(normal_a_prev)
+        length_b_prev = wp.length(normal_b_prev)
+        if length_a <= 1.0e-8 or length_b <= 1.0e-8:
+            continue
+        normal_a /= length_a
+        normal_b /= length_b
+        if length_a_prev > 1.0e-8:
+            normal_a_prev /= length_a_prev
+            if wp.dot(normal_a, normal_a_prev) < 0.0:
+                normal_a = -normal_a
+        else:
+            normal_a_prev = normal_a
+        if length_b_prev > 1.0e-8:
+            normal_b_prev /= length_b_prev
+            if wp.dot(normal_b, normal_b_prev) < 0.0:
+                normal_b = -normal_b
+        else:
+            normal_b_prev = normal_b
+
+        center_a_prev = (a0_prev + a1_prev + a2_prev) / 3.0
+        center_b_prev = (b0_prev + b1_prev + b2_prev) / 3.0
+        was_intersecting = wp.intersect_tri_tri(
+            a0_prev,
+            a1_prev,
+            a2_prev,
+            b0_prev,
+            b1_prev,
+            b2_prev,
+        )
+        use_shortest_local_exit = prefer_shortest_local_exit and is_local_rest_pair and was_intersecting
+        if not was_intersecting or is_local_rest_pair:
+            contact_zero_normal_velocity[offset + intersection_index] = 1
+        # Move each triangle back to the ordering from the beginning of the
+        # step. On the final iteration, a local pair that is still inverted has
+        # no useful historical ordering, so move it through the shorter exit.
+        side_a = 1.0
+        if wp.dot(center_a_prev - center_b_prev, normal_b_prev) < 0.0:
+            side_a = -1.0
+        distance_a0 = wp.dot(a0 - b0, normal_b)
+        distance_a1 = wp.dot(a1 - b0, normal_b)
+        distance_a2 = wp.dot(a2 - b0, normal_b)
+        shift_a = wp.max(target_radius - wp.min(distance_a0, wp.min(distance_a1, distance_a2)), 0.0)
+        if side_a < 0.0:
+            shift_a = wp.min(-target_radius - wp.max(distance_a0, wp.max(distance_a1, distance_a2)), 0.0)
+        if use_shortest_local_exit:
+            positive_shift = wp.max(
+                target_radius - wp.min(distance_a0, wp.min(distance_a1, distance_a2)),
+                0.0,
+            )
+            negative_shift = wp.min(
+                -target_radius - wp.max(distance_a0, wp.max(distance_a1, distance_a2)),
+                0.0,
+            )
+            if wp.abs(negative_shift) < wp.abs(positive_shift):
+                shift_a = negative_shift
+            else:
+                shift_a = positive_shift
+        relative_correction_a = normal_b * shift_a
+
+        # Candidate 1 moves B relative to A, then converts that motion to A-B.
+        side_b = 1.0
+        if wp.dot(center_b_prev - center_a_prev, normal_a_prev) < 0.0:
+            side_b = -1.0
+        distance_b0 = wp.dot(b0 - a0, normal_a)
+        distance_b1 = wp.dot(b1 - a0, normal_a)
+        distance_b2 = wp.dot(b2 - a0, normal_a)
+        shift_b = wp.max(target_radius - wp.min(distance_b0, wp.min(distance_b1, distance_b2)), 0.0)
+        if side_b < 0.0:
+            shift_b = wp.min(-target_radius - wp.max(distance_b0, wp.max(distance_b1, distance_b2)), 0.0)
+        if use_shortest_local_exit:
+            positive_shift = wp.max(
+                target_radius - wp.min(distance_b0, wp.min(distance_b1, distance_b2)),
+                0.0,
+            )
+            negative_shift = wp.min(
+                -target_radius - wp.max(distance_b0, wp.max(distance_b1, distance_b2)),
+                0.0,
+            )
+            if wp.abs(negative_shift) < wp.abs(positive_shift):
+                shift_b = negative_shift
+            else:
+                shift_b = positive_shift
+        relative_correction_b = -normal_a * shift_b
+
+        relative_correction = relative_correction_a
+        if wp.length_sq(relative_correction_b) < wp.length_sq(relative_correction_a):
+            relative_correction = relative_correction_b
+
+        correction_length = wp.length(relative_correction)
+        if correction_length <= 1.0e-8:
+            continue
+
+        # Exact recovery is an emergency depenetration path. Keep its configured
+        # cap even for a newly crossed pair: contact compression can make the
+        # apparent pair motion much larger than the physical separation needed,
+        # so using that motion as a correction limit creates positive feedback.
+        if max_depenetration_velocity >= 0.0:
+            max_correction = max_depenetration_velocity * dt
+            if correction_length > max_correction:
+                relative_correction *= max_correction / correction_length
+                correction_length = max_correction
+
+        normal = relative_correction / correction_length
+        contact_normals[offset + intersection_index] = normal
+
+        inverse_mass_sum = (
+            particle_invmass[a0_index]
+            + particle_invmass[a1_index]
+            + particle_invmass[a2_index]
+            + particle_invmass[b0_index]
+            + particle_invmass[b1_index]
+            + particle_invmass[b2_index]
+        )
+        if inverse_mass_sum <= 0.0:
+            continue
+        # A vertex shared by several intersecting pairs would otherwise receive
+        # each pair's full separation, and that overshoot creates new
+        # intersections faster than recovery removes them. A single shared
+        # Jacobi scale divides the work while keeping the impulse on the two
+        # triangles equal and opposite.
+        correction_count_sum = int(0)
+        all_indices = wp.vec3i(a0_index, a1_index, a2_index)
+        all_indices_b = wp.vec3i(b0_index, b1_index, b2_index)
+        for local_index in range(3):
+            correction_count_sum += wp.max(contact_counts[all_indices[local_index]], 1)
+            correction_count_sum += wp.max(contact_counts[all_indices_b[local_index]], 1)
+        jacobi_scale = 6.0 / float(correction_count_sum)
+        scale = 3.0 * relaxation * jacobi_scale / inverse_mass_sum
+        indices = wp.vec4i(a0_index, a1_index, a2_index, b0_index)
+        signs = wp.vec4(1.0, 1.0, 1.0, -1.0)
+        for local_index in range(4):
+            particle = indices[local_index]
+            correction = relative_correction * signs[local_index] * particle_invmass[particle] * scale
+            wp.atomic_add(deltas, particle, correction)
+            if was_intersecting and not is_local_rest_pair:
+                wp.atomic_add(split_deltas, particle, correction)
+        indices_b = wp.vec2i(b1_index, b2_index)
+        for local_index in range(2):
+            particle = indices_b[local_index]
+            correction = -relative_correction * particle_invmass[particle] * scale
+            wp.atomic_add(deltas, particle, correction)
+            if was_intersecting and not is_local_rest_pair:
+                wp.atomic_add(split_deltas, particle, correction)
+
+
+@wp.kernel
+def compute_particle_displacements(
+    particle_x_start: wp.array[wp.vec3],
+    particle_x_end: wp.array[wp.vec3],
+    displacements: wp.array[wp.vec3],
+):
+    """Compute particle trajectories for conservative self-contact truncation."""
+    particle = wp.tid()
+    displacements[particle] = particle_x_end[particle] - particle_x_start[particle]
+
+
+@wp.kernel
+def solve_triangle_intersection_self_contact_velocities(
+    particle_v: wp.array[wp.vec3],
+    particle_invmass: wp.array[float],
+    tri_indices: wp.array2d[int],
+    intersecting_triangles: wp.array[int],
+    intersecting_triangle_counts: wp.array[int],
+    intersecting_triangle_offsets: wp.array[int],
+    contact_counts: wp.array[int],
+    contact_normals: wp.array[wp.vec3],
+    contact_zero_normal_velocity: wp.array[int],
+    velocity_deltas: wp.array[wp.vec3],
+):
+    """Remove closing normal velocity after exact triangle-intersection recovery."""
+    triangle0 = wp.tid()
+    offset = intersecting_triangle_offsets[triangle0]
+    capacity = intersecting_triangle_offsets[triangle0 + 1] - offset
+    intersection_count = wp.min(intersecting_triangle_counts[triangle0], capacity)
+    for intersection_index in range(intersection_count):
+        triangle1 = intersecting_triangles[offset + intersection_index]
+        if triangle1 <= triangle0:
+            continue
+        normal = contact_normals[offset + intersection_index]
+        if wp.length_sq(normal) <= 0.0:
+            continue
+
+        a0 = tri_indices[triangle0, 0]
+        a1 = tri_indices[triangle0, 1]
+        a2 = tri_indices[triangle0, 2]
+        b0 = tri_indices[triangle1, 0]
+        b1 = tri_indices[triangle1, 1]
+        b2 = tri_indices[triangle1, 2]
+        velocity_a = (particle_v[a0] + particle_v[a1] + particle_v[a2]) / 3.0
+        velocity_b = (particle_v[b0] + particle_v[b1] + particle_v[b2]) / 3.0
+        closing_velocity = wp.dot(velocity_a - velocity_b, normal)
+        if closing_velocity >= 0.0 and contact_zero_normal_velocity[offset + intersection_index] == 0:
+            continue
+
+        inverse_mass_sum = (
+            particle_invmass[a0]
+            + particle_invmass[a1]
+            + particle_invmass[a2]
+            + particle_invmass[b0]
+            + particle_invmass[b1]
+            + particle_invmass[b2]
+        )
+        if inverse_mass_sum <= 0.0:
+            continue
+
+        indices = wp.vec4i(a0, a1, a2, b0)
+        signs = wp.vec4(1.0, 1.0, 1.0, -1.0)
+        for local_index in range(4):
+            particle = indices[local_index]
+            correction = (
+                -3.0
+                * particle_invmass[particle]
+                * signs[local_index]
+                * normal
+                * closing_velocity
+                / inverse_mass_sum
+                / float(wp.max(contact_counts[particle], 1))
+            )
+            wp.atomic_add(velocity_deltas, particle, correction)
+        indices_b = wp.vec2i(b1, b2)
+        for local_index in range(2):
+            particle = indices_b[local_index]
+            correction = (
+                3.0
+                * particle_invmass[particle]
+                * normal
+                * closing_velocity
+                / inverse_mass_sum
+                / float(wp.max(contact_counts[particle], 1))
+            )
+            wp.atomic_add(velocity_deltas, particle, correction)
+
+
+@wp.kernel
+def solve_vertex_triangle_self_contacts(
+    particle_x: wp.array[wp.vec3],
+    particle_x_prev: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
+    particle_invmass: wp.array[float],
+    tri_indices: wp.array2d[int],
+    collision_info_array: wp.array[TriMeshCollisionInfo],
+    collision_radius: float,
+    friction_coefficient: float,
+    max_depenetration_velocity: float,
+    dt: float,
+    relaxation: float,
+    contact_counts: wp.array[int],
+    lambdas: wp.array[float],
+    split_lambdas: wp.array[float],
+    friction_lambdas: wp.array[float],
+    deltas: wp.array[wp.vec3],
+    split_deltas: wp.array[wp.vec3],
+):
+    """Solve vertex-triangle cloth self-contact candidates."""
+    vertex = wp.tid()
+    collision_info = collision_info_array[0]
+    collision_count = get_vertex_colliding_triangles_count(collision_info, vertex)
+
+    for collision_index in range(collision_count):
+        triangle = get_vertex_colliding_triangles(collision_info, vertex, collision_index)
+        t0 = tri_indices[triangle, 0]
+        t1 = tri_indices[triangle, 1]
+        t2 = tri_indices[triangle, 2]
+        p = particle_x[vertex]
+        a = particle_x[t0]
+        b = particle_x[t1]
+        c = particle_x[t2]
+        closest, bary, _feature = triangle_closest_point(a, b, c, p)
+        diff = p - closest
+        distance = wp.length(diff)
+
+        p_prev = particle_x_prev[vertex]
+        a_prev = particle_x_prev[t0]
+        b_prev = particle_x_prev[t1]
+        c_prev = particle_x_prev[t2]
+        closest_prev = bary[0] * a_prev + bary[1] * b_prev + bary[2] * c_prev
+        diff_prev = p_prev - closest_prev
+
+        tri_normal = wp.cross(b - a, c - a)
+        tri_normal_prev = wp.cross(b_prev - a_prev, c_prev - a_prev)
+        normal_prev_length = wp.length(tri_normal_prev)
+        if normal_prev_length > 1.0e-8:
+            tri_normal_prev /= normal_prev_length
+        else:
+            tri_normal_prev = wp.vec3(0.0, 0.0, 1.0)
+
+        side = 1.0
+        if wp.dot(diff_prev, tri_normal_prev) < 0.0:
+            side = -1.0
+
+        normal_length = wp.length(tri_normal)
+        if normal_length > 1.0e-8:
+            tri_normal = tri_normal / normal_length * side
+        else:
+            tri_normal = tri_normal_prev * side
+
+        normal = tri_normal
+        if distance > 1.0e-8:
+            normal = diff / distance
+            if wp.dot(normal, tri_normal) < 0.0:
+                normal = -normal
+
+        signed_distance = wp.dot(diff, normal)
+        previous_distance = wp.length(diff_prev)
+        target_distance = collision_radius
+        if max_depenetration_velocity >= 0.0:
+            target_distance = wp.min(collision_radius, previous_distance + max_depenetration_velocity * dt)
+
+        weights = wp.vec4(1.0, -bary[0], -bary[1], -bary[2])
+        indices = wp.vec4i(vertex, t0, t1, t2)
+        denominator = float(0.0)
+        # A shared Jacobi scale preserves the equal-and-opposite impulse when
+        # the four vertices have different contact valences.
+        correction_count_sum = int(0)
+        for local_index in range(4):
+            particle = indices[local_index]
+            weighted_inverse_mass = particle_invmass[particle] * weights[local_index] * weights[local_index]
+            denominator += weighted_inverse_mass
+            correction_count_sum += wp.max(contact_counts[particle], 1)
+        jacobi_scale = 4.0 / float(correction_count_sum)
+        split_denominator = denominator * jacobi_scale
+
+        lambda_index = collision_info.vertex_colliding_triangles_offsets[vertex] + collision_index
+        lambda_old = lambdas[lambda_index]
+        constraint = signed_distance - target_distance
+        if denominator > 0.0 and (constraint < 0.0 or lambda_old > 0.0):
+            dlambda = -constraint / denominator
+            lambda_new = wp.max(lambda_old + dlambda, 0.0)
+            dlambda = (lambda_new - lambda_old) * relaxation
+            lambda_new = lambda_old + dlambda
+            lambdas[lambda_index] = lambda_new
+
+            recovery_distance = wp.max(target_distance - previous_distance, 0.0)
+            split_lambda_new = wp.min(lambda_new, recovery_distance / split_denominator)
+            split_dlambda = split_lambda_new - split_lambdas[lambda_index]
+            split_lambdas[lambda_index] = split_lambda_new
+
+            relative_displacement = p - p_prev
+            relative_displacement -= bary[0] * (a - a_prev)
+            relative_displacement -= bary[1] * (b - b_prev)
+            relative_displacement -= bary[2] * (c - c_prev)
+            tangent_displacement = relative_displacement - normal * wp.dot(relative_displacement, normal)
+            tangent_distance = wp.length(tangent_displacement)
+            tangent_impulse = wp.vec3(0.0)
+            if tangent_distance > 1.0e-8 and friction_coefficient > 0.0:
+                # Accumulate over the step and apply only the increment, so the
+                # tangential impulse is bounded by mu * lambda_n once per step
+                # instead of once per iteration.
+                friction_lambda_old = friction_lambdas[lambda_index]
+                friction_lambda_new = wp.min(
+                    friction_lambda_old + tangent_distance / denominator * relaxation,
+                    friction_coefficient * lambda_new,
+                )
+                friction_lambda_new = wp.max(friction_lambda_new, friction_lambda_old)
+                friction_lambdas[lambda_index] = friction_lambda_new
+                tangent_impulse = -tangent_displacement / tangent_distance * (friction_lambda_new - friction_lambda_old)
+
+            impulse = normal * dlambda + tangent_impulse
+            for local_index in range(4):
+                particle = indices[local_index]
+                correction = particle_invmass[particle] * weights[local_index] * impulse * jacobi_scale
+                cap_scale = 1.0
+                correction_length = wp.length(correction)
+                max_correction = 0.25 * collision_radius
+                if max_depenetration_velocity >= 0.0:
+                    max_correction = max_depenetration_velocity * dt
+                if correction_length > max_correction and correction_length > 0.0:
+                    cap_scale = max_correction / correction_length
+                    correction *= cap_scale
+                wp.atomic_add(deltas, particle, correction)
+                if split_dlambda != 0.0:
+                    split_correction = (
+                        particle_invmass[particle]
+                        * weights[local_index]
+                        * normal
+                        * split_dlambda
+                        * jacobi_scale
+                        * cap_scale
+                    )
+                    wp.atomic_add(split_deltas, particle, split_correction)
+
+
+@wp.kernel
+def solve_edge_edge_self_contacts(
+    particle_x: wp.array[wp.vec3],
+    particle_x_prev: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
+    particle_invmass: wp.array[float],
+    edge_indices: wp.array2d[int],
+    collision_info_array: wp.array[TriMeshCollisionInfo],
+    collision_radius: float,
+    friction_coefficient: float,
+    max_depenetration_velocity: float,
+    edge_parallel_epsilon: float,
+    dt: float,
+    relaxation: float,
+    contact_counts: wp.array[int],
+    lambdas: wp.array[float],
+    split_lambdas: wp.array[float],
+    friction_lambdas: wp.array[float],
+    deltas: wp.array[wp.vec3],
+    split_deltas: wp.array[wp.vec3],
+):
+    """Solve unique edge-edge cloth self-contact candidates."""
+    edge0 = wp.tid()
+    collision_info = collision_info_array[0]
+    collision_count = get_edge_colliding_edges_count(collision_info, edge0)
+
+    for collision_index in range(collision_count):
+        edge1 = get_edge_colliding_edges(collision_info, edge0, collision_index)
+        if edge1 <= edge0:
+            continue
+
+        e00 = edge_indices[edge0, 2]
+        e01 = edge_indices[edge0, 3]
+        e10 = edge_indices[edge1, 2]
+        e11 = edge_indices[edge1, 3]
+        x00 = particle_x[e00]
+        x01 = particle_x[e01]
+        x10 = particle_x[e10]
+        x11 = particle_x[e11]
+        closest_parameters = wp.closest_point_edge_edge(x00, x01, x10, x11, edge_parallel_epsilon)
+        s = closest_parameters[0]
+        t = closest_parameters[1]
+        point0 = x00 + (x01 - x00) * s
+        point1 = x10 + (x11 - x10) * t
+        diff = point0 - point1
+        distance = wp.length(diff)
+
+        x00_prev = particle_x_prev[e00]
+        x01_prev = particle_x_prev[e01]
+        x10_prev = particle_x_prev[e10]
+        x11_prev = particle_x_prev[e11]
+        point0_prev = x00_prev + (x01_prev - x00_prev) * s
+        point1_prev = x10_prev + (x11_prev - x10_prev) * t
+        diff_prev = point0_prev - point1_prev
+        previous_distance = wp.length(diff_prev)
+
+        normal = wp.vec3(0.0, 0.0, 1.0)
+        if distance > 1.0e-8:
+            normal = diff / distance
+            if previous_distance > 1.0e-8 and wp.dot(normal, diff_prev) < 0.0:
+                normal = -normal
+        elif previous_distance > 1.0e-8:
+            normal = diff_prev / previous_distance
+
+        signed_distance = wp.dot(diff, normal)
+        target_distance = collision_radius
+        if max_depenetration_velocity >= 0.0:
+            target_distance = wp.min(collision_radius, previous_distance + max_depenetration_velocity * dt)
+
+        weights = wp.vec4(1.0 - s, s, -1.0 + t, -t)
+        indices = wp.vec4i(e00, e01, e10, e11)
+        denominator = float(0.0)
+        # Per-vertex divisors inject momentum when the two edges have
+        # different contact valences.
+        correction_count_sum = int(0)
+        for local_index in range(4):
+            particle = indices[local_index]
+            weighted_inverse_mass = particle_invmass[particle] * weights[local_index] * weights[local_index]
+            denominator += weighted_inverse_mass
+            correction_count_sum += wp.max(contact_counts[particle], 1)
+        jacobi_scale = 4.0 / float(correction_count_sum)
+        split_denominator = denominator * jacobi_scale
+
+        lambda_index = collision_info.edge_colliding_edges_offsets[edge0] + collision_index
+        lambda_old = lambdas[lambda_index]
+        constraint = signed_distance - target_distance
+        if denominator > 0.0 and (constraint < 0.0 or lambda_old > 0.0):
+            dlambda = -constraint / denominator
+            lambda_new = wp.max(lambda_old + dlambda, 0.0)
+            dlambda = (lambda_new - lambda_old) * relaxation
+            lambda_new = lambda_old + dlambda
+            lambdas[lambda_index] = lambda_new
+
+            recovery_distance = wp.max(target_distance - previous_distance, 0.0)
+            split_lambda_new = wp.min(lambda_new, recovery_distance / split_denominator)
+            split_dlambda = split_lambda_new - split_lambdas[lambda_index]
+            split_lambdas[lambda_index] = split_lambda_new
+
+            relative_displacement = (point0 - point0_prev) - (point1 - point1_prev)
+            tangent_displacement = relative_displacement - normal * wp.dot(relative_displacement, normal)
+            tangent_distance = wp.length(tangent_displacement)
+            tangent_impulse = wp.vec3(0.0)
+            if tangent_distance > 1.0e-8 and friction_coefficient > 0.0:
+                # Accumulate over the step and apply only the increment, so the
+                # tangential impulse is bounded by mu * lambda_n once per step
+                # instead of once per iteration.
+                friction_lambda_old = friction_lambdas[lambda_index]
+                friction_lambda_new = wp.min(
+                    friction_lambda_old + tangent_distance / denominator * relaxation,
+                    friction_coefficient * lambda_new,
+                )
+                friction_lambda_new = wp.max(friction_lambda_new, friction_lambda_old)
+                friction_lambdas[lambda_index] = friction_lambda_new
+                tangent_impulse = -tangent_displacement / tangent_distance * (friction_lambda_new - friction_lambda_old)
+
+            impulse = normal * dlambda + tangent_impulse
+            for local_index in range(4):
+                particle = indices[local_index]
+                correction = particle_invmass[particle] * weights[local_index] * impulse * jacobi_scale
+                cap_scale = 1.0
+                correction_length = wp.length(correction)
+                max_correction = 0.25 * collision_radius
+                if max_depenetration_velocity >= 0.0:
+                    max_correction = max_depenetration_velocity * dt
+                if correction_length > max_correction and correction_length > 0.0:
+                    cap_scale = max_correction / correction_length
+                    correction *= cap_scale
+                wp.atomic_add(deltas, particle, correction)
+                if split_dlambda != 0.0:
+                    split_correction = (
+                        particle_invmass[particle]
+                        * weights[local_index]
+                        * normal
+                        * split_dlambda
+                        * jacobi_scale
+                        * cap_scale
+                    )
+                    wp.atomic_add(split_deltas, particle, split_correction)
+
+
+@wp.kernel
+def solve_vertex_triangle_self_contact_velocities(
+    particle_x: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
+    particle_invmass: wp.array[float],
+    tri_indices: wp.array2d[int],
+    collision_info_array: wp.array[TriMeshCollisionInfo],
+    friction_coefficient: float,
+    dt: float,
+    relaxation: float,
+    contact_counts: wp.array[int],
+    lambdas: wp.array[float],
+    friction_lambdas: wp.array[float],
+    velocity_deltas: wp.array[wp.vec3],
+):
+    """Stabilize normal motion and apply cloth self-contact friction."""
+    vertex = wp.tid()
+    collision_info = collision_info_array[0]
+    collision_count = get_vertex_colliding_triangles_count(collision_info, vertex)
+
+    for collision_index in range(collision_count):
+        lambda_index = collision_info.vertex_colliding_triangles_offsets[vertex] + collision_index
+        normal_support = lambdas[lambda_index] / dt
+        if normal_support <= 0.0:
+            continue
+        # The Coulomb budget is per step, not per pass: subtract what the
+        # positional solve already spent instead of granting a second full one.
+        friction_budget = (
+            wp.max(friction_coefficient * lambdas[lambda_index] - friction_lambdas[lambda_index], 0.0) / dt
+        )
+
+        triangle = get_vertex_colliding_triangles(collision_info, vertex, collision_index)
+        t0 = tri_indices[triangle, 0]
+        t1 = tri_indices[triangle, 1]
+        t2 = tri_indices[triangle, 2]
+        closest, bary, _feature = triangle_closest_point(
+            particle_x[t0], particle_x[t1], particle_x[t2], particle_x[vertex]
+        )
+        diff = particle_x[vertex] - closest
+        distance = wp.length(diff)
+        if distance <= 1.0e-8:
+            diff = wp.cross(particle_x[t1] - particle_x[t0], particle_x[t2] - particle_x[t0])
+            distance = wp.length(diff)
+            if distance <= 1.0e-8:
+                continue
+        normal = diff / distance
+
+        weights = wp.vec4(1.0, -bary[0], -bary[1], -bary[2])
+        indices = wp.vec4i(vertex, t0, t1, t2)
+        relative_velocity = wp.vec3(0.0)
+        denominator = float(0.0)
+        correction_count_sum = int(0)
+        for local_index in range(4):
+            particle = indices[local_index]
+            weight = weights[local_index]
+            relative_velocity += weight * particle_v[particle]
+            denominator += particle_invmass[particle] * weight * weight
+            correction_count_sum += wp.max(contact_counts[particle], 1)
+        if denominator <= 0.0:
+            continue
+
+        normal_velocity = wp.dot(relative_velocity, normal)
+        impulse = wp.vec3(0.0)
+        if normal_velocity < 0.0:
+            impulse = -normal * normal_velocity / denominator
+        tangent_velocity = relative_velocity - normal * normal_velocity
+        tangent_speed = wp.length(tangent_velocity)
+        if tangent_speed > 1.0e-8 and friction_coefficient > 0.0:
+            tangent_impulse = wp.min(
+                tangent_speed / denominator,
+                friction_budget,
+            )
+            impulse -= tangent_velocity / tangent_speed * tangent_impulse
+        impulse *= relaxation
+
+        for local_index in range(4):
+            particle = indices[local_index]
+            wp.atomic_add(
+                velocity_deltas,
+                particle,
+                particle_invmass[particle] * weights[local_index] * impulse * 4.0 / float(correction_count_sum),
+            )
+
+
+@wp.kernel
+def solve_edge_edge_self_contact_velocities(
+    particle_x: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
+    particle_invmass: wp.array[float],
+    edge_indices: wp.array2d[int],
+    collision_info_array: wp.array[TriMeshCollisionInfo],
+    friction_coefficient: float,
+    edge_parallel_epsilon: float,
+    dt: float,
+    relaxation: float,
+    contact_counts: wp.array[int],
+    lambdas: wp.array[float],
+    friction_lambdas: wp.array[float],
+    velocity_deltas: wp.array[wp.vec3],
+):
+    """Stabilize normal motion and apply edge-edge self-contact friction."""
+    edge0 = wp.tid()
+    collision_info = collision_info_array[0]
+    collision_count = get_edge_colliding_edges_count(collision_info, edge0)
+
+    for collision_index in range(collision_count):
+        edge1 = get_edge_colliding_edges(collision_info, edge0, collision_index)
+        if edge1 <= edge0:
+            continue
+        lambda_index = collision_info.edge_colliding_edges_offsets[edge0] + collision_index
+        normal_support = lambdas[lambda_index] / dt
+        if normal_support <= 0.0:
+            continue
+        # The Coulomb budget is per step, not per pass: subtract what the
+        # positional solve already spent instead of granting a second full one.
+        friction_budget = (
+            wp.max(friction_coefficient * lambdas[lambda_index] - friction_lambdas[lambda_index], 0.0) / dt
+        )
+
+        e00 = edge_indices[edge0, 2]
+        e01 = edge_indices[edge0, 3]
+        e10 = edge_indices[edge1, 2]
+        e11 = edge_indices[edge1, 3]
+        closest_parameters = wp.closest_point_edge_edge(
+            particle_x[e00],
+            particle_x[e01],
+            particle_x[e10],
+            particle_x[e11],
+            edge_parallel_epsilon,
+        )
+        s = closest_parameters[0]
+        t = closest_parameters[1]
+        point0 = particle_x[e00] + (particle_x[e01] - particle_x[e00]) * s
+        point1 = particle_x[e10] + (particle_x[e11] - particle_x[e10]) * t
+        diff = point0 - point1
+        distance = wp.length(diff)
+        if distance <= 1.0e-8:
+            continue
+        normal = diff / distance
+
+        weights = wp.vec4(1.0 - s, s, -1.0 + t, -t)
+        indices = wp.vec4i(e00, e01, e10, e11)
+        relative_velocity = wp.vec3(0.0)
+        denominator = float(0.0)
+        correction_count_sum = int(0)
+        for local_index in range(4):
+            particle = indices[local_index]
+            weight = weights[local_index]
+            relative_velocity += weight * particle_v[particle]
+            denominator += particle_invmass[particle] * weight * weight
+            correction_count_sum += wp.max(contact_counts[particle], 1)
+        if denominator <= 0.0:
+            continue
+
+        normal_velocity = wp.dot(relative_velocity, normal)
+        impulse = wp.vec3(0.0)
+        if normal_velocity < 0.0:
+            impulse = -normal * normal_velocity / denominator
+        tangent_velocity = relative_velocity - normal * normal_velocity
+        tangent_speed = wp.length(tangent_velocity)
+        if tangent_speed > 1.0e-8 and friction_coefficient > 0.0:
+            tangent_impulse = wp.min(
+                tangent_speed / denominator,
+                friction_budget,
+            )
+            impulse -= tangent_velocity / tangent_speed * tangent_impulse
+        impulse *= relaxation
+
+        for local_index in range(4):
+            particle = indices[local_index]
+            wp.atomic_add(
+                velocity_deltas,
+                particle,
+                particle_invmass[particle] * weights[local_index] * impulse * 4.0 / float(correction_count_sum),
+            )
+
+
+@wp.kernel
+def apply_particle_velocity_deltas(
+    particle_flags: wp.array[wp.int32],
+    deltas: wp.array[wp.vec3],
+    static_friction_limits: wp.array[wp.vec4],
+    max_velocity: float,
+    particle_qd: wp.array[wp.vec3],
+):
+    """Apply a post-position particle velocity correction."""
+    particle = wp.tid()
+    if (particle_flags[particle] & ParticleFlags.ACTIVE) != 0:
+        velocity = particle_qd[particle] + deltas[particle]
+        static_limit = static_friction_limits[particle]
+        capacity = static_limit[3]
+        normal_sum = wp.vec3(static_limit[0], static_limit[1], static_limit[2])
+        coherent_capacity = wp.length(normal_sum)
+        if capacity > 0.0 and coherent_capacity > 0.95 * capacity:
+            normal = normal_sum / coherent_capacity
+            tangent_velocity = velocity - normal * wp.dot(normal, velocity)
+            tangent_speed = wp.length(tangent_velocity)
+            if tangent_speed <= coherent_capacity + 1.0e-8:
+                velocity -= tangent_velocity
+        speed = wp.length(velocity)
+        if speed > max_velocity:
+            velocity *= max_velocity / speed
+        particle_qd[particle] = velocity
+
+
+@wp.kernel
+def remove_particle_split_velocity(
+    particle_flags: wp.array[wp.int32],
+    particle_qd_prev: wp.array[wp.vec3],
+    split_deltas: wp.array[wp.vec3],
+    dt: float,
+    particle_qd: wp.array[wp.vec3],
+):
+    """Remove only velocity changes caused by overlap recovery."""
+    particle = wp.tid()
+    if (particle_flags[particle] & ParticleFlags.ACTIVE) != 0:
+        split_velocity = split_deltas[particle] / dt
+        split_speed_sq = wp.length_sq(split_velocity)
+        if split_speed_sq > 0.0:
+            velocity_change = particle_qd[particle] - particle_qd_prev[particle]
+            scale = wp.clamp(wp.dot(velocity_change, split_velocity) / split_speed_sq, 0.0, 1.0)
+            particle_qd[particle] -= scale * split_velocity
+
+
+@wp.kernel
+def remove_body_split_velocity(
+    body_qd_prev: wp.array[wp.spatial_vector],
+    split_velocity_deltas: wp.array[wp.spatial_vector],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Remove only body velocity changes caused by overlap recovery."""
+    body = wp.tid()
+    split_velocity = split_velocity_deltas[body]
+    split_linear = wp.spatial_top(split_velocity)
+    split_angular = wp.spatial_bottom(split_velocity)
+    split_speed_sq = wp.length_sq(split_linear) + wp.length_sq(split_angular)
+    if split_speed_sq > 0.0:
+        velocity_change = body_qd[body] - body_qd_prev[body]
+        change_linear = wp.spatial_top(velocity_change)
+        change_angular = wp.spatial_bottom(velocity_change)
+        projected_change = wp.dot(change_linear, split_linear) + wp.dot(change_angular, split_angular)
+        scale = wp.clamp(projected_change / split_speed_sq, 0.0, 1.0)
+        body_qd[body] -= scale * split_velocity
 
 
 @wp.kernel
@@ -378,13 +1844,34 @@ def solve_springs(
 
 
 @wp.kernel
+def count_bending_constraints(
+    indices: wp.array2d[int],
+    counts: wp.array[int],
+):
+    """Count valid dihedral constraints incident on each particle."""
+    tid = wp.tid()
+    i = indices[tid, 0]
+    j = indices[tid, 1]
+    k = indices[tid, 2]
+    l = indices[tid, 3]
+    if i == -1 or j == -1 or k == -1 or l == -1:
+        return
+    wp.atomic_add(counts, i, 1)
+    wp.atomic_add(counts, j, 1)
+    wp.atomic_add(counts, k, 1)
+    wp.atomic_add(counts, l, 1)
+
+
+@wp.kernel
 def bending_constraint(
     x: wp.array[wp.vec3],
     v: wp.array[wp.vec3],
     invmass: wp.array[float],
     indices: wp.array2d[int],
     rest: wp.array[float],
+    rest_length: wp.array[float],
     bending_properties: wp.array2d[float],
+    particle_bending_constraint_counts: wp.array[int],
     dt: float,
     lambdas: wp.array[float],
     delta: wp.array[wp.vec3],
@@ -392,8 +1879,8 @@ def bending_constraint(
     tid = wp.tid()
     eps = 1.0e-6
 
-    ke = bending_properties[tid, 0]
-    kd = bending_properties[tid, 1]
+    ke = bending_properties[tid, 0] * rest_length[tid]
+    kd = bending_properties[tid, 1] * rest_length[tid]
 
     i = indices[tid, 0]
     j = indices[tid, 1]
@@ -441,11 +1928,17 @@ def bending_constraint(
     theta = wp.atan2(sin_theta, cos_theta)
 
     c = theta - rest_angle
+    if c > wp.pi:
+        c -= 2.0 * wp.pi
+    elif c < -wp.pi:
+        c += 2.0 * wp.pi
 
-    grad_x1 = -n1_hat * e_length
-    grad_x2 = -n2_hat * e_length
-    grad_x3 = -n1_hat * wp.dot(x1 - x4, e_hat) - n2_hat * wp.dot(x2 - x4, e_hat)
-    grad_x4 = -n1_hat * wp.dot(x3 - x1, e_hat) - n2_hat * wp.dot(x3 - x2, e_hat)
+    # Closed-form derivatives of the signed dihedral angle. These are
+    # algebraically equivalent to differentiating the normalized face normals.
+    grad_x1 = -n1_hat * e_length / n1_length
+    grad_x2 = -n2_hat * e_length / n2_length
+    grad_x3 = -n1_hat * wp.dot(x1 - x4, e_hat) / n1_length - n2_hat * wp.dot(x2 - x4, e_hat) / n2_length
+    grad_x4 = -n1_hat * wp.dot(x3 - x1, e_hat) / n1_length - n2_hat * wp.dot(x3 - x2, e_hat) / n2_length
 
     denominator = (
         w1 * wp.length_sq(grad_x1)
@@ -465,17 +1958,160 @@ def bending_constraint(
 
     dlambda = -1.0 * (c + alpha * lambdas[tid] + gamma * grad_dot_v) / ((1.0 + gamma) * denominator + alpha)
 
-    delta0 = w1 * dlambda * grad_x1
-    delta1 = w2 * dlambda * grad_x2
-    delta2 = w3 * dlambda * grad_x3
-    delta3 = w4 * dlambda * grad_x4
+    count0 = wp.max(particle_bending_constraint_counts[i], 1)
+    count1 = wp.max(particle_bending_constraint_counts[j], 1)
+    count2 = wp.max(particle_bending_constraint_counts[k], 1)
+    count3 = wp.max(particle_bending_constraint_counts[l], 1)
+    delta0 = w1 * dlambda * grad_x1 / float(wp.max(count0, 1))
+    delta1 = w2 * dlambda * grad_x2 / float(wp.max(count1, 1))
+    delta2 = w3 * dlambda * grad_x3 / float(wp.max(count2, 1))
+    delta3 = w4 * dlambda * grad_x4 / float(wp.max(count3, 1))
 
-    lambdas[tid] = lambdas[tid] + dlambda
+    # Jacobi averaging attenuates each particle correction by its incident
+    # constraint count. Apply the same effective relaxation to the persistent
+    # multiplier; otherwise the compliance term records a correction that was
+    # never applied and suppresses all subsequent bending iterations.
+    normalized_denominator = (
+        w1 * wp.length_sq(grad_x1) / float(count0)
+        + w2 * wp.length_sq(grad_x2) / float(count1)
+        + w3 * wp.length_sq(grad_x3) / float(count2)
+        + w4 * wp.length_sq(grad_x4) / float(count3)
+    )
+    lambdas[tid] = lambdas[tid] + dlambda * normalized_denominator / denominator
 
     wp.atomic_add(delta, i, delta0)
     wp.atomic_add(delta, j, delta1)
     wp.atomic_add(delta, k, delta2)
     wp.atomic_add(delta, l, delta3)
+
+
+@wp.kernel
+def solve_triangles(
+    x: wp.array[wp.vec3],
+    v: wp.array[wp.vec3],
+    inv_mass: wp.array[float],
+    indices: wp.array2d[int],
+    rest_pose: wp.array[wp.mat22],
+    rest_area: wp.array[float],
+    materials: wp.array2d[float],
+    vertex_triangle_adjacency_offsets: wp.array[int],
+    dt: float,
+    relaxation: float,
+    lambdas: wp.array2d[float],
+    delta: wp.array[wp.vec3],
+):
+    """Solve isotropic membrane strain constraints for one triangle."""
+    tid = wp.tid()
+
+    i = indices[tid, 0]
+    j = indices[tid, 1]
+    k = indices[tid, 2]
+
+    x0 = x[i]
+    x1 = x[j]
+    x2 = x[k]
+
+    v0 = v[i]
+    v1 = v[j]
+    v2 = v[k]
+
+    w0 = inv_mass[i]
+    w1 = inv_mass[j]
+    w2 = inv_mass[k]
+
+    pose = rest_pose[tid]
+    d10 = pose[0, 0]
+    d11 = pose[0, 1]
+    d20 = pose[1, 0]
+    d21 = pose[1, 1]
+
+    x10 = x1 - x0
+    x20 = x2 - x0
+    f0 = x10 * d10 + x20 * d20
+    f1 = x10 * d11 + x20 * d21
+
+    # Green strain is split into one trace and two deviatoric constraints:
+    #
+    #   C_trace = E00 + E11
+    #   C_diff  = E00 - E11
+    #   C_shear = 2 E01
+    #
+    # This diagonalizes the isotropic St. Venant-Kirchhoff membrane energy,
+    # giving stiffnesses lambda + mu, mu, and mu, respectively.
+    e00 = 0.5 * (wp.dot(f0, f0) - 1.0)
+    e11 = 0.5 * (wp.dot(f1, f1) - 1.0)
+    e01_2 = wp.dot(f0, f1)
+
+    df0_0 = -d10 - d20
+    df0_1 = d10
+    df0_2 = d20
+    df1_0 = -d11 - d21
+    df1_1 = d11
+    df1_2 = d21
+
+    grad_e00_0 = f0 * df0_0
+    grad_e00_1 = f0 * df0_1
+    grad_e00_2 = f0 * df0_2
+    grad_e11_0 = f1 * df1_0
+    grad_e11_1 = f1 * df1_1
+    grad_e11_2 = f1 * df1_2
+
+    k_mu = materials[tid, 0]
+    k_lambda = materials[tid, 1]
+    k_damp = materials[tid, 2]
+    area = rest_area[tid]
+
+    constraint = float(0.0)
+    stiffness = float(0.0)
+    grad0 = wp.vec3(0.0)
+    grad1 = wp.vec3(0.0)
+    grad2 = wp.vec3(0.0)
+
+    for term in range(3):
+        if term == 0:
+            constraint = e00 + e11
+            stiffness = area * (k_lambda + k_mu)
+            grad0 = grad_e00_0 + grad_e11_0
+            grad1 = grad_e00_1 + grad_e11_1
+            grad2 = grad_e00_2 + grad_e11_2
+        elif term == 1:
+            constraint = e00 - e11
+            stiffness = area * k_mu
+            grad0 = grad_e00_0 - grad_e11_0
+            grad1 = grad_e00_1 - grad_e11_1
+            grad2 = grad_e00_2 - grad_e11_2
+        else:
+            constraint = e01_2
+            stiffness = area * k_mu
+            grad0 = f1 * df0_0 + f0 * df1_0
+            grad1 = f1 * df0_1 + f0 * df1_1
+            grad2 = f1 * df0_2 + f0 * df1_2
+
+        denominator = w0 * wp.length_sq(grad0) + w1 * wp.length_sq(grad1) + w2 * wp.length_sq(grad2)
+        if stiffness > 0.0 and denominator > 0.0:
+            alpha = 1.0 / (stiffness * dt * dt)
+            gamma = wp.max(k_damp, 0.0) * area / (stiffness * dt)
+            grad_dot_v = dt * (wp.dot(grad0, v0) + wp.dot(grad1, v1) + wp.dot(grad2, v2))
+            dlambda = -(constraint + alpha * lambdas[tid, term] + gamma * grad_dot_v) / (
+                (1.0 + gamma) * denominator + alpha
+            )
+            dlambda *= relaxation
+
+            count0 = (vertex_triangle_adjacency_offsets[i + 1] - vertex_triangle_adjacency_offsets[i]) >> 1
+            count1 = (vertex_triangle_adjacency_offsets[j + 1] - vertex_triangle_adjacency_offsets[j]) >> 1
+            count2 = (vertex_triangle_adjacency_offsets[k + 1] - vertex_triangle_adjacency_offsets[k]) >> 1
+            count0 = wp.max(count0, 1)
+            count1 = wp.max(count1, 1)
+            count2 = wp.max(count2, 1)
+            normalized_denominator = (
+                w0 * wp.length_sq(grad0) / float(count0)
+                + w1 * wp.length_sq(grad1) / float(count1)
+                + w2 * wp.length_sq(grad2) / float(count2)
+            )
+            lambdas[tid, term] = lambdas[tid, term] + dlambda * normalized_denominator / denominator
+            wp.atomic_add(delta, i, w0 * dlambda * grad0 / float(count0))
+            wp.atomic_add(delta, j, w1 * dlambda * grad1 / float(count1))
+            wp.atomic_add(delta, k, w2 * dlambda * grad2 / float(count2))
 
 
 @wp.kernel

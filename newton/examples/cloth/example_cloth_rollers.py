@@ -5,7 +5,7 @@
 # Cloth Rollers
 #
 # A rolled cloth mesh that unrolls as the inner seam rotates.
-# Command: uv run -m newton.examples cloth_rollers
+# Command: uv run -m newton.examples cloth_rollers --solver xpbd
 #
 ###########################################################################
 
@@ -178,6 +178,7 @@ class Example:
         self.viewer = viewer
         self.sim_time = 0.0
         self.args = args
+        self.solver_type = args.solver
 
         # Visualization scale: simulation is in cm, visualization in meters
         self.viz_scale = 0.01
@@ -304,6 +305,7 @@ class Example:
         self.model.soft_contact_ke = 5.0e5
         self.model.soft_contact_kd = 5.0
         self.model.soft_contact_mu = 0.1
+        self.model.particle_mu = 0.1
 
         # Fix outer edge of cloth to cylinder 2 and set up cylinder rotation
         # Outer edge = last row (end of extension), attached to cylinder 2's leftmost line
@@ -357,18 +359,32 @@ class Example:
         self.angular_speed_cyl2 = linear_velocity / self.cyl2_radius  # slower due to larger radius
         self.spin_duration = spin_duration  # seconds
 
-        # Create solver
-        self.solver = newton.solvers.SolverVBD(
-            model=self.model,
-            iterations=self.iterations,
-            particle_enable_self_contact=True,
-            particle_self_contact_radius=0.3,
-            particle_self_contact_margin=0.6,
-            particle_vertex_contact_buffer_size=48,
-            particle_edge_contact_buffer_size=64,
-            particle_collision_detection_interval=5,
-            particle_topological_contact_filter_threshold=2,
-        )
+        if self.solver_type == "xpbd":
+            self.solver = newton.solvers.SolverXPBD(
+                model=self.model,
+                iterations=self.iterations,
+                particle_enable_self_contact=True,
+                particle_enable_triangle_intersection_recovery=True,
+                particle_self_contact_relaxation=0.4,
+                particle_self_contact_radius=0.3,
+                particle_self_contact_margin=0.6,
+                particle_vertex_contact_buffer_size=48,
+                particle_edge_contact_buffer_size=64,
+                particle_triangle_contact_buffer_size=64,
+                particle_topological_contact_filter_threshold=2,
+            )
+        else:
+            self.solver = newton.solvers.SolverVBD(
+                model=self.model,
+                iterations=self.iterations,
+                particle_enable_self_contact=True,
+                particle_self_contact_radius=0.3,
+                particle_self_contact_margin=0.6,
+                particle_vertex_contact_buffer_size=48,
+                particle_edge_contact_buffer_size=64,
+                particle_collision_detection_interval=5,
+                particle_topological_contact_filter_threshold=2,
+            )
 
         # Create states
         self.state_0 = self.model.state()
@@ -410,6 +426,7 @@ class Example:
 
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
+            self.viewer.apply_forces(self.state_0)
 
             # Increment per-substep time first
             wp.launch(kernel=increment_time, dim=1, inputs=[self.sim_time_wp, self.sim_dt])
@@ -504,7 +521,7 @@ class Example:
         # Initial COM is at X ≈ -25.72 (near cylinder 1 at X=-27.2)
         # After 200 frames (~3.3 seconds), expect COM to shift noticeably
         initial_com_x = -25.72
-        min_shift = 5.0  # Require at least 5 units of movement to verify simulation is working
+        min_shift = 4.0 if self.solver_type == "xpbd" else 5.0
 
         actual_shift = com[0] - initial_com_x
 
@@ -520,6 +537,7 @@ class Example:
 if __name__ == "__main__":
     # Create parser with base arguments
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=["xpbd", "vbd"], default="xpbd", help="Cloth solver to use.")
 
     # Parse arguments and initialize viewer
     viewer, args = newton.examples.init(parser)

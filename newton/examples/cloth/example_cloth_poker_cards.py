@@ -14,7 +14,7 @@
 # - Height: 8.89 cm (3.5 inches) = 0.0889 m
 # - Resolution: 4x6 cells per card
 #
-# Command: uv run -m newton.examples cloth_poker_cards
+# Command: uv run -m newton.examples cloth_poker_cards --solver xpbd
 #
 ###########################################################################
 
@@ -28,6 +28,7 @@ import newton.examples
 class Example:
     def __init__(self, viewer, args):
         newton.use_coord_layout_targets = True
+        self.solver_type = args.solver
         self.viewer = viewer
         self.sim_time = 0.0
 
@@ -188,19 +189,36 @@ class Example:
         self.model.soft_contact_ke = 1.0e5  # Contact stiffness
         self.model.soft_contact_kd = 1.0e2  # Contact damping
         self.model.soft_contact_mu = 0.3  # Friction coefficient
+        self.model.particle_mu = 0.3
+        self.model.shape_material_ka.zero_()
 
-        # Create VBD solver with self-contact enabled
-        self.solver = newton.solvers.SolverVBD(
-            model=self.model,
-            iterations=self.iterations,
-            rigid_compliant_alm=True,
-            particle_enable_self_contact=True,
-            particle_self_contact_radius=0.001,  # m (0.1 cm)
-            particle_self_contact_margin=0.0015,  # m (0.15 cm)
-            particle_topological_contact_filter_threshold=2,
-            particle_rest_shape_contact_exclusion_radius=0.0,  # m (0.5 cm)
-            rigid_body_particle_contact_buffer_size=1024,
-        )
+        if self.solver_type == "xpbd":
+            self.solver = newton.solvers.SolverXPBD(
+                model=self.model,
+                iterations=self.iterations,
+                integrate_with_external_rigid_solver=True,
+                particle_enable_self_contact=True,
+                particle_enable_triangle_intersection_recovery=True,
+                particle_self_contact_relaxation=0.4,
+                particle_self_contact_radius=0.001,
+                particle_self_contact_margin=0.0015,
+                particle_topological_contact_filter_threshold=2,
+                particle_vertex_contact_buffer_size=64,
+                particle_edge_contact_buffer_size=128,
+                particle_triangle_contact_buffer_size=64,
+            )
+        else:
+            self.solver = newton.solvers.SolverVBD(
+                model=self.model,
+                iterations=self.iterations,
+                rigid_compliant_alm=True,
+                particle_enable_self_contact=True,
+                particle_self_contact_radius=0.001,
+                particle_self_contact_margin=0.0015,
+                particle_topological_contact_filter_threshold=2,
+                particle_rest_shape_contact_exclusion_radius=0.0,
+                rigid_body_particle_contact_buffer_size=1024,
+            )
 
         # Create states
         self.state_0 = self.model.state()
@@ -237,6 +255,7 @@ class Example:
         self.graph = None
 
     def simulate(self):
+        self.solver.rebuild_bvh(self.state_0)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
 
@@ -250,7 +269,12 @@ class Example:
             body_q[self.sphere_body_index][0] = self.sphere_current_x
             body_q[self.sphere_body_index][1] = 0.0
             body_q[self.sphere_body_index][2] = self.sphere_height
-            self.state_0.body_q = wp.array(body_q, dtype=wp.transform)
+            self.state_0.body_q.assign(body_q)
+            self.state_1.body_q.assign(body_q)
+            body_qd = self.state_0.body_qd.numpy()
+            body_qd[self.sphere_body_index, :3] = (self.sphere_velocity_x, 0.0, 0.0)
+            self.state_0.body_qd.assign(body_qd)
+            self.state_1.body_qd.assign(body_qd)
 
             # Collision detection
             self.collision_pipeline.collide(self.state_0, self.contacts)
@@ -300,6 +324,7 @@ class Example:
 if __name__ == "__main__":
     # Create parser with base arguments
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=["xpbd", "vbd"], default="xpbd", help="Cloth solver to use.")
 
     # Parse arguments and initialize viewer
     viewer, args = newton.examples.init(parser)

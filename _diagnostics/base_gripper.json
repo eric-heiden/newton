@@ -1,0 +1,120 @@
+{
+ "example": "cloth_xpbd_gripper",
+ "particles": 884,
+ "triangles": 1536,
+ "substeps": 4,
+ "ms_per_frame_median": 4.452,
+ "ms_per_frame_p95": 6.01,
+ "samples": [
+  {
+   "frame": 0,
+   "time": 0.0333,
+   "intersections": 0,
+   "speed_p50": 0.00214,
+   "speed_p99": 0.26845,
+   "speed_max": 0.31993,
+   "z_min": 0.44989,
+   "finite": true
+  },
+  {
+   "frame": 30,
+   "time": 0.5333,
+   "intersections": 6,
+   "speed_p50": 0.0,
+   "speed_p99": 0.263,
+   "speed_max": 0.47257,
+   "z_min": 0.45,
+   "finite": true
+  },
+  {
+   "frame": 60,
+   "time": 1.0333,
+   "intersections": 0,
+   "speed_p50": 0.37191,
+   "speed_p99": 2.04,
+   "speed_max": 2.04,
+   "z_min": -0.31961,
+   "finite": true
+  },
+  {
+   "frame": 90,
+   "time": 1.5333,
+   "intersections": 1,
+   "speed_p50": 0.35002,
+   "speed_p99": 2.04,
+   "speed_max": 2.04,
+   "z_min": -1.33961,
+   "finite": true
+  },
+  {
+   "frame": 120,
+   "time": 2.0333,
+   "intersections": 1,
+   "speed_p50": 0.07051,
+   "speed_p99": 2.04002,
+   "speed_max": 2.04002,
+   "z_min": -2.35961,
+   "finite": true
+  },
+  {
+   "frame": 150,
+   "time": 2.5333,
+   "intersections": 0,
+   "speed_p50": 0.03545,
+   "speed_p99": 2.04002,
+   "speed_max": 2.04002,
+   "z_min": -3.37962,
+   "finite": true
+  },
+  {
+   "frame": 180,
+   "time": 3.0333,
+   "intersections": 1,
+   "speed_p50": 0.37906,
+   "speed_p99": 2.04002,
+   "speed_max": 2.04002,
+   "z_min": -4.39964,
+   "finite": true
+  },
+  {
+   "frame": 210,
+   "time": 3.5333,
+   "intersections": 0,
+   "speed_p50": 2.04002,
+   "speed_p99": 2.07099,
+   "speed_max": 2.12206,
+   "z_min": -5.41965,
+   "finite": true
+  },
+  {
+   "frame": 240,
+   "time": 4.0333,
+   "intersections": 0,
+   "speed_p50": 2.04,
+   "speed_p99": 2.04459,
+   "speed_max": 2.05109,
+   "z_min": -6.43966,
+   "finite": true
+  },
+  {
+   "frame": 270,
+   "time": 4.5333,
+   "intersections": 0,
+   "speed_p50": 2.04002,
+   "speed_p99": 2.04321,
+   "speed_max": 2.05231,
+   "z_min": -7.45967,
+   "finite": true
+  },
+  {
+   "frame": 299,
+   "time": 5.0167,
+   "intersections": 0,
+   "speed_p50": 2.04002,
+   "speed_p99": 2.04307,
+   "speed_max": 2.05122,
+   "z_min": -8.44568,
+   "finite": true
+  }
+ ]
+}

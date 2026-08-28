@@ -15,6 +15,7 @@ from newton.solvers import style3d
 class Example:
     def __init__(self, viewer, args):
         newton.use_coord_layout_targets = True
+        self.solver_type = args.solver
         # setup simulation parameters first
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -28,7 +29,8 @@ class Example:
 
         self.viewer = viewer
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        newton.solvers.SolverStyle3D.register_custom_attributes(builder)
+        if self.solver_type == "style3d":
+            newton.solvers.SolverStyle3D.register_custom_attributes(builder)
 
         use_cloth_mesh = True
         if use_cloth_mesh:
@@ -57,21 +59,34 @@ class Example:
             avatar_mesh_indices = avatar_mesh.indices
             avatar_mesh_points = avatar_mesh.vertices
 
-            style3d.add_cloth_mesh(
-                builder,
-                pos=wp.vec3(0, 0, 0),
-                rot=wp.quat_from_axis_angle(axis=wp.vec3(1, 0, 0), angle=wp.pi / 2.0),
-                vel=wp.vec3(0.0, 0.0, 0.0),
-                panel_verts=garment_mesh_uv.tolist(),
-                panel_indices=garment_mesh_uv_indices.tolist(),
-                vertices=garment_mesh.vertices.tolist(),
-                indices=garment_mesh.indices.tolist(),
-                density=0.3,
-                scale=1.0,
-                particle_radius=5.0e-3,
-                tri_aniso_ke=wp.vec3(1.0e2, 1.0e2, 1.0e1),
-                edge_aniso_ke=wp.vec3(2.0e-5, 1.0e-5, 5.0e-6),
-            )
+            cloth_args = {
+                "pos": wp.vec3(0, 0, 0),
+                "rot": wp.quat_from_axis_angle(axis=wp.vec3(1, 0, 0), angle=wp.pi / 2.0),
+                "vel": wp.vec3(0.0, 0.0, 0.0),
+                "vertices": garment_mesh.vertices.tolist(),
+                "indices": garment_mesh.indices.tolist(),
+                "density": 0.3,
+                "scale": 1.0,
+                "particle_radius": 5.0e-3,
+            }
+            if self.solver_type == "style3d":
+                style3d.add_cloth_mesh(
+                    builder,
+                    panel_verts=garment_mesh_uv.tolist(),
+                    panel_indices=garment_mesh_uv_indices.tolist(),
+                    tri_aniso_ke=wp.vec3(1.0e2, 1.0e2, 1.0e1),
+                    edge_aniso_ke=wp.vec3(2.0e-5, 1.0e-5, 5.0e-6),
+                    **cloth_args,
+                )
+            else:
+                builder.add_cloth_mesh(
+                    tri_ke=1.0e4,
+                    tri_ka=1.0e4,
+                    tri_kd=1.0,
+                    edge_ke=0.5,
+                    edge_kd=0.01,
+                    **cloth_args,
+                )
             builder.add_shape_mesh(
                 body=builder.add_body(),
                 xform=wp.transform(
@@ -86,21 +101,35 @@ class Example:
             grid_dim = 100
             grid_width = 1.0
             cloth_density = 0.3
-            style3d.add_cloth_grid(
-                builder,
-                pos=wp.vec3(-0.5, 0.0, 2.0),
-                rot=wp.quat_from_axis_angle(axis=wp.vec3(1, 0, 0), angle=wp.pi / 2.0),
-                dim_x=grid_dim,
-                dim_y=grid_dim,
-                cell_x=grid_width / grid_dim,
-                cell_y=grid_width / grid_dim,
-                vel=wp.vec3(0.0, 0.0, 0.0),
-                mass=cloth_density * (grid_width * grid_width) / (grid_dim * grid_dim),
-                tri_aniso_ke=wp.vec3(1.0e2, 1.0e2, 1.0e1),
-                tri_ka=1.0e2,
-                tri_kd=2.0e-6,
-                edge_aniso_ke=wp.vec3(2.0e-4, 1.0e-4, 5.0e-5),
-            )
+            grid_args = {
+                "pos": wp.vec3(-0.5, 0.0, 2.0),
+                "rot": wp.quat_from_axis_angle(axis=wp.vec3(1, 0, 0), angle=wp.pi / 2.0),
+                "dim_x": grid_dim,
+                "dim_y": grid_dim,
+                "cell_x": grid_width / grid_dim,
+                "cell_y": grid_width / grid_dim,
+                "vel": wp.vec3(0.0, 0.0, 0.0),
+                "mass": cloth_density * (grid_width * grid_width) / (grid_dim * grid_dim),
+            }
+            if self.solver_type == "style3d":
+                style3d.add_cloth_grid(
+                    builder,
+                    tri_aniso_ke=wp.vec3(1.0e2, 1.0e2, 1.0e1),
+                    tri_ka=1.0e2,
+                    tri_kd=2.0e-6,
+                    edge_aniso_ke=wp.vec3(2.0e-4, 1.0e-4, 5.0e-5),
+                    **grid_args,
+                )
+            else:
+                builder.add_cloth_grid(
+                    tri_ke=1.0e4,
+                    tri_ka=1.0e4,
+                    tri_kd=1.0,
+                    edge_ke=0.5,
+                    edge_kd=0.01,
+                    particle_radius=5.0e-3,
+                    **grid_args,
+                )
             fixed_points = [0, grid_dim]
 
         # add a table
@@ -121,10 +150,24 @@ class Example:
         self.model.soft_contact_mu = 0.2
         self.model.set_gravity((0.0, 0.0, -9.81))
 
-        self.solver = newton.solvers.SolverStyle3D(
-            model=self.model,
-            iterations=self.iterations,
-        )
+        if self.solver_type == "style3d":
+            self.solver = newton.solvers.SolverStyle3D(model=self.model, iterations=self.iterations)
+        else:
+            self.model.particle_mu = self.model.soft_contact_mu
+            self.model.shape_material_ka.zero_()
+            self.solver = newton.solvers.SolverXPBD(
+                model=self.model,
+                iterations=8,
+                integrate_with_external_rigid_solver=True,
+                particle_enable_self_contact=True,
+                particle_enable_triangle_intersection_recovery=True,
+                particle_self_contact_relaxation=0.4,
+                particle_self_contact_radius=5.0e-3,
+                particle_self_contact_margin=8.0e-3,
+                particle_vertex_contact_buffer_size=64,
+                particle_edge_contact_buffer_size=128,
+                particle_triangle_contact_buffer_size=64,
+            )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
@@ -139,7 +182,7 @@ class Example:
 
     def capture(self):
         # SolverStyle3D makes host calls (PCG dot products, BVH refit) that CPU graph capture cannot record
-        if wp.get_device().is_cpu:
+        if self.solver_type == "style3d" and wp.get_device().is_cpu:
             self.graph = None
             return
         with wp.ScopedCapture() as capture:
@@ -147,6 +190,7 @@ class Example:
         self.graph = capture.graph
 
     def simulate(self):
+        self.solver.rebuild_bvh(self.state_0)
         self.collision_pipeline.collide(self.state_0, self.contacts)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -183,7 +227,9 @@ class Example:
 
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=["style3d", "xpbd"], default="style3d", help="Cloth solver to use.")
+    viewer, args = newton.examples.init(parser)
 
     # Create example and run
     newton.examples.run(Example(viewer, args), args)

@@ -72,6 +72,24 @@ def _make_model_no_shapes(device=None):
     return builder.finalize(device=device)
 
 
+def _make_two_layer_cloth_model(device=None):
+    """Create two close but topologically disconnected cloth layers."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    for height in (0.0, -0.05):
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.5, -0.5, height),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.5,
+            cell_y=0.5,
+            mass=1.0,
+            particle_radius=0.02,
+        )
+    return builder.finalize(device=device)
+
+
 class TestPickingSetup(unittest.TestCase):
     """Tests for the Picking setup (construction, release, pick, update, apply_force)."""
 
@@ -226,6 +244,48 @@ class TestPickingSetup(unittest.TestCase):
 
         Picking(model, pick_max_acceleration=0.0)
 
+    def test_particle_pick_configuration_validation(self):
+        """Particle picking rejects invalid radii and updates valid parameters."""
+        model = _make_two_layer_cloth_model(device="cpu")
+        for value in (0.0, -0.1, np.nan, np.inf, -np.inf):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "finite and positive"):
+                Picking(model, particle_pick_radius=value)
+
+        for parameter in (
+            "particle_pick_stiffness",
+            "particle_pick_damping",
+            "particle_pick_max_acceleration",
+        ):
+            for value in (-0.1, np.nan, np.inf, -np.inf):
+                with (
+                    self.subTest(parameter=parameter, value=value),
+                    self.assertRaisesRegex(ValueError, "finite and nonnegative"),
+                ):
+                    Picking(model, **{parameter: value})
+
+        picking = Picking(model)
+        self.assertGreater(picking.particle_pick_stiffness, picking.pick_stiffness)
+        self.assertGreater(picking.particle_pick_max_acceleration, picking.pick_max_acceleration)
+        self.assertEqual(picking.particle_pick_stiffness, 600.0)
+        self.assertEqual(picking.particle_pick_damping, 50.0)
+        self.assertEqual(picking.particle_pick_max_acceleration, 40.0)
+        picking.configure(
+            pick_stiffness=70.0,
+            pick_damping=12.0,
+            pick_max_acceleration=4.0,
+            particle_pick_radius=0.3,
+            particle_pick_stiffness=160.0,
+            particle_pick_damping=22.0,
+            particle_pick_max_acceleration=14.0,
+        )
+        self.assertEqual(picking.pick_stiffness, 70.0)
+        self.assertEqual(picking.pick_damping, 12.0)
+        self.assertEqual(picking.pick_max_acceleration, 4.0)
+        self.assertEqual(picking.particle_pick_radius, 0.3)
+        self.assertEqual(picking.particle_pick_stiffness, 160.0)
+        self.assertEqual(picking.particle_pick_damping, 22.0)
+        self.assertEqual(picking.particle_pick_max_acceleration, 14.0)
+
     def test_world_offsets_optional(self):
         """Picking can be constructed with optional world_offsets."""
         model = _make_single_sphere_model(device="cpu")
@@ -262,6 +322,51 @@ def test_picking_setup_device(test: TestPickingSetup, device):
     picking.release()
     test.assertFalse(picking.is_picking())
     test.assertEqual(picking.pick_body.numpy()[0], -1)
+
+
+def test_particle_patch_picking_device(test: TestPickingSetup, device):
+    """Pick a smooth cloth patch without loading a nearby disconnected layer."""
+    model = _make_two_layer_cloth_model(device=device)
+    state = model.state()
+    picking = Picking(
+        model,
+        pick_stiffness=50.0,
+        pick_damping=0.0,
+        pick_max_acceleration=5.0,
+        particle_pick_radius=0.8,
+        particle_pick_stiffness=50.0,
+        particle_pick_damping=0.0,
+        particle_pick_max_acceleration=5.0,
+    )
+
+    picking.pick(state, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, -1.0))
+    test.assertTrue(picking.is_picking())
+    test.assertEqual(int(picking.pick_body.numpy()[0]), -1)
+    test.assertGreaterEqual(int(picking.pick_triangle.numpy()[0]), 0)
+
+    weights = picking.particle_pick_weights.numpy()
+    layer_particle_count = model.particle_count // 2
+    support = np.flatnonzero(weights > 0.0)
+    test.assertGreater(len(support), 3)
+    test.assertTrue(np.all(support < layer_particle_count))
+    test.assertAlmostEqual(float(np.sum(weights)), 1.0, places=6)
+    test.assertGreater(float(np.max(weights)), float(np.min(weights[support])))
+
+    pick_state = picking.pick_state.numpy()
+    pick_state[0]["picking_target_world"] += np.array([0.2, 0.0, 0.0], dtype=np.float32)
+    picking.pick_state.assign(pick_state)
+    state.clear_forces()
+    picking._apply_picking_force(state)
+
+    forces = state.particle_f.numpy()
+    test.assertTrue(np.all(np.linalg.norm(forces[support], axis=1) > 0.0))
+    assert_np_equal(forces[layer_particle_count:], np.zeros_like(forces[layer_particle_count:]), tol=1.0e-9)
+    acceleration = np.sum(weights[:, None] * forces / model.particle_mass.numpy()[:, None], axis=0)
+    assert_np_equal(acceleration, np.array([10.0, 0.0, 0.0]), tol=1.0e-4)
+
+    picking.release()
+    test.assertFalse(picking.is_picking())
+    test.assertEqual(int(picking.pick_triangle.numpy()[0]), -1)
 
 
 def _apply_picking_target(picking: Picking, state: newton.State, target: tuple[float, float, float]) -> np.ndarray:
@@ -393,6 +498,12 @@ add_function_test(
     TestPickingSetup,
     "test_picking_setup_device",
     test_picking_setup_device,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestPickingSetup,
+    "test_particle_patch_picking_device",
+    test_particle_patch_picking_device,
     devices=get_test_devices(),
 )
 add_function_test(

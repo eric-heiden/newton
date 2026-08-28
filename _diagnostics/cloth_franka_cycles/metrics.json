@@ -1,0 +1,461 @@
+[
+  {
+    "frame": 540,
+    "time": 9.000000000000027,
+    "label": "first_open_at_edge",
+    "left_particles": 24,
+    "right_particles": 9,
+    "bilateral": 0,
+    "left": {
+      "records": 283,
+      "active": 76,
+      "raw_gap_min": -0.7087634205818176,
+      "raw_gap_p10": -0.6806599497795105,
+      "inside_count": 76,
+      "inside_1mm": 76
+    },
+    "right": {
+      "records": 36,
+      "active": 13,
+      "raw_gap_min": -0.311924546957016,
+      "raw_gap_p10": -0.3119245171546936,
+      "inside_count": 6,
+      "inside_1mm": 6
+    },
+    "patch_active": 0,
+    "patch_count": 0,
+    "gripper_min_z": 0.20225875079631805
+  },
+  {
+    "frame": 570,
+    "time": 9.500000000000052,
+    "label": "first_closing",
+    "left_particles": 71,
+    "right_particles": 64,
+    "bilateral": 43,
+    "left": {
+      "records": 689,
+      "active": 424,
+      "raw_gap_min": -0.7270630598068237,
+      "raw_gap_p10": -0.6298383474349976,
+      "inside_count": 307,
+      "inside_1mm": 307
+    },
+    "right": {
+      "records": 462,
+      "active": 264,
+      "raw_gap_min": -0.6356467008590698,
+      "raw_gap_p10": -0.5943852066993713,
+      "inside_count": 87,
+      "inside_1mm": 87
+    },
+    "patch_active": 0,
+    "patch_count": 0,
+    "gripper_min_z": 0.20223350822925568
+  },
+  {
+    "frame": 600,
+    "time": 10.000000000000076,
+    "label": "first_closed",
+    "left_particles": 65,
+    "right_particles": 43,
+    "bilateral": 22,
+    "left": {
+      "records": 654,
+      "active": 339,
+      "raw_gap_min": -0.7007445096969604,
+      "raw_gap_p10": -0.6044142842292786,
+      "inside_count": 175,
+      "inside_1mm": 175
+    },
+    "right": {
+      "records": 317,
+      "active": 195,
+      "raw_gap_min": -0.6244731545448303,
+      "raw_gap_p10": -0.5984697937965393,
+      "inside_count": 96,
+      "inside_1mm": 96
+    },
+    "patch_active": 0,
+    "patch_count": 0,
+    "gripper_min_z": 0.2021142989397049
+  },
+  {
+    "frame": 660,
+    "time": 11.000000000000126,
+    "label": "first_lifting",
+    "left_particles": 52,
+    "right_particles": 26,
+    "bilateral": 15,
+    "left": {
+      "records": 504,
+      "active": 272,
+      "raw_gap_min": -0.6087079048156738,
+      "raw_gap_p10": -0.4349946975708008,
+      "inside_count": 169,
+      "inside_1mm": 169
+    },
+    "right": {
+      "records": 170,
+      "active": 71,
+      "raw_gap_min": -0.35400936007499695,
+      "raw_gap_p10": -0.21500805020332336,
+      "inside_count": 63,
+      "inside_1mm": 63
+    },
+    "patch_active": 1,
+    "patch_count": 128,
+    "gripper_min_z": 0.21509791910648346
+  },
+  {
+    "frame": 810,
+    "time": 13.50000000000025,
+    "label": "first_lifted",
+    "left_particles": 34,
+    "right_particles": 13,
+    "bilateral": 4,
+    "left": {
+      "records": 436,
+      "active": 178,
+      "raw_gap_min": -0.6203280687332153,
+      "raw_gap_p10": -0.4217616021633148,
+      "inside_count": 83,
+      "inside_1mm": 83
+    },
+    "right": {
+      "records": 112,
+      "active": 12,
+      "raw_gap_min": -0.18743778765201569,
+      "raw_gap_p10": -0.17909294366836548,
+      "inside_count": 8,
+      "inside_1mm": 8
+    },
+    "patch_active": 1,
+    "patch_count": 128,
+    "gripper_min_z": 0.24777156114578247
+  },
+  {
+    "frame": 1470,
+    "time": 24.49999999999989,
+    "label": "second_low_outside",
+    "left_particles": 0,
+    "right_particles": 0,
+    "bilateral": 0,
+    "left": {
+      "records": 0,
+      "active": 0,
+      "raw_gap_min": null,
+      "raw_gap_p10": null,
+      "inside_count": 0,
+      "inside_1mm": 0
+    },
+    "right": {
+      "records": 0,
+      "active": 0,
+      "raw_gap_min": null,
+      "raw_gap_p10": null,
+      "inside_count": 0,
+      "inside_1mm": 0
+    },
+    "patch_active": 0,
+    "patch_count": 128,
+    "gripper_min_z": 0.20695489645004272
+  },
+  {
+    "frame": 1590,
+    "time": 26.499999999999776,
+    "label": "second_open_at_edge",
+    "left_particles": 39,
+    "right_particles": 8,
+    "bilateral": 0,
+    "left": {
+      "records": 371,
+      "active": 154,
+      "raw_gap_min": -0.7075197100639343,
+      "raw_gap_p10": -0.6793712973594666,
+      "inside_count": 142,
+      "inside_1mm": 142
+    },
+    "right": {
+      "records": 34,
+      "active": 16,
+      "raw_gap_min": -0.30935633182525635,
+      "raw_gap_p10": -0.30935633182525635,
+      "inside_count": 8,
+      "inside_1mm": 8
+    },
+    "patch_active": 0,
+    "patch_count": 128,
+    "gripper_min_z": 0.20235222578048706
+  },
+  {
+    "frame": 1650,
+    "time": 27.49999999999972,
+    "label": "second_closing",
+    "left_particles": 38,
+    "right_particles": 30,
+    "bilateral": 18,
+    "left": {
+      "records": 399,
+      "active": 160,
+      "raw_gap_min": -0.713763952255249,
+      "raw_gap_p10": -0.5853184461593628,
+      "inside_count": 126,
+      "inside_1mm": 126
+    },
+    "right": {
+      "records": 215,
+      "active": 134,
+      "raw_gap_min": -0.6136680841445923,
+      "raw_gap_p10": -0.5749059319496155,
+      "inside_count": 60,
+      "inside_1mm": 60
+    },
+    "patch_active": 0,
+    "patch_count": 128,
+    "gripper_min_z": 0.20208938419818878
+  },
+  {
+    "frame": 1680,
+    "time": 27.99999999999969,
+    "label": "second_closed",
+    "left_particles": 32,
+    "right_particles": 26,
+    "bilateral": 11,
+    "left": {
+      "records": 377,
+      "active": 157,
+      "raw_gap_min": -0.6867905855178833,
+      "raw_gap_p10": -0.5700705647468567,
+      "inside_count": 112,
+      "inside_1mm": 112
+    },
+    "right": {
+      "records": 185,
+      "active": 95,
+      "raw_gap_min": -0.6220911145210266,
+      "raw_gap_p10": -0.6050851345062256,
+      "inside_count": 64,
+      "inside_1mm": 64
+    },
+    "patch_active": 0,
+    "patch_count": 128,
+    "gripper_min_z": 0.20200268924236298
+  },
+  {
+    "frame": 1740,
+    "time": 28.999999999999634,
+    "label": "second_lifting",
+    "left_particles": 12,
+    "right_particles": 12,
+    "bilateral": 4,
+    "left": {
+      "records": 182,
+      "active": 18,
+      "raw_gap_min": -0.3269849121570587,
+      "raw_gap_p10": -0.31893396377563477,
+      "inside_count": 18,
+      "inside_1mm": 18
+    },
+    "right": {
+      "records": 75,
+      "active": 34,
+      "raw_gap_min": -0.3757743835449219,
+      "raw_gap_p10": -0.37526074051856995,
+      "inside_count": 34,
+      "inside_1mm": 34
+    },
+    "patch_active": 1,
+    "patch_count": 128,
+    "gripper_min_z": 0.22464688122272491
+  },
+  {
+    "frame": 1860,
+    "time": 30.99999999999952,
+    "label": "second_lifted",
+    "left_particles": 11,
+    "right_particles": 14,
+    "bilateral": 7,
+    "left": {
+      "records": 151,
+      "active": 20,
+      "raw_gap_min": -0.3227683901786804,
+      "raw_gap_p10": -0.31475120782852173,
+      "inside_count": 20,
+      "inside_1mm": 20
+    },
+    "right": {
+      "records": 70,
+      "active": 32,
+      "raw_gap_min": -0.34763282537460327,
+      "raw_gap_p10": -0.29797181487083435,
+      "inside_count": 32,
+      "inside_1mm": 32
+    },
+    "patch_active": 1,
+    "patch_count": 128,
+    "gripper_min_z": 0.24755100905895233
+  },
+  {
+    "frame": 2550,
+    "time": 42.49999999999887,
+    "label": "third_low_outside",
+    "left_particles": 8,
+    "right_particles": 0,
+    "bilateral": 0,
+    "left": {
+      "records": 32,
+      "active": 16,
+      "raw_gap_min": -0.6198031902313232,
+      "raw_gap_p10": -0.590759813785553,
+      "inside_count": 16,
+      "inside_1mm": 16
+    },
+    "right": {
+      "records": 0,
+      "active": 0,
+      "raw_gap_min": null,
+      "raw_gap_p10": null,
+      "inside_count": 0,
+      "inside_1mm": 0
+    },
+    "patch_active": 0,
+    "patch_count": 128,
+    "gripper_min_z": 0.20489540696144104
+  },
+  {
+    "frame": 2670,
+    "time": 44.49999999999876,
+    "label": "third_open_at_edge",
+    "left_particles": 41,
+    "right_particles": 39,
+    "bilateral": 22,
+    "left": {
+      "records": 496,
+      "active": 215,
+      "raw_gap_min": -0.727662205696106,
+      "raw_gap_p10": -0.599368155002594,
+      "inside_count": 171,
+      "inside_1mm": 171
+    },
+    "right": {
+      "records": 280,
+      "active": 174,
+      "raw_gap_min": -0.6784904599189758,
+      "raw_gap_p10": -0.47238850593566895,
+      "inside_count": 73,
+      "inside_1mm": 73
+    },
+    "patch_active": 0,
+    "patch_count": 128,
+    "gripper_min_z": 0.2022191435098648
+  },
+  {
+    "frame": 2700,
+    "time": 44.99999999999873,
+    "label": "third_closing",
+    "left_particles": 38,
+    "right_particles": 31,
+    "bilateral": 18,
+    "left": {
+      "records": 371,
+      "active": 157,
+      "raw_gap_min": -0.6812124848365784,
+      "raw_gap_p10": -0.5747507214546204,
+      "inside_count": 119,
+      "inside_1mm": 119
+    },
+    "right": {
+      "records": 187,
+      "active": 139,
+      "raw_gap_min": -0.619204580783844,
+      "raw_gap_p10": -0.5976133942604065,
+      "inside_count": 69,
+      "inside_1mm": 69
+    },
+    "patch_active": 0,
+    "patch_count": 128,
+    "gripper_min_z": 0.20210373401641846
+  },
+  {
+    "frame": 2730,
+    "time": 45.4999999999987,
+    "label": "third_closed",
+    "left_particles": 31,
+    "right_particles": 22,
+    "bilateral": 12,
+    "left": {
+      "records": 340,
+      "active": 136,
+      "raw_gap_min": -0.6471960544586182,
+      "raw_gap_p10": -0.5423247218132019,
+      "inside_count": 91,
+      "inside_1mm": 91
+    },
+    "right": {
+      "records": 181,
+      "active": 88,
+      "raw_gap_min": -0.6216384172439575,
+      "raw_gap_p10": -0.5984283089637756,
+      "inside_count": 53,
+      "inside_1mm": 53
+    },
+    "patch_active": 0,
+    "patch_count": 128,
+    "gripper_min_z": 0.20201322436332703
+  },
+  {
+    "frame": 2790,
+    "time": 46.49999999999864,
+    "label": "third_lifting",
+    "left_particles": 12,
+    "right_particles": 12,
+    "bilateral": 5,
+    "left": {
+      "records": 143,
+      "active": 18,
+      "raw_gap_min": -0.3281519114971161,
+      "raw_gap_p10": -0.32116106152534485,
+      "inside_count": 18,
+      "inside_1mm": 18
+    },
+    "right": {
+      "records": 75,
+      "active": 36,
+      "raw_gap_min": -0.37583690881729126,
+      "raw_gap_p10": -0.37481123208999634,
+      "inside_count": 36,
+      "inside_1mm": 36
+    },
+    "patch_active": 1,
+    "patch_count": 120,
+    "gripper_min_z": 0.22465351223945618
+  },
+  {
+    "frame": 2850,
+    "time": 47.499999999998586,
+    "label": "third_lifted",
+    "left_particles": 12,
+    "right_particles": 13,
+    "bilateral": 6,
+    "left": {
+      "records": 120,
+      "active": 20,
+      "raw_gap_min": -0.3518907427787781,
+      "raw_gap_p10": -0.3225228488445282,
+      "inside_count": 20,
+      "inside_1mm": 20
+    },
+    "right": {
+      "records": 62,
+      "active": 35,
+      "raw_gap_min": -0.3750971555709839,
+      "raw_gap_p10": -0.3750922977924347,
+      "inside_count": 35,
+      "inside_1mm": 35
+    },
+    "patch_active": 1,
+    "patch_count": 120,
+    "gripper_min_z": 0.23893077671527863
+  }
+]

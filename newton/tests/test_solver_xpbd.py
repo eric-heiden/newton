@@ -7,13 +7,16 @@ Tests for the XPBD solver.
 Includes tests for particle-particle friction using relative velocity correctly.
 """
 
+import math
 import unittest
+from itertools import pairwise
 
 import numpy as np
 import warp as wp
 
 import newton
 import newton.examples
+from newton._src.solvers.vbd.tri_mesh_collision import TriMeshCollisionDetector
 from newton._src.solvers.xpbd.kernels import apply_rigid_restitution
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -1840,11 +1843,1543 @@ def test_xpbd_aligned_box_stack_remains_stable(test, device):
     )
 
 
+def test_xpbd_spring_compliance_is_iteration_independent(test, device):
+    """Keep an isolated compliant spring response independent of iteration count."""
+
+    def solve(iterations: int) -> float:
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        builder.add_particle(pos=(0.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.0)
+        builder.add_particle(pos=(1.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.0)
+        builder.add_spring(0, 1, ke=100.0, kd=0.0, control=0.0)
+
+        model = builder.finalize(device=device)
+        state_in = model.state()
+        state_out = model.state()
+        positions = state_in.particle_q.numpy()
+        positions[1, 0] = 2.0
+        state_in.particle_q.assign(positions)
+
+        solver = newton.solvers.SolverXPBD(model, iterations=iterations)
+        solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+        solved_positions = state_out.particle_q.numpy()
+        return float(np.linalg.norm(solved_positions[1] - solved_positions[0]))
+
+    one_iteration_length = solve(1)
+    many_iteration_length = solve(5)
+    test.assertAlmostEqual(one_iteration_length, many_iteration_length, places=5)
+
+
+def test_xpbd_cloth_triangle_resists_membrane_strain(test, device):
+    """Restore membrane strain in cloth created without auxiliary springs."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.add_cloth_mesh(
+        pos=wp.vec3(0.0),
+        rot=wp.quat_identity(),
+        scale=1.0,
+        vel=wp.vec3(0.0),
+        vertices=[wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0)],
+        indices=[0, 1, 2],
+        density=1.0,
+        tri_ke=1.0e5,
+        tri_ka=1.0e5,
+        tri_kd=0.0,
+        edge_ke=0.0,
+        add_springs=False,
+        particle_radius=0.0,
+    )
+    builder.particle_mass[0] = 0.0
+    builder.particle_mass[1] = 0.0
+
+    model = builder.finalize(device=device)
+    state_in = model.state()
+    state_out = model.state()
+    positions = state_in.particle_q.numpy()
+    positions[2] = (0.5, 1.8, 0.0)
+    state_in.particle_q.assign(positions)
+
+    def strain_error(q: np.ndarray) -> float:
+        f0 = q[1] - q[0]
+        f1 = q[2] - q[0]
+        e00 = 0.5 * (np.dot(f0, f0) - 1.0)
+        e11 = 0.5 * (np.dot(f1, f1) - 1.0)
+        e01 = np.dot(f0, f1)
+        return float(np.linalg.norm((e00 + e11, e00 - e11, e01)))
+
+    initial_error = strain_error(positions)
+    solver = newton.solvers.SolverXPBD(model, iterations=10)
+    solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+    final_error = strain_error(state_out.particle_q.numpy())
+
+    test.assertLess(final_error, 0.5 * initial_error)
+
+
+def test_xpbd_connected_cloth_constraints_continue_converging(test, device):
+    """Continue converging Jacobi-averaged compliant cloth constraints."""
+
+    def solve(iterations: int) -> float:
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=1.0,
+            cell_y=1.0,
+            mass=1.0,
+            tri_ke=1.0e5,
+            tri_ka=1.0e5,
+            tri_kd=0.0,
+            edge_ke=5.0,
+            edge_kd=0.0,
+            particle_radius=0.0,
+        )
+        model = builder.finalize(device=device)
+        state_in = model.state()
+        state_out = model.state()
+        positions = state_in.particle_q.numpy()
+        positions[12, 2] = 1.0
+        state_in.particle_q.assign(positions)
+
+        solver = newton.solvers.SolverXPBD(model, iterations=iterations)
+        solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+        heights = state_out.particle_q.numpy()[:, 2]
+        return float(np.sqrt(np.mean(np.square(heights - np.mean(heights)))))
+
+    one_iteration_error = solve(1)
+    five_iteration_error = solve(5)
+    test.assertLess(five_iteration_error, 0.8 * one_iteration_error)
+
+
+def test_xpbd_cloth_self_contact_separates_surfaces(test, device):
+    """Separate disconnected cloth surfaces with triangle-mesh self-contact."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    vertices = [wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0)]
+    common_args = {
+        "rot": wp.quat_identity(),
+        "scale": 1.0,
+        "vel": wp.vec3(0.0),
+        "vertices": vertices,
+        "indices": [0, 1, 2],
+        "density": 1.0,
+        "tri_ke": 1.0e4,
+        "tri_ka": 1.0e4,
+        "edge_ke": 0.0,
+        "particle_radius": 0.0,
+    }
+    builder.add_cloth_mesh(pos=wp.vec3(0.0), **common_args)
+    builder.add_cloth_mesh(pos=wp.vec3(0.0, 0.0, 0.05), **common_args)
+    for particle in range(3):
+        builder.particle_mass[particle] = 0.0
+
+    model = builder.finalize(device=device)
+    state_in = model.state()
+    state_out = model.state()
+    solver = newton.solvers.SolverXPBD(
+        model,
+        iterations=5,
+        particle_enable_self_contact=True,
+        particle_self_contact_radius=0.1,
+        particle_self_contact_margin=0.2,
+        particle_topological_contact_filter_threshold=1,
+    )
+    for _ in range(10):
+        solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+        state_in, state_out = state_out, state_in
+
+    positions = state_in.particle_q.numpy()
+    velocities = state_in.particle_qd.numpy()
+    separation = float(np.mean(positions[3:, 2]) - np.mean(positions[:3, 2]))
+    np.testing.assert_allclose(separation, 0.1, atol=1.0e-4)
+    np.testing.assert_allclose(velocities[3:], 0.0, atol=1.0e-4)
+
+
+def test_xpbd_cloth_self_contact_prevents_triangle_tunneling(test, device):
+    """Prevent a triangle trajectory from tunneling through another triangle."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    cloth_args = {
+        "rot": wp.quat_identity(),
+        "scale": 1.0,
+        "density": 1.0,
+        "tri_ke": 1.0e-6,
+        "tri_ka": 1.0e-6,
+        "tri_kd": 0.0,
+        "edge_ke": 0.0,
+        "particle_radius": 0.0,
+    }
+    builder.add_cloth_mesh(
+        pos=wp.vec3(0.0),
+        vel=wp.vec3(0.0),
+        vertices=[wp.vec3(-1.0, -1.0, 0.0), wp.vec3(1.0, -1.0, 0.0), wp.vec3(0.0, 1.0, 0.0)],
+        indices=[0, 1, 2],
+        **cloth_args,
+    )
+    for particle in range(3):
+        builder.particle_mass[particle] = 0.0
+    builder.add_cloth_mesh(
+        pos=wp.vec3(0.0),
+        vel=wp.vec3(0.0),
+        vertices=[wp.vec3(-0.5, -0.5, 0.1), wp.vec3(0.5, -0.5, 0.1), wp.vec3(0.0, 0.5, 0.1)],
+        indices=[0, 1, 2],
+        **cloth_args,
+    )
+
+    model = builder.finalize(device=device)
+    state_in = model.state()
+    state_out = model.state()
+    velocities = state_in.particle_qd.numpy()
+    velocities[5, 2] = -12.0
+    state_in.particle_qd.assign(velocities)
+    solver = newton.solvers.SolverXPBD(
+        model,
+        iterations=5,
+        particle_enable_self_contact=True,
+        particle_enable_triangle_intersection_recovery=True,
+        particle_self_contact_radius=0.02,
+        particle_self_contact_margin=0.05,
+        particle_max_depenetration_velocity=12.0,
+        particle_topological_contact_filter_threshold=1,
+    )
+
+    solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+    detector = solver.trimesh_collision_detector
+    detector.refit(state_out.particle_q)
+    detector.triangle_triangle_intersection_detection()
+    intersection_count = int(detector.triangle_intersecting_triangles_count.numpy().sum())
+    test.assertEqual(intersection_count, 0, "self-contact must not leave intersecting triangle pairs")
+    test.assertGreater(
+        float(np.min(state_out.particle_q.numpy()[3:, 2])),
+        0.0,
+        "conservative self-contact must stop a fully traversing triangle before it changes sides",
+    )
+
+
+def test_xpbd_cloth_self_contact_recovers_intersection_created_by_constraints(test, device):
+    """Recover a triangle intersection created during XPBD constraint iterations."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    cloth_args = {
+        "rot": wp.quat_identity(),
+        "scale": 1.0,
+        "density": 1.0,
+        "tri_ke": 1.0e-6,
+        "tri_ka": 1.0e-6,
+        "tri_kd": 0.0,
+        "edge_ke": 0.0,
+        "particle_radius": 0.0,
+    }
+    builder.add_cloth_mesh(
+        pos=wp.vec3(0.0),
+        vel=wp.vec3(0.0),
+        vertices=[wp.vec3(-1.0, -1.0, 0.0), wp.vec3(1.0, -1.0, 0.0), wp.vec3(0.0, 1.0, 0.0)],
+        indices=[0, 1, 2],
+        **cloth_args,
+    )
+    for particle in range(3):
+        builder.particle_mass[particle] = 0.0
+    builder.add_cloth_mesh(
+        pos=wp.vec3(0.0),
+        vel=wp.vec3(0.0),
+        vertices=[wp.vec3(-0.5, -0.5, 0.04), wp.vec3(0.5, -0.5, 0.04), wp.vec3(0.0, 0.5, 0.04)],
+        indices=[0, 1, 2],
+        **cloth_args,
+    )
+    anchor = builder.add_particle(wp.vec3(0.0, 0.5, 0.1), wp.vec3(0.0), mass=0.0, radius=0.0)
+    builder.add_spring(5, anchor, ke=1.0e8, kd=0.0, control=0.0)
+
+    model = builder.finalize(device=device)
+    state_in = model.state()
+    state_out = model.state()
+    positions = state_in.particle_q.numpy()
+    positions[anchor] = (0.0, 0.5, -0.2)
+    state_in.particle_q.assign(positions)
+    state_out.particle_q.assign(positions)
+
+    solver = newton.solvers.SolverXPBD(
+        model,
+        iterations=1,
+        particle_enable_self_contact=True,
+        particle_enable_triangle_intersection_recovery=True,
+        particle_self_contact_relaxation=1.0,
+        particle_triangle_intersection_relaxation=1.0,
+        particle_self_contact_radius=0.02,
+        particle_self_contact_margin=0.05,
+        particle_max_depenetration_velocity=100.0,
+        particle_topological_contact_filter_threshold=1,
+    )
+
+    detector = solver.trimesh_collision_detector
+    detector.refit(state_in.particle_q)
+    detector.triangle_triangle_intersection_detection()
+    test.assertEqual(int(detector.triangle_intersecting_triangles_count.numpy().sum()), 0)
+
+    solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+    detector.refit(state_out.particle_q)
+    detector.triangle_triangle_intersection_detection()
+    intersection_count = int(detector.triangle_intersecting_triangles_count.numpy().sum())
+    test.assertEqual(intersection_count, 0, "self-contact must catch intersections created inside the solve")
+
+
+def test_xpbd_triangle_intersection_recovery_honors_depenetration_limit(test, device):
+    """Limit exact recovery of a pre-existing triangle intersection."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    cloth_args = {
+        "rot": wp.quat_identity(),
+        "scale": 1.0,
+        "density": 1.0,
+        "tri_ke": 1.0e-6,
+        "tri_ka": 1.0e-6,
+        "tri_kd": 0.0,
+        "edge_ke": 0.0,
+        "particle_radius": 0.0,
+    }
+    builder.add_cloth_mesh(
+        pos=wp.vec3(0.0),
+        vel=wp.vec3(0.0),
+        vertices=[wp.vec3(-1.0, -1.0, 0.0), wp.vec3(1.0, -1.0, 0.0), wp.vec3(0.0, 1.0, 0.0)],
+        indices=[0, 1, 2],
+        **cloth_args,
+    )
+    for particle in range(3):
+        builder.particle_mass[particle] = 0.0
+    builder.add_cloth_mesh(
+        pos=wp.vec3(0.0),
+        vel=wp.vec3(0.0),
+        vertices=[wp.vec3(-0.5, -0.5, 0.1), wp.vec3(0.5, -0.5, 0.1), wp.vec3(0.0, 0.5, 0.1)],
+        indices=[0, 1, 2],
+        **cloth_args,
+    )
+
+    model = builder.finalize(device=device)
+    state_in = model.state()
+    state_out = model.state()
+    positions = state_in.particle_q.numpy()
+    positions[5, 2] = -0.1
+    state_in.particle_q.assign(positions)
+    state_out.particle_q.assign(positions)
+    dt = 1.0 / 60.0
+    max_depenetration_velocity = 0.1
+    ballistic_positions = positions.copy()
+    solver = newton.solvers.SolverXPBD(
+        model,
+        iterations=1,
+        particle_enable_self_contact=True,
+        particle_enable_triangle_intersection_recovery=True,
+        particle_self_contact_radius=0.02,
+        particle_self_contact_margin=0.05,
+        particle_max_depenetration_velocity=max_depenetration_velocity,
+        particle_topological_contact_filter_threshold=1,
+    )
+
+    solver.step(state_in, state_out, None, None, dt)
+    correction = np.linalg.norm(state_out.particle_q.numpy() - ballistic_positions, axis=1)
+    test.assertGreater(int(solver.trimesh_collision_detector.triangle_intersecting_triangles_count.numpy().sum()), 0)
+    test.assertLessEqual(
+        float(np.max(correction)),
+        max_depenetration_velocity * dt + 1.0e-5,
+        "exact recovery must not replace its configured limit with the pair's full crossing motion",
+    )
+
+
+def test_xpbd_cloth_self_contact_recovers_local_triangle_inversion(test, device):
+    """Recover intersecting local triangles without applying full cloth thickness."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.add_cloth_mesh(
+        pos=wp.vec3(0.0),
+        rot=wp.quat_identity(),
+        scale=1.0,
+        vel=wp.vec3(0.0),
+        vertices=[
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(1.0, 0.0, 0.0),
+            wp.vec3(2.0, 0.0, 0.0),
+            wp.vec3(0.0, 1.0, 0.0),
+            wp.vec3(1.0, 1.0, 0.0),
+            wp.vec3(2.0, 1.0, 0.0),
+        ],
+        indices=[0, 1, 3, 1, 4, 3, 1, 2, 4, 2, 5, 4],
+        density=1.0,
+        tri_ke=1.0e-6,
+        tri_ka=1.0e-6,
+        edge_ke=0.0,
+        particle_radius=0.0,
+    )
+    model = builder.finalize(device=device)
+    state_in = model.state()
+    state_out = model.state()
+    positions = state_in.particle_q.numpy()
+    positions[2] = (0.0, 0.0, -0.02)
+    positions[4] = (1.0, 0.0, 0.02)
+    positions[5] = (0.0, 1.0, 0.02)
+    state_in.particle_q.assign(positions)
+    state_out.particle_q.assign(positions)
+
+    solver = newton.solvers.SolverXPBD(
+        model,
+        iterations=10,
+        particle_enable_self_contact=True,
+        particle_enable_triangle_intersection_recovery=True,
+        particle_self_contact_relaxation=0.5,
+        particle_triangle_intersection_relaxation=0.5,
+        particle_self_contact_radius=0.1,
+        particle_self_contact_margin=1.0,
+        particle_topological_contact_filter_threshold=2,
+    )
+    detector = solver.trimesh_collision_detector
+    detector.refit(state_in.particle_q)
+    detector.triangle_triangle_intersection_detection()
+    test.assertGreater(int(detector.triangle_intersecting_triangles_count.numpy().sum()), 0)
+
+    solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+    detector.refit(state_out.particle_q)
+    detector.triangle_triangle_intersection_detection()
+    intersection_count = int(detector.triangle_intersecting_triangles_count.numpy().sum())
+    test.assertEqual(intersection_count, 0, "local exact recovery must remove the inversion")
+
+
+def test_xpbd_cloth_self_contact_relaxation_is_independent(test, device):
+    """Control cloth self-contact correction without changing the shared contact relaxation."""
+
+    def solve(self_contact_relaxation: float) -> tuple[float, newton.solvers.SolverXPBD]:
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        vertices = [wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0)]
+        cloth_args = {
+            "rot": wp.quat_identity(),
+            "scale": 1.0,
+            "vel": wp.vec3(0.0),
+            "vertices": vertices,
+            "indices": [0, 1, 2],
+            "density": 1.0,
+            "tri_ke": 1.0e4,
+            "tri_ka": 1.0e4,
+            "edge_ke": 0.0,
+            "particle_radius": 0.0,
+        }
+        builder.add_cloth_mesh(pos=wp.vec3(0.0), **cloth_args)
+        builder.add_cloth_mesh(pos=wp.vec3(0.0, 0.0, 0.05), **cloth_args)
+        for particle in range(3):
+            builder.particle_mass[particle] = 0.0
+
+        model = builder.finalize(device=device)
+        state_in = model.state()
+        state_out = model.state()
+        solver = newton.solvers.SolverXPBD(
+            model,
+            iterations=1,
+            soft_contact_relaxation=0.9,
+            particle_enable_self_contact=True,
+            particle_self_contact_relaxation=self_contact_relaxation,
+            particle_self_contact_radius=0.1,
+            particle_self_contact_margin=0.2,
+            particle_topological_contact_filter_threshold=1,
+        )
+        solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+        positions = state_out.particle_q.numpy()
+        separation = float(np.mean(positions[3:, 2]) - np.mean(positions[:3, 2]))
+        return separation, solver
+
+    low_separation, low_solver = solve(0.2)
+    high_separation, high_solver = solve(0.8)
+
+    test.assertGreater(high_separation, low_separation + 0.005)
+    test.assertEqual(low_solver.soft_contact_relaxation, high_solver.soft_contact_relaxation)
+    test.assertEqual(low_solver.particle_self_contact_relaxation, 0.2)
+    test.assertEqual(high_solver.particle_self_contact_relaxation, 0.8)
+
+
+def test_xpbd_cloth_overlap_recovery_does_not_accumulate_velocity(test, device):
+    """Avoid accumulating velocity when elasticity opposes overlap recovery."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    vertices = [wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0)]
+    common_args = {
+        "rot": wp.quat_identity(),
+        "scale": 1.0,
+        "vel": wp.vec3(0.0),
+        "vertices": vertices,
+        "indices": [0, 1, 2],
+        "density": 1.0,
+        "tri_ke": 1.0e4,
+        "tri_ka": 1.0e4,
+        "edge_ke": 0.0,
+        "particle_radius": 0.0,
+    }
+    builder.add_cloth_mesh(pos=wp.vec3(0.0), **common_args)
+    builder.add_cloth_mesh(pos=wp.vec3(0.0, 0.0, 0.05), **common_args)
+    for particle in range(3):
+        builder.particle_mass[particle] = 0.0
+
+    # Tether the moving surface inside the contact thickness. Each step asks
+    # self-contact to recover overlap while the springs oppose that recovery.
+    for vertex in vertices:
+        builder.add_particle(
+            pos=(vertex[0], vertex[1], vertex[2] + 0.05),
+            vel=(0.0, 0.0, 0.0),
+            mass=0.0,
+            radius=0.0,
+        )
+    for particle in range(3):
+        builder.add_spring(particle + 3, particle + 6, ke=1.0e5, kd=10.0, control=0.0)
+
+    model = builder.finalize(device=device)
+    state_in = model.state()
+    state_out = model.state()
+    solver = newton.solvers.SolverXPBD(
+        model,
+        iterations=5,
+        particle_enable_self_contact=True,
+        particle_self_contact_radius=0.1,
+        particle_self_contact_margin=0.2,
+        particle_topological_contact_filter_threshold=1,
+    )
+    for _ in range(60):
+        solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+        state_in, state_out = state_out, state_in
+
+    moving_velocities = state_in.particle_qd.numpy()[3:6]
+    np.testing.assert_allclose(moving_velocities, 0.0, atol=1.0e-4)
+
+
+def test_xpbd_cloth_self_contact_friction_reduces_slip(test, device):
+    """Reduce tangential slip between overlapping cloth surfaces."""
+
+    def simulate(friction: float) -> float:
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        vertices = [wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0)]
+        common_args = {
+            "rot": wp.quat_identity(),
+            "scale": 1.0,
+            "vertices": vertices,
+            "indices": [0, 1, 2],
+            "density": 1.0,
+            "tri_ke": 1.0e4,
+            "tri_ka": 1.0e4,
+            "edge_ke": 0.0,
+            "particle_radius": 0.0,
+        }
+        builder.add_cloth_mesh(pos=wp.vec3(0.0), vel=wp.vec3(0.0), **common_args)
+        builder.add_cloth_mesh(pos=wp.vec3(0.0, 0.0, 0.05), vel=wp.vec3(1.0, 0.0, 0.0), **common_args)
+        for particle in range(3):
+            builder.particle_mass[particle] = 0.0
+
+        model = builder.finalize(device=device)
+        model.particle_mu = friction
+        state_in = model.state()
+        state_out = model.state()
+        initial_positions = state_in.particle_q.numpy().copy()
+        solver = newton.solvers.SolverXPBD(
+            model,
+            iterations=5,
+            particle_enable_self_contact=True,
+            particle_self_contact_radius=0.1,
+            particle_self_contact_margin=0.2,
+            particle_topological_contact_filter_threshold=1,
+        )
+        solver.step(state_in, state_out, None, None, 1.0 / 60.0)
+        final_positions = state_out.particle_q.numpy()
+        return float(np.mean(final_positions[3:6, 0] - initial_positions[3:6, 0]))
+
+    slip_without_friction = simulate(0.0)
+    slip_partial_friction = simulate(0.5)
+    slip_with_friction = simulate(1.0)
+    test.assertGreater(slip_without_friction, 0.01)
+    # A high coefficient saturates into near-complete stick.
+    test.assertLess(slip_with_friction, 0.2 * slip_without_friction)
+    # Slip must vary continuously with the coefficient. A friction impulse that
+    # ignores its Coulomb bound would clamp every non-zero coefficient to the
+    # same near-zero slip and erase this ordering.
+    test.assertLess(slip_partial_friction, 0.75 * slip_without_friction)
+    test.assertGreater(slip_partial_friction, 1.5 * slip_with_friction)
+
+
+def test_xpbd_cloth_self_contact_velocity_stabilization_is_inelastic(test, device):
+    """Stop closing self-contact velocity independently of position relaxation."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    vertices = [wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0)]
+    builder.add_cloth_mesh(
+        pos=wp.vec3(0.0),
+        rot=wp.quat_identity(),
+        scale=1.0,
+        vel=wp.vec3(0.0),
+        vertices=vertices,
+        indices=[0, 1, 2],
+        density=1.0,
+        tri_ke=1.0e4,
+        tri_ka=1.0e4,
+        edge_ke=0.0,
+        particle_radius=0.0,
+    )
+    for particle in range(3):
+        builder.particle_mass[particle] = 0.0
+    moving_particle = builder.add_particle(
+        pos=(0.25, 0.25, 0.11),
+        vel=(0.0, 0.0, -1.0),
+        mass=1.0,
+        radius=0.0,
+    )
+
+    model = builder.finalize(device=device)
+    state_in = model.state()
+    state_out = model.state()
+    solver = newton.solvers.SolverXPBD(
+        model,
+        iterations=1,
+        particle_enable_self_contact=True,
+        particle_self_contact_relaxation=0.2,
+        particle_self_contact_radius=0.1,
+        particle_self_contact_margin=0.2,
+        particle_topological_contact_filter_threshold=1,
+    )
+    solver.step(state_in, state_out, None, None, 0.02)
+
+    test.assertGreaterEqual(
+        float(state_out.particle_qd.numpy()[moving_particle, 2]),
+        -1.0e-5,
+        "inelastic self-contact must remove the full closing velocity",
+    )
+
+
+def test_xpbd_external_rigid_solver_preserves_body_state(test, device):
+    """Preserve externally integrated bodies while resolving particle contact."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis="Y")
+    body = builder.add_body()
+    builder.add_shape_box(body, hx=0.5, hy=0.5, hz=0.5)
+    builder.add_particle(pos=(1.0, 0.6, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.2)
+
+    model = builder.finalize(device=device)
+    state_in = model.state()
+    state_out = model.state()
+    body_q = state_out.body_q.numpy()
+    body_q[body, :3] = (1.0, 0.0, 0.0)
+    state_out.body_q.assign(body_q)
+
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
+    collision_pipeline.collide(state_out, contacts)
+    solver = newton.solvers.SolverXPBD(
+        model,
+        iterations=4,
+        integrate_with_external_rigid_solver=True,
+    )
+    solver.step(state_in, state_out, None, contacts, 1.0 / 60.0)
+
+    np.testing.assert_allclose(state_out.body_q.numpy()[body, :3], (1.0, 0.0, 0.0), atol=1.0e-6)
+    test.assertGreater(float(state_out.particle_q.numpy()[0, 1]), 0.6)
+
+
+def test_xpbd_shape_adhesion_pulls_particle(test, device):
+    """Apply a shape's adhesion distance to a nearby particle."""
+
+    def solve(adhesion: float) -> float:
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis="Y")
+        builder.add_shape_box(
+            -1,
+            hx=1.0,
+            hy=0.5,
+            hz=1.0,
+            cfg=newton.ModelBuilder.ShapeConfig(ka=adhesion),
+        )
+        builder.add_particle(pos=(0.0, 0.7, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.1)
+        model = builder.finalize(device=device)
+        state_in = model.state()
+        state_out = model.state()
+        collision_pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.3)
+        contacts = collision_pipeline.contacts()
+        collision_pipeline.collide(state_in, contacts)
+        test.assertGreater(int(contacts.soft_contact_count.numpy()[0]), 0)
+
+        solver = newton.solvers.SolverXPBD(model, iterations=5)
+        solver.step(state_in, state_out, None, contacts, 1.0 / 60.0)
+        return float(state_out.particle_q.numpy()[0, 1])
+
+    position_without_adhesion = solve(0.0)
+    position_with_adhesion = solve(0.2)
+    test.assertAlmostEqual(position_without_adhesion, 0.7, places=5)
+    test.assertAlmostEqual(position_with_adhesion, 0.6, places=4)
+
+
+def test_xpbd_soft_contact_honors_shape_margin(test, device):
+    """Keep a soft particle outside the rigid shape's collision margin."""
+
+    def solve(shape_margin: float) -> float:
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis="Y")
+        builder.add_shape_box(
+            -1,
+            hx=1.0,
+            hy=0.5,
+            hz=1.0,
+            cfg=newton.ModelBuilder.ShapeConfig(margin=shape_margin),
+        )
+        builder.add_particle(pos=(0.0, 0.65, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.1)
+        model = builder.finalize(device=device)
+        state_in = model.state()
+        state_out = model.state()
+        collision_pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.2)
+        contacts = collision_pipeline.contacts()
+        collision_pipeline.collide(state_in, contacts)
+
+        solver = newton.solvers.SolverXPBD(model, iterations=8)
+        solver.step(state_in, state_out, None, contacts, 1.0 / 60.0)
+        return float(state_out.particle_q.numpy()[0, 1])
+
+    test.assertAlmostEqual(solve(0.0), 0.65, places=5)
+    test.assertGreater(solve(0.1), 0.69)
+
+
+def test_xpbd_full_surface_soft_contact_blocks_triangle_interior(test, device):
+    """Block a rigid sphere that contacts the interior of a coarse cloth triangle."""
+
+    def solve(full_surface: bool):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.25, -0.25, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=1,
+            dim_y=1,
+            cell_x=0.5,
+            cell_y=0.5,
+            mass=1.0,
+            particle_radius=0.01,
+        )
+        for particle in range(len(builder.particle_mass)):
+            builder.particle_mass[particle] = 0.0
+
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.09), wp.quat_identity()))
+        builder.body_qd[body] = wp.spatial_vector(0.0, 0.0, -1.0, 0.0, 0.0, 0.0)
+        shape_cfg = builder.default_shape_cfg.copy()
+        shape_cfg.density = 100.0
+        shape_cfg.margin = 0.01
+        builder.add_shape_sphere(body, radius=0.1, cfg=shape_cfg)
+
+        model = builder.finalize(device=device)
+        collision_pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            soft_contact_margin=0.03,
+            enable_rigid_soft_full_surface_contact=full_surface,
+        )
+        contacts = collision_pipeline.contacts()
+        state_in = model.state()
+        state_out = model.state()
+        collision_pipeline.collide(state_in, contacts)
+        contact_count = int(contacts.soft_contact_count.numpy()[0])
+        has_feature_contact = bool(np.any(contacts.soft_contact_particle.numpy()[:contact_count] < 0))
+
+        solver = newton.solvers.SolverXPBD(model, iterations=8)
+        test.assertTrue(solver.coupling_supports_full_surface_soft_contacts())
+        solver.step(state_in, state_out, None, contacts, 1.0 / 120.0)
+        return contact_count, has_feature_contact, state_out.body_q.numpy()[body], state_out.body_qd.numpy()[body]
+
+    vertex_count, _, vertex_position, vertex_velocity = solve(False)
+    feature_count, has_feature_contact, feature_position, feature_velocity = solve(True)
+
+    test.assertEqual(vertex_count, 0)
+    test.assertGreater(feature_count, 0)
+    test.assertTrue(has_feature_contact)
+    test.assertAlmostEqual(float(vertex_velocity[2]), -1.0, places=5)
+    test.assertGreater(float(feature_velocity[2]), -0.1)
+    test.assertGreater(float(feature_position[2]), float(vertex_position[2]) + 0.005)
+
+
+def test_xpbd_particle_contact_limits_depenetration_velocity(test, device):
+    """Limit correction velocity for a particle that starts deeply penetrating."""
+
+    def solve(max_velocity: float | None) -> float:
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis="Y")
+        builder.add_ground_plane()
+        builder.add_particle(pos=(0.0, -1.0, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.1)
+
+        model = builder.finalize(device=device)
+        state_in = model.state()
+        state_out = model.state()
+        collision_pipeline = newton.CollisionPipeline(model)
+        contacts = collision_pipeline.contacts()
+        collision_pipeline.collide(state_in, contacts)
+        solver = newton.solvers.SolverXPBD(
+            model,
+            iterations=4,
+            soft_contact_max_depenetration_velocity=max_velocity,
+        )
+        solver.step(state_in, state_out, None, contacts, 0.1)
+        return float(state_out.particle_q.numpy()[0, 1] - state_in.particle_q.numpy()[0, 1])
+
+    automatic_displacement = solve(None)
+    explicit_displacement = solve(1.0)
+    test.assertGreater(automatic_displacement, 0.0)
+    test.assertLessEqual(automatic_displacement, 0.025 + 1.0e-5)
+    test.assertGreater(explicit_displacement, automatic_displacement)
+    test.assertLessEqual(explicit_displacement, 0.1 + 1.0e-5)
+
+
+def test_xpbd_particle_contact_depenetration_does_not_launch_particle(test, device):
+    """Recover deep overlap without creating persistent separating velocity."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis="Y")
+    builder.add_ground_plane()
+    builder.add_particle(pos=(0.0, -0.1, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.2)
+
+    model = builder.finalize(device=device)
+    state_in = model.state()
+    state_out = model.state()
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
+    solver = newton.solvers.SolverXPBD(model, iterations=5)
+
+    heights = []
+    for _ in range(8):
+        collision_pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, None, contacts, 1.0 / 60.0)
+        heights.append(float(state_out.particle_q.numpy()[0, 1]))
+        np.testing.assert_allclose(state_out.particle_qd.numpy()[0], 0.0, atol=1.0e-5)
+        state_in, state_out = state_out, state_in
+
+    test.assertTrue(all(b >= a for a, b in pairwise(heights)))
+    np.testing.assert_allclose(heights[-1], 0.2, atol=1.0e-5)
+
+
+def test_xpbd_external_body_motion_transfers_friction(test, device):
+    """Transfer tangential motion from an externally integrated body through friction."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis="Y")
+    body = builder.add_body()
+    builder.add_shape_box(body, hx=0.5, hy=0.5, hz=0.5)
+    builder.add_particle(pos=(0.0, 0.6, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.2)
+
+    model = builder.finalize(device=device)
+    model.particle_mu = 1.0
+    state_in = model.state()
+    state_out = model.state()
+    dt = 1.0 / 60.0
+    body_q = state_out.body_q.numpy()
+    body_q[body, 0] = dt
+    state_out.body_q.assign(body_q)
+    body_qd = state_out.body_qd.numpy()
+    body_qd[body, 0] = 1.0
+    state_out.body_qd.assign(body_qd)
+
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
+    collision_pipeline.collide(state_in, contacts)
+    solver = newton.solvers.SolverXPBD(
+        model,
+        iterations=5,
+        integrate_with_external_rigid_solver=True,
+    )
+    solver.step(state_in, state_out, None, contacts, dt)
+
+    np.testing.assert_allclose(state_out.particle_qd.numpy()[0], (1.0, 0.0, 0.0), atol=1.0e-4)
+    np.testing.assert_allclose(state_out.body_qd.numpy()[body, :3], (1.0, 0.0, 0.0), atol=1.0e-6)
+
+
+def test_xpbd_external_body_velocity_transfers_friction_without_pose_delta(test, device):
+    """Use prescribed body velocity when a lagged proxy pose is unchanged."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis="Y")
+    body = builder.add_body()
+    builder.add_shape_box(body, hx=0.5, hy=0.5, hz=0.5)
+    builder.add_particle(pos=(0.0, 0.6, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.2)
+
+    model = builder.finalize(device=device)
+    model.particle_mu = 1.0
+    state_in = model.state()
+    state_out = model.state()
+    body_qd = state_out.body_qd.numpy()
+    body_qd[body, 0] = 1.0
+    state_out.body_qd.assign(body_qd)
+
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
+    collision_pipeline.collide(state_in, contacts)
+    solver = newton.solvers.SolverXPBD(
+        model,
+        iterations=5,
+        integrate_with_external_rigid_solver=True,
+    )
+    solver.step(state_in, state_out, None, contacts, 1.0 / 60.0)
+
+    test.assertGreater(float(state_out.particle_qd.numpy()[0, 0]), 0.9)
+
+
+def test_xpbd_static_soft_contact_enters_static_friction_branch(test, device):
+    """Stop low-speed cloth slip supported by redundant surface contacts."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=1.0))
+    builder.add_cloth_grid(
+        pos=wp.vec3(-0.25, -0.25, 0.005),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.01, 0.0, 0.0),
+        dim_x=1,
+        dim_y=1,
+        cell_x=0.5,
+        cell_y=0.5,
+        mass=1.0,
+        tri_ke=1.0e-6,
+        tri_ka=1.0e-6,
+        edge_ke=0.0,
+        particle_radius=0.01,
+    )
+    model = builder.finalize(device=device)
+    model.particle_mu = 1.0
+    model.soft_contact_mu = 1.0
+    state_in = model.state()
+    state_out = model.state()
+    collision_pipeline = newton.CollisionPipeline(
+        model,
+        soft_contact_margin=0.02,
+        enable_rigid_soft_full_surface_contact=True,
+    )
+    contacts = collision_pipeline.contacts()
+    collision_pipeline.collide(state_in, contacts)
+    solver = newton.solvers.SolverXPBD(model, iterations=2)
+
+    solver.step(state_in, state_out, None, contacts, 1.0 / 60.0)
+
+    tangent_speed = np.linalg.norm(state_out.particle_qd.numpy()[:, :2], axis=1)
+    np.testing.assert_allclose(tangent_speed, 0.0, atol=1.0e-6)
+
+
+def test_xpbd_particle_damping_is_time_step_independent(test, device):
+    """Apply exponential particle damping to velocity and predicted position."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.add_particle(pos=(0.0, 0.0, 0.0), vel=(1.0, 0.0, 0.0), mass=1.0, radius=0.0)
+    model = builder.finalize(device=device)
+    state_in = model.state()
+    state_out = model.state()
+    dt = 0.1
+    damping = 2.0
+
+    solver = newton.solvers.SolverXPBD(model, iterations=1, particle_damping=damping)
+    solver.step(state_in, state_out, None, None, dt)
+
+    expected_velocity = np.exp(-damping * dt)
+    np.testing.assert_allclose(state_out.particle_qd.numpy()[0], (expected_velocity, 0.0, 0.0), atol=1.0e-6)
+    np.testing.assert_allclose(
+        state_out.particle_q.numpy()[0],
+        (expected_velocity * dt, 0.0, 0.0),
+        atol=1.0e-6,
+    )
+
+
+def test_xpbd_inactive_shape_candidates_do_not_dilute_friction(test, device):
+    """Exclude inactive broad-phase candidates from contact averaging."""
+
+    def solve(inactive_shape_count: int) -> float:
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis="Y")
+        body = builder.add_body()
+        builder.add_shape_box(body, hx=0.5, hy=0.5, hz=0.5)
+        for i in range(inactive_shape_count):
+            builder.add_shape_box(
+                -1,
+                xform=wp.transform((0.0, -0.5 - 0.05 * i, 0.0), wp.quat_identity()),
+                hx=0.5,
+                hy=0.25,
+                hz=0.5,
+            )
+        builder.add_particle(pos=(0.0, 0.6, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.2)
+
+        model = builder.finalize(device=device)
+        model.particle_mu = 1.0
+        state_in = model.state()
+        state_out = model.state()
+        body_qd = state_out.body_qd.numpy()
+        body_qd[body, 0] = 1.0
+        state_out.body_qd.assign(body_qd)
+
+        collision_pipeline = newton.CollisionPipeline(model, soft_contact_margin=2.0)
+        contacts = collision_pipeline.contacts()
+        collision_pipeline.collide(state_in, contacts)
+        test.assertGreaterEqual(int(contacts.soft_contact_count.numpy()[0]), inactive_shape_count + 1)
+        solver = newton.solvers.SolverXPBD(
+            model,
+            iterations=5,
+            integrate_with_external_rigid_solver=True,
+        )
+        solver.step(state_in, state_out, None, contacts, 1.0 / 60.0)
+        return float(state_out.particle_qd.numpy()[0, 0])
+
+    reference_velocity = solve(0)
+    cluttered_velocity = solve(8)
+    test.assertGreater(reference_velocity, 0.9)
+    test.assertAlmostEqual(cluttered_velocity, reference_velocity, places=4)
+
+
+def test_xpbd_fully_coupled_rigid_cloth_contact(test, device):
+    """Exchange tangential momentum when XPBD owns both a rigid body and cloth."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis="Y")
+    body = builder.add_body(mass=10.0, inertia=wp.mat33(np.eye(3)))
+    builder.add_shape_box(body, hx=0.5, hy=0.5, hz=0.5)
+    builder.add_cloth_mesh(
+        pos=wp.vec3(0.0, 0.6, 0.0),
+        rot=wp.quat_identity(),
+        scale=1.0,
+        vel=wp.vec3(0.0),
+        vertices=[wp.vec3(-0.1, 0.0, -0.1), wp.vec3(0.1, 0.0, -0.1), wp.vec3(0.0, 0.0, 0.1)],
+        indices=[0, 1, 2],
+        density=1.0,
+        tri_ke=1.0e4,
+        tri_ka=1.0e4,
+        edge_ke=0.0,
+        particle_radius=0.2,
+    )
+
+    model = builder.finalize(device=device)
+    model.particle_mu = 1.0
+    state_in = model.state()
+    state_out = model.state()
+    body_qd = state_in.body_qd.numpy()
+    body_qd[body, 0] = 1.0
+    state_in.body_qd.assign(body_qd)
+
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
+    collision_pipeline.collide(state_in, contacts)
+    solver = newton.solvers.SolverXPBD(model, iterations=5)
+    solver.step(state_in, state_out, None, contacts, 1.0 / 60.0)
+
+    cloth_velocity = np.mean(state_out.particle_qd.numpy(), axis=0)
+    test.assertGreater(float(cloth_velocity[0]), 0.5)
+    test.assertLess(abs(float(cloth_velocity[1])), 1.0e-3)
+    test.assertLess(float(state_out.body_qd.numpy()[body, 0]), 1.0)
+
+
+def test_xpbd_many_particle_contacts_do_not_amplify_body_delta(test, device):
+    """Normalize simultaneous particle contacts sharing one rigid body."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis="Y")
+    body = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    builder.add_shape_box(
+        body,
+        hx=0.75,
+        hy=0.5,
+        hz=0.75,
+        cfg=newton.ModelBuilder.ShapeConfig(density=0.0),
+    )
+    for z in np.linspace(-0.5, 0.5, 5):
+        for x in np.linspace(-0.5, 0.5, 5):
+            builder.add_particle(pos=(x, 0.55, z), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.1)
+
+    model = builder.finalize(device=device)
+    state_in = model.state()
+    state_out = model.state()
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
+    collision_pipeline.collide(state_in, contacts)
+    solver = newton.solvers.SolverXPBD(model, iterations=5)
+    solver.compute_body_velocity_from_position_delta = True
+    solver.step(state_in, state_out, None, contacts, 1.0 / 60.0)
+
+    body_position = state_out.body_q.numpy()[body, :3]
+    body_velocity = state_out.body_qd.numpy()[body]
+    test.assertTrue(np.all(np.isfinite(body_position)))
+    test.assertTrue(np.all(np.isfinite(body_velocity)))
+    test.assertGreater(float(body_position[1]), -0.03)
+    test.assertLess(float(np.linalg.norm(body_velocity)), 0.1)
+
+
 devices = get_test_devices()
 
 
 class TestSolverXPBD(unittest.TestCase):
     pass
+
+
+def _incline_slide_distance(device, friction: float, iterations: int, frames: int = 60) -> float:
+    """Slide a cloth patch down a 40-degree incline and return its travel [m]."""
+    theta = math.radians(40.0)
+    builder = newton.ModelBuilder()
+    cfg = builder.default_shape_cfg.copy()
+    cfg.mu = friction
+    cfg.ka = 0.0
+    rot = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), theta)
+    builder.add_shape_plane(body=-1, xform=wp.transform(wp.vec3(0.0), rot), width=60.0, length=60.0, cfg=cfg)
+    size = 8 * 0.05
+    builder.add_cloth_grid(
+        pos=wp.vec3(
+            -0.5 * size * math.cos(theta) + 0.02 * math.sin(theta),
+            -0.5 * size,
+            0.5 * size * math.sin(theta) + 0.02 * math.cos(theta),
+        ),
+        rot=rot,
+        vel=wp.vec3(0.0),
+        dim_x=8,
+        dim_y=8,
+        cell_x=0.05,
+        cell_y=0.05,
+        mass=1.0e-3,
+        tri_ke=1.0e4,
+        tri_ka=1.0e4,
+        tri_kd=2.0,
+        edge_ke=1.0,
+        edge_kd=0.1,
+        particle_radius=0.01,
+    )
+    model = builder.finalize(device=device)
+    model.soft_contact_mu = friction
+    model.particle_mu = friction
+    model.shape_material_ka.zero_()
+
+    solver = newton.solvers.SolverXPBD(model, iterations=iterations)
+    pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.03, enable_rigid_soft_full_surface_contact=True)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    start = state_0.particle_q.numpy().mean(axis=0)
+    for _ in range(frames):
+        for _ in range(4):
+            state_0.clear_forces()
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+    end = state_0.particle_q.numpy().mean(axis=0)
+    downhill = np.array([math.cos(theta), 0.0, -math.sin(theta)])
+    return float(np.dot(end - start, downhill))
+
+
+def test_xpbd_cloth_friction_is_independent_of_iteration_count(test, device):
+    """Keep cloth-shape friction a material property, not a solver-iteration count.
+
+    A friction impulse that is re-applied at its full Coulomb bound on every
+    iteration makes the effective friction force scale with ``iterations``, so
+    the same material slides very different distances at different iteration
+    counts.
+    """
+    distances = [_incline_slide_distance(device, friction=0.3, iterations=n) for n in (1, 2, 4, 8)]
+    reference = distances[0]
+    test.assertGreater(reference, 0.1, "the patch must actually slide at mu below tan(theta)")
+    for iterations, distance in zip((1, 2, 4, 8), distances, strict=True):
+        test.assertAlmostEqual(
+            distance / reference,
+            1.0,
+            delta=0.15,
+            msg=f"slide distance changed by more than 15% at {iterations} iterations",
+        )
+
+
+def test_xpbd_cloth_friction_obeys_coulomb_threshold(test, device):
+    """Hold a cloth patch only when mu exceeds tan of the incline angle.
+
+    Spending the Coulomb budget once in the positional solve and again in the
+    velocity pass doubles the achievable friction force, which lets the patch
+    stick well below the analytic threshold.
+    """
+    tan_theta = math.tan(math.radians(40.0))
+    below = _incline_slide_distance(device, friction=0.5 * tan_theta, iterations=8)
+    above = _incline_slide_distance(device, friction=1.2 * tan_theta, iterations=8)
+    # Free-fall reference for the same duration, used to bound the sliding case.
+    frictionless = _incline_slide_distance(device, friction=0.0, iterations=8)
+
+    test.assertGreater(below, 0.25 * frictionless, "mu below tan(theta) must not arrest the patch")
+    test.assertLess(above, 0.05 * frictionless, "mu above tan(theta) must hold the patch")
+
+
+def test_xpbd_triangle_intersection_recovery_stays_bounded(test, device):
+    """Keep intersection recovery stable when one vertex joins many intersecting pairs.
+
+    Recovery separates each intersecting triangle pair. Without a shared Jacobi
+    scale, a vertex belonging to several pairs receives every pair's full
+    separation at once, and that overshoot creates more intersections than it
+    removes.
+    """
+    # Zero gravity keeps every bit of residual motion attributable to the
+    # recovery impulses rather than to bulk free fall.
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    # Two crumpled layers seeded close together produce many-to-many triangle
+    # intersections through a single shared region.
+    rng = np.random.default_rng(7)
+    for layer in range(2):
+        vertices = []
+        indices = []
+        stride = 9
+        for y in range(stride):
+            for x in range(stride):
+                vertices.append(wp.vec3(x * 0.05, y * 0.05, layer * 0.004 + float(rng.uniform(-0.004, 0.004))))
+        for y in range(stride - 1):
+            for x in range(stride - 1):
+                v0 = y * stride + x
+                indices.extend((v0, v0 + 1, v0 + stride, v0 + 1, v0 + 1 + stride, v0 + stride))
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0),
+            vertices=vertices,
+            indices=indices,
+            density=0.2,
+            tri_ke=1.0e4,
+            tri_ka=1.0e4,
+            tri_kd=0.0,
+            edge_ke=0.01,
+            edge_kd=0.0,
+            particle_radius=0.01,
+        )
+
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverXPBD(
+        model,
+        iterations=4,
+        particle_enable_self_contact=True,
+        particle_enable_triangle_intersection_recovery=True,
+        particle_self_contact_radius=0.02,
+        particle_self_contact_margin=0.04,
+    )
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    for _ in range(120):
+        solver.rebuild_bvh(state_0)
+        for _ in range(4):
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+
+    probe = TriMeshCollisionDetector(model)
+    probe.refit(state_0.particle_q)
+    probe.triangle_triangle_intersection_detection()
+    remaining = int(probe.triangle_intersecting_triangles_count.numpy().sum() // 2)
+    positions = state_0.particle_q.numpy()
+    speeds = np.linalg.norm(state_0.particle_qd.numpy(), axis=1)
+
+    test.assertTrue(np.all(np.isfinite(positions)), "recovery must not produce non-finite positions")
+    test.assertEqual(remaining, 0, f"recovery must resolve every triangle intersection ({remaining} left)")
+    # Unbounded overshoot shows up as runaway speed long before it shows up as
+    # a non-finite position.
+    test.assertLess(
+        float(np.max(speeds)),
+        2.0,
+        f"intersection recovery must not inject energy (max speed {float(np.max(speeds)):.3f} m/s)",
+    )
+
+
+def test_xpbd_cloth_vertices_do_not_self_repel_without_self_contact(test, device):
+    """Keep a plain cloth at rest when its vertex spacing is below the particle diameter.
+
+    The particle-particle fallback treats every vertex as a sphere. Without a
+    rest-pose exclusion it collides each vertex with its own immediate mesh
+    neighbors, and that permanent overlap fights the stretch constraints until
+    the surface tears itself apart.
+    """
+    builder = newton.ModelBuilder()
+    cfg = builder.default_shape_cfg.copy()
+    cfg.mu = 1.0
+    cfg.ka = 0.0
+    builder.add_ground_plane(cfg=cfg)
+    # Spacing 0.025 m is deliberately below the 0.03 m particle diameter.
+    builder.add_cloth_grid(
+        pos=wp.vec3(-0.2, -0.2, 0.2),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=16,
+        dim_y=16,
+        cell_x=0.025,
+        cell_y=0.025,
+        mass=2.0e-4,
+        tri_ke=8.0e3,
+        tri_ka=8.0e3,
+        tri_kd=0.0,
+        edge_ke=0.002,
+        edge_kd=0.0,
+        particle_radius=0.015,
+    )
+    model = builder.finalize(device=device)
+    model.particle_mu = 1.0
+    model.soft_contact_mu = 1.0
+
+    solver = newton.solvers.SolverXPBD(model, iterations=6)
+    pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.04, enable_rigid_soft_full_surface_contact=True)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    for _ in range(240):
+        for _ in range(4):
+            state_0.clear_forces()
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+
+    positions = state_0.particle_q.numpy()
+    speeds = np.linalg.norm(state_0.particle_qd.numpy(), axis=1)
+    rest = model.particle_q.numpy()
+    test.assertTrue(np.all(np.isfinite(positions)), "cloth positions must remain finite")
+    test.assertLess(
+        float(np.max(speeds)), 0.2, f"settled cloth must be at rest (max speed {float(np.max(speeds)):.3f} m/s)"
+    )
+    # Self-repulsion inflates the patch well beyond its rest footprint.
+    rest_extent = float(np.max(rest[:, 0]) - np.min(rest[:, 0]))
+    final_extent = float(np.max(positions[:, 0]) - np.min(positions[:, 0]))
+    test.assertLess(final_extent, 1.25 * rest_extent, "cloth must not stretch itself apart by vertex self-repulsion")
+
+
+def _aerodynamic_patch(device, gravity, air_density, air_velocity, frames, lift=0.0, drag=1.0):
+    """Simulate a free cloth patch lying in the XY plane and return (drift, velocity)."""
+    builder = newton.ModelBuilder(gravity=gravity)
+    builder.add_cloth_grid(
+        pos=wp.vec3(-0.25, -0.25, 2.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=16,
+        dim_y=16,
+        cell_x=0.03125,
+        cell_y=0.03125,
+        mass=5.0e-4,
+        tri_ke=1.0e4,
+        tri_ka=1.0e4,
+        tri_kd=1.0,
+        edge_ke=0.5,
+        edge_kd=0.05,
+        particle_radius=0.005,
+    )
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverXPBD(
+        model,
+        iterations=4,
+        air_density=air_density,
+        air_drag_coefficient=drag,
+        air_lift_coefficient=lift,
+        air_velocity=air_velocity,
+    )
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    start = state_0.particle_q.numpy().mean(axis=0)
+    for _ in range(frames):
+        for _ in range(4):
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+    drift = state_0.particle_q.numpy().mean(axis=0) - start
+    velocity = state_0.particle_qd.numpy().mean(axis=0)
+    return drift, velocity
+
+
+def test_xpbd_air_drag_reduces_fall_speed(test, device):
+    """Slow a falling cloth patch with aerodynamic drag and reach a terminal speed."""
+    _, free_fall = _aerodynamic_patch(device, (0.0, 0.0, -9.81), 0.0, (0.0, 0.0, 0.0), frames=90)
+    _, light = _aerodynamic_patch(device, (0.0, 0.0, -9.81), 1.225, (0.0, 0.0, 0.0), frames=90)
+    _, heavy = _aerodynamic_patch(device, (0.0, 0.0, -9.81), 20.0, (0.0, 0.0, 0.0), frames=90)
+
+    # 1.5 s of unresisted free fall.
+    test.assertAlmostEqual(free_fall[2], -9.81 * 1.5, delta=0.2)
+    test.assertGreater(light[2], free_fall[2], "drag must slow the fall")
+    test.assertGreater(heavy[2], light[2], "denser air must slow the fall further")
+    test.assertLess(heavy[2], 0.0, "the patch must still fall")
+
+
+def test_xpbd_air_drag_is_disabled_by_zero_density(test, device):
+    """Leave the simulation untouched when air density is zero."""
+    drift, velocity = _aerodynamic_patch(device, (0.0, 0.0, 0.0), 0.0, (0.0, 0.0, 5.0), frames=60)
+    np.testing.assert_allclose(drift, 0.0, atol=1.0e-6)
+    np.testing.assert_allclose(velocity, 0.0, atol=1.0e-6)
+
+
+def test_xpbd_air_drag_follows_angle_of_attack(test, device):
+    """Push cloth with face-on wind and leave edge-on wind without effect.
+
+    The patch lies in the XY plane, so wind along +Z meets its full frontal
+    area while wind along +X slides past edge-on and projects to zero area.
+    """
+    face_on, face_velocity = _aerodynamic_patch(device, (0.0, 0.0, 0.0), 1.225, (0.0, 0.0, 3.0), frames=60)
+    edge_on, edge_velocity = _aerodynamic_patch(device, (0.0, 0.0, 0.0), 1.225, (3.0, 0.0, 0.0), frames=60)
+
+    test.assertGreater(face_velocity[2], 1.0, "face-on wind must accelerate the patch downwind")
+    # Drag can only approach the wind speed, never exceed it.
+    test.assertLess(face_velocity[2], 3.0, "drag must not accelerate cloth past the air velocity")
+    test.assertGreater(face_on[2], 0.5, "the patch must travel downwind")
+    np.testing.assert_allclose(edge_velocity, 0.0, atol=1.0e-6)
+    np.testing.assert_allclose(edge_on, 0.0, atol=1.0e-6)
+
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_spring_compliance_is_iteration_independent",
+    test_xpbd_spring_compliance_is_iteration_independent,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_cloth_triangle_resists_membrane_strain",
+    test_xpbd_cloth_triangle_resists_membrane_strain,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_connected_cloth_constraints_continue_converging",
+    test_xpbd_connected_cloth_constraints_continue_converging,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_cloth_self_contact_separates_surfaces",
+    test_xpbd_cloth_self_contact_separates_surfaces,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_cloth_self_contact_prevents_triangle_tunneling",
+    test_xpbd_cloth_self_contact_prevents_triangle_tunneling,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_cloth_self_contact_recovers_intersection_created_by_constraints",
+    test_xpbd_cloth_self_contact_recovers_intersection_created_by_constraints,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_triangle_intersection_recovery_honors_depenetration_limit",
+    test_xpbd_triangle_intersection_recovery_honors_depenetration_limit,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_cloth_self_contact_recovers_local_triangle_inversion",
+    test_xpbd_cloth_self_contact_recovers_local_triangle_inversion,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_cloth_self_contact_relaxation_is_independent",
+    test_xpbd_cloth_self_contact_relaxation_is_independent,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_external_rigid_solver_preserves_body_state",
+    test_xpbd_external_rigid_solver_preserves_body_state,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_shape_adhesion_pulls_particle",
+    test_xpbd_shape_adhesion_pulls_particle,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_soft_contact_honors_shape_margin",
+    test_xpbd_soft_contact_honors_shape_margin,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_full_surface_soft_contact_blocks_triangle_interior",
+    test_xpbd_full_surface_soft_contact_blocks_triangle_interior,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_contact_limits_depenetration_velocity",
+    test_xpbd_particle_contact_limits_depenetration_velocity,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_cloth_overlap_recovery_does_not_accumulate_velocity",
+    test_xpbd_cloth_overlap_recovery_does_not_accumulate_velocity,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_cloth_self_contact_friction_reduces_slip",
+    test_xpbd_cloth_self_contact_friction_reduces_slip,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_cloth_self_contact_velocity_stabilization_is_inelastic",
+    test_xpbd_cloth_self_contact_velocity_stabilization_is_inelastic,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_contact_depenetration_does_not_launch_particle",
+    test_xpbd_particle_contact_depenetration_does_not_launch_particle,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_external_body_motion_transfers_friction",
+    test_xpbd_external_body_motion_transfers_friction,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_external_body_velocity_transfers_friction_without_pose_delta",
+    test_xpbd_external_body_velocity_transfers_friction_without_pose_delta,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_static_soft_contact_enters_static_friction_branch",
+    test_xpbd_static_soft_contact_enters_static_friction_branch,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_damping_is_time_step_independent",
+    test_xpbd_particle_damping_is_time_step_independent,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_inactive_shape_candidates_do_not_dilute_friction",
+    test_xpbd_inactive_shape_candidates_do_not_dilute_friction,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_fully_coupled_rigid_cloth_contact",
+    test_xpbd_fully_coupled_rigid_cloth_contact,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_many_particle_contacts_do_not_amplify_body_delta",
+    test_xpbd_many_particle_contacts_do_not_amplify_body_delta,
+    devices=devices,
+    check_output=False,
+)
 
 
 add_function_test(
@@ -2048,6 +3583,64 @@ add_function_test(
     TestSolverXPBD,
     "test_xpbd_aligned_box_stack_remains_stable",
     test_xpbd_aligned_box_stack_remains_stable,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_cloth_friction_is_independent_of_iteration_count",
+    test_xpbd_cloth_friction_is_independent_of_iteration_count,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_cloth_friction_obeys_coulomb_threshold",
+    test_xpbd_cloth_friction_obeys_coulomb_threshold,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_triangle_intersection_recovery_stays_bounded",
+    test_xpbd_triangle_intersection_recovery_stays_bounded,
+    devices=devices,
+    check_output=False,
+)
+
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_cloth_vertices_do_not_self_repel_without_self_contact",
+    test_xpbd_cloth_vertices_do_not_self_repel_without_self_contact,
+    devices=devices,
+    check_output=False,
+)
+
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_air_drag_reduces_fall_speed",
+    test_xpbd_air_drag_reduces_fall_speed,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_air_drag_is_disabled_by_zero_density",
+    test_xpbd_air_drag_is_disabled_by_zero_density,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_air_drag_follows_angle_of_attack",
+    test_xpbd_air_drag_follows_angle_of_attack,
     devices=devices,
     check_output=False,
 )

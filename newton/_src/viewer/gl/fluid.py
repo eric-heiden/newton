@@ -1424,9 +1424,9 @@ class DiffuseBatch:
 class FluidRenderer:
     """Owns the fluid render targets and programs; driven by RendererGL."""
 
-    # Fluid depth/thickness/blur run at reduced resolution; half resolution
-    # lowers fill cost and doubles the filter's effective world-space reach.
-    RESOLUTION_SCALE = 0.5
+    # Surface reconstruction stays at the framebuffer resolution. Half-size
+    # targets are faster, but visibly staircase thin sheets and silhouettes.
+    RESOLUTION_SCALE = 1.0
 
     def __init__(self, gl):
         self._gl = gl

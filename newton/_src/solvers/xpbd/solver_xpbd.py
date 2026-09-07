@@ -545,11 +545,12 @@ class SolverXPBD(SolverBase, CouplingInterface):
         the particles back into Morton (Z-curve) order restores it.
 
         The reorder is a pure relabeling, so the simulation result is unchanged.
-        It only runs when every active particle is a free fluid particle;
-        reordering would otherwise scramble the index-based topology of cloth or
-        soft bodies. Call it once per frame, before the substep loop. Every step
-        is on device and CUDA-graph-capturable, so it may run inside a captured
-        region.
+        It only runs when every active particle is a free fluid particle in a
+        single world; reordering would otherwise scramble the index-based
+        topology of cloth or soft bodies, or invalidate the collision pipeline's
+        precomputed per-world particle-shape candidate pairs. Call it once per
+        frame, before the substep loop. Every step is on device and CUDA-graph-
+        capturable, so it may run inside a captured region.
 
         Args:
             state: State whose ``particle_q`` defines the sort order; its
@@ -558,7 +559,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         """
         model = self.model
         n = model.particle_count
-        if not self._all_fluid or not self._has_fluid or n <= 1:
+        if not self._all_fluid or not self._has_fluid or model.world_count > 1 or n <= 1:
             return
 
         dev = model.device
@@ -1465,6 +1466,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                     model.body_com,
                                     self.body_inv_mass_effective,
                                     self.body_inv_inertia_effective,
+                                    model.body_flags,
                                     model.shape_body,
                                     model.shape_material_mu,
                                     model.soft_contact_mu,
@@ -1508,6 +1510,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                     model.body_com,
                                     self.body_inv_mass_effective,
                                     self.body_inv_inertia_effective,
+                                    model.body_flags,
                                     model.shape_body,
                                     model.shape_material_mu,
                                     model.soft_contact_mu,

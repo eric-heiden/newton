@@ -12891,11 +12891,7 @@ class ModelBuilder:
                 cache_key = None
                 mesh_sdf = None
 
-                if (
-                    shape_type in (GeoType.MESH, GeoType.CONVEX_MESH)
-                    and has_sdf_collision
-                    and shape_src is not None
-                ):
+                if shape_type in (GeoType.MESH, GeoType.CONVEX_MESH) and has_sdf_collision and shape_src is not None:
                     mesh_sdf = getattr(shape_src, "sdf", None)
                     # Build on a Mesh clone so shapes sharing one Mesh at different
                     # scale/margin/resolution end up with distinct SDFs.

@@ -124,7 +124,7 @@ class Example:
         wall_thickness = args.wall_thickness
         self.wall_thickness = wall_thickness
 
-        builder = newton.ModelBuilder(up_axis="Z", gravity=args.gravity)
+        builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, args.gravity))
         builder.default_particle_radius = radius
         builder.default_shape_cfg.mu = 0.2
 
@@ -182,7 +182,8 @@ class Example:
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
-        self.contacts = self.model.contacts()
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
 
         self.fluid_colors = (tuple(args.fluid_color_0), tuple(args.fluid_color_1))
         self.fluid_radius_scale = args.fluid_radius_scale
@@ -276,7 +277,7 @@ class Example:
         self.solver.reorder_particles(self.state_0)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
-            self.model.collide(self.state_0, self.contacts)
+            self.collision_pipeline.collide(self.state_0, self.contacts)
             self.viewer.apply_forces(self.state_0)
             self.solver.step(self.state_0, self.state_1, None, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0

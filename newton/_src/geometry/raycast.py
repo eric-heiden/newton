@@ -971,18 +971,26 @@ def raycast_pick_kernel(
     geomtype = geom_type[shape_idx]
 
     if geomtype == GeoType.MESH or geomtype == GeoType.CONVEX_MESH or geomtype == GeoType.HFIELD:
-        mesh_id = shape_source_ptr[shape_idx]
+        ray_origin_local, ray_direction_local = map_ray_to_local(
+            geom_to_world, ray_origin, ray_direction, geom_size[shape_idx]
+        )
+        t, _normal, _u, _v, _face = ray_intersect_mesh(
+            ray_origin_local,
+            ray_direction_local,
+            geom_size[shape_idx],
+            shape_source_ptr[shape_idx],
+            False,
+            _DEFAULT_MESH_MAX_T,
+        )
     else:
-        mesh_id = wp.uint64(0)
-
-    t, _normal = ray_intersect_geom(
-        geom_to_world,
-        geom_size[shape_idx],
-        geomtype,
-        ray_origin,
-        ray_direction,
-        mesh_id,
-    )
+        t, _normal = ray_intersect_shape(
+            geom_to_world,
+            geom_size[shape_idx],
+            geomtype,
+            ray_origin,
+            ray_direction,
+            False,
+        )
 
     if t >= 0.0 and t < min_dist[0]:
         _spinlock_acquire(lock)

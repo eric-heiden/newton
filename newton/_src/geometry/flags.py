@@ -20,6 +20,8 @@ class ParticleFlags(IntEnum):
 
         This flag is part of the experimental coupled-solver contract and may
         change without prior notice.
+    """
+
     FLUID = 1 << 2
     """Indicates that the particle is part of a fluid.
 

@@ -1042,6 +1042,68 @@ add_example_test(
 )
 
 
+class TestFluidExamples(NewtonTestCase):
+    pass
+
+
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_xpbd_dam_break",
+    devices=cuda_test_devices,
+    test_options={"num_frames": 60, "particle_count": 6_720, "substeps": 4},
+    use_viewer=True,
+)
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_xpbd_cereal_bowl",
+    devices=cuda_test_devices,
+    test_options={"num_frames": 180, "particle_count": 3_600, "sdf_resolution": 64},
+    use_viewer=True,
+)
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_xpbd_cup",
+    devices=cuda_test_devices,
+    test_options={"num_frames": 60, "particle_count": 1_450, "sdf_resolution": 48},
+    use_viewer=True,
+)
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_xpbd_cup_transfer",
+    devices=cuda_test_devices,
+    test_options={"num_frames": 40, "particle_count": 384, "sdf_resolution": 48},
+    use_viewer=True,
+)
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_xpbd_interactive_tank",
+    devices=cuda_test_devices,
+    test_options={"num_frames": 90, "particle_count": 9_500},
+    use_viewer=True,
+)
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_xpbd_multi_fluid_tank",
+    devices=cuda_test_devices,
+    test_options={"num_frames": 60, "particle_count": 9_600, "foam_max_particles": 0},
+    use_viewer=True,
+)
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_xpbd_multiworld_cup",
+    devices=cuda_test_devices,
+    test_options={"num_frames": 20, "particle_count": 1_740, "fill_height": 0.055, "sdf_resolution": 48},
+    use_viewer=True,
+)
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_xpbd_wave_pool",
+    devices=cuda_test_devices,
+    test_options={"num_frames": 120, "particle_count": 7_500},
+    use_viewer=True,
+)
+
+
 add_basic_example_test(
     name="basic.example_basic_plotting",
     devices=test_devices,

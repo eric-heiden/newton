@@ -95,7 +95,7 @@ class Example:
         self.paddle_amplitude = args.paddle_amplitude
         self.paddle_frequency = 2.0 * np.pi / max(args.paddle_period, 1.0e-3)
 
-        builder = newton.ModelBuilder(up_axis="Z", gravity=args.gravity)
+        builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, args.gravity))
         builder.default_particle_radius = radius
         builder.default_shape_cfg.mu = 0.2
 
@@ -203,7 +203,8 @@ class Example:
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
-        self.contacts = self.model.contacts()
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
         self.paddle_time = wp.zeros(1, dtype=float, device=self.model.device)
 
         # remove spawned particles that started inside the beach ramp
@@ -292,7 +293,7 @@ class Example:
                 ],
                 device=self.model.device,
             )
-            self.model.collide(self.state_0, self.contacts)
+            self.collision_pipeline.collide(self.state_0, self.contacts)
             self.viewer.apply_forces(self.state_0)
             self.solver.step(self.state_0, self.state_1, None, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0

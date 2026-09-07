@@ -115,7 +115,7 @@ class Example:
         ik_builder.add_urdf(urdf, xform=wp.transform(wp.vec3(0.0), wp.quat_identity()), enable_self_collisions=False)
         self.ik_model = ik_builder.finalize()
 
-        builder = newton.ModelBuilder(gravity=args.gravity)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, args.gravity))
         builder.default_particle_radius = radius
         builder.add_urdf(urdf, xform=wp.transform(wp.vec3(0.0), wp.quat_identity()), enable_self_collisions=False)
         builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.4), color=(0.55, 0.56, 0.54))
@@ -184,7 +184,8 @@ class Example:
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
-        self.contacts = self.model.contacts()
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
 
         self.solver = newton.solvers.SolverXPBD(
             self.model,
@@ -471,7 +472,7 @@ class Example:
                 device=self.model.device,
             )
             self.state_0.clear_forces()
-            self.model.collide(self.state_0, self.contacts)
+            self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, None, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 

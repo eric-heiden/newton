@@ -46,7 +46,7 @@ class Example:
         mass = args.rest_density * spacing**3
         dim_x, dim_y, dim_z = particle_grid.dimensions
 
-        builder = newton.ModelBuilder(up_axis="Z", gravity=args.gravity)
+        builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, args.gravity))
         builder.default_particle_radius = radius
 
         builder.add_particle_grid(
@@ -112,7 +112,8 @@ class Example:
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
-        self.contacts = self.model.contacts()
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
 
         self.fluid_color = tuple(args.fluid_color)
         self.fluid_ior = args.fluid_ior
@@ -137,7 +138,7 @@ class Example:
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
-            self.model.collide(self.state_0, self.contacts)
+            self.collision_pipeline.collide(self.state_0, self.contacts)
             self.viewer.apply_forces(self.state_0)
             self.solver.step(self.state_0, self.state_1, None, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0

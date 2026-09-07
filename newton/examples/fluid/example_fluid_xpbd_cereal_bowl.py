@@ -182,7 +182,7 @@ class Example:
         self.body_max_velocity = args.body_max_velocity
         self.body_max_angular_velocity = args.body_max_angular_velocity
 
-        builder = newton.ModelBuilder(up_axis="Z", gravity=args.gravity)
+        builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, args.gravity))
         builder.default_particle_radius = radius
 
         # dynamic ceramic bowl
@@ -273,7 +273,7 @@ class Example:
         self._collision_pipeline = newton.CollisionPipeline(
             self.model, soft_contact_max=soft_contact_max, broad_phase="explicit"
         )
-        self.contacts = self.model.contacts(collision_pipeline=self._collision_pipeline)
+        self.contacts = self._collision_pipeline.contacts()
 
         self.fluid_color = tuple(args.fluid_color)
         self.fluid_blur_radius = 2.5 * spacing
@@ -450,7 +450,7 @@ class Example:
         self.solver.reorder_particles(self.state_0)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
-            self.model.collide(self.state_0, self.contacts)
+            self._collision_pipeline.collide(self.state_0, self.contacts)
             self.viewer.apply_forces(self.state_0)
             self.solver.step(self.state_0, self.state_1, None, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0

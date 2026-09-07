@@ -775,6 +775,30 @@ def test_fluid_reorder_noop_when_not_all_fluid(test, device):
     test.assertEqual(float(np.abs(before - state.particle_q.numpy()).max()), 0.0)
 
 
+def test_fluid_reorder_noop_for_multiworld_model(test, device):
+    """Reordering must preserve indices referenced by the collision pipeline's
+    precomputed per-world particle-shape candidate pairs."""
+    builder = newton.ModelBuilder(up_axis="Z", gravity=0.0)
+    for world in range(2):
+        builder.begin_world(label=f"world_{world}")
+        builder.add_particle(
+            pos=(float(1 - world), float(world), 0.0),
+            vel=(0.0, 0.0, 0.0),
+            mass=PARTICLE_MASS,
+            radius=RADIUS,
+            flags=FLUID_FLAGS,
+        )
+        builder.end_world()
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverXPBD(model, fluid_rest_distance=SPACING)
+    state = model.state()
+    before = _particle_records(model, state)
+
+    solver.reorder_particles(state)
+
+    test.assertEqual(float(np.abs(before - _particle_records(model, state)).max()), 0.0)
+
+
 def test_fluid_render_particles_ignore_non_fluid_neighbors(test, device):
     builder = newton.ModelBuilder(up_axis="Z", gravity=0.0)
     builder.default_particle_radius = RADIUS
@@ -1011,6 +1035,7 @@ for _name in (
     "test_fluid_sdf_mesh_contains_particles",
     "test_fluid_reorder_is_pure_relabel",
     "test_fluid_reorder_noop_when_not_all_fluid",
+    "test_fluid_reorder_noop_for_multiworld_model",
     "test_fluid_render_particles_ignore_non_fluid_neighbors",
     "test_inactive_fluid_flags_do_not_enable_solver",
     "test_fluid_cohesion_assignment_updates_derived_coefficient",

@@ -137,15 +137,27 @@ If you run the examples from a source checkout with uv, use
         <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_plotting.jpg" alt="Plotting">
       </a>
     </td>
-    <td></td>
-    <td></td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_dzhanibekov.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_dzhanibekov.jpg" alt="Dzhanibekov">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_conveyor_forces.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_conveyor_forces.jpg" alt="Conveyor Forces">
+      </a>
+    </td>
   </tr>
   <tr>
     <td align="center" width="33%">
       <code>python -m newton.examples basic_plotting</code>
     </td>
-    <td></td>
-    <td></td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples basic_dzhanibekov</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples basic_conveyor_forces</code>
+    </td>
   </tr>
   <tr>
     <td colspan="3"><h3>Robot Examples</h3></td>
@@ -235,6 +247,57 @@ If you run the examples from a source checkout with uv, use
     </td>
   </tr>
   <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_robot_omniwheel.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_robot_omniwheel.jpg" alt="Omniwheel">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_robot_asroballet.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_robot_asroballet.jpg" alt="asRoBallet">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples robot_omniwheel</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples robot_asroballet</code>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="3"><h3>Controller Examples</h3></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/controllers/example_controller_joint_impedance_heterogeneous.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_controller_joint_impedance_heterogeneous.jpg" alt="Joint Impedance Heterogeneous">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/controllers/example_controller_operational_space_hybrid_force_motion.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_controller_operational_space_hybrid_force_motion.jpg" alt="Operational Space Hybrid Force/Motion">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/controllers/example_controller_differential_ik.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_controller_differential_ik.jpg" alt="Differential IK">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples controller_joint_impedance_heterogeneous</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples controller_operational_space_hybrid_force_motion</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples controller_differential_ik</code>
+    </td>
+  </tr>
+  <tr>
     <td colspan="3"><h3>Cable Examples</h3></td>
   </tr>
   <tr>
@@ -277,6 +340,9 @@ If you run the examples from a source checkout with uv, use
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cable/example_cable_plectoneme.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cable_plectoneme.jpg" alt="Cable Plectoneme">
+      </a>
     </td>
   </tr>
   <tr>
@@ -287,6 +353,7 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples cable_cross_slide_table</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples cable_plectoneme</code>
     </td>
   </tr>
   <tr>
@@ -476,7 +543,8 @@ If you run the examples from a source checkout with uv, use
   </tr>
   <tr>
     <td align="center" width="33%">
-      <code>python -m newton.examples mpm_granular</code>
+      <code>python -m newton.examples mpm_granular</code><br>
+      <code>python -m newton.examples mpm_granular --from-usd</code>
     </td>
     <td align="center" width="33%">
       <code>python -m newton.examples mpm_anymal</code>
@@ -525,6 +593,9 @@ If you run the examples from a source checkout with uv, use
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mpm/example_mpm_water_dam_break.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mpm_water_dam_break.jpg" alt="MPM Water Dam Break">
+      </a>
     </td>
   </tr>
   <tr>
@@ -535,6 +606,7 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples mpm_snow_ball</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples mpm_water_dam_break</code>
     </td>
   </tr>
   <tr>
@@ -710,6 +782,28 @@ If you run the examples from a source checkout with uv, use
     </td>
   </tr>
   <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/multiphysics/example_franka_cable_ik_pick_place.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_franka_cable_ik_pick_place.jpg" alt="Franka Cable IK Pick and Place">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/multiphysics/example_mujoco_franka_vbd_cable_admm_solver.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mujoco_franka_vbd_cable_admm_solver.jpg" alt="MuJoCo Franka VBD Cable ADMM">
+      </a>
+    </td>
+    <td></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples franka_cable_ik_pick_place</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples mujoco_franka_vbd_cable_admm_solver</code>
+    </td>
+    <td></td>
+  </tr>
+  <tr>
     <td colspan="3"><h3>Contacts Examples</h3></td>
   </tr>
   <tr>
@@ -752,6 +846,9 @@ If you run the examples from a source checkout with uv, use
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/contacts/example_newton_cradle.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_newton_cradle.jpg" alt="Newton Cradle">
+      </a>
     </td>
   </tr>
   <tr>
@@ -760,6 +857,31 @@ If you run the examples from a source checkout with uv, use
     </td>
     <td align="center" width="33%">
       <code>python -m newton.examples contacts_rj45_plug</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples newton_cradle</code>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/contacts/example_balance_bird.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_balance_bird.jpg" alt="Balance Bird">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/contacts/example_domino_spiral.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_domino_spiral.jpg" alt="Domino Spiral">
+      </a>
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples balance_bird</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples domino_spiral</code>
     </td>
     <td align="center" width="33%">
     </td>
@@ -883,7 +1005,7 @@ python -m newton.examples basic_viewer --viewer gl --num-frames 500 --device cpu
 
 ## Contributing and Development
 
-See the [contribution guidelines](https://github.com/newton-physics/newton-governance/blob/main/CONTRIBUTING.md) and the [development guide](https://newton-physics.github.io/newton/latest/guide/development.html) for instructions on how to contribute to Newton.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for ways to contribute and the pull-request process. The [governance contribution guidelines](https://github.com/newton-physics/newton-governance/blob/main/CONTRIBUTING.md) cover legal requirements, project roles, and approval authority. Use the [development guide](https://newton-physics.github.io/newton/latest/guide/development.html) for environment setup and development workflows. Code and public API changes must follow the [source code guidelines](CODING_GUIDELINES.rst); reviewers may use the suggested [review guidelines](REVIEW_GUIDELINES.rst).
 
 ## Support and Community Discussion
 

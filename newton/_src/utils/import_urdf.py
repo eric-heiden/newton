@@ -7,6 +7,7 @@ import os
 import tempfile
 import warnings
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Literal
 from urllib.parse import unquote, urlsplit
 
@@ -15,11 +16,12 @@ import warp as wp
 
 from ..core import Axis, AxisType, quat_between_axes
 from ..core.types import Transform
-from ..geometry import Mesh
+from ..geometry import Mesh, ShapeFlags
 from ..sim import ModelBuilder
 from ..sim.enums import JointTargetMode
 from ..sim.model import Model
 from .import_utils import (
+    clamp_imported_opacity,
     collapse_massless_fixed_root_joints,
     parse_custom_attributes,
     sanitize_xml_content,
@@ -30,6 +32,7 @@ from .texture import load_texture
 from .topology import topological_sort
 
 AttributeFrequency = Model.AttributeFrequency
+
 
 # Optional dependency for robust URI resolution
 try:
@@ -85,7 +88,7 @@ def parse_urdf(
     Parses a URDF file and adds the bodies and joints to the given ModelBuilder.
 
     Args:
-        builder (ModelBuilder): The :class:`ModelBuilder` to add the bodies and joints to.
+        builder: The :class:`ModelBuilder` to add the bodies and joints to.
         source: The filename of the URDF file to parse, or the URDF XML string content.
         xform: The transform to apply to the root body. If None, the transform is set to identity.
         override_root_xform: If ``True``, the articulation root's world-space
@@ -280,8 +283,14 @@ def parse_urdf(
                     fn = filename.replace("package://", "")
                     package_name = fn.split("/")[0]
                     urdf_folder = os.path.dirname(source)
-                    if package_name in urdf_folder:
-                        filename = os.path.join(urdf_folder[: urdf_folder.rindex(package_name)], fn)
+                    package_root = None
+                    urdf_parts = Path(os.path.abspath(urdf_folder)).parts
+                    for index in range(len(urdf_parts) - 1, -1, -1):
+                        if urdf_parts[index] == package_name:
+                            package_root = Path(*urdf_parts[:index])
+                            break
+                    if package_root is not None:
+                        filename = os.path.join(os.fspath(package_root), fn)
                     else:
                         warnings.warn(
                             f'Warning: could not resolve package "{package_name}" in URI "{filename}". '
@@ -319,18 +328,21 @@ def parse_urdf(
 
     def _parse_material_properties(material_element):
         if material_element is None:
-            return None, None
+            return None, None, None
 
         color = None
+        opacity = None
         texture = None
 
         color_el = material_element.find("color")
         if color_el is not None:
             rgba = color_el.get("rgba")
             if rgba:
-                parts = rgba.split()
-                if len(parts) >= 3:
-                    color = (float(parts[0]), float(parts[1]), float(parts[2]))
+                values = np.fromstring(rgba, sep=" ", dtype=np.float32)
+                if len(values) >= 3:
+                    color = (float(values[0]), float(values[1]), float(values[2]))
+                if len(values) >= 4:
+                    opacity = clamp_imported_opacity(values[3], "URDF material rgba")
 
         texture_el = material_element.find("texture")
         if texture_el is not None:
@@ -349,22 +361,23 @@ def parse_urdf(
                     if tmpfile is not None:
                         os.remove(tmpfile.name)
 
-        return color, texture
+        return color, opacity, texture
 
-    materials: dict[str, dict[str, np.ndarray | None]] = {}
+    materials: dict[str, dict[str, object | None]] = {}
     for material in urdf_root.findall("material"):
         mat_name = material.get("name")
         if not mat_name:
             continue
-        color, texture = _parse_material_properties(material)
+        color, opacity, texture = _parse_material_properties(material)
         materials[mat_name] = {
             "color": color,
+            "opacity": opacity,
             "texture": texture,
         }
 
     def resolve_material(material_element):
         if material_element is None:
-            return {"color": None, "texture": None}
+            return {"color": None, "opacity": None, "texture": None}
         mat_name = material_element.get("name")
 
         # Fast path: pure name reference to an already-parsed material. URDFs
@@ -374,19 +387,21 @@ def parse_urdf(
         if mat_name and mat_name in materials and len(material_element) == 0:
             return dict(materials[mat_name])
 
-        color, texture = _parse_material_properties(material_element)
+        color, opacity, texture = _parse_material_properties(material_element)
 
         if mat_name and mat_name in materials:
             resolved = dict(materials[mat_name])
         else:
-            resolved = {"color": None, "texture": None}
+            resolved = {"color": None, "opacity": None, "texture": None}
 
         if color is not None:
             resolved["color"] = color
+        if opacity is not None:
+            resolved["opacity"] = opacity
         if texture is not None:
             resolved["texture"] = texture
 
-        if mat_name and mat_name not in materials and any(value is not None for value in (color, texture)):
+        if mat_name and mat_name not in materials and any(value is not None for value in (color, opacity, texture)):
             materials[mat_name] = dict(resolved)
 
         return resolved
@@ -440,6 +455,13 @@ def parse_urdf(
                 tf = incoming_xform * tf
 
             material_info = resolve_material(geom_group.find("material"))
+            if just_visual:
+                if material_info["opacity"] is not None:
+                    shape_kwargs["opacity"] = material_info["opacity"]
+                else:
+                    shape_kwargs.pop("opacity", None)
+            else:
+                shape_kwargs.pop("opacity", None)
 
             for box in geo.findall("box"):
                 size = box.get("size") or "1 1 1"
@@ -620,8 +642,8 @@ def parse_urdf(
 
     # maps from link name -> link index
     link_index: dict[str, int] = {}
-    visual_shapes: list[int] = []
     start_shape_count = len(builder.shape_type)
+    model_has_visual_shapes = any(len(urdf_link.findall("visual")) > 0 for urdf_link in urdf_links)
 
     for urdf_link in urdf_links:
         name = urdf_link.get("name")
@@ -641,12 +663,11 @@ def parse_urdf(
         if parse_visuals_as_colliders:
             colliders = visuals
         else:
-            s = parse_shapes(link, visuals, density=0.0, just_visual=True, visible=not hide_visuals)
-            visual_shapes.extend(s)
+            parse_shapes(link, visuals, density=0.0, just_visual=True, visible=not hide_visuals)
 
         show_colliders = should_show_collider(
             force_show_colliders,
-            has_visual_shapes=len(visuals) > 0,
+            model_has_visual_shapes=model_has_visual_shapes,
             parse_visuals_as_colliders=parse_visuals_as_colliders,
         )
 
@@ -824,7 +845,7 @@ def parse_urdf(
             created_joint_idx = builder.add_joint_d6(
                 linear_axes=[
                     ModelBuilder.JointDofConfig(
-                        u,
+                        axis=u,
                         limit_lower=lower * scale,
                         limit_upper=upper * scale,
                         target_kd=joint_damping,
@@ -832,7 +853,7 @@ def parse_urdf(
                         actuator_mode=actuator_mode,
                     ),
                     ModelBuilder.JointDofConfig(
-                        v,
+                        axis=v,
                         limit_lower=lower * scale,
                         limit_upper=upper * scale,
                         target_kd=joint_damping,
@@ -888,13 +909,13 @@ def parse_urdf(
         custom_attributes=articulation_custom_attrs,
     )
 
-    for i in range(start_shape_count, end_shape_count):
-        for j in visual_shapes:
-            builder.add_shape_collision_filter_pair(i, j)
-
     if not enable_self_collisions:
-        for i in range(start_shape_count, end_shape_count):
-            for j in range(i + 1, end_shape_count):
+        # The broad phase only ever tests colliding shapes, so visual-only shapes need no filter pairs.
+        colliding_shapes = [
+            i for i in range(start_shape_count, end_shape_count) if builder.shape_flags[i] & ShapeFlags.COLLIDE_SHAPES
+        ]
+        for a, i in enumerate(colliding_shapes):
+            for j in colliding_shapes[a + 1 :]:
                 builder.add_shape_collision_filter_pair(i, j)
 
     if collapse_fixed_joints:

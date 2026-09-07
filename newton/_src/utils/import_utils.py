@@ -3,13 +3,30 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 from typing import Any, Literal
 
+import numpy as np
 import warp as wp
 
 from ..sim.builder import ModelBuilder
 from ..sim.enums import JointType
+
+
+def clamp_imported_opacity(value: float, source: str) -> float | None:
+    """Clamp display-only importer data without failing the model import."""
+    opacity = float(value)
+    if not np.isfinite(opacity):
+        warnings.warn(f"Ignoring non-finite opacity {opacity!r} from {source}.", stacklevel=2)
+        return None
+    clamped_opacity = float(np.clip(opacity, 0.0, 1.0))
+    if clamped_opacity != opacity:
+        warnings.warn(
+            f"Clamping opacity {opacity!r} from {source} to {clamped_opacity!r}.",
+            stacklevel=2,
+        )
+    return clamped_opacity
 
 
 def string_to_warp(value: str, warp_dtype: Any, default: Any = None) -> Any:
@@ -181,29 +198,26 @@ def sanitize_name(name: str) -> str:
 
 def should_show_collider(
     force_show_colliders: bool,
-    has_visual_shapes: bool,
+    model_has_visual_shapes: bool,
     parse_visuals_as_colliders: bool = False,
 ) -> bool:
     """Determine whether collision shapes should have the VISIBLE flag.
 
     Collision shapes are shown (VISIBLE flag) when explicitly forced, when
-    visual shapes are used as colliders, or when no visual shapes exist for
-    the owning body (so there is something to render). Otherwise, collision
-    shapes get only COLLIDE_SHAPES and are controlled by the viewer's
-    "Show Collision" toggle.
+    visual shapes are used as colliders, or when the imported model has no
+    visual shapes. Otherwise, collision shapes get only COLLIDE_SHAPES and are
+    controlled by the viewer's "Show Collision" toggle.
 
     Args:
         force_show_colliders: User explicitly wants collision shapes visible.
-        has_visual_shapes: Whether the body/link has visual (non-collision) shapes.
+        model_has_visual_shapes: Whether the current import has visual (non-collision) shapes.
         parse_visuals_as_colliders: Whether visual geometry is repurposed as collision geometry.
 
     Returns:
         True if the collision shape should carry the VISIBLE flag; False if it should
         be hidden by default and only revealed via the viewer's "Show Collision" toggle.
     """
-    if force_show_colliders or parse_visuals_as_colliders:
-        return True
-    return not has_visual_shapes
+    return force_show_colliders or parse_visuals_as_colliders or not model_has_visual_shapes
 
 
 def collapse_massless_fixed_root_joints(

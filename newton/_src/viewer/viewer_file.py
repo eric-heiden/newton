@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterable, Mapping
+from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
@@ -245,6 +246,10 @@ def _ptr_key_from_numpy(arr: np.ndarray) -> int:
     # Use the underlying buffer address as a stable key within a process
     # for non-aliased arrays. For views, this still points to the base buffer;
     # since user guarantees no aliasing across arrays, we can use the data address.
+    # Empty arrays share a null data buffer, so distinct empties would otherwise
+    # collide on the same key; fall back to object identity for them.
+    if arr.size == 0:
+        return id(arr)
     return int(arr.__array_interface__["data"][0])
 
 
@@ -265,12 +270,8 @@ def _warp_key(x) -> int:
     return _WARP_TAG + base
 
 
-def _mesh_key_from_vertices(vertices: np.ndarray, fallback_obj=None) -> int:
-    try:
-        base = _ptr_key_from_numpy(vertices)
-    except Exception:
-        base = int(id(fallback_obj)) if fallback_obj is not None else int(id(vertices))
-    return _MESH_TAG + base
+def _mesh_key_from_object(mesh: Mesh) -> int:
+    return _MESH_TAG + int(id(mesh))
 
 
 def serialize_ndarray(arr: np.ndarray, format_type: str = "json", cache: ArrayCache | None = None) -> dict:
@@ -453,8 +454,9 @@ def serialize(obj, callback, _visited=None, _path="", format_type="json", cache:
 
         # Iterables (like list, tuple, set)
         if isinstance(obj, Iterable) and not isinstance(obj, str | bytes | bytearray):
+            type_name = "set" if isinstance(obj, AbstractSet) else type(obj).__name__
             return {
-                "__type__": type(obj).__name__,
+                "__type__": type_name,
                 "items": [
                     serialize(
                         item, callback, _visited, f"{_path}[{i}]" if _path else f"[{i}]", format_type, cache=cache
@@ -598,12 +600,14 @@ def pointer_as_key(obj, format_type: str = "json", cache: ArrayCache | None = No
                 "is_solid": x.is_solid,
                 "has_inertia": x.has_inertia,
                 "maxhullvert": x.maxhullvert,
+                "color": x.color,
+                "opacity": x.opacity,
                 "mass": x.mass,
                 "com": [float(x.com[0]), float(x.com[1]), float(x.com[2])],
                 "inertia": serialize_ndarray(np.array(x.inertia), format_type, cache),
             }
             if cache is not None:
-                mesh_key = _mesh_key_from_vertices(x.vertices, fallback_obj=x)
+                mesh_key = _mesh_key_from_object(x)
                 idx = cache.try_register_pointer_and_value(mesh_key, x)
                 if idx > 0:
                     return {"__type__": "newton.geometry.Mesh_ref", "cache_index": int(idx)}
@@ -651,8 +655,16 @@ def transfer_to_model(source_dict: Mapping[str, Any], target_obj, post_load_init
     target_is_namespace = isinstance(target_obj, Model.AttributeNamespace)
 
     for attr_name, source_value in source_dict.items():
+        if isinstance(target_obj, Model) and attr_name in {
+            "_shape_collision_filter_pairs",
+            "shape_collision_filter_pairs",
+        }:
+            target_obj._set_shape_collision_filter_pairs(source_value)  # pyright: ignore[reportPrivateUsage]
+            continue
+
         if attr_name.startswith("_"):
             continue
+
         target_value = getattr(target_obj, attr_name, _MISSING)
 
         # Source carries a reconstructed AttributeNamespace (e.g. ``model.mujoco``).
@@ -734,10 +746,22 @@ def deserialize(data, callback, _path="", format_type="json", cache: ArrayCache 
     if type_name.startswith("numpy."):
         if type_name == "numpy.ndarray":
             return deserialize_ndarray(data, format_type, cache)
-        else:
-            # NumPy scalar types
-            numpy_type = getattr(np, type_name.split(".")[-1])
-            return numpy_type(data["value"])
+
+        scalar_name = type_name.removeprefix("numpy.")
+        numpy_type = getattr(np, scalar_name, None)
+        try:
+            is_number_type = (
+                isinstance(numpy_type, type)
+                and issubclass(numpy_type, np.number)
+                and np.dtype(numpy_type).type is numpy_type
+                and numpy_type.__name__ == scalar_name
+            )
+        except TypeError:
+            is_number_type = False
+        if not is_number_type:
+            raise ValueError(f"Unsupported NumPy scalar type: {type_name}")
+        assert isinstance(numpy_type, type)
+        return numpy_type(data["value"])
 
     # Mappings (like dict)
     if type_name == "dict":
@@ -761,6 +785,18 @@ def deserialize(data, callback, _path="", format_type="json", cache: ArrayCache 
 
     # Custom objects
     if "attributes" in data:
+        if type_name == "AttributeSpec" and data.get("__module__") == Model.AttributeSpec.__module__:
+            attributes = {
+                attr: deserialize(value, callback, f"{_path}.{attr}" if _path else attr, format_type, cache)
+                for attr, value in data["attributes"].items()
+            }
+            for attr in ("frequency", "references"):
+                if isinstance(attributes.get(attr), int):
+                    attributes[attr] = Model.AttributeFrequency(attributes[attr])
+            if isinstance(attributes.get("assignment"), int):
+                attributes["assignment"] = Model.AttributeAssignment(attributes["assignment"])
+            return Model.AttributeSpec(**attributes)
+
         # Reconstruct AttributeNamespace as a real instance so downstream consumers
         # (notably ``transfer_to_model``) can identify it without resorting to a
         # heuristic on serialized field names.
@@ -1021,6 +1057,8 @@ def depointer_as_key(data: Mapping[str, Any], format_type: str = "json", cache: 
                     compute_inertia=False,
                     is_solid=mesh_data["is_solid"],
                     maxhullvert=mesh_data["maxhullvert"],
+                    color=mesh_data.get("color"),
+                    opacity=mesh_data.get("opacity"),
                 )
 
                 # Restore the saved inertia properties
@@ -1035,7 +1073,7 @@ def depointer_as_key(data: Mapping[str, Any], format_type: str = "json", cache: 
                 # Optimization: single dict lookup
                 cache_index = x.get("cache_index")
                 if cache is not None and cache_index is not None:
-                    mesh_key = _mesh_key_from_vertices(vertices, fallback_obj=mesh)
+                    mesh_key = _mesh_key_from_object(mesh)
                     cache.try_register_pointer_and_value_and_index(mesh_key, mesh, int(cache_index))
                 return mesh
             except Exception as e:
@@ -1120,16 +1158,16 @@ class ViewerFile(ViewerBase):
 
         self._frame_count = 0
         self._model_recorded = False
+        self._running = True
 
     @override
-    def set_model(self, model: Model | None, max_worlds: int | None = None):
+    def set_model(self, model: Model | None):
         """Override set_model to record the model when it is set.
 
         Args:
             model: Model to bind to this viewer.
-            max_worlds: Optional cap on rendered worlds.
         """
-        super().set_model(model, max_worlds=max_worlds)
+        super().set_model(model)
 
         if model is not None and not self._model_recorded:
             self.record_model(model)
@@ -1151,6 +1189,15 @@ class ViewerFile(ViewerBase):
         # Auto-save if enabled
         if self.auto_save and self._frame_count % self.save_interval == 0:
             self._save_recording()
+
+    @override
+    def is_running(self) -> bool:
+        """Report whether the file viewer should continue recording.
+
+        Returns:
+            bool: False after :meth:`close` has been called.
+        """
+        return self._running
 
     def save_recording(self, file_path: str | None = None, verbose: bool = False):
         """Save the recorded data to file.
@@ -1299,6 +1346,8 @@ class ViewerFile(ViewerBase):
         color: tuple[float, float, float] | None = None,
         roughness: float | None = None,
         metallic: float | None = None,
+        dynamic: bool = False,
+        opacity: float | None = None,
     ):
         """File viewer does not render meshes.
 
@@ -1317,6 +1366,8 @@ class ViewerFile(ViewerBase):
                 smooth, ``1`` is fully rough.
             metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
                 is metal.
+            dynamic: Whether mesh topology may change between frames.
+            opacity: Optional display opacity in [0, 1].
         """
         pass
 
@@ -1330,6 +1381,7 @@ class ViewerFile(ViewerBase):
         colors: wp.array[wp.vec3] | None,
         materials: wp.array[wp.vec4] | None,
         hidden: bool = False,
+        opacities: wp.array[wp.float32] | None = None,
     ):
         """File viewer does not render instances.
 
@@ -1341,6 +1393,7 @@ class ViewerFile(ViewerBase):
             colors: Optional per-instance colors.
             materials: Optional per-instance material parameters.
             hidden: Whether the instance batch is hidden.
+            opacities: Optional per-instance opacity values.
         """
         pass
 
@@ -1427,6 +1480,7 @@ class ViewerFile(ViewerBase):
         """Save final recording and cleanup."""
         if self._frame_count > 0:
             self._save_recording()
+        self._running = False
         print(f"ViewerFile closed. Total frames recorded: {self._frame_count}")
 
     def load_recording(self, file_path: str | None = None, verbose: bool = False):

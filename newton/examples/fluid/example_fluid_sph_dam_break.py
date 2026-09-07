@@ -31,7 +31,7 @@ class Example:
         self.diffuse_alpha = args.fluid_diffuse_alpha
         self.diffuse_motion_blur_scale = args.fluid_diffuse_motion_blur
 
-        builder = newton.ModelBuilder(gravity=args.gravity)
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0, 0.0, args.gravity))
         builder.default_particle_radius = args.radius
 
         mass = args.rest_density * args.spacing**3
@@ -97,6 +97,8 @@ class Example:
             render_anisotropy_scale=args.fluid_render_anisotropy_scale,
             render_anisotropy_min=args.fluid_render_anisotropy_min,
             render_anisotropy_max=args.fluid_render_anisotropy_max,
+            render_update_interval=args.fluid_render_update_interval,
+            diffuse_update_interval=args.fluid_diffuse_update_interval,
         )
 
         self.viewer.set_model(self.model)
@@ -393,7 +395,12 @@ class Example:
         parser.add_argument("--fps", type=float, default=60.0)
         parser.add_argument("--substeps", type=int, default=4)
         parser.add_argument("--render-mode", choices=["fluid", "particles"], default="fluid")
-        parser.add_argument("--capture-graph", action="store_true", help="Capture the SPH substeps in a CUDA graph.")
+        parser.add_argument(
+            "--capture-graph",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Capture the SPH substeps in a CUDA graph.",
+        )
         parser.add_argument("--show-bounds", action=argparse.BooleanOptionalAction, default=False)
         parser.add_argument("--show-diffuse", action=argparse.BooleanOptionalAction, default=True)
         parser.add_argument("--beach-lighting", action=argparse.BooleanOptionalAction, default=True)
@@ -445,6 +452,8 @@ class Example:
         parser.add_argument("--fluid-render-anisotropy-scale", type=float, default=0.82)
         parser.add_argument("--fluid-render-anisotropy-min", type=float, default=0.1)
         parser.add_argument("--fluid-render-anisotropy-max", type=float, default=2.0)
+        parser.add_argument("--fluid-render-update-interval", type=int, default=2)
+        parser.add_argument("--fluid-diffuse-update-interval", type=int, default=2)
         parser.add_argument("--gravity", type=float, default=-9.81)
         parser.add_argument("--bounds-lower", type=float, nargs=3, default=(-0.75, -0.45, 0.0))
         parser.add_argument("--bounds-upper", type=float, nargs=3, default=(0.75, 0.45, 1.0))

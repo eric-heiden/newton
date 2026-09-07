@@ -79,7 +79,7 @@ class Example:
         self.diffuse_alpha = args.fluid_diffuse_alpha
         self.diffuse_motion_blur_scale = args.fluid_diffuse_motion_blur
 
-        builder = newton.ModelBuilder(gravity=args.gravity)
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0, 0.0, args.gravity))
         builder.default_particle_radius = args.radius
 
         mass = args.rest_density * args.spacing**3

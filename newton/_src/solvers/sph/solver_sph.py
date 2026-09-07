@@ -39,6 +39,10 @@ def _vec3(value: Sequence[float] | wp.vec3 | None, default: tuple[float, float, 
 class SolverSPH(SolverBase):
     """Weakly-compressible SPH prototype for Newton particle fluids.
 
+    .. experimental::
+
+        ``SolverSPH`` public API and behavior may change without prior notice.
+
     The solver advances :attr:`newton.State.particle_q` and
     :attr:`newton.State.particle_qd` using Warp kernels and a
     :class:`warp.HashGrid` neighbor search. It is intentionally small: it
@@ -428,21 +432,22 @@ class SolverSPH(SolverBase):
                 device=model.device,
             )
 
-            wp.launch(
-                kernel=compute_sph_vorticity,
-                dim=model.particle_count,
-                inputs=[
-                    model.particle_grid.id,
-                    state_in.particle_q,
-                    state_in.particle_qd,
-                    model.particle_mass,
-                    model.particle_flags,
-                    self.particle_density,
-                    self.smoothing_length,
-                    self.particle_vorticity,
-                ],
-                device=model.device,
-            )
+            if self.vorticity_confinement > 0.0:
+                wp.launch(
+                    kernel=compute_sph_vorticity,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        state_in.particle_q,
+                        state_in.particle_qd,
+                        model.particle_mass,
+                        model.particle_flags,
+                        self.particle_density,
+                        self.smoothing_length,
+                        self.particle_vorticity,
+                    ],
+                    device=model.device,
+                )
 
             wp.launch(
                 kernel=integrate_sph_particles,

@@ -17,6 +17,7 @@
 
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import warp as wp
@@ -70,6 +71,10 @@ def _add_rigid_body(stage, path):
 
     prim = stage.DefinePrim(path, "Xform")
     UsdPhysics.RigidBodyAPI.Apply(prim)
+    # SDF tests do not exercise inertia, so keep their shared body fixture valid.
+    mass_api = UsdPhysics.MassAPI.Apply(prim)
+    mass_api.CreateMassAttr().Set(1.0)
+    mass_api.CreateDiagonalInertiaAttr().Set((1.0, 1.0, 1.0))
     return prim
 
 
@@ -86,6 +91,23 @@ def _add_collision_mesh(stage, path):
 
 class TestSDFUSDParsing(unittest.TestCase):
     """Tests for SDF attribute parsing from USD."""
+
+    def test_rigid_body_fixture_finalizes_without_warnings(self):
+        """Finalize the shared rigid-body fixture without warnings."""
+        from pxr import Usd, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdPhysics.Scene.Define(stage, "/PhysicsScene")
+        _add_rigid_body(stage, "/World/Body")
+        _add_collision_mesh(stage, "/World/Body/CollisionMesh")
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            builder = newton.ModelBuilder()
+            builder.add_usd(stage)
+            builder.finalize(device="cpu")
+
+        self.assertEqual(caught, [], f"unexpected warnings: {[str(warning.message) for warning in caught]}")
 
     def test_usd_sdf_mesh_attributes(self, device=None):
         """USD newton:sdf* attributes cause SDF to be built during finalize()."""
@@ -500,8 +522,8 @@ class TestSDFUSDParsing(unittest.TestCase):
         self.assertGreaterEqual(idx1, 0)
         self.assertNotEqual(idx0, idx1)
 
-    def test_add_shape_convex_hull_rejects_hydroelastic(self):
-        """add_shape_convex_hull must raise when cfg.is_hydroelastic is set, regardless of mesh.sdf."""
+    def test_add_shape_convex_hull_rejects_hydroelastic_without_sdf(self):
+        """add_shape_convex_hull must raise for hydroelastic convex meshes without mesh.sdf."""
         builder = newton.ModelBuilder()
         body = builder.add_body()
         # 4-vertex tetrahedron — minimum valid input for a convex hull
@@ -510,7 +532,7 @@ class TestSDFUSDParsing(unittest.TestCase):
             indices=[0, 1, 2, 0, 1, 3, 0, 2, 3, 1, 2, 3],
         )
         cfg = newton.ModelBuilder.ShapeConfig(is_hydroelastic=True)
-        with self.assertRaisesRegex(ValueError, "Hydroelastic is not supported on GeoType.CONVEX_MESH"):
+        with self.assertRaisesRegex(ValueError, "Hydroelastic mesh-backed shapes require mesh.sdf"):
             builder.add_shape_convex_hull(body, mesh=mesh, cfg=cfg)
 
     def test_approximate_meshes_rejects_sdf_state(self):

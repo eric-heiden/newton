@@ -1,0 +1,1 @@
+Improve SPH example throughput with default CUDA graph capture, decimated render and diffuse updates, skipped unused vorticity work, and CUDA-OpenGL render-data packing when available; pass ``--no-capture-graph``, ``--fluid-render-update-interval 1``, and ``--fluid-diffuse-update-interval 1`` to restore the uncaptured per-substep behavior.

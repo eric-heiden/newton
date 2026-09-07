@@ -1387,7 +1387,10 @@ def spawn_sph_diffuse_particles(
     # sheets, and beach run-up fronts. Fast laminar bulk flow has little
     # separating motion and no crest alignment, so it stays foam-free.
     speed = wp.sqrt(speed_sq)
-    crest = float(0.0)
+    # An isolated ballistic particle has no neighbors from which to estimate a
+    # surface normal, but it is still unambiguously spray.  Treat it as a full
+    # crest so high-speed droplets can seed the diffuse system.
+    crest = float(1.0 if neighbors == 0 else 0.0)
     separation_len = wp.length(separation)
     if separation_len > EPS and speed > EPS:
         crest = wp.max(wp.dot(separation / separation_len, vi / speed), 0.0)

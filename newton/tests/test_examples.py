@@ -1083,6 +1083,13 @@ add_example_test(
 )
 add_example_test(
     TestFluidExamples,
+    name="fluid.example_fluid_xpbd_archimedes_screw",
+    devices=cuda_test_devices,
+    test_options={"num_frames": 240, "particle_count": 12_000},
+    use_viewer=True,
+)
+add_example_test(
+    TestFluidExamples,
     name="fluid.example_fluid_xpbd_multi_fluid_tank",
     devices=cuda_test_devices,
     test_options={"num_frames": 60, "particle_count": 9_600, "foam_max_particles": 0},

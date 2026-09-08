@@ -67,9 +67,9 @@ def initialize_step(
     active = (particle_flags[particle] & ParticleFlags.ACTIVE) != 0 and mass > 0.0
     if active:
         world = particle_world[particle]
-        x_predictor[particle] = x + particle_qd[particle] * dt + (
-            gravity[world] + particle_f[particle] / mass
-        ) * (dt * dt)
+        x_predictor[particle] = (
+            x + particle_qd[particle] * dt + (gravity[world] + particle_f[particle] / mass) * (dt * dt)
+        )
         static_diagonal[particle] = mass / (dt * dt) + pd_diagonal[particle]
 
         gap = wp.dot(normal, x) - plane_offset - minimum_separation
@@ -176,9 +176,7 @@ def add_triangle_forces(
         gradient = area * (
             stiffness[0] * (length_u - 1.0) * derivative_u[local] * direction_u
             + stiffness[1] * (length_v - 1.0) * derivative_v[local] * direction_v
-            + stiffness[2]
-            * shear
-            * (derivative_u[local] * fv + derivative_v[local] * fu)
+            + stiffness[2] * shear * (derivative_u[local] * fv + derivative_v[local] * fu)
         )
         wp.atomic_sub(rhs, indices[local], gradient)
 
@@ -238,11 +236,7 @@ def add_barrier_forces(
 ):
     particle = wp.tid()
     contact_hessian[particle] = 0.0
-    if (
-        solve_active[0] == 0
-        or (particle_flags[particle] & ParticleFlags.ACTIVE) == 0
-        or particle_mass[particle] <= 0.0
-    ):
+    if solve_active[0] == 0 or (particle_flags[particle] & ParticleFlags.ACTIVE) == 0 or particle_mass[particle] <= 0.0:
         return
 
     gap = wp.dot(normal, x[particle]) - plane_offset - minimum_separation
@@ -253,9 +247,7 @@ def add_barrier_forces(
         first = barrier_first_derivative(s)
         second = barrier_second_derivative(s)
         gradient = barrier_stiffness * first * ds_dd
-        hessian = barrier_stiffness * (
-            second * ds_dd * ds_dd + first * 2.0 * inverse_distance_squared
-        )
+        hessian = barrier_stiffness * (second * ds_dd * ds_dd + first * 2.0 * inverse_distance_squared)
         wp.atomic_sub(rhs, particle, gradient * normal)
         contact_hessian[particle] = wp.max(hessian, 0.0)
 
@@ -268,11 +260,7 @@ def mask_rhs(
     rhs: wp.array[wp.vec3],
 ):
     particle = wp.tid()
-    if (
-        solve_active[0] == 0
-        or (particle_flags[particle] & ParticleFlags.ACTIVE) == 0
-        or particle_mass[particle] <= 0.0
-    ):
+    if solve_active[0] == 0 or (particle_flags[particle] & ParticleFlags.ACTIVE) == 0 or particle_mass[particle] <= 0.0:
         rhs[particle] = wp.vec3(0.0)
 
 
@@ -384,11 +372,7 @@ def mask_direction(
     direction: wp.array[wp.vec3],
 ):
     particle = wp.tid()
-    if (
-        solve_active[0] == 0
-        or (particle_flags[particle] & ParticleFlags.ACTIVE) == 0
-        or particle_mass[particle] <= 0.0
-    ):
+    if solve_active[0] == 0 or (particle_flags[particle] & ParticleFlags.ACTIVE) == 0 or particle_mass[particle] <= 0.0:
         direction[particle] = wp.vec3(0.0)
 
 
@@ -420,11 +404,7 @@ def bound_plane_step(
     alpha: wp.array[float],
 ):
     particle = wp.tid()
-    if (
-        solve_active[0] == 0
-        or (particle_flags[particle] & ParticleFlags.ACTIVE) == 0
-        or particle_mass[particle] <= 0.0
-    ):
+    if solve_active[0] == 0 or (particle_flags[particle] & ParticleFlags.ACTIVE) == 0 or particle_mass[particle] <= 0.0:
         return
     projected_direction = wp.dot(normal, direction[particle])
     if projected_direction < 0.0:
@@ -480,10 +460,10 @@ def add_triangle_energy(
     stretch_u = wp.length(fu) - 1.0
     stretch_v = wp.length(fv) - 1.0
     shear = wp.dot(fu, fv)
-    value = 0.5 * triangle_area[triangle] * (
-        stiffness[0] * stretch_u * stretch_u
-        + stiffness[1] * stretch_v * stretch_v
-        + stiffness[2] * shear * shear
+    value = (
+        0.5
+        * triangle_area[triangle]
+        * (stiffness[0] * stretch_u * stretch_u + stiffness[1] * stretch_v * stretch_v + stiffness[2] * shear * shear)
     )
     wp.atomic_add(energy, 0, value)
 

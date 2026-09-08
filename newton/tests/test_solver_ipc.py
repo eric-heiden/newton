@@ -48,9 +48,7 @@ def test_particle_matches_scalar_reference(test, device):
 
     def derivative(x):
         s = x * x / (distance * distance)
-        return (x - inertial_target) / (dt * dt) + stiffness * _barrier_first(s) * 2.0 * x / (
-            distance * distance
-        )
+        return (x - inertial_target) / (dt * dt) + stiffness * _barrier_first(s) * 2.0 * x / (distance * distance)
 
     lower, upper = 1.0e-8, distance
     for _ in range(100):
@@ -259,13 +257,25 @@ class TestSolverIPC(unittest.TestCase):
     pass
 
 
-add_function_test(TestSolverIPC, "test_particle_matches_scalar_reference", test_particle_matches_scalar_reference, devices=devices)
-add_function_test(TestSolverIPC, "test_cloth_force_matches_energy_gradient", test_cloth_force_matches_energy_gradient, devices=devices)
-add_function_test(TestSolverIPC, "test_invalid_initial_state_rolls_back", test_invalid_initial_state_rolls_back, devices=devices)
-add_function_test(TestSolverIPC, "test_newton_exhaustion_rolls_back", test_newton_exhaustion_rolls_back, devices=devices)
+add_function_test(
+    TestSolverIPC, "test_particle_matches_scalar_reference", test_particle_matches_scalar_reference, devices=devices
+)
+add_function_test(
+    TestSolverIPC, "test_cloth_force_matches_energy_gradient", test_cloth_force_matches_energy_gradient, devices=devices
+)
+add_function_test(
+    TestSolverIPC, "test_invalid_initial_state_rolls_back", test_invalid_initial_state_rolls_back, devices=devices
+)
+add_function_test(
+    TestSolverIPC, "test_newton_exhaustion_rolls_back", test_newton_exhaustion_rolls_back, devices=devices
+)
 add_function_test(TestSolverIPC, "test_factorizations_agree", test_factorizations_agree, devices=devices)
-add_function_test(TestSolverIPC, "test_captured_replay_stays_feasible", test_captured_replay_stays_feasible, devices=devices)
-add_function_test(TestSolverIPC, "test_eager_and_captured_step_agree", test_eager_and_captured_step_agree, devices=devices)
+add_function_test(
+    TestSolverIPC, "test_captured_replay_stays_feasible", test_captured_replay_stays_feasible, devices=devices
+)
+add_function_test(
+    TestSolverIPC, "test_eager_and_captured_step_agree", test_eager_and_captured_step_agree, devices=devices
+)
 add_function_test(TestSolverIPC, "test_failure_count_is_persistent", test_failure_count_is_persistent, devices=devices)
 
 

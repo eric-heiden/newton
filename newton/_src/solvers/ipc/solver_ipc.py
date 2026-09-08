@@ -274,9 +274,7 @@ class SolverIPC(SolverBase):
                 self.model.style3d.edge_rest_area.numpy().tolist(),
                 self.model.style3d.edge_bending_cot.numpy().tolist(),
             )
-        self.pd_diagonal, self.pd_non_diagonals.num_nz, self.pd_non_diagonals.nz_ell = builder.finalize(
-            self.device
-        )
+        self.pd_diagonal, self.pd_non_diagonals.num_nz, self.pd_non_diagonals.nz_ell = builder.finalize(self.device)
 
     def _add_elastic_forces(self) -> None:
         if self.model.tri_count > 0:

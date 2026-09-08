@@ -220,8 +220,9 @@ def add_cloth_mesh(
 
     It overwrites :attr:`newton.ModelBuilder.tri_poses` and
     :attr:`newton.ModelBuilder.tri_areas` with panel rest data. Call
-    :meth:`newton.solvers.SolverStyle3D.register_custom_attributes` before
-    invoking this helper.
+    :meth:`newton.solvers.SolverStyle3D.register_custom_attributes` or
+    :meth:`newton.solvers.SolverIPC.register_custom_attributes` before invoking
+    this helper.
 
     Args:
         builder: :class:`newton.ModelBuilder` to populate.

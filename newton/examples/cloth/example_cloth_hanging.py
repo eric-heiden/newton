@@ -7,7 +7,7 @@
 # This simulation demonstrates a simple cloth hanging behavior. A planar cloth
 # mesh is fixed on one side and hangs under gravity, colliding with the ground.
 #
-# Command: python -m newton.examples cloth_hanging (--solver [semi_implicit, style3d, xpbd, vbd])
+# Command: python -m newton.examples cloth_hanging (--solver [ipc, semi_implicit, style3d, xpbd, vbd])
 #
 ###########################################################################
 
@@ -34,7 +34,7 @@ class Example:
 
         if self.solver_type == "semi_implicit":
             self.sim_substeps = 32
-        elif self.solver_type == "style3d":
+        elif self.solver_type in ("ipc", "style3d"):
             self.sim_substeps = 2
         else:
             self.sim_substeps = 10
@@ -44,9 +44,12 @@ class Example:
 
         self.viewer = viewer
 
-        if self.solver_type == "style3d":
+        if self.solver_type in ("ipc", "style3d"):
             builder = newton.ModelBuilder()
-            newton.solvers.SolverStyle3D.register_custom_attributes(builder)
+            if self.solver_type == "ipc":
+                newton.solvers.SolverIPC.register_custom_attributes(builder)
+            else:
+                newton.solvers.SolverStyle3D.register_custom_attributes(builder)
         else:
             builder = newton.ModelBuilder()
 
@@ -82,6 +85,13 @@ class Example:
                 "tri_kd": 1.0e1,
             }
 
+        elif self.solver_type == "ipc":
+            common_params.pop("edge_ke")
+            solver_params = {
+                "tri_aniso_ke": wp.vec3(1.0e3, 1.0e3, 1.0e2),
+                "edge_aniso_ke": wp.vec3(2.0e-6, 1.0e-6, 5.0e-6),
+            }
+
         elif self.solver_type == "style3d":
             common_params.pop("edge_ke")
             solver_params = {
@@ -103,7 +113,7 @@ class Example:
                 "tri_kd": 1.0e2,
             }
 
-        if self.solver_type == "style3d":
+        if self.solver_type in ("ipc", "style3d"):
             style3d.add_cloth_grid(builder, **common_params, **solver_params)
         else:
             builder.add_cloth_grid(**common_params, **solver_params)
@@ -123,6 +133,22 @@ class Example:
                 model=self.model,
                 iterations=self.iterations,
             )
+        elif self.solver_type == "ipc":
+            self.solver = newton.solvers.SolverIPC(
+                model=self.model,
+                config=newton.solvers.SolverIPC.Config(
+                    minimum_separation=0.01,
+                    contact_distance=0.08,
+                    barrier_stiffness=0.1,
+                    max_newton_iterations=48,
+                    max_pcg_iterations=24,
+                    max_line_search_iterations=16,
+                    absolute_tolerance=5.0e-2,
+                    relative_tolerance=2.0e-3,
+                    energy_tolerance=1.0e-5,
+                    initial_step_size=1.0,
+                ),
+            )
         elif self.solver_type == "xpbd":
             self.solver = newton.solvers.SolverXPBD(
                 model=self.model,
@@ -141,16 +167,21 @@ class Example:
         self.state_1 = self.model.state()
         self.control = self.model.control()
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
-        self.contacts = self.collision_pipeline.contacts()
+        if self.solver_type == "ipc":
+            self.collision_pipeline = None
+            self.contacts = None
+        else:
+            self.collision_pipeline = newton.CollisionPipeline(self.model)
+            self.contacts = self.collision_pipeline.contacts()
 
         self.viewer.set_model(self.model)
 
         self.capture()
 
     def capture(self):
-        # SolverStyle3D makes host calls (PCG dot products, BVH refit) that CPU graph capture cannot record
-        if self.solver_type == "style3d" and wp.get_device().is_cpu:
+        # Style3D uses an unrecordable native reduction, while SolverIPC's
+        # nested conditional graph does not yet replay reliably with CPU APIC.
+        if self.solver_type in ("ipc", "style3d") and wp.get_device().is_cpu:
             self.graph = None
             return
         with wp.ScopedCapture() as capture:
@@ -164,7 +195,8 @@ class Example:
             # apply forces to the model
             self.viewer.apply_forces(self.state_0)
 
-            self.collision_pipeline.collide(self.state_0, self.contacts)
+            if self.collision_pipeline is not None:
+                self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
             # swap states
@@ -195,10 +227,19 @@ class Example:
             lambda q, qd: newton.math.vec_inside_limits(q, p_lower, p_upper),
         )
 
+        if self.solver_type == "ipc":
+            status = int(self.solver.diagnostics.status.numpy()[0])
+            assert status == int(self.solver.Status.CONVERGED), self.solver.Status(status).name
+
+    def test_post_step(self):
+        if self.solver_type == "ipc":
+            assert int(self.solver.diagnostics.failed_steps.numpy()[0]) == 0
+
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
-        self.viewer.log_contacts(self.contacts, self.state_0)
+        if self.contacts is not None:
+            self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
     @staticmethod
@@ -208,7 +249,7 @@ class Example:
             "--solver",
             help="Type of solver",
             type=str,
-            choices=["semi_implicit", "style3d", "xpbd", "vbd"],
+            choices=["ipc", "semi_implicit", "style3d", "xpbd", "vbd"],
             default="vbd",
         )
         parser.add_argument("--width", type=int, default=64, help="Cloth resolution in x.")

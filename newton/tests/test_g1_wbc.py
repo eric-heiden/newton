@@ -106,22 +106,48 @@ class TestG1WBC(unittest.TestCase):
             wp.launch(evaluate, 3, inputs=[q], outputs=[output])
             np.testing.assert_allclose(output.numpy(), expected, atol=1e-6)
 
+    def test_motion_oscillation_diagnostic(self):
+        """A 10 Hz joint oscillation is measured; a slow motion is rejected."""
+        import mujoco
+
+        from newton.examples.robot.wbc_controller import measure_motion_tracking  # noqa: PLC0415
+
+        bodies = []
+        for j in range(29):
+            name = "left_wrist_yaw_link" if j == 28 else f"link{j}"
+            bodies.append(f'<body name="{name}"><joint/><geom size=".01" mass=".1"/></body>')
+        model = mujoco.MjModel.from_xml_string(
+            '<mujoco><worldbody><body><freejoint/><geom size=".1"/>' + "".join(bodies) + "</body></worldbody></mujoco>"
+        )
+        times = np.arange(0, 5, 0.01)
+        poses = np.tile(model.qpos0, (len(times), 1))
+        reference = self.reference_type(model, np.tile(model.qpos0, (151, 1)))
+        values = []
+        for frequency in (2, 10):
+            poses[:, -1] = 0.02 * np.sin(2 * np.pi * frequency * times)
+            values.append(measure_motion_tracking(model, reference, times, poses))
+        expected = 0.02 / np.sqrt(2 * 29)
+        self.assertAlmostEqual(values[1]["joint_highpass_rms"], expected, delta=expected * 0.05)
+        self.assertLess(values[0]["joint_highpass_rms"], expected * 0.05)
+        expected_velocity = 0.02 * np.sin(2 * np.pi * 10 * 0.01) / 0.01 / np.sqrt(2 * 29)
+        self.assertAlmostEqual(values[1]["joint_velocity_error_rms"], expected_velocity, delta=0.001)
+
     def test_hand_pose_and_joint_velocity_cost(self):
         """Known wrist offsets and speeds have an independent quadratic oracle."""
         from newton.examples.robot.wbc_mpc import _score  # noqa: PLC0415
 
         with wp.ScopedDevice("cpu"):
-            q = np.zeros((1, 9), dtype=np.float32)
+            q = np.zeros((1, 36), dtype=np.float32)
             q[0, 3] = 1
-            v = np.zeros((1, 8), dtype=np.float32)
-            v[0, 6:] = [1, -2]
+            v = np.zeros((1, 35), dtype=np.float32)
+            v[0, [6, 34]] = [1, -2]
             positions = np.zeros((1, 4, 3), dtype=np.float32)
             positions[0, 2] = [0.2, -0.1, 0.3]
             positions[0, 3] = [-0.1, 0.2, 0.1]
             rotations = np.tile([1, 0, 0, 0], (1, 4, 1)).astype(np.float32)
             rotations[0, 2] = [np.cos(0.3), 0, np.sin(0.3), 0]
             rotationref = np.tile([1, 0, 0, 0], (2, 4)).astype(np.float32)
-            width = 42  # 2 joints, 2 feet, 2 hands; no force residuals.
+            width = 96  # 29 joints, 2 feet, 2 hands; no force residuals.
             residual, costs = wp.zeros((1, width)), wp.zeros(1)
             common = [
                 wp.array(q),
@@ -129,7 +155,7 @@ class TestG1WBC(unittest.TestCase):
                 wp.array(positions, dtype=wp.vec3),
                 wp.array(rotations, dtype=wp.quat),
                 wp.array(np.repeat(q, 2, axis=0)),
-                wp.zeros((2, 8)),
+                wp.zeros((2, 35)),
                 wp.zeros((2, 12)),
                 wp.array(rotationref),
                 wp.array([0, 1, 2, 3], dtype=int),
@@ -158,6 +184,7 @@ class TestG1WBC(unittest.TestCase):
                         hand_position,
                         hand_rotation,
                         joint_velocity,
+                        5.0,
                         0,
                         width,
                         True,
@@ -169,7 +196,7 @@ class TestG1WBC(unittest.TestCase):
                     ],
                     outputs=[costs],
                 )
-                expected = 0.4 * (hand_position * 0.2 + hand_rotation * 0.3**2 + joint_velocity * 5)
+                expected = 0.4 * (hand_position * 0.2 + hand_rotation * 0.3**2 + joint_velocity * 21)
                 self.assertAlmostEqual(float(costs.numpy()[0]), expected, places=5)
                 self.assertAlmostEqual(float(np.sum(residual.numpy() ** 2)), expected, places=5)
 
@@ -197,6 +224,36 @@ class TestG1WBC(unittest.TestCase):
             np.testing.assert_allclose(direction.numpy()[:4], expected, atol=1e-5, rtol=1e-4)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Gauss-Newton requires CUDA")
+    def test_gauss_newton_coordinate_fallback(self):
+        """A useful physical probe survives a deliberately stalled line search."""
+        from newton.examples.robot.wbc_mpc_gn import WholeBodyGaussNewton  # noqa: PLC0415
+
+        poses = np.tile(self.model.qpos0, (31, 1))
+        poses[:, -1] = 0.4
+        reference = self.reference_type(self.model, poses)
+        with wp.ScopedDevice("cuda:0"):
+            mpc = WholeBodyGaussNewton(
+                self.model,
+                np.array([30.0]),
+                np.array([3.0]),
+                reference,
+                horizon=0.1,
+                rounds=1,
+                hand_weight=0,
+                nonfoot_weight=0,
+                trust=1e-6,
+                coordinate_search=True,
+            )
+            q = wp.array(self.model.qpos0[None], dtype=float)
+            mpc.capture(q, wp.zeros((1, self.model.nv)), wp.zeros(1))
+            mpc.solve()
+            costs = mpc.diff_costs.numpy()
+            index = int(np.argmin(costs))
+            self.assertLess(costs[index], float(mpc.line_costs.numpy().min()) - 1e-4)
+            self.assertAlmostEqual(float(mpc.minimum.numpy()[0]), float(costs[index]), places=5)
+            np.testing.assert_array_equal(mpc.plan.numpy(), mpc.diff_proposals.numpy()[index])
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Gauss-Newton requires CUDA")
     def test_gauss_newton_rollout_descent(self):
         """A captured shooting update must reduce a physical tracking objective."""
         from newton.examples.robot.wbc_mpc_gn import WholeBodyGaussNewton  # noqa: PLC0415
@@ -213,6 +270,7 @@ class TestG1WBC(unittest.TestCase):
                 horizon=0.1,
                 rounds=1,
                 hand_weight=0,
+                joint_velocity=0.1,
                 nonfoot_weight=0,
             )
             q = wp.array(self.model.qpos0[None], dtype=float)

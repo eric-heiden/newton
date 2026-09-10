@@ -186,6 +186,7 @@ def _score(
     hand_position: float,
     hand_rotation: float,
     joint_velocity: float,
+    arm_velocity_scale: float,
     step: int,
     width: int,
     record: bool,
@@ -258,7 +259,11 @@ def _score(
         cost += residual_term(value, world, off + 9 + nu + 6 * feet + hands + j, weight, record, residual)
     extra = off + 12 + nu + 6 * feet + hands
     for j in range(nu):
-        value = wp.sqrt(joint_velocity) * (qvel[world, j + 6] - reference_velocity(vref, t, fps, j + 6))
+        velocity_weight = joint_velocity
+        # The G1 CSV orders the waist and legs before its 14 arm joints.
+        if nu == 29 and j >= 15:
+            velocity_weight *= arm_velocity_scale
+        value = wp.sqrt(velocity_weight) * (qvel[world, j + 6] - reference_velocity(vref, t, fps, j + 6))
         cost += residual_term(value, world, extra + j, weight, record, residual)
     for k in range(hands):
         body = tracked[k + 2]
@@ -410,6 +415,7 @@ class WholeBodyMPC:
         hand_position=0.0,
         hand_rotation=0.0,
         joint_velocity=0.0,
+        arm_velocity_scale=1.0,
         iterations=20,
         temperature=0.2,
         nonfoot_weight=1000.0,
@@ -434,6 +440,7 @@ class WholeBodyMPC:
                 hand_position,
                 hand_rotation,
                 joint_velocity,
+                arm_velocity_scale,
             ]
         )
         if not np.isfinite(scales).all() or noise < 0 or joint_scale <= 0 or np.any(scales[4:] < 0) or iterations < 1:
@@ -461,6 +468,7 @@ class WholeBodyMPC:
         m.actuator_forcerange[:] = m.jnt_actfrcrange[1:]
         self.samples, self.rounds, self.seed = samples, rounds, seed
         self.temperature = temperature
+        self.arm_velocity_scale = arm_velocity_scale
         self.hand_position, self.hand_rotation, self.joint_velocity = hand_position, hand_rotation, joint_velocity
         self.hand_clearance = hand_clearance
         self.root_scale, self.rotation_scale = root_scale, rotation_scale
@@ -614,6 +622,7 @@ class WholeBodyMPC:
                     self.hand_position,
                     self.hand_rotation,
                     self.joint_velocity,
+                    self.arm_velocity_scale,
                     step,
                     self.residual_width,
                     self.save_residuals,

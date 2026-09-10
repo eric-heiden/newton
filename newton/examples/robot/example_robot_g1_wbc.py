@@ -159,7 +159,12 @@ class Example:
         if self.gpu:
             controller = WholeBodyGaussNewton if args.controller == "mpc-gn" else WholeBodyMPC
             extra = (
-                {"epsilon": args.gn_epsilon, "damping": args.gn_damping, "trust": args.gn_trust}
+                {
+                    "epsilon": args.gn_epsilon,
+                    "damping": args.gn_damping,
+                    "trust": args.gn_trust,
+                    "coordinate_search": args.gn_coordinate_search,
+                }
                 if args.controller == "mpc-gn"
                 else {}
             )
@@ -187,6 +192,7 @@ class Example:
                 hand_position=args.hand_position,
                 hand_rotation=args.hand_rotation,
                 joint_velocity=args.joint_velocity,
+                arm_velocity_scale=args.arm_velocity_scale,
                 iterations=args.prediction_iterations,
                 device=self.model.device,
                 prediction_dt=args.prediction_dt,
@@ -469,6 +475,11 @@ class Example:
         parser.add_argument("--slowdown", type=float, default=1.0)
         parser.add_argument("--controller", choices=("qp", "pd", "mpc", "mpc-gn"), default="mpc-gn")
         parser.add_argument("--actuation", choices=("torque", "pd"), default="torque")
+        parser.add_argument(
+            "--gn-coordinate-search",
+            action="store_true",
+            help="Reuse improving finite-difference trials as coordinate-search candidates",
+        )
         parser.add_argument("--gn-epsilon", type=float, default=0.03)
         parser.add_argument("--gn-damping", type=float, default=0.1)
         parser.add_argument("--gn-trust", type=float, default=0.2)
@@ -501,6 +512,9 @@ class Example:
             "--hand-rotation", type=float, default=0.0, help="Wrist half-angle rotation tracking weight"
         )
         parser.add_argument("--joint-velocity", type=float, default=0.0, help="Per-joint velocity tracking weight")
+        parser.add_argument(
+            "--arm-velocity-scale", type=float, default=1.0, help="G1 arm multiplier for joint-velocity tracking"
+        )
         parser.add_argument("--hand-clearance", type=float, default=0.2)
         parser.add_argument("--hand-weight", type=float, default=10000.0)
         parser.add_argument("--seed", type=int, default=123)

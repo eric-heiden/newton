@@ -47,7 +47,9 @@ Reported foot metrics always use the four sole corners.
 Experimental `--hand-position`, `--hand-rotation` and `--joint-velocity`
 weights add world-frame wrist position, wrist rotation, and per-joint velocity
 tracking. They enter both the scalar rollout cost and Gauss-Newton residuals.
-Hand clearance remains a separate safety cost. Zero weights recover the
+`--arm-velocity-scale` multiplies the velocity weight for the 14 G1 arm
+joints, allowing stronger damping of arm tracking errors without applying the
+same weight to takeoff joints. Hand clearance remains a separate safety cost. Zero weights recover the
 previous objective. Output diagnostics include wrist position error, joint
 velocity error from recorded pose differences, and the RMS component of
 joint-angle error above 6 Hz. The latter uses a zero-phase fourth-order
@@ -56,7 +58,9 @@ corrections, not a perceptual quality score.
 
 Gauss-Newton controls are `--gn-epsilon 0.03` (central-difference perturbation
 in radians), `--gn-damping 0.1` and `--gn-trust 0.2` (maximum knot update in
-radians). It accepts only evaluated candidates. The tiled solve supports at
+radians). It accepts only evaluated candidates. Optional `--gn-coordinate-search` also
+compares the best finite-difference probe with the line-search result. This
+adds a coordinate-search fallback without extra physical rollouts. The tiled solve supports at
 most 127 parameters. Use `--mpc-rounds 1` for approximately half the optimizer latency, with
 lower swing accuracy in the tested jumping motion. Sampling uses `--mpc-samples 1024`, `--noise 0.12` and
 `--temperature 0.2`. `--seed` affects sampling only; Gauss-Newton has no random

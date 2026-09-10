@@ -105,6 +105,27 @@ def _lines(
     proposals[world, k, j] = wp.clamp(value, -0.7, 0.7)
 
 
+@wp.kernel
+def _coordinate_fallback(
+    proposals: wp.array3d[float],
+    candidate_cost: wp.array[float],
+    best: wp.array[int],
+    line_cost: wp.array[float],
+    center: wp.array2d[float],
+    plan: wp.array2d[float],
+):
+    k, j = wp.tid()
+    if candidate_cost[0] < line_cost[0] and candidate_cost[0] < 1.0e19:
+        value = proposals[best[0], k, j]
+        center[k, j] = value
+        plan[k, j] = value
+
+
+@wp.kernel
+def _merge_minimum(candidate_cost: wp.array[float], minimum: wp.array[float]):
+    minimum[0] = wp.min(candidate_cost[0], minimum[0])
+
+
 class WholeBodyGaussNewton(WholeBodyMPC):
     """Optimize the knot vector with central differences and damped least squares.
 
@@ -113,7 +134,9 @@ class WholeBodyGaussNewton(WholeBodyMPC):
     Capture includes both rollout batches and the linear solve.
     """
 
-    def __init__(self, model, kp, kd, reference, *, epsilon=0.03, damping=0.1, trust=0.2, **kwargs):
+    def __init__(
+        self, model, kp, kd, reference, *, epsilon=0.03, damping=0.1, trust=0.2, coordinate_search=False, **kwargs
+    ):
         count = kwargs.get("knots", 4) * model.nu
         if count >= 128:
             raise ValueError("The tiled Gauss-Newton solve supports at most 127 knot parameters")
@@ -122,6 +145,7 @@ class WholeBodyGaussNewton(WholeBodyMPC):
         kwargs["samples"] = 2 * count + 1
         super().__init__(model, kp, kd, reference, **kwargs)
         self.epsilon, self.damping, self.trust = epsilon, damping, trust
+        self.coordinate_search = coordinate_search
         self.count = count
         self.size = max(16, 1 << count.bit_length())
         self.width = self.residual_width
@@ -134,6 +158,7 @@ class WholeBodyGaussNewton(WholeBodyMPC):
             self.line_data = mjw.make_data(self.cpu_model, nworld=8, nconmax=96, njmax=192)
             self.line_proposals = wp.zeros((8, self.plan.shape[0], model.nu))
             self.line_costs = wp.zeros(8)
+            self.difference_minimum, self.difference_best = wp.zeros(1), wp.zeros(1, dtype=int)
         self.solve_kernel = _solve_kernel(self.size)
 
     def select(self):
@@ -162,6 +187,10 @@ class WholeBodyGaussNewton(WholeBodyMPC):
                 inputs=[self.costs, self.data.overflow, self.statistics],
                 outputs=[self.minimum],
             )
+            if self.coordinate_search:
+                wp.copy(self.difference_minimum, self.minimum)
+                self.difference_best.fill_(self.samples)
+                wp.launch(_min_index, self.samples, inputs=[self.costs, self.minimum], outputs=[self.difference_best])
             wp.launch(
                 _jacobian,
                 self.jacobian.shape,
@@ -197,4 +226,13 @@ class WholeBodyGaussNewton(WholeBodyMPC):
             )
             self.rollout(q, v, clock)
             self.select()
+            if self.coordinate_search:
+                # Reuse the evaluated coordinate probes when the local solve stalls.
+                wp.launch(
+                    _coordinate_fallback,
+                    self.plan.shape,
+                    inputs=[self.diff_proposals, self.difference_minimum, self.difference_best, self.minimum],
+                    outputs=[self.center, self.plan],
+                )
+                wp.launch(_merge_minimum, 1, inputs=[self.difference_minimum], outputs=[self.minimum])
         wp.launch(_finish, 1, inputs=[clock, self.minimum], outputs=[self.last, self.iteration, self.failure_count])

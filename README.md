@@ -169,7 +169,7 @@ If you run the examples from a source checkout with uv, use
       </a><br>
       <code>python -m newton.examples robot_g1_wbc</code><br>
       Install <code>uv sync --extra wbc</code>. Add <code>--motion motion.csv --controller mpc</code>
-      for Kimodo G1 tracking; default QP demonstrates standing balance.
+      for Kimodo G1 tracking with CUDA graph MPC. Use <code>--controller qp</code> for CPU standing balance.
       MPC currently runs slower than real time.
     </td>
   </tr>

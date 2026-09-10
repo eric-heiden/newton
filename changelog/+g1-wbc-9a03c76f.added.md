@@ -1,1 +1,1 @@
-Add an experimental G1 whole-body control example with Kimodo reference playback, bounded torque QP and sampling MPC controllers, and reproducible tracking measurements.
+Add a G1 whole-body control example for native Kimodo references, with GPU sampling MPC captured as a CUDA graph, MuJoCo Warp prediction, bounded torque control, ViewerGL visualization, and CPU PD/QP baselines.

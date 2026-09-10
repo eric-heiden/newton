@@ -44,6 +44,41 @@ class MotionReference:
         return q, v, acc
 
 
+def measure_foot_tracking(model, reference, times, poses, points):
+    """Measure sole tracking offline, without changing the simulated trajectory.
+
+    Each foot is identified by its body in ``points``. Clearance is the lowest
+    supplied sole corner. Reference clearance above 3 cm defines swing; actual
+    clearance above 2 cm counts as lifted. Values are in metres and seconds.
+    """
+    bodies = sorted({body for body, _ in points})
+    data = mujoco.MjData(model)
+    measured, desired = [], []
+    for t, q in zip(times, poses, strict=True):
+        for configuration, output in ((q, measured), (reference.sample(t)[0], desired)):
+            data.qpos[:] = configuration
+            mujoco.mj_kinematics(model, data)
+            feet = []
+            for body in bodies:
+                local = np.array([p for b, p in points if b == body])
+                world = data.xpos[body] + local @ data.xmat[body].reshape(3, 3).T
+                feet.append(np.r_[world.mean(axis=0), world[:, 2].min()])
+            output.append(feet)
+    measured, desired = np.asarray(measured), np.asarray(desired)
+    swing = desired[:, :, 3] > 0.03
+    stance = desired[:, :, 3] < 0.01
+    return {
+        "foot_position_rmse": float(np.sqrt(np.mean(np.sum((measured[:, :, :3] - desired[:, :, :3]) ** 2, axis=2)))),
+        "foot_height_rmse": float(np.sqrt(np.mean((measured[:, :, 3] - desired[:, :, 3]) ** 2))),
+        "swing_height_rmse": float(np.sqrt(np.mean((measured[:, :, 3][swing] - desired[:, :, 3][swing]) ** 2)))
+        if swing.any()
+        else None,
+        "swing_recall": float(np.mean(measured[:, :, 3][swing] > 0.02)) if swing.any() else None,
+        "false_lift_fraction": float(np.mean(measured[:, :, 3][stance] > 0.03)) if stance.any() else None,
+        "reference_swing_fraction": float(swing.mean()),
+    }
+
+
 class WholeBodyQP:
     """Optimize accelerations and unilateral friction-limited support forces.
 

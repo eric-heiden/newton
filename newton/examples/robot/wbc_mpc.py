@@ -355,6 +355,7 @@ class WholeBodyMPC:
             self.last = wp.zeros(1)
             self.statistics = wp.zeros(5, dtype=int)
         self.graph = None
+        self.record_residuals = None
 
     def optimize(self, q, v, clock):
         wp.launch(_shift, self.plan.shape, inputs=[self.plan, clock, self.last, self.spacing], outputs=[self.center])
@@ -366,84 +367,7 @@ class WholeBodyMPC:
                 inputs=[self.center, self.iteration, self.seed, r, scale, self.noise, self.plan, self.temperature > 0],
                 outputs=[self.proposals],
             )
-            wp.launch(
-                _reset,
-                (self.samples, self.cpu_model.nq),
-                inputs=[q, v, clock],
-                outputs=[
-                    self.data.qpos,
-                    self.data.qvel,
-                    self.data.qacc_warmstart,
-                    self.data.time,
-                    self.costs,
-                    self.data.overflow,
-                ],
-            )
-            for step in range(self.steps):
-                wp.launch(
-                    _targets,
-                    (self.samples, self.cpu_model.nu),
-                    inputs=[
-                        self.proposals,
-                        self.qref,
-                        self.vref,
-                        clock,
-                        self.fps,
-                        step * self.dt,
-                        self.spacing,
-                        self.kp,
-                        self.kd,
-                    ],
-                    outputs=[self.data.ctrl],
-                )
-                mjw.step(self.model, self.data)
-                if self.foot_weight or self.hand_weight:
-                    mjw.kinematics(self.model, self.data)
-                weight = 1.0 / self.steps + float(step == self.steps - 1)
-                wp.launch(
-                    _score,
-                    self.samples,
-                    inputs=[
-                        self.data.qpos,
-                        self.data.qvel,
-                        self.data.xpos,
-                        self.qref,
-                        self.vref,
-                        self.bodyref,
-                        self.tracked,
-                        clock,
-                        self.fps,
-                        (step + 1) * self.dt,
-                        weight,
-                        self.joint_scale,
-                        self.foot_weight,
-                        self.hand_weight,
-                        self.hand_clearance,
-                        self.data.overflow,
-                        self.data.nefc,
-                        self.data.nacon,
-                        self.statistics,
-                    ],
-                    outputs=[self.costs],
-                )
-                if self.nonfoot_weight and self.tracked.shape[0] >= 2:
-                    wp.launch(
-                        _contact_cost,
-                        self.data.contact.geom.shape[0],
-                        inputs=[
-                            self.data.contact.geom,
-                            self.data.contact.efc_address,
-                            self.data.nacon,
-                            self.data.contact.worldid,
-                            self.data.contact.dim,
-                            self.data.efc.force,
-                            self.model.geom_bodyid,
-                            self.tracked,
-                            int(self.cpu_model.opt.cone),
-                            weight * self.nonfoot_weight / 90000.0,
-                        ],
-                        outputs=[self.costs],
-                    )
+            self.rollout(q, v, clock)
             self.minimum.fill_(float("inf"))
             self.best.fill_(self.samples)
             wp.launch(
@@ -467,6 +391,88 @@ class WholeBodyMPC:
                     outputs=[self.center],
                 )
         wp.launch(_finish, 1, inputs=[clock, self.minimum], outputs=[self.last, self.iteration, self.failure_count])
+
+    def rollout(self, q, v, clock):
+        wp.launch(
+            _reset,
+            (self.samples, self.cpu_model.nq),
+            inputs=[q, v, clock],
+            outputs=[
+                self.data.qpos,
+                self.data.qvel,
+                self.data.qacc_warmstart,
+                self.data.time,
+                self.costs,
+                self.data.overflow,
+            ],
+        )
+        for step in range(self.steps):
+            wp.launch(
+                _targets,
+                (self.samples, self.cpu_model.nu),
+                inputs=[
+                    self.proposals,
+                    self.qref,
+                    self.vref,
+                    clock,
+                    self.fps,
+                    step * self.dt,
+                    self.spacing,
+                    self.kp,
+                    self.kd,
+                ],
+                outputs=[self.data.ctrl],
+            )
+            mjw.step(self.model, self.data)
+            if self.foot_weight or self.hand_weight:
+                mjw.kinematics(self.model, self.data)
+            weight = 1.0 / self.steps + float(step == self.steps - 1)
+            wp.launch(
+                _score,
+                self.samples,
+                inputs=[
+                    self.data.qpos,
+                    self.data.qvel,
+                    self.data.xpos,
+                    self.qref,
+                    self.vref,
+                    self.bodyref,
+                    self.tracked,
+                    clock,
+                    self.fps,
+                    (step + 1) * self.dt,
+                    weight,
+                    self.joint_scale,
+                    self.foot_weight,
+                    self.hand_weight,
+                    self.hand_clearance,
+                    self.data.overflow,
+                    self.data.nefc,
+                    self.data.nacon,
+                    self.statistics,
+                ],
+                outputs=[self.costs],
+            )
+            if self.record_residuals:
+                self.record_residuals(step, clock, weight)
+            if self.nonfoot_weight and self.tracked.shape[0] >= 2:
+                wp.launch(
+                    _contact_cost,
+                    self.data.contact.geom.shape[0],
+                    inputs=[
+                        self.data.contact.geom,
+                        self.data.contact.efc_address,
+                        self.data.nacon,
+                        self.data.contact.worldid,
+                        self.data.contact.dim,
+                        self.data.efc.force,
+                        self.model.geom_bodyid,
+                        self.tracked,
+                        int(self.cpu_model.opt.cone),
+                        weight * self.nonfoot_weight / 90000.0,
+                    ],
+                    outputs=[self.costs],
+                )
 
     def capture(self, q, v, clock):
         with wp.ScopedDevice(self.device):

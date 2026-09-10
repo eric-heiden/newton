@@ -48,6 +48,74 @@ class TestG1WBC(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.reference_type(self.model, q, fps=fps)
 
+    def test_foot_clearance_measurement(self):
+        """A known suppressed swing must be distinguished from pose matching."""
+        from newton.examples.robot.wbc_controller import measure_foot_tracking  # noqa: PLC0415
+
+        poses = np.tile(self.model.qpos0, (3, 1))
+        poses[:, 2] = [0.1, 0.15, 0.1]
+        ref = self.reference_type(self.model, poses, fps=10)
+        points = [(1, np.array([0.0, 0.0, -0.1]))]
+        actual = poses.copy()
+        actual[:, 2] = 0.1
+        metrics = measure_foot_tracking(self.model, ref, [0, 0.1, 0.2], actual, points)
+        self.assertEqual(metrics["swing_recall"], 0.0)
+        self.assertAlmostEqual(metrics["swing_height_rmse"], 0.05)
+        self.assertAlmostEqual(metrics["foot_height_rmse"], 0.05 / np.sqrt(3))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Gauss-Newton requires CUDA")
+    def test_gauss_newton_graph_solve(self):
+        """Check the captured damped solve against independent NumPy algebra."""
+        from newton.examples.robot.wbc_mpc_gn import _gram, _solve_kernel, _system  # noqa: PLC0415
+
+        rng = np.random.default_rng(42)
+        jac = rng.normal(size=(4, 64)).astype(np.float32)
+        residual = rng.normal(size=64).astype(np.float32)
+        augmented = np.zeros((16, 64), dtype=np.float32)
+        augmented[:4], augmented[4] = jac, residual
+        h = jac @ jac.T
+        expected = np.linalg.solve(h + 0.1 * np.diag(h.diagonal() + 1), -jac @ residual)
+        with wp.ScopedDevice("cuda:0"):
+            a = wp.array(augmented)
+            gram, matrix, rhs, direction = wp.zeros((16, 16)), wp.zeros((16, 16)), wp.zeros(16), wp.zeros(16)
+            solve = _solve_kernel(16)
+            with wp.ScopedCapture() as capture:
+                wp.launch_tiled(_gram, dim=(1, 1), inputs=[a], outputs=[gram], block_dim=128)
+                wp.launch(_system, (16, 16), inputs=[gram, 4, 0.1], outputs=[matrix, rhs])
+                wp.launch_tiled(solve, dim=1, inputs=[matrix, rhs], outputs=[direction], block_dim=128)
+            wp.capture_launch(capture.graph)
+            np.testing.assert_allclose(direction.numpy()[:4], expected, atol=1e-5, rtol=1e-4)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Gauss-Newton requires CUDA")
+    def test_gauss_newton_rollout_descent(self):
+        """A captured shooting update must reduce a physical tracking objective."""
+        from newton.examples.robot.wbc_mpc_gn import WholeBodyGaussNewton  # noqa: PLC0415
+
+        poses = np.tile(self.model.qpos0, (31, 1))
+        poses[:, -1] = 0.4
+        reference = self.reference_type(self.model, poses)
+        with wp.ScopedDevice("cuda:0"):
+            mpc = WholeBodyGaussNewton(
+                self.model,
+                np.array([30.0]),
+                np.array([3.0]),
+                reference,
+                horizon=0.1,
+                rounds=1,
+                hand_weight=0,
+                nonfoot_weight=0,
+            )
+            q = wp.array(self.model.qpos0[None], dtype=float)
+            v, clock = wp.zeros((1, self.model.nv)), wp.zeros(1)
+            mpc.capture(q, v, clock)
+            mpc.solve()
+            costs = mpc.costs.numpy()
+            self.assertLess(float(mpc.minimum.numpy()[0]), costs[0] - 1e-4)
+            # Residuals used for the finite differences equal the actual cost here.
+            np.testing.assert_allclose(
+                np.sum(mpc.residual.numpy() ** 2, axis=1), mpc.diff_costs.numpy(), rtol=1e-4, atol=1e-5
+            )
+
     @unittest.skipUnless(importlib.util.find_spec("osqp"), "Install the wbc extra for QP tests")
     def test_qp_unactuated_base_and_contact_force_balance(self):
         """Verify that ground forces support the unactuated floating base."""

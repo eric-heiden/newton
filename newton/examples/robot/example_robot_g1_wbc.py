@@ -22,8 +22,9 @@ import newton
 import newton.examples
 import newton.solvers
 import newton.utils
-from newton.examples.robot.wbc_controller import MotionReference, WholeBodyQP
+from newton.examples.robot.wbc_controller import MotionReference, WholeBodyQP, measure_foot_tracking
 from newton.examples.robot.wbc_mpc import WholeBodyMPC, audit_step
+from newton.examples.robot.wbc_mpc_gn import WholeBodyGaussNewton
 
 
 class Example:
@@ -65,8 +66,12 @@ class Example:
         builder.joint_armature[6:] = armature.tolist()
         self.kp = armature * (2 * np.pi * 10) ** 2
         self.kd = 4 * armature * (2 * np.pi * 10)
+        if not np.isfinite(args.gain_scale) or args.gain_scale <= 0:
+            raise ValueError("gain-scale must be finite and positive")
+        self.kp *= args.gain_scale
+        self.kd *= np.sqrt(args.gain_scale)
         # The MJCF already supplies the textured ground plane.
-        self.gpu = args.controller == "mpc"
+        self.gpu = args.controller in ("mpc", "mpc-gn")
         if self.gpu and not wp.get_device(args.device or "cuda:0").is_cuda:
             raise ValueError("MPC requires CUDA; use --controller qp for the CPU baseline")
         self.model = builder.finalize(device=(args.device or "cuda:0") if self.gpu else "cpu")
@@ -111,8 +116,14 @@ class Example:
         self.floor_shift = 0.002 - points[:, 2].min()
         qpos[:, 2] += self.floor_shift
         self.mpc = None
-        if args.controller == "mpc":
-            self.mpc = WholeBodyMPC(
+        if self.gpu:
+            controller = WholeBodyGaussNewton if args.controller == "mpc-gn" else WholeBodyMPC
+            extra = (
+                {"epsilon": args.gn_epsilon, "damping": args.gn_damping, "trust": args.gn_trust}
+                if args.controller == "mpc-gn"
+                else {}
+            )
+            self.mpc = controller(
                 self.mj,
                 self.kp,
                 self.kd,
@@ -132,6 +143,7 @@ class Example:
                 prediction_dt=args.prediction_dt,
                 rounds=args.mpc_rounds,
                 seed=args.seed,
+                **extra,
             )
         q, v, _ = self.motion.sample(0)
         nq = q.copy()
@@ -383,6 +395,7 @@ class Example:
             "nonfoot_bodies": sorted(self.nonfoot_bodies),
             "config": vars(self.args),
         }
+        summary.update(measure_foot_tracking(self.mj, self.motion, rows[:, 0], self.poses, self.points))
         path.with_suffix(".json").write_text(json.dumps(summary, indent=2) + "\n")
         np.savez_compressed(
             path.with_suffix(".npz"), rows=rows, qpos=self.poses, reference=self.motion.qpos, contacts=contacts
@@ -396,7 +409,10 @@ class Example:
         parser.add_argument("--motion", type=str, default=None, help="Kimodo G1 MuJoCo qpos CSV")
         parser.add_argument("--motion-fps", type=float, default=30.0)
         parser.add_argument("--slowdown", type=float, default=1.0)
-        parser.add_argument("--controller", choices=("qp", "pd", "mpc"), default="mpc")
+        parser.add_argument("--controller", choices=("qp", "pd", "mpc", "mpc-gn"), default="mpc")
+        parser.add_argument("--gn-epsilon", type=float, default=0.01)
+        parser.add_argument("--gn-damping", type=float, default=0.1)
+        parser.add_argument("--gn-trust", type=float, default=0.2)
         parser.add_argument("--mpc-samples", type=int, default=1024)
         parser.add_argument("--mpc-rounds", type=int, default=2)
         parser.add_argument("--prediction-dt", type=float, default=0.01)
@@ -409,6 +425,9 @@ class Example:
         parser.add_argument("--horizon", type=float, default=0.5)
         parser.add_argument("--noise", type=float, default=0.12)
         parser.add_argument("--joint-scale", type=float, default=0.3)
+        parser.add_argument(
+            "--gain-scale", type=float, default=1.0, help="PD stiffness scale; damping scales by its square root"
+        )
         parser.add_argument("--foot-weight", type=float, default=0.0)
         parser.add_argument("--hand-clearance", type=float, default=0.2)
         parser.add_argument("--hand-weight", type=float, default=10000.0)

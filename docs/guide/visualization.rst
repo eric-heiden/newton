@@ -308,6 +308,43 @@ This installs ``ovrtx`` (the NVIDIA OVRTX renderer) and ``usd-core``, in additio
     viewer.log_state(state)
     viewer.end_frame()
 
+External ovstage scenes (prototype)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. experimental::
+    ``ViewerRTX(stage=..., renderer=..., render_product=...)`` and
+    :class:`~newton.viewer.OvstageBodyBinding` are experimental.
+
+With OVRTX 0.5 and ovstage 0.2, an application can retain its source scene and
+publish Newton poses separately. This mode does not invoke the USD viewer's
+scene generation or require ovnewton. The application must attach the stage to
+the renderer and populate it before constructing the viewer.
+
+.. code-block:: python
+
+    binding = newton.viewer.OvstageBodyBinding(
+        stage, model, ordinal=1,
+        prim_paths=paths, body_indices=indices,
+        body_local_transforms=offsets,
+    )
+    viewer = newton.viewer.ViewerRTX(
+        stage=stage, renderer=renderer,
+        render_product="/Render/Camera", headless=True,
+    )
+
+    binding.write(state, ordinal=2)
+    stage.advance_write_floor(2).wait()
+    viewer.render(ordinal=2)
+
+The bridge preserves full affine rest offsets and uses final-model body
+indices. Rebuild it after topology or mapping changes. The application owns
+camera, lighting, materials and publication order. Close the viewer and
+binding before detaching or destroying the stage and renderer.
+
+This synchronous prototype supports headless capture and a fixed-camera
+preview. Interactive scene editing, GUI overlays and deformation binding are
+not implemented. The regular generated-scene path remains available.
+
 Recording and Offline Viewers
 -----------------------------
 

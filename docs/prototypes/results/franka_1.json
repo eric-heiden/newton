@@ -1,0 +1,17 @@
+{
+  "scope": "Newton FK pose replay through prototype APIs; no solver, CPU window preview excluded when headless",
+  "versions": {
+    "newton": "1.7.0.dev0",
+    "ovrtx": "0.5.0.377615",
+    "ovstage": "0.2.0.377349",
+    "warp-lang": "1.17.0"
+  },
+  "bodies": 11,
+  "targets": 11,
+  "frames": 60,
+  "median_frame_ms": 10.608850003336556,
+  "p95_frame_ms": 28.654820007795934,
+  "median_publication_ms": 3.7022499964223243,
+  "pxr_imported": false,
+  "ovnewton_imported": false
+}

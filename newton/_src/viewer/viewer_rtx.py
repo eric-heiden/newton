@@ -38,8 +38,9 @@ except ImportError:
 
 from .camera import Camera
 from .picking import Picking
+from .rtx_scene import _RtxScene
 from .utils import OPAQUE_OPACITY_THRESHOLD
-from .viewer import _DEFAULT_LAYER_ID
+from .viewer import _DEFAULT_LAYER_ID, ViewerBase
 from .viewer_gui import ViewerGui
 from .viewer_usd import ViewerUSD, _compute_segment_xform
 from .wind import Wind
@@ -108,10 +109,20 @@ class ViewerRTX(ViewerUSD):
     real-time path-traced rendering.  Subsequent frames update rigid-body
     transforms (and deforming-mesh vertices) via the OVRTX attribute API
     and present the rendered image in a pyglet / OpenGL window.
+
+    .. experimental::
+        The ``stage``, ``renderer``, ``render_product`` and ``color_output``
+        parameters and :meth:`render` form an experimental external-scene mode.
+        It consumes OVRTX 0.5 render products without building a USD scene or
+        importing physics. The caller owns stage population, pose bindings,
+        camera/settings, publication ordinals and renderer lifetime. This mode
+        is synchronous and supports headless capture or a fixed-camera preview;
+        procedural logging, overlays, picking and the viewer GUI are not supported.
     """
 
     _PHASE_BUILD = 0
     _PHASE_RENDER = 1
+    _external_scene: _RtxScene | None = None
     _PICKING_LINE_NAME = "picking_line"
     _PICKING_LINE_RADIUS = 0.01
     _PICKING_LINE_COLOR = (0.0, 1.0, 1.0)
@@ -121,6 +132,8 @@ class ViewerRTX(ViewerUSD):
 
     @override
     def activate(self, layer_id: str):
+        if getattr(self, "_external_scene", None) is not None:
+            raise NotImplementedError("External-scene layers are owned by the application")
         if (
             getattr(self, "_phase", self._PHASE_BUILD) == self._PHASE_RENDER
             and layer_id != _DEFAULT_LAYER_ID
@@ -142,6 +155,11 @@ class ViewerRTX(ViewerUSD):
         scaling: float = 1.0,
         environment: Literal["default", "studio", "none"] = "default",
         async_rendering: bool = True,
+        *,
+        stage: Any | None = None,
+        renderer: Any | None = None,
+        render_product: str | None = None,
+        color_output: str = "/Render/Vars/LdrColor",
     ):
         """Initialize the OVRTX-backed real-time ray-tracing viewer.
 
@@ -160,8 +178,21 @@ class ViewerRTX(ViewerUSD):
             environment: Lighting preset; one of :attr:`ENVIRONMENTS`.
             async_rendering: Submit OVRTX render work asynchronously and
                 present the previous frame while the next one is still in
-                flight.
+                flight. Ignored in the synchronous external-scene prototype.
+            stage: Optional caller-owned ovstage, already attached to renderer.
+            renderer: Caller-owned OVRTX 0.5 renderer; required with stage.
+            render_product: Absolute path of the external render product.
+            color_output: Absolute RenderVar path for screenshots and preview.
         """
+        if (stage is None) != (renderer is None) or (stage is not None and render_product is None):
+            raise ValueError("External scenes require stage, renderer and render_product together")
+        if stage is None and render_product is not None:
+            raise ValueError("render_product requires an external stage and renderer")
+        if fps <= 0:
+            raise ValueError("fps must be positive")
+        self._external_scene = None
+        if stage is not None:
+            self._external_scene = _RtxScene(stage, renderer, render_product, color_output)
         # FIXME: Disable USD checks in OVRTX that refuse to load the library if `usd-core` is present.
         # OVRTX 0.3+ ships with namespaced USD builds that should be safe to use in conjunction with
         # `usd-core`, but the check wasn't removed yet. Upcoming OVRTX releases should remove the check,
@@ -173,7 +204,7 @@ class ViewerRTX(ViewerUSD):
         except ImportError as e:
             raise ImportError("ovrtx package is required for ViewerRTX. Install with: pip install ovrtx") from e
 
-        if UsdGeom is None:
+        if UsdGeom is None and stage is None:
             raise ImportError("usd-core package is required for ViewerRTX. Install with: pip install usd-core")
 
         self._environment = environment.lower()
@@ -221,6 +252,21 @@ class ViewerRTX(ViewerUSD):
         # flushed once the GUI exists.
         self._pending_ui_callbacks: list[tuple] = []
         self._pending_splash: tuple[bool, str | None] | None = None
+
+        if self._external_scene is not None:
+            self.fps = fps
+            self.num_frames = num_frames
+            self._frame_count = 0
+            self._rtx = renderer
+            self.stage = stage
+            self._render_product_path = render_product
+            self._async = False
+            self.picking = None
+            self.wind = None
+            # Initialize only viewer bookkeeping. ViewerUSD.__init__ would
+            # create another scene and clear source appearance.
+            ViewerBase.__init__(self)
+            return
 
         # Generate a temporary USD path to share with OVRTX renderer
         fd, output_path = tempfile.mkstemp(suffix=".usd")
@@ -677,6 +723,8 @@ void main() {
         Args:
             path: Absolute or relative path to a USD file.
         """
+        if self._external_scene is not None:
+            raise NotImplementedError("External-scene content and interaction are owned by the application")
         if self._phase != self._PHASE_BUILD:
             raise RuntimeError("add_background_usd() must be called before the first simulation frame")
         path = os.path.abspath(path)
@@ -801,6 +849,9 @@ void main() {
         Args:
             model: The Newton model instance.
         """
+        if self._external_scene is not None:
+            self.model = model
+            return
         super().set_model(model)
         if model is not None:
             from pyglet.math import Vec3 as PyVec3
@@ -841,6 +892,8 @@ void main() {
         Args:
             spacing: Spacing between worlds along each axis [m].
         """
+        if self._external_scene is not None:
+            raise NotImplementedError("External-scene content and interaction are owned by the application")
         super().set_world_offsets(spacing)
         if self.picking is not None:
             self.picking.world_offsets = self.world_offsets
@@ -854,6 +907,8 @@ void main() {
             pitch: Camera pitch [deg].
             yaw: Camera yaw [deg].
         """
+        if self._external_scene is not None:
+            raise NotImplementedError("Edit the external stage's camera in the application")
         from pyglet.math import Vec3 as PyVec3
 
         try:
@@ -1266,6 +1321,8 @@ void main() {
             snap_to: Optional world transform to snap to when this gizmo is
                 released by the user.
         """
+        if self._external_scene is not None:
+            raise NotImplementedError("External-scene content and interaction are owned by the application")
         self._gizmo_log[name] = {
             "transform": transform,
             "snap_to": snap_to,
@@ -1280,6 +1337,8 @@ void main() {
         Args:
             state: The current state of the simulation.
         """
+        if self._external_scene is not None:
+            raise RuntimeError("Use OvstageBodyBinding.write(), publish the stage, then render(ordinal=...)")
         self._last_state = state
         if self.model is None:
             return
@@ -1368,6 +1427,9 @@ void main() {
         Args:
             time: Current simulation time [s].
         """
+        if self._external_scene is not None:
+            self.time = time
+            return
         with wp.ScopedTimer("ViewerRTX::begin_frame", active=PROFILE_ENABLED, use_nvtx=True):
             super().begin_frame(time)
             self._pending_xforms.clear()
@@ -1402,13 +1464,21 @@ void main() {
             self._last_perf_time = now
 
     @override
-    def end_frame(self) -> None:
+    def end_frame(self, *, ordinal: int | None = None) -> None:
         """Finish rendering the current frame.
 
         On the first call, the RTX renderer is initialized from the USD stage
         built up during the build phase; subsequent calls update transforms
         and dispatch the next ray-traced render.
+
+        Args:
+            ordinal: Published ordinal, required in external-scene mode.
         """
+        if self._external_scene is not None:
+            if ordinal is None:
+                raise ValueError("External-scene end_frame requires the published ordinal")
+            self.render(ordinal=ordinal)
+            return
         if self._phase == self._PHASE_BUILD:
             self._init_ovrtx()
 
@@ -1420,6 +1490,31 @@ void main() {
             self._update_ovrtx_point_batches()
             self._update_ovrtx_mesh_points()
             self._render_and_display()
+
+    def render(self, *, ordinal: int, delta_time: float | None = None) -> Any:
+        """Consume an already-published external scene and return render products.
+
+        This experimental method neither writes poses nor advances the stage
+        floor. Finish all scene writes and advance the global floor first.
+        The returned frame is complete before another publication may start.
+        Reusing an ordinal supports static accumulation. Render-variable keys
+        are full paths in OVRTX 0.5. The caller must keep stage and renderer
+        alive until the viewer is closed.
+
+        Args:
+            ordinal: Nondecreasing published stage ordinal.
+            delta_time: Render timestep in seconds; defaults to ``1 / fps``.
+
+        Returns:
+            The completed OVRTX render-product dictionary.
+        """
+        if self._external_scene is None:
+            raise RuntimeError("render(ordinal=...) requires an external stage and renderer")
+        products = self._external_scene.render(ordinal, 1.0 / self.fps if delta_time is None else delta_time)
+        self._frame_count += 1
+        if not self._headless:
+            self._external_scene.display(vsync=self._vsync)
+        return products
 
     # ViewerUSD authors PreviewSurface materials while ViewerRTX is in the
     # build phase. RTX fractional opacity is evaluated per ray hit, so the
@@ -1480,6 +1575,8 @@ void main() {
             dynamic: Whether mesh topology may change between frames.
             opacity: Optional display opacity in [0, 1].
         """
+        if self._external_scene is not None:
+            raise NotImplementedError("External-scene content and interaction are owned by the application")
         name = self._qualify(name)
 
         if self._phase == self._PHASE_BUILD:
@@ -1548,6 +1645,8 @@ void main() {
             hidden: Whether the instances are hidden.
             opacities: Optional per-instance opacity values.
         """
+        if self._external_scene is not None:
+            raise NotImplementedError("External-scene content and interaction are owned by the application")
         name = self._qualify(name)
         mesh = self._qualify(mesh)
 
@@ -1593,6 +1692,8 @@ void main() {
             width: Line width [m].
             hidden: Whether the lines are initially hidden.
         """
+        if self._external_scene is not None:
+            raise NotImplementedError("External-scene content and interaction are owned by the application")
         name = self._qualify(name)
 
         if self._phase == self._PHASE_BUILD:
@@ -1625,6 +1726,8 @@ void main() {
             colors: Array of point colors, a single RGB triplet, or ``None``.
             hidden: Whether the points are hidden.
         """
+        if self._external_scene is not None:
+            raise NotImplementedError("External-scene content and interaction are owned by the application")
         name = self._qualify(name)
 
         if self._phase == self._PHASE_BUILD:
@@ -2038,6 +2141,8 @@ void main() {
             self._window.flip()
 
     def _capture_screenshot_pixels(self) -> np.ndarray:
+        if self._external_scene is not None:
+            return self._external_scene.pixels()
         if self._render_products is not None:
             products = self._render_products
         elif self._render_result is not None:
@@ -2093,6 +2198,9 @@ void main() {
         UI callbacks, releases the picking and wind helpers, and drains the
         async rendering pipeline before releasing the renderer.
         """
+        if getattr(self, "_external_scene", None) is not None:
+            ViewerBase.clear_model(self)
+            return
         if self._has_other_user_layers():
             raise RuntimeError(
                 "ViewerRTX cannot clear one layer while other user layers are still live; "
@@ -2191,6 +2299,8 @@ void main() {
                      "panel" - Top-level collapsing headers in left panel
                      "rendering" - Extra items inside the Rendering Options section
         """
+        if self._external_scene is not None:
+            raise NotImplementedError("External-scene content and interaction are owned by the application")
         if not callable(callback):
             raise TypeError("callback must be callable")
         if self.gui is not None:
@@ -2205,6 +2315,8 @@ void main() {
         Args:
             text: Optional sub-label drawn below the cradle.
         """
+        if self._external_scene is not None:
+            raise NotImplementedError("External-scene content and interaction are owned by the application")
         if self.gui is not None:
             self.gui.show_loading_splash(text)
         else:
@@ -2213,6 +2325,8 @@ void main() {
 
     def hide_loading_splash(self) -> None:
         """Remove the splash set by :meth:`show_loading_splash`."""
+        if self._external_scene is not None:
+            raise NotImplementedError("External-scene content and interaction are owned by the application")
         if self.gui is not None:
             self.gui.hide_loading_splash()
         else:
@@ -2261,6 +2375,13 @@ void main() {
         Returns:
             bool: True while the viewer should continue rendering.
         """
+        if self._external_scene is not None:
+            scene = self._external_scene
+            return (
+                not scene.closed
+                and not (scene.window is not None and scene.window.has_exit)
+                and (self.num_frames is None or self._frame_count < self.num_frames)
+            )
         if self._should_close:
             return False
         if self._headless and self.num_frames is not None:
@@ -2273,7 +2394,12 @@ void main() {
 
         Waits for any in-flight asynchronous render, releases the OVRTX
         renderer, transform bindings, and the underlying pyglet window.
+        In external-scene mode, only the viewer's preview and frame references
+        are released; the caller retains ownership of the renderer and stage.
         """
+        if self._external_scene is not None:
+            self._external_scene.close()
+            return
         # wait for async rendering results before closing
         if self._render_result is not None:
             self._render_result.wait().fetch()

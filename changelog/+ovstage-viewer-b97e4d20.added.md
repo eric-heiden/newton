@@ -1,0 +1,1 @@
+Add an experimental external-scene mode to `ViewerRTX` and `newton.viewer.OvstageBodyBinding` for rendering caller-owned ovstage scenes with explicit pose publication and without rebuilding their appearance through Newton's USD viewer.

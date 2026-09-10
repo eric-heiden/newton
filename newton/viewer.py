@@ -13,9 +13,11 @@ from ._src.viewer import (
     ViewerUSD,
     ViewerViser,
 )
+from ._src.viewer.ovstage import OvstageBodyBinding
 
 __all__ = [
     "Layer",
+    "OvstageBodyBinding",
     "ViewerBase",
     "ViewerFile",
     "ViewerGL",

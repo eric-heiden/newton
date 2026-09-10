@@ -14,6 +14,7 @@ newton.viewer
    :nosignatures:
 
    Layer
+   OvstageBodyBinding
    ViewerBase
    ViewerFile
    ViewerGL

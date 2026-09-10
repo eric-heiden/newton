@@ -35,7 +35,6 @@ class Example:
         # Gauss-Newton benefits from stronger pose tasks and a stiffer inner PD.
         # Sampling retains its broader, lower-gain starting configuration.
         defaults = {
-            "mpc_rounds": (2, 1),
             "gain_scale": (1.0, 4.0),
             "joint_scale": (0.3, 0.15),
             "root_scale": (0.08, 0.04),
@@ -51,6 +50,9 @@ class Example:
         if not np.isfinite(args.slowdown) or args.slowdown <= 0:
             raise ValueError("slowdown must be finite and positive")
         self.fps = 50
+        self.step_rate = max(args.control_rate, self.fps)
+        if args.control_rate < self.fps and args.controller not in ("mpc", "mpc-gn"):
+            raise ValueError("Replanning below 50 Hz is supported by the GPU MPC modes")
         self.frame_dt = 1 / self.fps
         self.sim_time = 0.0
         self.sim_dt = 0.002
@@ -174,6 +176,7 @@ class Example:
                 foot_vertical=args.foot_vertical,
                 foot_rotation=args.foot_rotation,
                 angular_weight=args.angular_weight,
+                sole_tracking=args.foot_task == "sole",
                 hand_weight=args.hand_weight,
                 hand_clearance=args.hand_clearance,
                 iterations=args.prediction_iterations,
@@ -209,7 +212,7 @@ class Example:
             self.solver.reset(self.state_0)
             self.mpc.capture(self.solver.mjw_data.qpos, self.solver.mjw_data.qvel, self.solver.mjw_data.time)
             with wp.ScopedDevice(self.model.device):
-                self.audit = wp.zeros((round(1 / args.control_rate / self.sim_dt), 7))
+                self.audit = wp.zeros((round(1 / self.step_rate / self.sim_dt), 7))
                 self.touched = wp.zeros(self.mj.nbody, dtype=int)
                 self.geom_bodies = wp.array(self.mj.geom_bodyid, dtype=int)
                 self.foot_bodies = wp.array(sorted({point[0] for point in self.points}), dtype=int)
@@ -263,8 +266,10 @@ class Example:
         start = time.perf_counter()
         self.state_0.clear_forces()
         self.viewer.apply_forces(self.state_0)
+        replan = self.physics_steps % round(1 / self.args.control_rate / self.sim_dt) == 0
         wp.record_event(self.start_event)
-        self.mpc.solve()
+        if replan:
+            self.mpc.solve()
         wp.record_event(self.end_event)
         wp.capture_launch(self.physics_graph)
         data = self.solver.mjw_data
@@ -287,7 +292,7 @@ class Example:
                 np.linalg.norm(error[:3]),
                 np.linalg.norm(error[3:6]),
                 np.sqrt(np.mean(error[6:] ** 2)),
-                wp.get_event_elapsed_time(self.start_event, self.end_event),
+                wp.get_event_elapsed_time(self.start_event, self.end_event) if replan else 0.0,
                 float(audit[:, 3].max()),
                 0.0,
                 (time.perf_counter() - start) * 1000,
@@ -297,7 +302,7 @@ class Example:
 
     def step(self):
         if self.gpu:
-            for _ in range(self.args.control_rate // self.fps):
+            for _ in range(self.step_rate // self.fps):
                 self.gpu_control()
             return
         for _ in range(self.args.control_rate // self.fps):
@@ -401,7 +406,10 @@ class Example:
         path = Path(self.args.output)
         path.parent.mkdir(parents=True, exist_ok=True)
         rows = np.array(self.rows)
-        timing = rows[min(10, len(rows) - 1) :, 5]
+        timing = rows[:, 5]
+        if self.gpu:
+            timing = timing[timing > 0]
+        timing = timing[min(10, len(timing) - 1) :]
         d = mujoco.MjData(self.mj)
         d.qpos[:] = self.q
         mujoco.mj_kinematics(self.mj, d)
@@ -452,13 +460,15 @@ class Example:
         parser.add_argument("--slowdown", type=float, default=1.0)
         parser.add_argument("--controller", choices=("qp", "pd", "mpc", "mpc-gn"), default="mpc-gn")
         parser.add_argument("--actuation", choices=("torque", "pd"), default="torque")
-        parser.add_argument("--gn-epsilon", type=float, default=0.01)
+        parser.add_argument("--gn-epsilon", type=float, default=0.03)
         parser.add_argument("--gn-damping", type=float, default=0.1)
         parser.add_argument("--gn-trust", type=float, default=0.2)
         parser.add_argument("--mpc-samples", type=int, default=1024)
-        parser.add_argument("--mpc-rounds", type=int, help="Search rounds: 1 for Gauss-Newton, 2 for sampling")
+        parser.add_argument(
+            "--mpc-rounds", type=int, default=2, help="Search iterations; 1 trades tracking quality for latency"
+        )
         parser.add_argument("--prediction-dt", type=float, default=0.01)
-        parser.add_argument("--control-rate", type=int, choices=(50, 100), default=100)
+        parser.add_argument("--control-rate", type=int, choices=(10, 25, 50, 100), default=100)
         parser.add_argument("--nonfoot-weight", type=float, default=1000.0)
         parser.add_argument("--temperature", type=float, default=0.2)
         parser.add_argument("--cone", choices=("elliptic", "pyramidal"), default="pyramidal")
@@ -469,6 +479,7 @@ class Example:
         parser.add_argument("--joint-scale", type=float)
         parser.add_argument("--gain-scale", type=float, help="PD stiffness scale; damping scales by its square root")
         parser.add_argument("--foot-weight", type=float)
+        parser.add_argument("--foot-task", choices=("ankle", "sole"), default="sole")
         parser.add_argument("--root-scale", type=float)
         parser.add_argument("--rotation-scale", type=float)
         parser.add_argument("--foot-vertical", type=float, help="Foot vertical position weight multiplier")

@@ -145,6 +145,19 @@ def rotation_error(current: wp.quat, desired: wp.quat):
     return sign * factor * vector
 
 
+@wp.func
+def sole_position(position: wp.vec3, rotation: wp.quat):
+    center = position + wp.quat_rotate(rotation, wp.vec3(0.035, 0.0, -0.035))
+    height = float(1.0e10)
+    for i in range(2):
+        for j in range(2):
+            corner = position + wp.quat_rotate(
+                rotation, wp.vec3(-0.05 + 0.17 * float(i), -0.025 + 0.05 * float(j), -0.035)
+            )
+            height = wp.min(height, corner[2])
+    return wp.vec3(center[0], center[1], height)
+
+
 @wp.kernel
 def _score(
     qpos: wp.array2d[float],
@@ -169,6 +182,7 @@ def _score(
     foot_vertical: float,
     foot_rotation: float,
     angular_weight: float,
+    sole_tracking: bool,
     step: int,
     width: int,
     record: bool,
@@ -201,15 +215,17 @@ def _score(
     for k in range(tracked.shape[0]):
         p = xpos[world, tracked[k]]
         if k < 2:
+            # MuJoCo Warp stores body quaternions in scalar-first order.
+            raw = xquat[world, tracked[k]]
+            actual = wp.quat(raw[1], raw[2], raw[3], raw[0])
+            if sole_tracking:
+                p = sole_position(p, actual)
             for j in range(3):
                 scale = foot_weight
                 if j == 2:
                     scale *= foot_vertical
                 value = wp.sqrt(scale) * (p[j] - reference_value(bodyref, t, fps, 3 * k + j))
                 cost += residual_term(value, world, off + 9 + nu + 3 * k + j, weight, record, residual)
-            # MuJoCo Warp stores body quaternions in scalar-first order.
-            raw = xquat[world, tracked[k]]
-            actual = wp.quat(raw[1], raw[2], raw[3], raw[0])
             target = wp.quat(
                 reference_value(rotationref, t, fps, 4 * k + 1),
                 reference_value(rotationref, t, fps, 4 * k + 2),
@@ -364,6 +380,7 @@ class WholeBodyMPC:
         foot_vertical=1.0,
         foot_rotation=0.0,
         angular_weight=0.0,
+        sole_tracking=False,
         hand_weight=10000.0,
         hand_clearance=0.2,
         iterations=20,
@@ -415,9 +432,8 @@ class WholeBodyMPC:
         self.samples, self.rounds, self.seed = samples, rounds, seed
         self.temperature = temperature
         self.hand_clearance = hand_clearance
-        if root_scale <= 0 or rotation_scale <= 0 or not np.isfinite([root_scale, rotation_scale]).all():
-            raise ValueError("Root position and rotation scales must be finite and positive")
         self.root_scale, self.rotation_scale = root_scale, rotation_scale
+        self.sole_tracking = sole_tracking
         self.nonfoot_weight = nonfoot_weight
         self.foot_vertical, self.foot_rotation, self.angular_weight = foot_vertical, foot_rotation, angular_weight
         self.steps = round(horizon / prediction_dt)
@@ -436,6 +452,11 @@ class WholeBodyMPC:
             mujoco.mj_kinematics(m, data)
             bodyref[i] = data.xpos[tracked].ravel()
             rotationref[i] = data.xquat[tracked].ravel()
+            if sole_tracking:
+                local = np.array([[x, y, -0.035] for x in (-0.05, 0.12) for y in (-0.025, 0.025)])
+                for k, body in enumerate(tracked[:2]):
+                    corners = data.xpos[body] + local @ data.xmat[body].reshape(3, 3).T
+                    bodyref[i, 3 * k : 3 * k + 3] = [*corners.mean(axis=0)[:2], corners[:, 2].min()]
         with wp.ScopedDevice(self.device):
             self.model = mjw.put_model(m)
             self.model.opt.warn_overflow = False
@@ -558,6 +579,7 @@ class WholeBodyMPC:
                     self.foot_vertical,
                     self.foot_rotation,
                     self.angular_weight,
+                    self.sole_tracking,
                     step,
                     self.residual_width,
                     self.save_residuals,

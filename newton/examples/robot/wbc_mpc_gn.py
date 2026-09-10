@@ -113,7 +113,7 @@ class WholeBodyGaussNewton(WholeBodyMPC):
     Capture includes both rollout batches and the linear solve.
     """
 
-    def __init__(self, model, kp, kd, reference, *, epsilon=0.01, damping=0.1, trust=0.2, **kwargs):
+    def __init__(self, model, kp, kd, reference, *, epsilon=0.03, damping=0.1, trust=0.2, **kwargs):
         count = kwargs.get("knots", 4) * model.nu
         if count >= 128:
             raise ValueError("The tiled Gauss-Newton solve supports at most 127 knot parameters")

@@ -27,7 +27,7 @@ The resolved configuration is included in every output JSON.
 
 | Option | Gauss-Newton | Sampling / CPU baselines |
 | --- | ---: | ---: |
-| `--mpc-rounds` | 1 | 2 |
+| `--mpc-rounds` | 2 | 2 |
 | `--gain-scale` | 4 | 1 |
 | `--joint-scale` | 0.15 | 0.3 |
 | `--root-scale` | 0.04 | 0.08 |
@@ -40,13 +40,15 @@ The resolved configuration is included in every output JSON.
 The horizon is 0.5 s, prediction step 0.01 s, replan rate 100 Hz, and plant
 step 0.002 s. `--gain-scale` multiplies proportional gains and its square root
 multiplies derivative gains; torque bounds remain unchanged. Rotation costs
-use half of the shortest SO(3) logarithm. Foot position weights apply to ankle
-body origins; reported foot metrics use the four sole corners.
+use half of the shortest SO(3) logarithm. The default `--foot-task sole` penalizes the horizontal sole center and
+minimum sole-corner height; `--foot-task ankle` uses ankle-body origins.
+Reported foot metrics always use the four sole corners.
 
-Gauss-Newton controls are `--gn-epsilon 0.01` (central-difference perturbation
+Gauss-Newton controls are `--gn-epsilon 0.03` (central-difference perturbation
 in radians), `--gn-damping 0.1` and `--gn-trust 0.2` (maximum knot update in
 radians). It accepts only evaluated candidates. The tiled solve supports at
-most 127 parameters. Sampling uses `--mpc-samples 1024`, `--noise 0.12` and
+most 127 parameters. Use `--mpc-rounds 1` for approximately half the optimizer latency, with
+lower swing accuracy in the tested jumping motion. Sampling uses `--mpc-samples 1024`, `--noise 0.12` and
 `--temperature 0.2`. `--seed` affects sampling only; Gauss-Newton has no random
 search. Floating-point contact reductions can affect repeatability in either
 mode. Increasing samples, gains, weights, or iteration counts need not improve
@@ -74,3 +76,8 @@ terrain and long-duration motion have not been evaluated.
 The [live report](https://reports.eric-heiden.com/g1-whole-body-control/) contains
 motion sources, measurements, failed trials, reproduction configurations,
 GPU graph inspection and the separate Newton inverse-dynamics audit.
+
+Replanning at 10 or 25 Hz is available for GPU MPC experiments while the
+inner PD and physics remain at 500 Hz. It is not a demonstrated real-time
+configuration: lowering the replan rate caused falls in the tested motions.
+Optimizer timing excludes frames that only replay physics.

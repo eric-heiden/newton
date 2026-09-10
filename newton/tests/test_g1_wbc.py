@@ -83,6 +83,29 @@ class TestG1WBC(unittest.TestCase):
             expected[:, 1] = np.tile(angles / 2, 2)
             np.testing.assert_allclose(output.numpy(), expected, atol=1e-6)
 
+    def test_sole_task_geometry(self):
+        """Pitch and roll must change the lowest corner, not just ankle height."""
+        from scipy.spatial.transform import Rotation
+
+        from newton.examples.robot.wbc_mpc import sole_position  # noqa: PLC0415
+
+        @wp.kernel(module="unique")
+        def evaluate(quats: wp.array[wp.quat], errors: wp.array[wp.vec3]):
+            i = wp.tid()
+            errors[i] = sole_position(wp.vec3(0.1, -0.2, 0.3), quats[i])
+
+        rotations = Rotation.from_euler("xyz", [[0, 0, 0], [30, 0, 0], [0, -45, 20]], degrees=True)
+        local = np.array([[x, y, -0.035] for x in (-0.05, 0.12) for y in (-0.025, 0.025)])
+        expected = []
+        for rotation in rotations:
+            corners = rotation.apply(local) + [0.1, -0.2, 0.3]
+            expected.append([*corners.mean(axis=0)[:2], corners[:, 2].min()])
+        with wp.ScopedDevice("cpu"):
+            q = wp.array(rotations.as_quat(), dtype=wp.quat)
+            output = wp.zeros(3, dtype=wp.vec3)
+            wp.launch(evaluate, 3, inputs=[q], outputs=[output])
+            np.testing.assert_allclose(output.numpy(), expected, atol=1e-6)
+
     @unittest.skipUnless(wp.is_cuda_available(), "Gauss-Newton requires CUDA")
     def test_gauss_newton_graph_solve(self):
         """Check the captured damped solve against independent NumPy algebra."""

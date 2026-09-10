@@ -168,8 +168,9 @@ If you run the examples from a source checkout with uv, use
         <img width="320" src="docs/images/examples/example_robot_g1_wbc.jpg" alt="G1 whole-body motion tracking">
       </a><br>
       <code>python -m newton.examples robot_g1_wbc</code><br>
-      Install <code>uv sync --extra wbc</code>. Add <code>--motion motion.csv --controller mpc</code>
-      for Kimodo G1 tracking with CUDA graph MPC. Use <code>--controller qp</code> for CPU standing balance.
+      Install <code>uv sync --extra wbc</code>. Add <code>--motion motion.csv</code>
+      for Kimodo G1 tracking with CUDA graph Gauss-Newton MPC. Use <code>--controller mpc</code> for sampling
+      or <code>--controller qp</code> for CPU standing balance. See <a href="newton/examples/robot/g1_wbc.md">controller notes</a>.
       MPC currently runs slower than real time.
     </td>
   </tr>

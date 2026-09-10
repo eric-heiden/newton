@@ -14,9 +14,6 @@ from newton.examples.robot.wbc_mpc import (
     _min_index,
     _select,
     _shift,
-    reference_rotation,
-    reference_value,
-    reference_velocity,
 )
 
 
@@ -30,59 +27,6 @@ def _differences(center: wp.array2d[float], epsilon: float, proposals: wp.array3
             sign = -1.0
         value += sign * epsilon
     proposals[world, k, j] = wp.clamp(value, -0.7, 0.7)
-
-
-@wp.kernel
-def _residuals(
-    q: wp.array2d[float],
-    v: wp.array2d[float],
-    xpos: wp.array2d[wp.vec3],
-    qref: wp.array2d[float],
-    vref: wp.array2d[float],
-    bodyref: wp.array2d[float],
-    tracked: wp.array[int],
-    clock: wp.array[float],
-    fps: float,
-    elapsed: float,
-    joint_scale: float,
-    foot_weight: float,
-    hand_weight: float,
-    hand_clearance: float,
-    step: int,
-    width: int,
-    weight: float,
-    residual: wp.array2d[float],
-):
-    world = wp.tid()
-    t = clock[0] + elapsed
-    off = step * width
-    scale = wp.sqrt(weight)
-    for j in range(3):
-        residual[world, off + j] = scale * (q[world, j] - reference_value(qref, t, fps, j)) / 0.08
-        residual[world, off + 6 + j] = scale * wp.sqrt(0.1) * (v[world, j] - reference_velocity(vref, t, fps, j))
-    desired = reference_rotation(qref, t, fps)
-    current = wp.quat(q[world, 4], q[world, 5], q[world, 6], q[world, 3])
-    rotation = wp.quat_inverse(desired) * current
-    sign = float(1.0)
-    if rotation[3] < 0.0:
-        sign = -1.0
-    for j in range(3):
-        residual[world, off + 3 + j] = scale * sign * rotation[j] / 0.15
-    nu = q.shape[1] - 7
-    for j in range(nu):
-        residual[world, off + 9 + j] = (
-            scale * (q[world, j + 7] - reference_value(qref, t, fps, j + 7)) / (joint_scale * wp.sqrt(float(nu)))
-        )
-    for k in range(tracked.shape[0]):
-        p = xpos[world, tracked[k]]
-        if k < 2:
-            for j in range(3):
-                residual[world, off + 9 + nu + 3 * k + j] = (
-                    scale * wp.sqrt(foot_weight) * (p[j] - reference_value(bodyref, t, fps, 3 * k + j))
-                )
-        else:
-            clearance = wp.min(hand_clearance, reference_value(bodyref, t, fps, 3 * k + 2))
-            residual[world, off + 15 + nu + k - 2] = scale * wp.sqrt(hand_weight) * wp.max(0.0, clearance - p[2])
 
 
 @wp.kernel
@@ -164,9 +108,9 @@ def _lines(
 class WholeBodyGaussNewton(WholeBodyMPC):
     """Optimize the knot vector with central differences and damped least squares.
 
-    Every line-search candidate is re-simulated with the complete cost, including
-    non-foot forces. The linear system uses pose residuals; force costs are only
-    used for accepting a step. Capture includes both rollout batches and solves.
+    Every line-search candidate is re-simulated with the complete cost.
+    Pose and non-foot force residuals share the exact objective with sampling.
+    Capture includes both rollout batches and the linear solve.
     """
 
     def __init__(self, model, kp, kd, reference, *, epsilon=0.01, damping=0.1, trust=0.2, **kwargs):
@@ -180,7 +124,7 @@ class WholeBodyGaussNewton(WholeBodyMPC):
         self.epsilon, self.damping, self.trust = epsilon, damping, trust
         self.count = count
         self.size = max(16, 1 << count.bit_length())
-        self.width = model.nu + 9 + 3 * min(2, self.tracked.shape[0]) + max(0, self.tracked.shape[0] - 2)
+        self.width = self.residual_width
         self.diff_data, self.diff_proposals, self.diff_costs = self.data, self.proposals, self.costs
         with wp.ScopedDevice(self.device):
             self.residual = wp.zeros((self.samples, self.steps * self.width))
@@ -191,32 +135,6 @@ class WholeBodyGaussNewton(WholeBodyMPC):
             self.line_proposals = wp.zeros((8, self.plan.shape[0], model.nu))
             self.line_costs = wp.zeros(8)
         self.solve_kernel = _solve_kernel(self.size)
-
-    def record(self, step, clock, weight):
-        wp.launch(
-            _residuals,
-            self.samples,
-            inputs=[
-                self.data.qpos,
-                self.data.qvel,
-                self.data.xpos,
-                self.qref,
-                self.vref,
-                self.bodyref,
-                self.tracked,
-                clock,
-                self.fps,
-                (step + 1) * self.dt,
-                self.joint_scale,
-                self.foot_weight,
-                self.hand_weight,
-                self.hand_clearance,
-                step,
-                self.width,
-                weight,
-            ],
-            outputs=[self.residual],
-        )
 
     def select(self):
         self.minimum.fill_(float("inf"))
@@ -234,7 +152,7 @@ class WholeBodyGaussNewton(WholeBodyMPC):
         for _ in range(self.rounds):
             self.data, self.proposals, self.costs = self.diff_data, self.diff_proposals, self.diff_costs
             self.samples = self.proposals.shape[0]
-            self.record_residuals = self.record
+            self.save_residuals = True
             wp.launch(_differences, self.proposals.shape, inputs=[self.center, self.epsilon], outputs=[self.proposals])
             self.rollout(q, v, clock)
             self.minimum.fill_(float("inf"))
@@ -270,7 +188,7 @@ class WholeBodyGaussNewton(WholeBodyMPC):
             wp.launch(_max_step, self.count, inputs=[self.direction], outputs=[self.maximum])
             self.data, self.proposals, self.costs = self.line_data, self.line_proposals, self.line_costs
             self.samples = self.proposals.shape[0]
-            self.record_residuals = None
+            self.save_residuals = False
             wp.launch(
                 _lines,
                 self.proposals.shape,

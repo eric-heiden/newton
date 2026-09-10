@@ -1,1 +1,1 @@
-Add a G1 whole-body control example for native Kimodo references, with GPU sampling MPC captured as a CUDA graph, MuJoCo Warp prediction, bounded torque control, ViewerGL visualization, and CPU PD/QP baselines.
+Add a G1 whole-body control example for native Kimodo references, with GPU sampling and Gauss-Newton MPC captured as CUDA graphs, MuJoCo Warp prediction, bounded torque or PD control, foot-tracking diagnostics, ViewerGL visualization, and CPU PD/QP baselines.

@@ -125,23 +125,54 @@ def _targets(
     )
 
 
+@wp.func
+def residual_term(value: float, world: int, column: int, weight: float, record: bool, residual: wp.array2d[float]):
+    if record:
+        residual[world, column] = wp.sqrt(weight) * value
+    return value * value
+
+
+@wp.func
+def rotation_error(current: wp.quat, desired: wp.quat):
+    rotation = wp.quat_inverse(desired) * current
+    sign = float(1.0)
+    if rotation[3] < 0.0:
+        sign = -1.0
+    vector = wp.vec3(rotation[0], rotation[1], rotation[2])
+    length = wp.length(vector)
+    # Half the SO(3) logarithm retains a useful gradient near a half turn.
+    factor = wp.atan2(length, wp.abs(rotation[3])) / wp.max(length, 1.0e-8)
+    return sign * factor * vector
+
+
 @wp.kernel
 def _score(
     qpos: wp.array2d[float],
     qvel: wp.array2d[float],
     xpos: wp.array2d[wp.vec3],
+    xquat: wp.array2d[wp.quat],
     qref: wp.array2d[float],
     vref: wp.array2d[float],
     bodyref: wp.array2d[float],
+    rotationref: wp.array2d[float],
     tracked: wp.array[int],
     clock: wp.array[float],
     fps: float,
     elapsed: float,
     weight: float,
     joint_scale: float,
+    root_scale: float,
+    rotation_scale: float,
     foot_weight: float,
     hand_weight: float,
     hand_clearance: float,
+    foot_vertical: float,
+    foot_rotation: float,
+    angular_weight: float,
+    step: int,
+    width: int,
+    record: bool,
+    residual: wp.array2d[float],
     overflow: wp.array[int],
     nefc: wp.array[int],
     nacon: wp.array[int],
@@ -150,29 +181,62 @@ def _score(
 ):
     world = wp.tid()
     t = clock[0] + elapsed
+    off = step * width
     cost = float(0.0)
     for j in range(3):
-        e = qpos[world, j] - reference_value(qref, t, fps, j)
-        cost += e * e / 0.0064
-        ev = qvel[world, j] - reference_velocity(vref, t, fps, j)
-        cost += 0.1 * ev * ev
+        value = (qpos[world, j] - reference_value(qref, t, fps, j)) / root_scale
+        cost += residual_term(value, world, off + j, weight, record, residual)
+        value = wp.sqrt(0.1) * (qvel[world, j] - reference_velocity(vref, t, fps, j))
+        cost += residual_term(value, world, off + 6 + j, weight, record, residual)
     current = wp.quat(qpos[world, 4], qpos[world, 5], qpos[world, 6], qpos[world, 3])
     desired = reference_rotation(qref, t, fps)
-    dot = wp.dot(current, desired)
-    cost += (1.0 - wp.clamp(dot * dot, 0.0, 1.0)) / 0.0225
-    for j in range(7, qpos.shape[1]):
-        e = qpos[world, j] - reference_value(qref, t, fps, j)
-        cost += e * e / (joint_scale * joint_scale * float(qpos.shape[1] - 7))
+    rotation = rotation_error(current, desired)
+    for j in range(3):
+        cost += residual_term(rotation[j] / rotation_scale, world, off + 3 + j, weight, record, residual)
+    nu = qpos.shape[1] - 7
+    for j in range(nu):
+        value = (qpos[world, j + 7] - reference_value(qref, t, fps, j + 7)) / (joint_scale * wp.sqrt(float(nu)))
+        cost += residual_term(value, world, off + 9 + j, weight, record, residual)
+    feet = wp.min(2, tracked.shape[0])
     for k in range(tracked.shape[0]):
         p = xpos[world, tracked[k]]
         if k < 2:
             for j in range(3):
-                e = p[j] - reference_value(bodyref, t, fps, 3 * k + j)
-                cost += foot_weight * e * e
+                scale = foot_weight
+                if j == 2:
+                    scale *= foot_vertical
+                value = wp.sqrt(scale) * (p[j] - reference_value(bodyref, t, fps, 3 * k + j))
+                cost += residual_term(value, world, off + 9 + nu + 3 * k + j, weight, record, residual)
+            # MuJoCo Warp stores body quaternions in scalar-first order.
+            raw = xquat[world, tracked[k]]
+            actual = wp.quat(raw[1], raw[2], raw[3], raw[0])
+            target = wp.quat(
+                reference_value(rotationref, t, fps, 4 * k + 1),
+                reference_value(rotationref, t, fps, 4 * k + 2),
+                reference_value(rotationref, t, fps, 4 * k + 3),
+                reference_value(rotationref, t, fps, 4 * k),
+            )
+            error = rotation_error(actual, wp.normalize(target))
+            for j in range(3):
+                value = wp.sqrt(foot_rotation) * error[j]
+                cost += residual_term(value, world, off + 9 + nu + 3 * feet + 3 * k + j, weight, record, residual)
         else:
             clearance = wp.min(hand_clearance, reference_value(bodyref, t, fps, 3 * k + 2))
-            penetration = wp.max(0.0, clearance - p[2])
-            cost += hand_weight * penetration * penetration
+            value = wp.sqrt(hand_weight) * wp.max(0.0, clearance - p[2])
+            cost += residual_term(value, world, off + 9 + nu + 6 * feet + k - 2, weight, record, residual)
+    hands = wp.max(0, tracked.shape[0] - 2)
+    actual_omega = wp.quat_rotate(current, wp.vec3(qvel[world, 3], qvel[world, 4], qvel[world, 5]))
+    desired_omega = wp.quat_rotate(
+        desired,
+        wp.vec3(
+            reference_velocity(vref, t, fps, 3),
+            reference_velocity(vref, t, fps, 4),
+            reference_velocity(vref, t, fps, 5),
+        ),
+    )
+    for j in range(3):
+        value = wp.sqrt(angular_weight) * (actual_omega[j] - desired_omega[j])
+        cost += residual_term(value, world, off + 9 + nu + 6 * feet + hands + j, weight, record, residual)
     if not wp.isfinite(cost) or overflow[world] != 0:
         cost = 1.0e20
     costs[world] += weight * cost
@@ -252,6 +316,26 @@ def apply_pd(
     force[j + 6] = wp.clamp(kp[j] * (target - q[0, j + 7]) + kd[j] * (velocity - v[0, j + 6]), -limits[j], limits[j])
 
 
+@wp.kernel
+def apply_targets(
+    clock: wp.array[float],
+    qref: wp.array2d[float],
+    vref: wp.array2d[float],
+    fps: float,
+    plan: wp.array2d[float],
+    last: wp.array[float],
+    spacing: float,
+    kp: wp.array[float],
+    kd: wp.array[float],
+    target: wp.array[float],
+):
+    j = wp.tid()
+    q = reference_value(qref, clock[0], fps, j + 7) + spline(plan, clock[0] - last[0], spacing, j)
+    v = reference_velocity(vref, clock[0], fps, j + 6)
+    # A position drive embeds the desired velocity in its position input.
+    target[j + target.shape[0] - kp.shape[0]] = q + kd[j] / kp[j] * v
+
+
 class WholeBodyMPC:
     """Annealed predictive sampling with GPU-only search and MuJoCo Warp prediction.
 
@@ -274,7 +358,12 @@ class WholeBodyMPC:
         knots=4,
         noise=0.12,
         joint_scale=0.3,
+        root_scale=0.08,
+        rotation_scale=0.15,
         foot_weight=0.0,
+        foot_vertical=1.0,
+        foot_rotation=0.0,
+        angular_weight=0.0,
         hand_weight=10000.0,
         hand_clearance=0.2,
         iterations=20,
@@ -295,10 +384,15 @@ class WholeBodyMPC:
                 hand_clearance,
                 temperature,
                 nonfoot_weight,
+                foot_vertical,
+                foot_rotation,
+                angular_weight,
             ]
         )
         if not np.isfinite(scales).all() or noise < 0 or joint_scale <= 0 or np.any(scales[4:] < 0) or iterations < 1:
             raise ValueError("MPC costs, noise and solver settings must be finite and nonnegative")
+        if not all(np.isfinite(x) and x > 0 for x in (root_scale, rotation_scale)):
+            raise ValueError("Root position and rotation scales must be finite and positive")
         if model.nv != model.nu + 6 or model.nq != model.nv + 1:
             raise ValueError("MPC expects one free root and one actuator per scalar joint")
         self.device = wp.get_device(device)
@@ -321,7 +415,11 @@ class WholeBodyMPC:
         self.samples, self.rounds, self.seed = samples, rounds, seed
         self.temperature = temperature
         self.hand_clearance = hand_clearance
+        if root_scale <= 0 or rotation_scale <= 0 or not np.isfinite([root_scale, rotation_scale]).all():
+            raise ValueError("Root position and rotation scales must be finite and positive")
+        self.root_scale, self.rotation_scale = root_scale, rotation_scale
         self.nonfoot_weight = nonfoot_weight
+        self.foot_vertical, self.foot_rotation, self.angular_weight = foot_vertical, foot_rotation, angular_weight
         self.steps = round(horizon / prediction_dt)
         self.dt, self.spacing, self.fps = prediction_dt, horizon / (knots - 1), reference.fps
         self.joint_scale, self.foot_weight, self.hand_weight = joint_scale, foot_weight, hand_weight
@@ -330,10 +428,14 @@ class WholeBodyMPC:
             tracked.extend(i for i in range(m.nbody) if m.body(i).name.endswith(part))
         data = mujoco.MjData(m)
         bodyref = np.zeros((len(reference.qpos), 3 * len(tracked)))
+        rotationref = np.zeros((len(reference.qpos), 4 * len(tracked)))
+        self.state_width = m.nu + 12 + 6 * min(2, len(tracked)) + max(0, len(tracked) - 2)
+        self.residual_width = self.state_width + m.nbody
         for i, q in enumerate(reference.qpos):
             data.qpos[:] = q
             mujoco.mj_kinematics(m, data)
             bodyref[i] = data.xpos[tracked].ravel()
+            rotationref[i] = data.xquat[tracked].ravel()
         with wp.ScopedDevice(self.device):
             self.model = mjw.put_model(m)
             self.model.opt.warn_overflow = False
@@ -341,6 +443,9 @@ class WholeBodyMPC:
             self.qref = wp.array(reference.qpos, dtype=float)
             self.vref = wp.array(reference.velocity, dtype=float)
             self.bodyref = wp.array(bodyref, dtype=float)
+            self.rotationref = wp.array(rotationref, dtype=float)
+            self.residual = wp.zeros((1, 0))
+            self.body_force = wp.zeros((samples, m.nbody))
             self.tracked = wp.array(tracked, dtype=int)
             self.kp, self.kd = wp.array(kp, dtype=float), wp.array(kd, dtype=float)
             self.limits = wp.array(m.jnt_actfrcrange[1:, 1], dtype=float)
@@ -355,7 +460,7 @@ class WholeBodyMPC:
             self.last = wp.zeros(1)
             self.statistics = wp.zeros(5, dtype=int)
         self.graph = None
-        self.record_residuals = None
+        self.save_residuals = False
 
     def optimize(self, q, v, clock):
         wp.launch(_shift, self.plan.shape, inputs=[self.plan, clock, self.last, self.spacing], outputs=[self.center])
@@ -424,7 +529,7 @@ class WholeBodyMPC:
                 outputs=[self.data.ctrl],
             )
             mjw.step(self.model, self.data)
-            if self.foot_weight or self.hand_weight:
+            if self.foot_weight or self.hand_weight or self.foot_rotation:
                 mjw.kinematics(self.model, self.data)
             weight = 1.0 / self.steps + float(step == self.steps - 1)
             wp.launch(
@@ -434,18 +539,29 @@ class WholeBodyMPC:
                     self.data.qpos,
                     self.data.qvel,
                     self.data.xpos,
+                    self.data.xquat,
                     self.qref,
                     self.vref,
                     self.bodyref,
+                    self.rotationref,
                     self.tracked,
                     clock,
                     self.fps,
                     (step + 1) * self.dt,
                     weight,
                     self.joint_scale,
+                    self.root_scale,
+                    self.rotation_scale,
                     self.foot_weight,
                     self.hand_weight,
                     self.hand_clearance,
+                    self.foot_vertical,
+                    self.foot_rotation,
+                    self.angular_weight,
+                    step,
+                    self.residual_width,
+                    self.save_residuals,
+                    self.residual,
                     self.data.overflow,
                     self.data.nefc,
                     self.data.nacon,
@@ -453,8 +569,7 @@ class WholeBodyMPC:
                 ],
                 outputs=[self.costs],
             )
-            if self.record_residuals:
-                self.record_residuals(step, clock, weight)
+            self.body_force.zero_()
             if self.nonfoot_weight and self.tracked.shape[0] >= 2:
                 wp.launch(
                     _contact_cost,
@@ -469,10 +584,24 @@ class WholeBodyMPC:
                         self.model.geom_bodyid,
                         self.tracked,
                         int(self.cpu_model.opt.cone),
-                        weight * self.nonfoot_weight / 90000.0,
                     ],
-                    outputs=[self.costs],
+                    outputs=[self.body_force],
                 )
+            wp.launch(
+                _force_score,
+                self.samples,
+                inputs=[
+                    self.body_force,
+                    self.nonfoot_weight,
+                    step,
+                    self.residual_width,
+                    self.state_width,
+                    weight,
+                    self.save_residuals,
+                    self.residual,
+                ],
+                outputs=[self.costs],
+            )
 
     def capture(self, q, v, clock):
         with wp.ScopedDevice(self.device):
@@ -490,7 +619,26 @@ class WholeBodyMPC:
     def solve(self):
         wp.capture_launch(self.graph)
 
-    def apply(self, data, control):
+    def apply(self, data, control, *, native_pd=False):
+        if native_pd:
+            wp.launch(
+                apply_targets,
+                self.cpu_model.nu,
+                inputs=[
+                    data.time,
+                    self.qref,
+                    self.vref,
+                    self.fps,
+                    self.plan,
+                    self.last,
+                    self.spacing,
+                    self.kp,
+                    self.kd,
+                ],
+                outputs=[control.joint_target_q],
+                device=self.device,
+            )
+            return
         wp.launch(
             apply_pd,
             self.cpu_model.nu,
@@ -593,8 +741,7 @@ def _contact_cost(
     bodies: wp.array[int],
     feet: wp.array[int],
     cone: int,
-    weight: float,
-    costs: wp.array[float],
+    body_force: wp.array2d[float],
 ):
     i = wp.tid()
     if i < nacon[0]:
@@ -610,4 +757,24 @@ def _contact_cost(
                     for k in range(wp.min(2 * (dimensions[i] - 1), forces.shape[1] - efc)):
                         force += wp.max(0.0, forces[world, efc + k])
                 if wp.isfinite(force):
-                    wp.atomic_add(costs, world, weight * force * force)
+                    wp.atomic_add(body_force, world, body, force)
+
+
+@wp.kernel
+def _force_score(
+    body_force: wp.array2d[float],
+    penalty: float,
+    step: int,
+    width: int,
+    state_width: int,
+    weight: float,
+    record: bool,
+    residual: wp.array2d[float],
+    costs: wp.array[float],
+):
+    world = wp.tid()
+    cost = float(0.0)
+    for body in range(body_force.shape[1]):
+        value = wp.sqrt(penalty) * body_force[world, body] / 300.0
+        cost += residual_term(value, world, step * width + state_width + body, weight, record, residual)
+    costs[world] += weight * cost

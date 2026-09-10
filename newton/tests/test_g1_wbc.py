@@ -63,6 +63,26 @@ class TestG1WBC(unittest.TestCase):
         self.assertAlmostEqual(metrics["swing_height_rmse"], 0.05)
         self.assertAlmostEqual(metrics["foot_height_rmse"], 0.05 / np.sqrt(3))
 
+    def test_rotation_residual_near_half_turn(self):
+        """Large-angle residuals retain slope and ignore quaternion sign."""
+        from newton.examples.robot.wbc_mpc import rotation_error  # noqa: PLC0415
+
+        @wp.kernel(module="unique")
+        def evaluate(quats: wp.array[wp.quat], errors: wp.array[wp.vec3]):
+            i = wp.tid()
+            errors[i] = rotation_error(quats[i], wp.quat_identity())
+
+        angles = np.deg2rad([0, 1, 170, 175])
+        quats = np.zeros((4, 4), dtype=np.float32)
+        quats[:, 1], quats[:, 3] = np.sin(angles / 2), np.cos(angles / 2)
+        with wp.ScopedDevice("cpu"):
+            q = wp.array(np.concatenate([quats, -quats]), dtype=wp.quat)
+            output = wp.zeros(8, dtype=wp.vec3)
+            wp.launch(evaluate, 8, inputs=[q], outputs=[output])
+            expected = np.zeros((8, 3))
+            expected[:, 1] = np.tile(angles / 2, 2)
+            np.testing.assert_allclose(output.numpy(), expected, atol=1e-6)
+
     @unittest.skipUnless(wp.is_cuda_available(), "Gauss-Newton requires CUDA")
     def test_gauss_newton_graph_solve(self):
         """Check the captured damped solve against independent NumPy algebra."""
@@ -208,7 +228,8 @@ class TestG1WBC(unittest.TestCase):
           <body name="right_ankle_roll_link" pos=".2 0 0"><geom size=".05" mass="1"/></body>
           <body name="right_wrist_yaw_link" pos="0 .2 0">
             <joint name="hinge" armature=".01" actuatorfrcrange="-20 20"/>
-            <geom size=".05" mass="1"/>
+            <geom size=".05" mass=".5" pos="-.06 0 0"/>
+            <geom size=".05" mass=".5" pos=".06 0 0"/>
           </body>
         </body></worldbody><actuator><motor joint="hinge"/></actuator></mujoco>""")
         ref = self.reference_type(model, np.tile(model.qpos0, (31, 1)))
@@ -239,12 +260,14 @@ class TestG1WBC(unittest.TestCase):
                 for step in range(mpc.steps):
                     data.ctrl[0] = np.interp(step * mpc.dt, np.linspace(0, 0.03, 4), proposals[world, :, 0])
                     mujoco.mj_step(mpc.cpu_model, data)
+                    normal_force = 0.0
                     for index, contact in enumerate(data.contact):
                         bodies = model.geom_bodyid[[contact.geom1, contact.geom2]]
                         if 0 in bodies and 4 in bodies:
                             force = np.zeros(6)
                             mujoco.mj_contactForce(mpc.cpu_model, data, index, force)
-                            accumulated += (1 / mpc.steps + float(step == mpc.steps - 1)) * 1000 * (force[0] / 300) ** 2
+                            normal_force += force[0]
+                    accumulated += (1 / mpc.steps + float(step == mpc.steps - 1)) * 1000 * (normal_force / 300) ** 2
                 expected.append(accumulated)
             self.assertGreater(min(expected), 0.1)
             np.testing.assert_allclose(costs[1] - costs[0], expected, rtol=0.01, atol=0.01)

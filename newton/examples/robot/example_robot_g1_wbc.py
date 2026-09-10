@@ -3,11 +3,13 @@
 """Track Kimodo G1 CSV motions with bounded joint torques in SolverMuJoCo.
 
 Run ``uv run --extra wbc -m newton.examples robot_g1_wbc`` for standing balance.
-Add ``--motion walk.csv --controller mpc`` for a native Kimodo G1 reference
-(30 Hz, xyz + wxyz + 29 joint angles). The sampling optimizer and its MuJoCo Warp rollouts execute as a CUDA graph.
-The CPU QP handles standing gestures but
-does not reliably track dynamic locomotion. Neither controller guarantees
-feasibility or balance for an arbitrary kinematic reference.
+Add ``--motion walk.csv`` for a native Kimodo G1 reference
+(30 Hz, xyz + wxyz + 29 joint angles). Gauss-Newton shooting is the default;
+``--controller mpc`` selects predictive sampling. Both complete optimizers,
+including their MuJoCo Warp rollouts, execute as CUDA graphs. The CPU QP handles
+standing gestures but does not reliably track dynamic locomotion. No mode
+guarantees feasibility or balance for an arbitrary kinematic reference.
+See ``g1_wbc.md`` for parameters and measured limitations.
 """
 
 import json
@@ -30,6 +32,22 @@ from newton.examples.robot.wbc_mpc_gn import WholeBodyGaussNewton
 class Example:
     def __init__(self, viewer, args):
         self.viewer, self.args = viewer, args
+        # Gauss-Newton benefits from stronger pose tasks and a stiffer inner PD.
+        # Sampling retains its broader, lower-gain starting configuration.
+        defaults = {
+            "mpc_rounds": (2, 1),
+            "gain_scale": (1.0, 4.0),
+            "joint_scale": (0.3, 0.15),
+            "root_scale": (0.08, 0.04),
+            "rotation_scale": (0.15, 0.1),
+            "foot_weight": (0.0, 300.0),
+            "foot_vertical": (1.0, 4.0),
+            "foot_rotation": (0.0, 10.0),
+            "angular_weight": (0.0, 0.2),
+        }
+        for name, values in defaults.items():
+            if getattr(args, name) is None:
+                setattr(args, name, values[int(args.controller == "mpc-gn")])
         if not np.isfinite(args.slowdown) or args.slowdown <= 0:
             raise ValueError("slowdown must be finite and positive")
         self.fps = 50
@@ -70,6 +88,20 @@ class Example:
             raise ValueError("gain-scale must be finite and positive")
         self.kp *= args.gain_scale
         self.kd *= np.sqrt(args.gain_scale)
+        self.native_pd = args.actuation == "pd" and args.controller in ("mpc", "mpc-gn")
+        if self.native_pd:
+            builder.joint_target_ke[6:] = self.kp.tolist()
+            builder.joint_target_kd[6:] = self.kd.tolist()
+            builder.joint_target_mode[6:] = [int(newton.JointTargetMode.POSITION)] * len(self.kp)
+            # Route the imported motor definitions through Newton's PD drives.
+            builder.custom_attributes["mujoco:ctrl_source"].values = [
+                int(newton.solvers.SolverMuJoCo.CtrlSource.JOINT_TARGET)
+            ] * len(self.kp)
+            builder.custom_attributes["mujoco:actuator_has_forcerange"].values = [True] * len(self.kp)
+            builder.custom_attributes["mujoco:actuator_forcelimited"].values = [1] * len(self.kp)
+            builder.custom_attributes["mujoco:actuator_forcerange"].values = [
+                (-limit, limit) for limit in builder.joint_effort_limit[6:]
+            ]
         # The MJCF already supplies the textured ground plane.
         self.gpu = args.controller in ("mpc", "mpc-gn")
         if self.gpu and not wp.get_device(args.device or "cuda:0").is_cuda:
@@ -91,6 +123,7 @@ class Example:
         self.mj = self.solver.mj_model
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         self.control = self.model.control()
+        self.applied_torque = self.solver.mjw_data.qfrc_actuator.flatten() if self.native_pd else self.control.joint_f
         self.points = []
         for side in ("left", "right"):
             body = next(i for i in range(self.mj.nbody) if self.mj.body(i).name.endswith(f"{side}_ankle_roll_link"))
@@ -135,7 +168,12 @@ class Example:
                 nonfoot_weight=args.nonfoot_weight,
                 noise=args.noise,
                 joint_scale=args.joint_scale,
+                root_scale=args.root_scale,
+                rotation_scale=args.rotation_scale,
                 foot_weight=args.foot_weight,
+                foot_vertical=args.foot_vertical,
+                foot_rotation=args.foot_rotation,
+                angular_weight=args.angular_weight,
                 hand_weight=args.hand_weight,
                 hand_clearance=args.hand_clearance,
                 iterations=args.prediction_iterations,
@@ -192,7 +230,7 @@ class Example:
     def gpu_physics(self):
         data = self.solver.mjw_data
         for i in range(self.audit.shape[0]):
-            self.mpc.apply(data, self.control)
+            self.mpc.apply(data, self.control, native_pd=self.native_pd)
             wp.copy(self.state_1.body_f, self.state_0.body_f)
             self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
             wp.launch(
@@ -208,7 +246,7 @@ class Example:
                     data.efc.force,
                     self.geom_bodies,
                     self.foot_bodies,
-                    self.control.joint_f,
+                    self.applied_torque,
                     self.mpc.limits,
                     data.overflow,
                     data.nefc,
@@ -349,6 +387,11 @@ class Example:
         robot_bodies = self.mj.nbody - 1
         assert self.mj.nexclude == robot_bodies * (robot_bodies - 1) // 2, "Robot self-contact was not excluded"
         assert np.isfinite(self.q).all(), "Non-finite simulation state"
+        if self.native_pd:
+            assert self.mj.nu == len(self.limits), "Duplicated PD actuators"
+            np.testing.assert_allclose(self.mj.actuator_forcerange[:, 1], self.limits)
+            assert max(row[6] for row in self.rows) <= 1.0001, "Actuator force limit exceeded"
+            np.testing.assert_allclose(self.solver.mjw_data.qfrc_actuator.numpy()[0, :6], 0)
         if not self.args.motion:
             assert self.q[2] > 0.5, "Standing robot fell"
 
@@ -396,10 +439,8 @@ class Example:
             "config": vars(self.args),
         }
         summary.update(measure_foot_tracking(self.mj, self.motion, rows[:, 0], self.poses, self.points))
-        path.with_suffix(".json").write_text(json.dumps(summary, indent=2) + "\n")
-        np.savez_compressed(
-            path.with_suffix(".npz"), rows=rows, qpos=self.poses, reference=self.motion.qpos, contacts=contacts
-        )
+        Path(f"{path}.json").write_text(json.dumps(summary, indent=2) + "\n")
+        np.savez_compressed(f"{path}.npz", rows=rows, qpos=self.poses, reference=self.motion.qpos, contacts=contacts)
         print(json.dumps(summary))
 
     @staticmethod
@@ -409,12 +450,13 @@ class Example:
         parser.add_argument("--motion", type=str, default=None, help="Kimodo G1 MuJoCo qpos CSV")
         parser.add_argument("--motion-fps", type=float, default=30.0)
         parser.add_argument("--slowdown", type=float, default=1.0)
-        parser.add_argument("--controller", choices=("qp", "pd", "mpc", "mpc-gn"), default="mpc")
+        parser.add_argument("--controller", choices=("qp", "pd", "mpc", "mpc-gn"), default="mpc-gn")
+        parser.add_argument("--actuation", choices=("torque", "pd"), default="torque")
         parser.add_argument("--gn-epsilon", type=float, default=0.01)
         parser.add_argument("--gn-damping", type=float, default=0.1)
         parser.add_argument("--gn-trust", type=float, default=0.2)
         parser.add_argument("--mpc-samples", type=int, default=1024)
-        parser.add_argument("--mpc-rounds", type=int, default=2)
+        parser.add_argument("--mpc-rounds", type=int, help="Search rounds: 1 for Gauss-Newton, 2 for sampling")
         parser.add_argument("--prediction-dt", type=float, default=0.01)
         parser.add_argument("--control-rate", type=int, choices=(50, 100), default=100)
         parser.add_argument("--nonfoot-weight", type=float, default=1000.0)
@@ -424,11 +466,14 @@ class Example:
         parser.add_argument("--mpc-knots", type=int, default=4)
         parser.add_argument("--horizon", type=float, default=0.5)
         parser.add_argument("--noise", type=float, default=0.12)
-        parser.add_argument("--joint-scale", type=float, default=0.3)
-        parser.add_argument(
-            "--gain-scale", type=float, default=1.0, help="PD stiffness scale; damping scales by its square root"
-        )
-        parser.add_argument("--foot-weight", type=float, default=0.0)
+        parser.add_argument("--joint-scale", type=float)
+        parser.add_argument("--gain-scale", type=float, help="PD stiffness scale; damping scales by its square root")
+        parser.add_argument("--foot-weight", type=float)
+        parser.add_argument("--root-scale", type=float)
+        parser.add_argument("--rotation-scale", type=float)
+        parser.add_argument("--foot-vertical", type=float, help="Foot vertical position weight multiplier")
+        parser.add_argument("--foot-rotation", type=float)
+        parser.add_argument("--angular-weight", type=float, help="World-frame root angular velocity weight")
         parser.add_argument("--hand-clearance", type=float, default=0.2)
         parser.add_argument("--hand-weight", type=float, default=10000.0)
         parser.add_argument("--seed", type=int, default=123)

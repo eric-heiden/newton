@@ -98,13 +98,80 @@ class TestG1WBC(unittest.TestCase):
         local = np.array([[x, y, -0.035] for x in (-0.05, 0.12) for y in (-0.025, 0.025)])
         expected = []
         for rotation in rotations:
-            corners = rotation.apply(local) + [0.1, -0.2, 0.3]
+            corners = rotation.apply(local) + np.array([0.1, -0.2, 0.3])
             expected.append([*corners.mean(axis=0)[:2], corners[:, 2].min()])
         with wp.ScopedDevice("cpu"):
             q = wp.array(rotations.as_quat(), dtype=wp.quat)
             output = wp.zeros(3, dtype=wp.vec3)
             wp.launch(evaluate, 3, inputs=[q], outputs=[output])
             np.testing.assert_allclose(output.numpy(), expected, atol=1e-6)
+
+    def test_hand_pose_and_joint_velocity_cost(self):
+        """Known wrist offsets and speeds have an independent quadratic oracle."""
+        from newton.examples.robot.wbc_mpc import _score  # noqa: PLC0415
+
+        with wp.ScopedDevice("cpu"):
+            q = np.zeros((1, 9), dtype=np.float32)
+            q[0, 3] = 1
+            v = np.zeros((1, 8), dtype=np.float32)
+            v[0, 6:] = [1, -2]
+            positions = np.zeros((1, 4, 3), dtype=np.float32)
+            positions[0, 2] = [0.2, -0.1, 0.3]
+            positions[0, 3] = [-0.1, 0.2, 0.1]
+            rotations = np.tile([1, 0, 0, 0], (1, 4, 1)).astype(np.float32)
+            rotations[0, 2] = [np.cos(0.3), 0, np.sin(0.3), 0]
+            rotationref = np.tile([1, 0, 0, 0], (2, 4)).astype(np.float32)
+            width = 42  # 2 joints, 2 feet, 2 hands; no force residuals.
+            residual, costs = wp.zeros((1, width)), wp.zeros(1)
+            common = [
+                wp.array(q),
+                wp.array(v),
+                wp.array(positions, dtype=wp.vec3),
+                wp.array(rotations, dtype=wp.quat),
+                wp.array(np.repeat(q, 2, axis=0)),
+                wp.zeros((2, 8)),
+                wp.zeros((2, 12)),
+                wp.array(rotationref),
+                wp.array([0, 1, 2, 3], dtype=int),
+                wp.zeros(1),
+                30.0,
+                0.0,
+                0.4,
+                0.15,
+                0.04,
+                0.1,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                False,
+            ]
+            for hand_position, hand_rotation, joint_velocity in [(100.0, 0.0, 0.0), (0.0, 3.0, 0.0), (0.0, 0.0, 0.1)]:
+                costs.zero_()
+                wp.launch(
+                    _score,
+                    1,
+                    inputs=[
+                        *common,
+                        hand_position,
+                        hand_rotation,
+                        joint_velocity,
+                        0,
+                        width,
+                        True,
+                        residual,
+                        wp.zeros(1, dtype=int),
+                        wp.zeros(1, dtype=int),
+                        wp.zeros(1, dtype=int),
+                        wp.zeros(5, dtype=int),
+                    ],
+                    outputs=[costs],
+                )
+                expected = 0.4 * (hand_position * 0.2 + hand_rotation * 0.3**2 + joint_velocity * 5)
+                self.assertAlmostEqual(float(costs.numpy()[0]), expected, places=5)
+                self.assertAlmostEqual(float(np.sum(residual.numpy() ** 2)), expected, places=5)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Gauss-Newton requires CUDA")
     def test_gauss_newton_graph_solve(self):

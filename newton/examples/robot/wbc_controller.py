@@ -5,6 +5,7 @@
 import mujoco
 import numpy as np
 from scipy import sparse
+from scipy.signal import butter, sosfiltfilt
 
 
 class MotionReference:
@@ -76,6 +77,46 @@ def measure_foot_tracking(model, reference, times, poses, points):
         "swing_recall": float(np.mean(measured[:, :, 3][swing] > 0.02)) if swing.any() else None,
         "false_lift_fraction": float(np.mean(measured[:, :, 3][stance] > 0.03)) if stance.any() else None,
         "reference_swing_fraction": float(swing.mean()),
+    }
+
+
+def measure_motion_tracking(model, reference, times, poses):
+    """Offline wrist errors and motion diagnostics, independent of the optimizer.
+
+    Velocity error differentiates the recorded joint-angle error at the median
+    recording interval. Oscillation is its zero-phase fourth-order Butterworth
+    high-pass component above 6 Hz, omitting 0.1 s at each end. These diagnostics
+    supplement pose/contact errors; they are not a perceptual quality score.
+    """
+    bodies = [
+        i for i in range(model.nbody) if model.body(i).name.endswith(("left_wrist_yaw_link", "right_wrist_yaw_link"))
+    ]
+    if not bodies or len(times) < 25:
+        return {}
+    desired = np.array([reference.sample(t)[0] for t in times])
+    data = mujoco.MjData(model)
+    positions = []
+    for configurations in (poses, desired):
+        values = []
+        for q in configurations:
+            data.qpos[:] = q
+            mujoco.mj_kinematics(model, data)
+            values.append(data.xpos[bodies].copy())
+        positions.append(np.asarray(values))
+    error = positions[0] - positions[1]
+    joint = np.asarray(poses)[:, 7:] - desired[:, 7:]
+    dt = float(np.median(np.diff(times)))
+    velocity = np.gradient(joint, dt, axis=0)[2:-2]
+    trim = max(1, round(0.1 / dt))
+    highpass = sosfiltfilt(butter(4, 6, fs=1 / dt, btype="highpass", output="sos"), joint, axis=0)[trim:-trim]
+    return {
+        "hand_position_rmse": float(np.sqrt(np.mean(np.sum(error**2, axis=2)))),
+        "hand_position_p95": float(np.percentile(np.linalg.norm(error, axis=2), 95)),
+        "joint_velocity_error_rms": float(np.sqrt(np.mean(velocity**2))),
+        "joint_highpass_rms": float(np.sqrt(np.mean(highpass**2))),
+        "arm_highpass_rms": float(np.sqrt(np.mean(highpass[:, 15:] ** 2))),
+        "arm_joint_rmse": float(np.sqrt(np.mean(joint[:, 15:] ** 2))),
+        "leg_joint_rmse": float(np.sqrt(np.mean(joint[:, :12] ** 2))),
     }
 
 

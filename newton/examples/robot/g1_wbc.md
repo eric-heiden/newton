@@ -44,6 +44,16 @@ use half of the shortest SO(3) logarithm. The default `--foot-task sole` penaliz
 minimum sole-corner height; `--foot-task ankle` uses ankle-body origins.
 Reported foot metrics always use the four sole corners.
 
+Experimental `--hand-position`, `--hand-rotation` and `--joint-velocity`
+weights add world-frame wrist position, wrist rotation, and per-joint velocity
+tracking. They enter both the scalar rollout cost and Gauss-Newton residuals.
+Hand clearance remains a separate safety cost. Zero weights recover the
+previous objective. Output diagnostics include wrist position error, joint
+velocity error from recorded pose differences, and the RMS component of
+joint-angle error above 6 Hz. The latter uses a zero-phase fourth-order
+Butterworth filter and excludes 0.1 s at each end; it is a diagnostic of rapid
+corrections, not a perceptual quality score.
+
 Gauss-Newton controls are `--gn-epsilon 0.03` (central-difference perturbation
 in radians), `--gn-damping 0.1` and `--gn-trust 0.2` (maximum knot update in
 radians). It accepts only evaluated candidates. The tiled solve supports at

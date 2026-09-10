@@ -24,7 +24,12 @@ import newton
 import newton.examples
 import newton.solvers
 import newton.utils
-from newton.examples.robot.wbc_controller import MotionReference, WholeBodyQP, measure_foot_tracking
+from newton.examples.robot.wbc_controller import (
+    MotionReference,
+    WholeBodyQP,
+    measure_foot_tracking,
+    measure_motion_tracking,
+)
 from newton.examples.robot.wbc_mpc import WholeBodyMPC, audit_step
 from newton.examples.robot.wbc_mpc_gn import WholeBodyGaussNewton
 
@@ -179,6 +184,9 @@ class Example:
                 sole_tracking=args.foot_task == "sole",
                 hand_weight=args.hand_weight,
                 hand_clearance=args.hand_clearance,
+                hand_position=args.hand_position,
+                hand_rotation=args.hand_rotation,
+                joint_velocity=args.joint_velocity,
                 iterations=args.prediction_iterations,
                 device=self.model.device,
                 prediction_dt=args.prediction_dt,
@@ -447,6 +455,7 @@ class Example:
             "config": vars(self.args),
         }
         summary.update(measure_foot_tracking(self.mj, self.motion, rows[:, 0], self.poses, self.points))
+        summary.update(measure_motion_tracking(self.mj, self.motion, rows[:, 0], self.poses))
         Path(f"{path}.json").write_text(json.dumps(summary, indent=2) + "\n")
         np.savez_compressed(f"{path}.npz", rows=rows, qpos=self.poses, reference=self.motion.qpos, contacts=contacts)
         print(json.dumps(summary))
@@ -485,6 +494,13 @@ class Example:
         parser.add_argument("--foot-vertical", type=float, help="Foot vertical position weight multiplier")
         parser.add_argument("--foot-rotation", type=float)
         parser.add_argument("--angular-weight", type=float, help="World-frame root angular velocity weight")
+        parser.add_argument(
+            "--hand-position", type=float, default=0.0, help="Wrist position tracking weight in inverse metres squared"
+        )
+        parser.add_argument(
+            "--hand-rotation", type=float, default=0.0, help="Wrist half-angle rotation tracking weight"
+        )
+        parser.add_argument("--joint-velocity", type=float, default=0.0, help="Per-joint velocity tracking weight")
         parser.add_argument("--hand-clearance", type=float, default=0.2)
         parser.add_argument("--hand-weight", type=float, default=10000.0)
         parser.add_argument("--seed", type=int, default=123)

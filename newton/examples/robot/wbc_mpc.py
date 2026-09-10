@@ -183,6 +183,9 @@ def _score(
     foot_rotation: float,
     angular_weight: float,
     sole_tracking: bool,
+    hand_position: float,
+    hand_rotation: float,
+    joint_velocity: float,
     step: int,
     width: int,
     record: bool,
@@ -253,6 +256,27 @@ def _score(
     for j in range(3):
         value = wp.sqrt(angular_weight) * (actual_omega[j] - desired_omega[j])
         cost += residual_term(value, world, off + 9 + nu + 6 * feet + hands + j, weight, record, residual)
+    extra = off + 12 + nu + 6 * feet + hands
+    for j in range(nu):
+        value = wp.sqrt(joint_velocity) * (qvel[world, j + 6] - reference_velocity(vref, t, fps, j + 6))
+        cost += residual_term(value, world, extra + j, weight, record, residual)
+    for k in range(hands):
+        body = tracked[k + 2]
+        p = xpos[world, body]
+        raw = xquat[world, body]
+        actual = wp.quat(raw[1], raw[2], raw[3], raw[0])
+        target = wp.quat(
+            reference_value(rotationref, t, fps, 4 * (k + 2) + 1),
+            reference_value(rotationref, t, fps, 4 * (k + 2) + 2),
+            reference_value(rotationref, t, fps, 4 * (k + 2) + 3),
+            reference_value(rotationref, t, fps, 4 * (k + 2)),
+        )
+        error = rotation_error(actual, wp.normalize(target))
+        for j in range(3):
+            value = wp.sqrt(hand_position) * (p[j] - reference_value(bodyref, t, fps, 3 * (k + 2) + j))
+            cost += residual_term(value, world, extra + nu + 6 * k + j, weight, record, residual)
+            value = wp.sqrt(hand_rotation) * error[j]
+            cost += residual_term(value, world, extra + nu + 6 * k + 3 + j, weight, record, residual)
     if not wp.isfinite(cost) or overflow[world] != 0:
         cost = 1.0e20
     costs[world] += weight * cost
@@ -383,6 +407,9 @@ class WholeBodyMPC:
         sole_tracking=False,
         hand_weight=10000.0,
         hand_clearance=0.2,
+        hand_position=0.0,
+        hand_rotation=0.0,
+        joint_velocity=0.0,
         iterations=20,
         temperature=0.2,
         nonfoot_weight=1000.0,
@@ -404,6 +431,9 @@ class WholeBodyMPC:
                 foot_vertical,
                 foot_rotation,
                 angular_weight,
+                hand_position,
+                hand_rotation,
+                joint_velocity,
             ]
         )
         if not np.isfinite(scales).all() or noise < 0 or joint_scale <= 0 or np.any(scales[4:] < 0) or iterations < 1:
@@ -431,6 +461,7 @@ class WholeBodyMPC:
         m.actuator_forcerange[:] = m.jnt_actfrcrange[1:]
         self.samples, self.rounds, self.seed = samples, rounds, seed
         self.temperature = temperature
+        self.hand_position, self.hand_rotation, self.joint_velocity = hand_position, hand_rotation, joint_velocity
         self.hand_clearance = hand_clearance
         self.root_scale, self.rotation_scale = root_scale, rotation_scale
         self.sole_tracking = sole_tracking
@@ -445,7 +476,7 @@ class WholeBodyMPC:
         data = mujoco.MjData(m)
         bodyref = np.zeros((len(reference.qpos), 3 * len(tracked)))
         rotationref = np.zeros((len(reference.qpos), 4 * len(tracked)))
-        self.state_width = m.nu + 12 + 6 * min(2, len(tracked)) + max(0, len(tracked) - 2)
+        self.state_width = 2 * m.nu + 12 + 6 * min(2, len(tracked)) + 7 * max(0, len(tracked) - 2)
         self.residual_width = self.state_width + m.nbody
         for i, q in enumerate(reference.qpos):
             data.qpos[:] = q
@@ -550,7 +581,7 @@ class WholeBodyMPC:
                 outputs=[self.data.ctrl],
             )
             mjw.step(self.model, self.data)
-            if self.foot_weight or self.hand_weight or self.foot_rotation:
+            if self.foot_weight or self.hand_weight or self.foot_rotation or self.hand_position or self.hand_rotation:
                 mjw.kinematics(self.model, self.data)
             weight = 1.0 / self.steps + float(step == self.steps - 1)
             wp.launch(
@@ -580,6 +611,9 @@ class WholeBodyMPC:
                     self.foot_rotation,
                     self.angular_weight,
                     self.sole_tracking,
+                    self.hand_position,
+                    self.hand_rotation,
+                    self.joint_velocity,
                     step,
                     self.residual_width,
                     self.save_residuals,

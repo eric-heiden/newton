@@ -27,24 +27,31 @@ The resolved configuration is included in every output JSON.
 
 | Option | Gauss-Newton | Sampling / CPU baselines |
 | --- | ---: | ---: |
-| `--mpc-rounds` | 2 | 2 |
+| `--mpc-rounds` | 1 | 2 |
+| `--prediction-dt` | 0.005 | 0.01 |
+| `--actuation` | pd | torque |
+| `--gn-coordinate-search` | enabled | disabled |
 | `--gain-scale` | 4 | 1 |
 | `--joint-scale` | 0.15 | 0.3 |
 | `--root-scale` | 0.04 | 0.08 |
 | `--rotation-scale` | 0.1 | 0.15 |
 | `--foot-weight` | 300 | 0 |
-| `--foot-vertical` | 4 | 1 |
+| `--foot-vertical` | 6 | 1 |
 | `--foot-rotation` | 10 | 0 |
 | `--angular-weight` | 0.2 | 0 |
+| `--hand-position` | 300 | 0 |
+| `--hand-rotation` | 3 | 0 |
+| `--joint-velocity` | 0.02 | 0 |
+| `--arm-velocity-scale` | 5 | 1 |
 
-The horizon is 0.5 s, prediction step 0.01 s, replan rate 100 Hz, and plant
+The horizon is 0.5 s, replan rate 100 Hz, and plant
 step 0.002 s. `--gain-scale` multiplies proportional gains and its square root
 multiplies derivative gains; torque bounds remain unchanged. Rotation costs
 use half of the shortest SO(3) logarithm. The default `--foot-task sole` penalizes the horizontal sole center and
 minimum sole-corner height; `--foot-task ankle` uses ankle-body origins.
 Reported foot metrics always use the four sole corners.
 
-Experimental `--hand-position`, `--hand-rotation` and `--joint-velocity`
+The `--hand-position`, `--hand-rotation` and `--joint-velocity`
 weights add world-frame wrist position, wrist rotation, and per-joint velocity
 tracking. They enter both the scalar rollout cost and Gauss-Newton residuals.
 `--arm-velocity-scale` multiplies the velocity weight for the 14 G1 arm
@@ -58,18 +65,23 @@ corrections, not a perceptual quality score.
 
 Gauss-Newton controls are `--gn-epsilon 0.03` (central-difference perturbation
 in radians), `--gn-damping 0.1` and `--gn-trust 0.2` (maximum knot update in
-radians). It accepts only evaluated candidates. Optional `--gn-coordinate-search` also
+radians). It accepts only evaluated candidates. Enabled `--gn-coordinate-search` also
 compares the best finite-difference probe with the line-search result. This
-adds a coordinate-search fallback without extra physical rollouts. The tiled solve supports at
-most 127 parameters. Use `--mpc-rounds 1` for approximately half the optimizer latency, with
-lower swing accuracy in the tested jumping motion. Sampling uses `--mpc-samples 1024`, `--noise 0.12` and
+adds a coordinate-search fallback without extra physical rollouts. Disable
+it with `--no-gn-coordinate-search` for the original line-search-only solver. The tiled solve supports at
+most 127 parameters. The default uses one iteration (241 trajectories per update) and a finer
+5 ms prediction step. In the evaluated motions, that allocation improves
+tracking relative to two iterations with 10 ms prediction steps at similar
+compute cost. `--mpc-rounds 2` spends more compute; improvement is not guaranteed.
+Sampling uses `--mpc-samples 1024`, `--noise 0.12` and
 `--temperature 0.2`. `--seed` affects sampling only; Gauss-Newton has no random
 search. Floating-point contact reductions can affect repeatability in either
 mode. Increasing samples, gains, weights, or iteration counts need not improve
 closed-loop tracking.
 
-The default actuation is explicit bounded torque PD. `--actuation pd` instead
-uses Newton's target interface with force-limited native PD actuators. Both
+The default Gauss-Newton actuation uses Newton's target interface with
+force-limited native PD actuators. `--actuation torque` selects explicit
+bounded torque PD. Both
 modes retain 29 actuators and zero commanded base wrench. Native PD uses the
 same integration formulation as the predictor, but prediction still uses a
 coarser time step.

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-"""Track Kimodo G1 CSV motions with bounded joint torques in SolverMuJoCo.
+"""Track Kimodo G1 CSV motions with bounded joint actuation in SolverMuJoCo.
 
 Run ``uv run --extra wbc -m newton.examples robot_g1_wbc`` for standing balance.
 Add ``--motion walk.csv`` for a native Kimodo G1 reference
@@ -12,6 +12,7 @@ guarantees feasibility or balance for an arbitrary kinematic reference.
 See ``g1_wbc.md`` for parameters and measured limitations.
 """
 
+import argparse
 import json
 import time
 from pathlib import Path
@@ -37,7 +38,7 @@ from newton.examples.robot.wbc_mpc_gn import WholeBodyGaussNewton
 class Example:
     def __init__(self, viewer, args):
         self.viewer, self.args = viewer, args
-        # Gauss-Newton benefits from stronger pose tasks and a stiffer inner PD.
+        # Gauss-Newton uses finer prediction and explicit limb tracking.
         # Sampling retains its broader, lower-gain starting configuration.
         defaults = {
             "gain_scale": (1.0, 4.0),
@@ -45,9 +46,17 @@ class Example:
             "root_scale": (0.08, 0.04),
             "rotation_scale": (0.15, 0.1),
             "foot_weight": (0.0, 300.0),
-            "foot_vertical": (1.0, 4.0),
+            "foot_vertical": (1.0, 6.0),
             "foot_rotation": (0.0, 10.0),
             "angular_weight": (0.0, 0.2),
+            "hand_position": (0.0, 300.0),
+            "hand_rotation": (0.0, 3.0),
+            "joint_velocity": (0.0, 0.02),
+            "arm_velocity_scale": (1.0, 5.0),
+            "prediction_dt": (0.01, 0.005),
+            "mpc_rounds": (2, 1),
+            "actuation": ("torque", "pd"),
+            "gn_coordinate_search": (False, True),
         }
         for name, values in defaults.items():
             if getattr(args, name) is None:
@@ -474,20 +483,19 @@ class Example:
         parser.add_argument("--motion-fps", type=float, default=30.0)
         parser.add_argument("--slowdown", type=float, default=1.0)
         parser.add_argument("--controller", choices=("qp", "pd", "mpc", "mpc-gn"), default="mpc-gn")
-        parser.add_argument("--actuation", choices=("torque", "pd"), default="torque")
+        parser.add_argument("--actuation", choices=("torque", "pd"))
         parser.add_argument(
             "--gn-coordinate-search",
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
+            default=None,
             help="Reuse improving finite-difference trials as coordinate-search candidates",
         )
         parser.add_argument("--gn-epsilon", type=float, default=0.03)
         parser.add_argument("--gn-damping", type=float, default=0.1)
         parser.add_argument("--gn-trust", type=float, default=0.2)
         parser.add_argument("--mpc-samples", type=int, default=1024)
-        parser.add_argument(
-            "--mpc-rounds", type=int, default=2, help="Search iterations; 1 trades tracking quality for latency"
-        )
-        parser.add_argument("--prediction-dt", type=float, default=0.01)
+        parser.add_argument("--mpc-rounds", type=int, help="Search iterations; compute cost scales with this count")
+        parser.add_argument("--prediction-dt", type=float)
         parser.add_argument("--control-rate", type=int, choices=(10, 25, 50, 100), default=100)
         parser.add_argument("--nonfoot-weight", type=float, default=1000.0)
         parser.add_argument("--temperature", type=float, default=0.2)
@@ -506,15 +514,11 @@ class Example:
         parser.add_argument("--foot-rotation", type=float)
         parser.add_argument("--angular-weight", type=float, help="World-frame root angular velocity weight")
         parser.add_argument(
-            "--hand-position", type=float, default=0.0, help="Wrist position tracking weight in inverse metres squared"
+            "--hand-position", type=float, help="Wrist position tracking weight in inverse metres squared"
         )
-        parser.add_argument(
-            "--hand-rotation", type=float, default=0.0, help="Wrist half-angle rotation tracking weight"
-        )
-        parser.add_argument("--joint-velocity", type=float, default=0.0, help="Per-joint velocity tracking weight")
-        parser.add_argument(
-            "--arm-velocity-scale", type=float, default=1.0, help="G1 arm multiplier for joint-velocity tracking"
-        )
+        parser.add_argument("--hand-rotation", type=float, help="Wrist half-angle rotation tracking weight")
+        parser.add_argument("--joint-velocity", type=float, help="Per-joint velocity tracking weight")
+        parser.add_argument("--arm-velocity-scale", type=float, help="G1 arm multiplier for joint-velocity tracking")
         parser.add_argument("--hand-clearance", type=float, default=0.2)
         parser.add_argument("--hand-weight", type=float, default=10000.0)
         parser.add_argument("--seed", type=int, default=123)

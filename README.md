@@ -163,6 +163,17 @@ If you run the examples from a source checkout with uv, use
     <td colspan="3"><h3>Robot Examples</h3></td>
   </tr>
   <tr>
+    <td colspan="3" align="center">
+      <a href="newton/examples/robot/example_robot_g1_wbc.py">
+        <img width="320" src="docs/images/examples/example_robot_g1_wbc.jpg" alt="G1 whole-body motion tracking">
+      </a><br>
+      <code>python -m newton.examples robot_g1_wbc</code><br>
+      Install <code>uv sync --extra wbc</code>. Add <code>--motion motion.csv --controller mpc</code>
+      for Kimodo G1 tracking; default QP demonstrates standing balance.
+      MPC currently runs slower than real time.
+    </td>
+  </tr>
+  <tr>
     <td align="center" width="33%">
       <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/robot/example_robot_cartpole.py">
         <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_robot_cartpole.jpg" alt="Cartpole">

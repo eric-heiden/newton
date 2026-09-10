@@ -174,7 +174,8 @@ class WholeBodyGaussNewton(WholeBodyMPC):
 
     def optimize(self, q, v, clock):
         wp.launch(_shift, self.plan.shape, inputs=[self.plan, clock, self.last, self.spacing], outputs=[self.center])
-        for _ in range(self.rounds):
+        for r in range(self.rounds):
+            self.record_traces = self.traces is not None and r == self.rounds - 1
             self.data, self.proposals, self.costs = self.diff_data, self.diff_proposals, self.diff_costs
             self.samples = self.proposals.shape[0]
             self.save_residuals = True
@@ -236,3 +237,5 @@ class WholeBodyGaussNewton(WholeBodyMPC):
                 )
                 wp.launch(_merge_minimum, 1, inputs=[self.difference_minimum], outputs=[self.minimum])
         wp.launch(_finish, 1, inputs=[clock, self.minimum], outputs=[self.last, self.iteration, self.failure_count])
+        if self.traces is not None:
+            self.traces.finish(self, q, clock)

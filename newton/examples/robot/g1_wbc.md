@@ -91,6 +91,44 @@ Use `--viewer null --output local/run` for measurements. This creates local
 website. The viewer displays visual meshes, materials, the textured ground,
 sky and shadows. `--fixed-camera` disables camera following.
 
+Add `--show-rollouts` to inspect the actual candidate futures in ViewerGL:
+
+```bash
+uv run --extra wbc -m newton.examples robot_g1_wbc \
+  --motion walk.csv --num-frames 250 --show-rollouts
+```
+
+Solid lines show the selected plan; muted dashed lines show three alternative
+predictions. Blue/green mark left/right ankle origins, cyan/orange mark
+left/right wrist origins, and yellow marks the torso origin. These are body
+origins, not sole-clearance measurements. `--rollout-count 1` shows only the
+selected plan; `--rollout-count 4` includes three alternatives, chosen for
+spatial diversity from valid candidates. This display subset is not a
+confidence interval and does not influence control. Gauss-Newton includes
+both line-search candidates and, when enabled, coordinate probes. The solid
+path follows whichever batch actually supplied the command.
+
+`--rollout-horizon 0.4` trims the displayed future without changing the 0.5 s
+optimization horizon. `--rollout-stride 4` records every fourth prediction step
+(20 ms at the default 5 ms step), including both endpoints. Use
+`--no-rollout-torso` to remove the torso trace. Already elapsed segments are
+clipped in the live viewer. Predictions are in world coordinates and start at
+the live planning state; they are not histories or the later realized motion.
+
+Recording observes the existing final-iteration rollouts inside the same CUDA
+graph. It adds no physical rollouts or CPU optimization. With the option off,
+there are no trajectory buffers or recording kernels. With it on, display
+readback, thinning and line rendering occur outside the optimizer. Adding
+`--output local/walk` saves a local archive with `trace_time`, `trace_qpos`,
+`trace_positions`, `trace_offsets`, `trace_bodies`, `trace_indices` and
+`trace_costs`. Each trace is anchored at the recorded planning time and pose;
+candidate zero is the selected plan. Indices address the final sampling batch,
+or the concatenated derivative and line-search batches in Gauss-Newton.
+Invalid searches have index -1 and NaN paths. Only the displayed subset is
+saved, at the example's 50 Hz frame rate. The report's
+[rendering script](https://reports.eric-heiden.com/g1-whole-body-control/tools/render_rollouts.py)
+can replay this archive separately; archives stay local.
+
 The improved ordinary-motion tracking does not imply reliable backflips.
 Gauss-Newton can get trapped around saturated actuators and landing contacts.
 Sampling remains useful for that case. Arbitrary kinematic references need

@@ -33,11 +33,17 @@ from newton.examples.robot.wbc_controller import (
 )
 from newton.examples.robot.wbc_mpc import WholeBodyMPC, audit_step
 from newton.examples.robot.wbc_mpc_gn import WholeBodyGaussNewton
+from newton.examples.robot.wbc_rollouts import G1_TRACE_BODIES, RolloutTraces, draw_rollouts
 
 
 class Example:
     def __init__(self, viewer, args):
         self.viewer, self.args = viewer, args
+        if args.show_rollouts and args.controller not in ("mpc", "mpc-gn"):
+            raise ValueError("Rollout visualization requires an MPC controller")
+        if args.rollout_count < 1 or args.rollout_count > 16:
+            raise ValueError("Display between 1 and 16 rollout candidates")
+        self.trace_frames, self.trace_frame = [], None
         # Gauss-Newton uses finer prediction and explicit limb tracking.
         # Sampling retains its broader, lower-gain starting configuration.
         defaults = {
@@ -209,6 +215,13 @@ class Example:
                 seed=args.seed,
                 **extra,
             )
+            if args.show_rollouts:
+                self.mpc.traces = RolloutTraces(
+                    self.mpc,
+                    G1_TRACE_BODIES if args.rollout_torso else G1_TRACE_BODIES[:4],
+                    horizon=args.rollout_horizon,
+                    stride=args.rollout_stride,
+                )
         q, v, _ = self.motion.sample(0)
         nq = q.copy()
         nq[3:7] = q[[4, 5, 6, 3]]
@@ -327,6 +340,10 @@ class Example:
         if self.gpu:
             for _ in range(self.step_rate // self.fps):
                 self.gpu_control()
+            if self.mpc.traces is not None:
+                self.trace_frame = self.mpc.traces.snapshot(self.args.rollout_count)
+                if self.args.output:
+                    self.trace_frames.append(self.trace_frame)
             return
         for _ in range(self.args.control_rate // self.fps):
             target = self.motion.sample(self.sim_time)
@@ -408,6 +425,13 @@ class Example:
             self.camera_root += delta
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
+        if self.trace_frame is not None:
+            draw_rollouts(
+                self.viewer,
+                self.trace_frame["positions"],
+                self.mpc.traces.offsets,
+                elapsed=self.sim_time - self.trace_frame["time"],
+            )
         self.viewer.end_frame()
 
     def test_final(self):
@@ -472,13 +496,30 @@ class Example:
         summary.update(measure_foot_tracking(self.mj, self.motion, rows[:, 0], self.poses, self.points))
         summary.update(measure_motion_tracking(self.mj, self.motion, rows[:, 0], self.poses))
         Path(f"{path}.json").write_text(json.dumps(summary, indent=2) + "\n")
-        np.savez_compressed(f"{path}.npz", rows=rows, qpos=self.poses, reference=self.motion.qpos, contacts=contacts)
+        traces = {}
+        if self.trace_frames:
+            traces = {f"trace_{key}": np.array([f[key] for f in self.trace_frames]) for key in self.trace_frames[0]}
+            traces.update(trace_offsets=self.mpc.traces.offsets, trace_bodies=self.mpc.traces.names)
+        np.savez_compressed(
+            f"{path}.npz", rows=rows, qpos=self.poses, reference=self.motion.qpos, contacts=contacts, **traces
+        )
         print(json.dumps(summary))
 
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--fixed-camera", action="store_true", help="Disable horizontal camera following")
+        parser.add_argument(
+            "--show-rollouts", action="store_true", help="Draw and optionally record actual GPU futures"
+        )
+        parser.add_argument(
+            "--rollout-count", type=int, default=4, help="Selected plan plus display alternatives (1-16)"
+        )
+        parser.add_argument(
+            "--rollout-horizon", type=float, default=0.4, help="Displayed prediction duration in seconds"
+        )
+        parser.add_argument("--rollout-stride", type=int, default=4, help="Record every Nth prediction step")
+        parser.add_argument("--rollout-torso", action=argparse.BooleanOptionalAction, default=True)
         parser.add_argument("--motion", type=str, default=None, help="Kimodo G1 MuJoCo qpos CSV")
         parser.add_argument("--motion-fps", type=float, default=30.0)
         parser.add_argument("--slowdown", type=float, default=1.0)

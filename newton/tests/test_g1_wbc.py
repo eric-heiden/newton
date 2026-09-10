@@ -284,6 +284,87 @@ class TestG1WBC(unittest.TestCase):
                 np.sum(mpc.residual.numpy() ** 2, axis=1), mpc.diff_costs.numpy(), rtol=1e-4, atol=1e-5
             )
 
+    @unittest.skipUnless(wp.is_cuda_available(), "Rollout visualization requires CUDA")
+    def test_recorded_candidate_futures(self):
+        """Every saved future matches native dynamics, including a selected probe."""
+        import mujoco
+
+        from newton.examples.robot.wbc_mpc_gn import WholeBodyGaussNewton  # noqa: PLC0415
+        from newton.examples.robot.wbc_rollouts import RolloutTraces  # noqa: PLC0415
+
+        model = mujoco.MjModel.from_xml_string("""
+        <mujoco><worldbody><body name="root" pos="0 0 .8"><freejoint/>
+          <geom size=".1" mass="10"/>
+          <body name="tip" pos=".2 0 0"><joint name="j" armature=".01" actuatorfrcrange="-20 20"/>
+            <geom size=".05" pos=".1 0 0" mass="1"/>
+          </body></body></worldbody><actuator><motor joint="j"/></actuator></mujoco>
+        """)
+        poses = np.tile(model.qpos0, (31, 1))
+        poses[:, -1] = 0.4
+        reference = self.reference_type(model, poses)
+        cases = [(self.mpc_type, {}), (WholeBodyGaussNewton, {"coordinate_search": False})]
+        cases.append((WholeBodyGaussNewton, {"coordinate_search": True, "trust": 1e-6}))
+        with wp.ScopedDevice("cuda:0"):
+            q, v, clock = wp.array(model.qpos0[None], dtype=float), wp.zeros((1, model.nv)), wp.zeros(1)
+            for controller, extra in cases:
+                baseline = None
+                for record in (False, True):
+                    mpc = controller(
+                        model,
+                        np.array([30.0]),
+                        np.array([3.0]),
+                        reference,
+                        horizon=0.1,
+                        rounds=2,
+                        samples=8,
+                        hand_weight=0,
+                        nonfoot_weight=0,
+                        **extra,
+                    )
+                    if record:
+                        mpc.traces = RolloutTraces(mpc, ("root", "tip"), horizon=0.1, stride=3)
+                    mpc.capture(q, v, clock)
+                    for _ in range(2):
+                        mpc.solve()
+                    if not record:
+                        baseline = mpc.plan.numpy()
+                        continue
+                    np.testing.assert_array_equal(mpc.plan.numpy(), baseline)
+                    trace = mpc.traces
+                    predictions = trace.positions.numpy()
+                    proposals = mpc.proposals.numpy()
+                    if trace.line_offset:
+                        proposals = np.concatenate([mpc.diff_proposals.numpy(), proposals])
+                    index = int(trace.selected.numpy()[0])
+                    np.testing.assert_array_equal(proposals[index], mpc.plan.numpy())
+                    if extra.get("coordinate_search"):
+                        self.assertLess(index, trace.line_offset, "Test must exercise a selected coordinate probe")
+                    self.assertAlmostEqual(float(trace.costs.numpy()[index]), float(mpc.minimum.numpy()[0]), places=5)
+                    for world, proposal in enumerate(proposals):
+                        data = mujoco.MjData(mpc.cpu_model)
+                        data.qpos[:] = model.qpos0
+                        expected = []
+                        for step in range(mpc.steps + 1):
+                            mujoco.mj_kinematics(mpc.cpu_model, data)
+                            if step in trace.step_index:
+                                expected.append(data.xpos[[1, 2]].copy())
+                            if step < mpc.steps:
+                                offset = np.interp(step * mpc.dt, np.arange(4) * mpc.spacing, proposal[:, 0])
+                                data.ctrl[0] = 0.4 + offset
+                                mujoco.mj_step(mpc.cpu_model, data)
+                        np.testing.assert_allclose(predictions[world], expected, atol=2e-5)
+                    snapshot = trace.snapshot(4)
+                    self.assertEqual(snapshot["indices"][0], index)
+                    self.assertEqual(len(set(snapshot["indices"])), 4)
+                    np.testing.assert_array_equal(snapshot["positions"], predictions[snapshot["indices"]])
+                    # An invalid final search must not highlight a stale plan.
+                    mpc.costs.fill_(1e20)
+                    if trace.line_offset:
+                        mpc.diff_costs.fill_(1e20)
+                    trace.finish(mpc, q, clock)
+                    self.assertEqual(int(trace.selected.numpy()[0]), -1)
+                    self.assertTrue(np.isnan(trace.snapshot()["positions"]).all())
+
     @unittest.skipUnless(importlib.util.find_spec("osqp"), "Install the wbc extra for QP tests")
     def test_qp_unactuated_base_and_contact_force_balance(self):
         """Verify that ground forces support the unactuated floating base."""

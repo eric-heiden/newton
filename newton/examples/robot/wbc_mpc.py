@@ -521,10 +521,13 @@ class WholeBodyMPC:
             self.statistics = wp.zeros(5, dtype=int)
         self.graph = None
         self.save_residuals = False
+        self.traces = None
+        self.record_traces = False
 
     def optimize(self, q, v, clock):
         wp.launch(_shift, self.plan.shape, inputs=[self.plan, clock, self.last, self.spacing], outputs=[self.center])
         for r in range(self.rounds):
+            self.record_traces = self.traces is not None and r == self.rounds - 1
             scale = 0.35 ** (r / max(1, self.rounds - 1))
             wp.launch(
                 _propose,
@@ -556,6 +559,8 @@ class WholeBodyMPC:
                     outputs=[self.center],
                 )
         wp.launch(_finish, 1, inputs=[clock, self.minimum], outputs=[self.last, self.iteration, self.failure_count])
+        if self.traces is not None:
+            self.traces.finish(self, q, clock)
 
     def rollout(self, q, v, clock):
         wp.launch(
@@ -571,6 +576,8 @@ class WholeBodyMPC:
                 self.data.overflow,
             ],
         )
+        if self.record_traces:
+            self.traces.record(self, 0)
         for step in range(self.steps):
             wp.launch(
                 _targets,
@@ -589,8 +596,17 @@ class WholeBodyMPC:
                 outputs=[self.data.ctrl],
             )
             mjw.step(self.model, self.data)
-            if self.foot_weight or self.hand_weight or self.foot_rotation or self.hand_position or self.hand_rotation:
+            if (
+                self.foot_weight
+                or self.hand_weight
+                or self.foot_rotation
+                or self.hand_position
+                or self.hand_rotation
+                or self.record_traces
+            ):
                 mjw.kinematics(self.model, self.data)
+            if self.record_traces:
+                self.traces.record(self, step + 1)
             weight = 1.0 / self.steps + float(step == self.steps - 1)
             wp.launch(
                 _score,
@@ -680,6 +696,8 @@ class WholeBodyMPC:
             self.failure_count.zero_()
             self.statistics.zero_()
             self.last.zero_()
+            if self.traces is not None:
+                self.traces.selected.fill_(-1)
 
     def solve(self):
         wp.capture_launch(self.graph)

@@ -97,6 +97,9 @@ class RolloutTraces:
         self.line_offset = sum(cost.size for _, cost in self.batches[:-1])
         count = sum(cost.size for _, cost in self.batches)
         self.coordinate = bool(self.line_offset and getattr(mpc, "coordinate_search", False))
+        self.candidate_offset = (
+            0 if self.coordinate or getattr(mpc, "trace_batches", None) is not None else self.line_offset
+        )
         with wp.ScopedDevice(mpc.device):
             self.bodies = wp.array(ids, dtype=int)
             self.local = wp.array(local, dtype=wp.vec3)
@@ -159,9 +162,8 @@ class RolloutTraces:
         paths = np.full((count, *positions.shape[1:]), np.nan, dtype=np.float32)
         values = np.full(count, np.nan, dtype=np.float32)
         if selected >= 0:
-            first = 0 if self.coordinate else self.line_offset
             valid = np.isfinite(positions).all(axis=(1, 2, 3)) & (costs < 1e19)
-            valid[:first] = False
+            valid[: self.candidate_offset] = False
             distance = np.full(len(costs), np.inf)
             for i in range(min(count, int(valid.sum()))):
                 indices[i], paths[i], values[i] = selected, positions[selected], costs[selected]

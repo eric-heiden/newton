@@ -120,6 +120,34 @@ class TestG1WBC(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.reference_type(self.model, q, fps=fps)
 
+    def test_custom_batches_keep_candidate_alternatives(self):
+        """DIAL's executed mean must not hide all sampled alternative futures."""
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        import mujoco
+
+        from newton.examples.robot.wbc_rollouts import RolloutTraces  # noqa: PLC0415
+
+        model = mujoco.MjModel.from_xml_string(
+            '<mujoco><worldbody><body name="base"><freejoint/><geom size=".1"/></body></worldbody></mujoco>'
+        )
+        with wp.ScopedDevice("cpu"):
+            mpc = SimpleNamespace(
+                cpu_model=model,
+                device="cpu",
+                steps=1,
+                dt=0.01,
+                trace_batches=((object(), wp.zeros(3)), (object(), wp.zeros(1))),
+            )
+            traces = RolloutTraces(mpc, ("base",), horizon=0.01, stride=1)
+            paths = np.broadcast_to(np.arange(4, dtype=np.float32)[:, None, None, None], (4, 2, 1, 3)).copy()
+            traces.positions.assign(paths)
+            traces.costs.assign(np.array([4, 3, 2, 1], dtype=np.float32))
+            traces.selected.fill_(3)
+            frame = traces.snapshot(3)
+            np.testing.assert_array_equal(frame["indices"], [3, 0, 1])
+            np.testing.assert_array_equal(frame["positions"], paths[[3, 0, 1]])
+
     @unittest.skipUnless(wp.is_cuda_available(), "Analytic MPC requires CUDA")
     def test_adjoint_multistep_gradient_and_graph(self):
         """Compare repeated adjoints with physical finite differences, then test descent."""

@@ -214,6 +214,7 @@ class Example:
                     "round_decay": args.dial_round_decay,
                     "initial_rounds": args.dial_initial_rounds,
                     "dial_temperature": args.dial_temperature,
+                    "fixed_first": args.dial_fixed_first,
                 }
             if args.controller in ("mpc-adjoint", "mpc-hybrid"):
                 if args.adjoint_starts is None:
@@ -599,6 +600,12 @@ class Example:
         parser.add_argument("--dial-horizon-decay", type=float, default=0.9)
         parser.add_argument("--dial-round-decay", type=float, default=0.5)
         parser.add_argument("--dial-initial-rounds", type=int, default=10)
+        parser.add_argument(
+            "--dial-fixed-first",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Hold DIAL's first knot fixed, as in the reference implementation",
+        )
         parser.add_argument("--mpc-samples", type=int, default=1024)
         parser.add_argument("--mpc-rounds", type=int, help="Search iterations; compute cost scales with this count")
         parser.add_argument("--prediction-dt", type=float)

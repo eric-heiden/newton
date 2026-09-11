@@ -49,12 +49,20 @@ class TestG1WBC(unittest.TestCase):
                 wp.launch(
                     _dial_propose,
                     output.shape,
-                    inputs=[center, iteration, 42, 2, 0.01, horizon, decay],
+                    inputs=[center, iteration, 42, 2, 0.01, horizon, decay, True],
                     outputs=[output],
                 )
             expected = base.numpy() * (0.5 ** np.arange(3, -1, -1))[None, :, None] * 0.25**2
             np.testing.assert_allclose(annealed.numpy(), expected, atol=1e-8)
             np.testing.assert_array_equal(base.numpy()[:, 0], 0)
+            wp.launch(
+                _dial_propose,
+                base.shape,
+                inputs=[center, iteration, 42, 2, 0.01, 1.0, 1.0, False],
+                outputs=[base],
+            )
+            self.assertGreater(float(np.linalg.norm(base.numpy()[1:, 0])), 0.0)
+            np.testing.assert_array_equal(base.numpy()[0], 0)
             costs = wp.array([4.0, 6.0, 8.0, 1e20], dtype=float)
             minimum, moments, weights = wp.array([4.0], dtype=float), wp.zeros(3), wp.zeros(4)
             values = np.arange(16, dtype=np.float32).reshape(4, 2, 2)

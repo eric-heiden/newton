@@ -32,6 +32,8 @@ of `mpc-gn`:
   onto the shared four **linear PD-offset knots**; it does not reproduce the
   upstream quadratic spline or normalized action space. The returned mean
   receives its own physical rollout for measured cost and prediction paths.
+  `--no-dial-fixed-first` also permits changing the current command in this
+  synchronous implementation; the default preserves the upstream boundary.
 - `--controller mpc-adjoint`: experimental sketched Gauss-Newton using the
   MuJoCo Warp PR #1535 reverse derivatives. With `--adjoint-sketch 16`, 17
   identical forward lanes carry 16 residual projections and one unprojected

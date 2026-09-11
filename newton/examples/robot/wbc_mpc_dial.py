@@ -24,11 +24,12 @@ def _dial_propose(
     sigma: float,
     horizon_decay: float,
     round_decay: float,
+    fixed_first: bool,
     proposals: wp.array3d[float],
 ):
     world, k, j = wp.tid()
     value = center[k, j]
-    if world > 0 and k > 0:
+    if world > 0 and (k > 0 or not fixed_first):
         rng = wp.rand_init(
             seed + 7919 * iteration[0] + 104729 * round_index, (world * center.shape[0] + k) * center.shape[1] + j
         )
@@ -85,7 +86,16 @@ class WholeBodyDial(WholeBodyMPC):
     extra rollout so its displayed future and acceptance cost are measured.
     """
 
-    def __init__(self, *args, horizon_decay=0.9, round_decay=0.5, initial_rounds=10, dial_temperature=0.06, **kwargs):
+    def __init__(
+        self,
+        *args,
+        horizon_decay=0.9,
+        round_decay=0.5,
+        initial_rounds=10,
+        dial_temperature=0.06,
+        fixed_first=True,
+        **kwargs,
+    ):
         if not all(math.isfinite(x) and 0 < x <= 1 for x in (horizon_decay, round_decay)):
             raise ValueError("DIAL noise decay factors must be in (0, 1]")
         if not math.isfinite(dial_temperature) or dial_temperature <= 0 or initial_rounds < 1:
@@ -93,6 +103,7 @@ class WholeBodyDial(WholeBodyMPC):
         super().__init__(*args, **kwargs)
         self.horizon_decay, self.round_decay = horizon_decay, round_decay
         self.initial_rounds, self.dial_temperature = initial_rounds, dial_temperature
+        self.fixed_first = fixed_first
         self.sigma = kwargs.get("noise", 0.12)
         self.search_data, self.search_proposals, self.search_costs = self.data, self.proposals, self.costs
         with wp.ScopedDevice(self.device):
@@ -113,7 +124,16 @@ class WholeBodyDial(WholeBodyMPC):
             wp.launch(
                 _dial_propose,
                 self.proposals.shape,
-                inputs=[self.center, self.iteration, self.seed, r, self.sigma, self.horizon_decay, self.round_decay],
+                inputs=[
+                    self.center,
+                    self.iteration,
+                    self.seed,
+                    r,
+                    self.sigma,
+                    self.horizon_decay,
+                    self.round_decay,
+                    self.fixed_first,
+                ],
                 outputs=[self.proposals],
             )
             self.rollout(q, v, clock)

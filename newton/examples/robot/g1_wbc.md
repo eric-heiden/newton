@@ -70,8 +70,30 @@ linear solve, and the line searches execute in one CUDA graph. `--seed` affects
 DIAL, the analytic sketch, and hybrid starts. The adapter is experimental and
 currently assumes a G1-style free root followed by scalar hinge joints.
 
+The [measured comparison](https://reports.eric-heiden.com/g1-whole-body-control/)
+uses these optional profiles on a shared 0.3 s horizon and 10 ms prediction step:
+
+```bash
+# Append the same motion and --show-rollouts to each command.
+uv run --extra wbc -m newton.examples robot_g1_wbc --controller mpc-gn --horizon .3 --prediction-dt .01
+uv run --extra wbc -m newton.examples robot_g1_wbc --controller mpc-dial --horizon .3 --prediction-dt .01 \
+  --mpc-samples 1024 --mpc-rounds 3 --mpc-knots 6 --noise .04
+PYTHONPATH=../mujoco-warp-adjoint uv run --extra wbc -m newton.examples robot_g1_wbc \
+  --controller mpc-adjoint --horizon .3 --prediction-dt .01 --adjoint-sketch 128
+PYTHONPATH=../mujoco-warp-adjoint uv run --extra wbc -m newton.examples robot_g1_wbc \
+  --controller mpc-hybrid --horizon .3 --prediction-dt .01 --adjoint-sketch 64 --adjoint-noise .025
+```
+
+The shorter finite-difference profile improves the tested walking speed/quality
+tradeoff, but loses quality on dancing. The original finer-step profile remains
+the general default. Analytic derivatives and parallel starts did not establish
+a reliable improvement or stable real-time operation on the evaluated GPU
+partition. The report retains complete settings, seeds, failures, and source
+revisions; these are comparison configurations, not universal tuned defaults.
+
 The following defaults are chosen by controller; explicit flags override them.
-The resolved configuration is included in every output JSON.
+The resolved configuration is included in every output JSON. DIAL uses two
+refinement rounds by default, overriding the GN value below.
 
 | Option | GN / DIAL / analytic | Legacy sampling / CPU baselines |
 | --- | ---: | ---: |

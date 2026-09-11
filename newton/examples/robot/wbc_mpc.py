@@ -143,7 +143,10 @@ def rotation_error(current: wp.quat, desired: wp.quat):
     vector = wp.vec3(rotation[0], rotation[1], rotation[2])
     length = wp.length(vector)
     # Half the SO(3) logarithm retains a useful gradient near a half turn.
-    factor = wp.atan2(length, wp.abs(rotation[3])) / wp.max(length, 1.0e-8)
+    # Preserve the logarithm's nonzero slope at exact tracking for analytic GN.
+    factor = 1.0 / wp.max(wp.abs(rotation[3]), 1.0e-8)
+    if length > 1.0e-8:
+        factor = wp.atan2(length, wp.abs(rotation[3])) / length
     return sign * factor * vector
 
 

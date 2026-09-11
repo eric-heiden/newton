@@ -264,6 +264,26 @@ class TestG1WBC(unittest.TestCase):
             expected[:, 1] = np.tile(angles / 2, 2)
             np.testing.assert_allclose(output.numpy(), expected, atol=1e-6)
 
+    def test_rotation_residual_identity_derivative(self):
+        """The half-angle rotation residual must retain its slope at exact tracking."""
+        from newton.examples.robot.wbc_mpc import rotation_error  # noqa: PLC0415
+
+        @wp.kernel(module="unique")
+        def evaluate(angles: wp.array[float], output: wp.array[float]):
+            i = wp.tid()
+            rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), angles[i])
+            output[i] = rotation_error(rotation, wp.quat_identity())[1]
+
+        with wp.ScopedDevice("cpu"):
+            angles = wp.array([0.0, 1e-9, -1e-9, 0.2], dtype=float, requires_grad=True)
+            output = wp.zeros(4, requires_grad=True)
+            with wp.Tape() as tape:
+                wp.launch(evaluate, 4, inputs=[angles], outputs=[output])
+            output.grad.fill_(1.0)
+            tape.backward()
+            np.testing.assert_allclose(output.numpy(), angles.numpy() / 2, atol=1e-11)
+            np.testing.assert_allclose(angles.grad.numpy(), 0.5, atol=1e-6)
+
     def test_sole_task_geometry(self):
         """Pitch and roll must change the lowest corner, not just ankle height."""
         from scipy.spatial.transform import Rotation

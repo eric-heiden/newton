@@ -58,7 +58,7 @@ class Example:
             "angular_weight": (0.0, 0.2),
             "hand_position": (0.0, 300.0),
             "hand_rotation": (0.0, 3.0),
-            "head_position": (0.0, 300.0),
+            "head_position": (0.0, 100.0),
             "head_rotation": (0.0, 300.0),
             "joint_velocity": (0.0, 0.02),
             "arm_velocity_scale": (1.0, 5.0),

@@ -41,7 +41,7 @@ The resolved configuration is included in every output JSON.
 | `--angular-weight` | 0.2 | 0 |
 | `--hand-position` | 300 | 0 |
 | `--hand-rotation` | 3 | 0 |
-| `--head-position` | 300 | 0 |
+| `--head-position` | 100 | 0 |
 | `--head-rotation` | 300 | 0 |
 | `--joint-velocity` | 0.02 | 0 |
 | `--arm-velocity-scale` | 5 | 1 |

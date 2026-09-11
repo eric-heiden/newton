@@ -22,6 +22,7 @@ import newton
 import newton.utils
 from newton import ModelBuilder
 from newton._src.geometry.utils import transform_points
+from newton._src.sim.model import _pack_shape_pair_codes
 from newton._src.solvers.mujoco.equality import _add_equality_constraint
 from newton._src.viewer.viewer_file import depointer_as_key, pointer_as_key, transfer_to_model
 from newton.tests.unittest_utils import assert_np_equal, patch_sys_module
@@ -1679,6 +1680,108 @@ class TestModelMesh(unittest.TestCase):
 
                 self.assertIs(model.shape_collision_filter_pairs, filters)
 
+    def test_replicated_same_body_filters_finalize_without_expansion(self):
+        """Keep same-body filter storage independent of the number of replicas."""
+        source = ModelBuilder()
+        shapes_per_world = 32
+        world_count = 64
+        for _ in range(shapes_per_world):
+            source.add_shape_box(-1)
+
+        builder = ModelBuilder()
+        builder.replicate(source, world_count)
+        template_pair_count = shapes_per_world * (shapes_per_world - 1) // 2
+
+        def pack_template(shape_a, shape_b):
+            self.assertLessEqual(shape_a.size, template_pair_count)
+            return _pack_shape_pair_codes(shape_a, shape_b)
+
+        with mock.patch("newton._src.sim.builder._pack_shape_pair_codes", side_effect=pack_template):
+            model = builder.finalize(device="cpu")
+
+        self.assertEqual(len(model.shape_collision_filter_pairs), template_pair_count * world_count)
+        filters = model._shape_collision_filter_pairs  # pyright: ignore[reportPrivateUsage]
+        stored_pair_count = filters._packed.size + sum(  # pyright: ignore[reportPrivateUsage]
+            template.size
+            for template in filters._templates  # pyright: ignore[reportPrivateUsage]
+        )
+        self.assertEqual(stored_pair_count, template_pair_count)
+        self.assertEqual(model.shape_contact_pair_count, 0)
+        for world in (0, world_count // 2, world_count - 1):
+            start = world * shapes_per_world
+            self.assertTrue(model.shape_collision_filter_contains(start + 1, start))
+        self.assertFalse(model.shape_collision_filter_contains(shapes_per_world - 1, shapes_per_world))
+
+    def test_compact_filter_queries_and_iteration_do_not_materialize(self):
+        """Query and iterate mixed compact filters without expanding all replicas."""
+        source = ModelBuilder()
+        for _ in range(3):
+            source.add_shape_box(-1)
+        # Exercise canonicalization and duplicates within a template.
+        source.shape_collision_filter_pairs.extend([(1, 0), (0, 1)])
+
+        builder = ModelBuilder()
+        global_shape = builder.add_shape_box(-1)
+        builder.add_builder(source)
+        builder.replicate(source, 2)
+        builder.add_shape_collision_filter_pair(global_shape, 4)
+        builder.add_shape_collision_filter_pair(5, 4)  # Already in a compact block.
+        builder.add_shape_collision_filter_pair(5, 4)
+        builder.add_shape_collision_filter_pair(4, 7)  # Cross-world residual.
+        builder.add_shape_collision_filter_pair(7, 7)
+        expected = {(1, 2), (1, 3), (2, 3), (4, 5), (4, 6), (5, 6), (7, 8), (7, 9), (8, 9)}
+        expected.update({(0, 4), (4, 7), (7, 7)})
+
+        model = builder.finalize(device="cpu")
+        filters = model.shape_collision_filter_pairs
+        candidates = np.array([(a, b) for a in range(11) for b in range(11)], dtype=np.int64)
+        with mock.patch.object(filters, "pairs_array", side_effect=AssertionError("Filters were materialized")):
+            self.assertTrue(filters)
+            self.assertEqual(len(filters), len(expected))
+            self.assertEqual(list(filters), sorted(expected))
+            self.assertNotIn((5, 4), filters)
+            for shape_a, shape_b in candidates:
+                self.assertEqual(
+                    model.shape_collision_filter_contains(shape_a, shape_b),
+                    tuple(sorted((shape_a, shape_b))) in expected,
+                )
+            np.testing.assert_array_equal(
+                model.shape_collision_filter_mask(candidates),
+                [tuple(sorted(pair)) in expected for pair in candidates],
+            )
+
+        np.testing.assert_array_equal(model.shape_collision_filter_pairs_array(), sorted(expected))
+
+    def test_heterogeneous_compact_filters_match_builder(self):
+        """Preserve different templates, unfiltered gaps, and nested replication."""
+        sources = []
+        for shape_count in (3, 1, 4):
+            source = ModelBuilder()
+            for _ in range(shape_count):
+                source.add_shape_box(-1)
+            sources.append(source)
+
+        nested = ModelBuilder()
+        nested.replicate(sources[0], 2)
+        builder = ModelBuilder()
+        for source in (*sources, nested, sources[0]):
+            builder.add_world(source)
+        builder.add_shape_collision_filter_pair(0, builder.shape_count - 1)
+        model = builder.finalize(device="cpu")
+        expected = set(builder.shape_collision_filter_pairs)
+        filters = model.shape_collision_filter_pairs
+        self.assertEqual(len(filters), len(expected))
+        self.assertEqual(list(filters), sorted(expected))
+
+        indices = [-1, *range(builder.shape_count + 1), 2**32, 2**63 - 1]
+        candidates = np.array([(a, b) for a in indices for b in indices], dtype=np.int64)
+        expected_mask = [tuple(sorted(pair)) in expected for pair in candidates]
+        np.testing.assert_array_equal(model.shape_collision_filter_mask(candidates), expected_mask)
+        for pair, filtered in zip(candidates, expected_mask, strict=True):
+            self.assertEqual(model.shape_collision_filter_contains(*pair), filtered)
+        np.testing.assert_array_equal(model.shape_collision_filter_pairs_array(), sorted(expected))
+        self.assertEqual(model.shape_collision_filter_mask(np.empty((0, 2), dtype=np.int64)).shape, (0,))
+
     def test_builder_collision_filter_pairs_preserve_list_api(self):
         robot = ModelBuilder()
         body0 = robot.add_body()
@@ -1761,8 +1864,8 @@ class TestModelMesh(unittest.TestCase):
 
         with mock.patch.object(
             builder,
-            "_build_shape_collision_filter_packed",
-            wraps=builder._build_shape_collision_filter_packed,  # pyright: ignore[reportPrivateUsage]
+            "_build_shape_collision_filters",
+            wraps=builder._build_shape_collision_filters,  # pyright: ignore[reportPrivateUsage]
         ) as build_filters:
             model = builder.finalize()
         build_filters.assert_called_once()

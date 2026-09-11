@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import heapq
 import logging
 import operator
 import warnings
@@ -57,19 +58,51 @@ def _unpack_shape_pair_codes(codes: np.ndarray) -> np.ndarray:
     return pairs
 
 
-class _ShapeCollisionFilterPairs(AbstractSet[tuple[int, int]]):
-    """Read-only set view over sorted, unique packed filter-pair codes."""
+@dataclass(frozen=True)
+class _PackedShapeCollisionFilterBlock:
+    """A shared packed filter template within a disjoint range of shapes."""
 
-    def __init__(self, packed: np.ndarray):
+    shape_start: int
+    """First absolute shape index in the block."""
+    shape_count: int
+    """Number of shapes in the block."""
+    packed: np.ndarray
+    """Sorted unique packed pairs in local shape coordinates."""
+
+
+class _ShapeCollisionFilterPairs(AbstractSet[tuple[int, int]]):
+    """Read-only set of explicit pairs and shared, disjoint filter templates."""
+
+    def __init__(self, packed: np.ndarray, blocks: tuple[_PackedShapeCollisionFilterBlock, ...] = ()):
         self._packed = packed
         self._pairs_array: np.ndarray | None = None
+        self._blocks = tuple(sorted(blocks, key=lambda block: block.shape_start))
+        self._block_starts = np.asarray([block.shape_start for block in self._blocks], dtype=np.int64)
+        self._block_ends = np.asarray([block.shape_start + block.shape_count for block in self._blocks], dtype=np.int64)
+        template_indices = {}
+        templates = []
+        block_templates = []
+        for block in self._blocks:
+            key = id(block.packed)
+            if key not in template_indices:
+                template_indices[key] = len(templates)
+                templates.append(block.packed)
+            block_templates.append(template_indices[key])
+        self._templates = tuple(templates)
+        self._block_templates = np.asarray(block_templates, dtype=np.int32)
+
+        # Explicit additions may repeat pairs already present in a block.
+        # Remove only those residual duplicates, without expanding the blocks.
+        if self._blocks and packed.size:
+            self._packed = packed[~self._mask_blocks(_unpack_shape_pair_codes(packed))]
+        self._pair_count = self._packed.size + sum(block.packed.size for block in self._blocks)
 
     @classmethod
     def _from_iterable(cls, iterable: Iterable[tuple[int, int]]) -> frozenset[tuple[int, int]]:
         return frozenset(iterable)
 
     def __bool__(self) -> bool:
-        return self._packed.shape[0] > 0
+        return self._pair_count > 0
 
     def __contains__(self, pair: object) -> bool:
         if not isinstance(pair, tuple) or len(pair) != 2:
@@ -78,15 +111,21 @@ class _ShapeCollisionFilterPairs(AbstractSet[tuple[int, int]]):
             shape_a, shape_b = operator.index(pair[0]), operator.index(pair[1])
             if shape_a > shape_b:
                 return False
-            return self._contains_code((shape_a << 32) | shape_b)
+            return self.contains_pair(shape_a, shape_b)
         except (OverflowError, TypeError, ValueError):
             return False
 
     def __iter__(self) -> Iterator[tuple[int, int]]:
-        return iter(map(tuple, self.pairs_array().tolist()))
+        block_codes = (
+            int(code) + ((block.shape_start << 32) | block.shape_start)
+            for block in self._blocks
+            for code in block.packed
+        )
+        for code in heapq.merge(map(int, self._packed), block_codes):
+            yield (code >> 32, code & 0xFFFFFFFF)
 
     def __len__(self) -> int:
-        return self._packed.shape[0]
+        return self._pair_count
 
     def _contains_code(self, code: int) -> bool:
         index = int(np.searchsorted(self._packed, code))
@@ -99,28 +138,75 @@ class _ShapeCollisionFilterPairs(AbstractSet[tuple[int, int]]):
         shape_a, shape_b = operator.index(shape_a), operator.index(shape_b)
         if shape_a > shape_b:
             shape_a, shape_b = shape_b, shape_a
-        return self._contains_code((shape_a << 32) | shape_b)
+        if shape_a < 0 or shape_b > 0x7FFFFFFF:
+            return False
+        if self._contains_code((shape_a << 32) | shape_b):
+            return True
+        block_index = int(np.searchsorted(self._block_starts, shape_a, side="right")) - 1
+        if block_index < 0 or shape_b >= self._block_ends[block_index]:
+            return False
+        block = self._blocks[block_index]
+        code = ((shape_a - block.shape_start) << 32) | (shape_b - block.shape_start)
+        index = int(np.searchsorted(block.packed, code))
+        return bool(index < block.packed.size and block.packed[index] == code)
+
+    @staticmethod
+    def _mask_codes(packed: np.ndarray, codes: np.ndarray) -> np.ndarray:
+        if packed.size == 0:
+            return np.zeros(codes.size, dtype=bool)
+        index = np.searchsorted(packed, codes)
+        return (index < packed.size) & (packed[np.minimum(index, packed.size - 1)] == codes)
+
+    def _mask_blocks(self, pairs: np.ndarray) -> np.ndarray:
+        mask = np.zeros(pairs.shape[0], dtype=bool)
+        if not self._blocks or pairs.shape[0] == 0:
+            return mask
+        lo = np.minimum(pairs[:, 0], pairs[:, 1])
+        hi = np.maximum(pairs[:, 0], pairs[:, 1])
+        block_indices = np.searchsorted(self._block_starts, lo, side="right") - 1
+        valid = (block_indices >= 0) & (hi < self._block_ends[np.maximum(block_indices, 0)])
+        rows = np.flatnonzero(valid)
+        block_indices = block_indices[rows]
+        offsets = self._block_starts[block_indices]
+        codes = _pack_shape_pair_codes(lo[rows] - offsets, hi[rows] - offsets)
+        template_indices = self._block_templates[block_indices]
+        # Query each shared template once, even when the batch spans many worlds.
+        for template_index in np.unique(template_indices):
+            selected = template_indices == template_index
+            mask[rows[selected]] = self._mask_codes(self._templates[template_index], codes[selected])
+        return mask
 
     def mask_pairs(self, pairs: np.ndarray) -> np.ndarray:
         """Return a boolean membership mask for shape pairs in any order."""
-        if pairs.shape[0] == 0:
-            return np.zeros(0, dtype=bool)
-        if self._packed.shape[0] == 0:
+        if pairs.shape[0] == 0 or self._pair_count == 0:
             return np.zeros(pairs.shape[0], dtype=bool)
-        codes = _pack_shape_pair_codes(pairs[:, 0], pairs[:, 1])
-        index = np.searchsorted(self._packed, codes)
-        in_range = index < self._packed.shape[0]
-        return in_range & (self._packed[np.minimum(index, self._packed.shape[0] - 1)] == codes)
+        mask = self._mask_blocks(pairs)
+        if self._packed.size:
+            codes = _pack_shape_pair_codes(pairs[:, 0], pairs[:, 1])
+            mask |= self._mask_codes(self._packed, codes)
+        valid = np.all((pairs >= 0) & (pairs <= 0x7FFFFFFF), axis=1)
+        return valid & mask
 
     def pairs_array(self) -> np.ndarray:
         """Canonical pairs sorted lexicographically, shape [pair_count, 2].
 
-        The returned array is read-only: while the packed store exists it
-        aliases the cached canonical pairs, and mutating it would corrupt
-        every later filter query and public set iteration.
+        The returned array is read-only because it is cached and shared by callers.
         """
         if self._pairs_array is None:
-            self._pairs_array = _unpack_shape_pair_codes(self._packed)
+            packed = self._packed
+            if self._blocks:
+                # Full enumeration is opt-in; finalize and membership queries
+                # keep one template per source builder instead of per world.
+                packed = np.empty(self._pair_count, dtype=np.int64)
+                packed[: self._packed.size] = self._packed
+                start = self._packed.size
+                for block in self._blocks:
+                    end = start + block.packed.size
+                    offset = (block.shape_start << 32) | block.shape_start
+                    np.add(block.packed, offset, out=packed[start:end])
+                    start = end
+                packed.sort()
+            self._pairs_array = _unpack_shape_pair_codes(packed)
             self._pairs_array.setflags(write=False)
         return self._pairs_array
 
@@ -1318,13 +1404,17 @@ class Model:
 
     @property
     def shape_collision_filter_pairs(self) -> AbstractSet[tuple[int, int]]:
-        """Read-only set of canonical shape index pairs that should not collide."""
+        """Read-only set of canonical shape index pairs that should not collide.
+
+        Replicated filters share compact templates. Iteration yields pairs
+        lazily without materializing an array of all replicated filters.
+        """
         return self._shape_collision_filter_pairs
 
     def shape_collision_filter_contains(self, shape_a: SupportsIndex, shape_b: SupportsIndex) -> bool:
         """Return whether a canonicalized shape pair is collision-filtered.
 
-        This queries the canonical filter-pair array without copying it.
+        This queries explicit pairs and replicated templates without expanding them.
 
         Args:
             shape_a: First shape index.
@@ -1341,10 +1431,12 @@ class Model:
     def shape_collision_filter_pairs_array(self) -> np.ndarray:
         """Return the collision-filter pairs as an array.
 
-        Array counterpart to :attr:`shape_collision_filter_pairs` that returns
-        the canonical filter-pair array without copying the public set.
+        Array counterpart to :attr:`shape_collision_filter_pairs` that materializes
+        all canonical filter pairs, including every replica, and caches the result.
         Consumers that need every excluded pair — such as the ``"nxn"`` and
         ``"sap"`` broad-phase exclusion arrays — should prefer this form.
+        Use :meth:`shape_collision_filter_contains` or :meth:`shape_collision_filter_mask`
+        to query large replicated models without allocating the full array.
 
         Returns:
             Canonical shape index pairs sorted lexicographically, shape
@@ -1356,8 +1448,8 @@ class Model:
         """Return a boolean mask of which shape pairs are collision-filtered.
 
         Bulk counterpart to :meth:`shape_collision_filter_contains`: one
-        vectorized query against the canonical filter-pair array instead of a
-        Python-level membership test per pair.
+        vectorized query against explicit pairs and shared replicated templates
+        instead of a Python-level membership test per pair.
 
         Args:
             pairs: Shape index pairs in any order, shape [pair_count, 2].

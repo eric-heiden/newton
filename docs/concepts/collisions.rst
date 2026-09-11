@@ -713,6 +713,13 @@ set of ``(shape_index_a, shape_index_b)`` tuples (canonical order: ``a < b``). U
 :attr:`~ModelBuilder.shape_collision_filter_pairs` before calling ``finalize()`` and rebuild the
 model to change collision filters.
 
+Replicated builders retain shared filter templates through finalization, so the model does not
+allocate a separate copy of every excluded pair for every world. Membership queries through
+:meth:`~Model.shape_collision_filter_contains` and :meth:`~Model.shape_collision_filter_mask`
+use these templates directly, and iterating the read-only set yields pairs lazily. Calling
+:meth:`~Model.shape_collision_filter_pairs_array` materializes all replicated pairs; this is
+also required by the ``"nxn"`` and ``"sap"`` broad-phase exclusion arrays.
+
 **USD Import Example**
 
 .. code-block:: python

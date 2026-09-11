@@ -69,7 +69,7 @@ from .graph_coloring import (
     combine_independent_coloring_plan,
     construct_particle_graph,
 )
-from .model import Model, _pack_shape_pair_codes
+from .model import Model, _pack_shape_pair_codes, _PackedShapeCollisionFilterBlock, _ShapeCollisionFilterPairs
 from .rod import Rod
 
 if TYPE_CHECKING:
@@ -12487,7 +12487,7 @@ class ModelBuilder:
         # static particles (with zero mass) have zero inverse mass
         particle_inv_mass = np.divide(1.0, ms, out=np.zeros_like(ms), where=ms != 0.0)
 
-        shape_collision_filter_packed = self._build_shape_collision_filter_packed()
+        shape_collision_filters = self._build_shape_collision_filters()
         with wp.ScopedDevice(device):
             current_device = wp.get_device()
             sdf_texture_paired_samples = _resolve_paired_samples_flag(self.sdf_texture_paired_samples, current_device)
@@ -12497,7 +12497,7 @@ class ModelBuilder:
 
             m = Model(device)
             m._sdf_texture_paired_samples = sdf_texture_paired_samples
-            m._set_shape_collision_filter_packed(shape_collision_filter_packed)  # pyright: ignore[reportPrivateUsage]
+            m._shape_collision_filter_pairs = shape_collision_filters  # pyright: ignore[reportPrivateUsage]
             m.request_contact_attributes(*self._requested_contact_attributes)
             m.request_state_attributes(*self._requested_state_attributes)
             m.requires_grad = requires_grad
@@ -13979,49 +13979,36 @@ class ModelBuilder:
                 )
             yield (shape_a, shape_b) if shape_a <= shape_b else (shape_b, shape_a)
 
-    def _build_shape_collision_filter_packed(self) -> np.ndarray:
-        """Build the canonical filter store handed to :class:`Model`.
+    def _build_shape_collision_filters(self) -> _ShapeCollisionFilterPairs:
+        """Pack each filter template once and retain disjoint replicated blocks."""
 
-        Returns:
-            Sorted unique packed pair codes ``(shape_a << 32) | shape_b`` with
-            ``shape_a <= shape_b``, shape [pair_count].
-        """
+        def pack_pairs(pairs):
+            pair_array = np.asarray(pairs, dtype=np.int64).reshape((-1, 2))
+            codes = _pack_shape_pair_codes(pair_array[:, 0], pair_array[:, 1])
+            # NumPy's hash-based unique degrades on packed codes; queries also
+            # need sorted order, so deduplicate adjacent entries after sorting.
+            codes.sort()
+            if codes.size > 1:
+                codes = codes[np.concatenate(([True], codes[1:] != codes[:-1]))]
+            return codes
+
         filter_pairs = self._shape_collision_filter_pairs
-        chunks: list[np.ndarray] = []
+        packed_blocks = []
         if isinstance(filter_pairs, _BuilderShapeCollisionFilterPairs):
             explicit_pairs = tuple(self._iter_validated_shape_collision_filter_pairs(filter_pairs.explicit_pairs))
-            if explicit_pairs:
-                chunks.append(np.asarray(explicit_pairs, dtype=np.int64).reshape((-1, 2)))
             blocks = filter_pairs.blocks
             self._validate_compact_shape_collision_filter_blocks(blocks)
-            # Replicated blocks share one local-pair template; replay each
-            # group of blocks as a single broadcast offset add.
-            starts_by_template: dict[int, tuple[np.ndarray, list[int]]] = {}
+            templates = {}
             for block in blocks:
-                entry = starts_by_template.get(id(block.local_pairs))
-                if entry is None:
-                    template = np.asarray(block.local_pairs, dtype=np.int64).reshape((-1, 2))
-                    starts_by_template[id(block.local_pairs)] = (template, [block.shape_start])
-                else:
-                    entry[1].append(block.shape_start)
-            for template, starts in starts_by_template.values():
-                offsets = np.asarray(starts, dtype=np.int64)
-                chunks.append((template[None, :, :] + offsets[:, None, None]).reshape((-1, 2)))
+                key = id(block.local_pairs)
+                if key not in templates:
+                    templates[key] = pack_pairs(block.local_pairs)
+                packed_blocks.append(
+                    _PackedShapeCollisionFilterBlock(block.shape_start, block.shape_count, templates[key])
+                )
         else:
-            pairs = tuple(self._iter_validated_shape_collision_filter_pairs(filter_pairs))
-            if pairs:
-                chunks.append(np.asarray(pairs, dtype=np.int64).reshape((-1, 2)))
-        if not chunks:
-            return np.empty(0, dtype=np.int64)
-        all_pairs = np.concatenate(chunks, axis=0)
-        codes = _pack_shape_pair_codes(all_pairs[:, 0], all_pairs[:, 1])
-        # Sort + mask instead of np.unique: NumPy's hash-based unique for 1-D
-        # integers degrades badly on packed pair codes, and searchsorted needs
-        # the sorted order anyway.
-        codes.sort()
-        if codes.shape[0] > 1:
-            codes = codes[np.concatenate(([True], codes[1:] != codes[:-1]))]
-        return codes
+            explicit_pairs = tuple(self._iter_validated_shape_collision_filter_pairs(filter_pairs))
+        return _ShapeCollisionFilterPairs(pack_pairs(explicit_pairs), tuple(packed_blocks))
 
     def _validate_compact_shape_collision_filter_blocks(self, compact_filter_blocks) -> None:
         shape_count = len(self.shape_type)

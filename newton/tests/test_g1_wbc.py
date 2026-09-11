@@ -185,6 +185,21 @@ class TestG1WBC(unittest.TestCase):
             selected = int(mpc.traces.selected.numpy()[0])
             self.assertGreaterEqual(selected, mpc.gradient_proposals.shape[0])
             self.assertTrue(np.isfinite(mpc.traces.positions.numpy()[selected]).all())
+            # A fully force-saturated actuator cannot respond to a small target change.
+            mpc.record_traces = False
+            mpc.gradient_proposals.fill_(3.0)
+            mpc.differentiate(q, v, clock)
+            for state in mpc.states[1:]:
+                np.testing.assert_allclose(state.actuator_force.numpy(), 20.0, atol=1e-5)
+            np.testing.assert_allclose(mpc.gradient.numpy(), 0.0, atol=1e-7)
+            plans.fill(3.0)
+            plans[1] += epsilon * direction
+            plans[2] -= epsilon * direction
+            mpc.data, mpc.proposals, mpc.costs = mpc.line_data, mpc.line_proposals, mpc.line_costs
+            mpc.samples = mpc.line_proposals.shape[0]
+            mpc.line_proposals.assign(plans)
+            mpc.rollout(q, v, clock)
+            np.testing.assert_array_equal(mpc.line_costs.numpy()[1:3], mpc.line_costs.numpy()[0])
 
     def test_foot_clearance_measurement(self):
         """A known suppressed swing must be distinguished from pose matching."""

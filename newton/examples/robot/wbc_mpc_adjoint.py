@@ -3,7 +3,7 @@
 """Sketched Gauss-Newton shooting using MuJoCo Warp PR #1535 adjoints.
 
 Random residual projections approximate J.T @ J; a separate adjoint computes
-the exact gradient of the pose/velocity objective. Multiple independently
+the unprojected gradient of the pose/velocity objective. Multiple independently
 perturbed starts combine sampling with local updates. Contact-force penalties
 remain in candidate acceptance, but are not differentiated by this adapter.
 """
@@ -109,8 +109,20 @@ def _sum_gradient(local: wp.array2d[float], future: wp.array2d[float], output: w
 
 
 @wp.kernel
-def _control_vjp(ctrl: wp.array2d[float], elapsed: float, spacing: float, gradient: wp.array3d[float]):
+def _control_vjp(
+    ctrl: wp.array2d[float],
+    force: wp.array2d[float],
+    limits: wp.array2d[wp.vec2],
+    elapsed: float,
+    spacing: float,
+    gradient: wp.array3d[float],
+):
     w, j = wp.tid()
+    bounds = limits[w % limits.shape[0], j]
+    # PR #1535's fixed-gain control VJP omits the force-clamp derivative.
+    # Every actuator in this adapter is force limited by the shared model.
+    if force[w, j] <= bounds[0] or force[w, j] >= bounds[1]:
+        return
     phase = elapsed / spacing
     k = wp.min(int(phase), gradient.shape[1] - 2)
     a = phase - float(k)
@@ -342,7 +354,13 @@ class WholeBodyAdjoint(WholeBodyMPC):
             wp.launch(
                 _control_vjp,
                 before.ctrl.shape,
-                inputs=[before.ctrl.grad, step * self.dt, self.spacing],
+                inputs=[
+                    before.ctrl.grad,
+                    after.actuator_force,
+                    self.model.actuator_forcerange,
+                    step * self.dt,
+                    self.spacing,
+                ],
                 outputs=[self.gradient],
             )
             wp.copy(self.future_q, before.qpos.grad)

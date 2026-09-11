@@ -34,7 +34,7 @@ of `mpc-gn`:
   receives its own physical rollout for measured cost and prediction paths.
 - `--controller mpc-adjoint`: experimental sketched Gauss-Newton using the
   MuJoCo Warp PR #1535 reverse derivatives. With `--adjoint-sketch 16`, 17
-  identical forward lanes carry 16 residual projections and one exact
+  identical forward lanes carry 16 residual projections and one unprojected
   pose/velocity gradient. Eight additional trajectories evaluate step lengths.
   The Hessian approximation is `(S J).T @ (S J)` for a Rademacher sketch `S`,
   while the right-hand side uses the full pose/velocity gradient. This reduces
@@ -58,6 +58,8 @@ PYTHONPATH=../mujoco-warp-adjoint uv run --extra wbc -m newton.examples robot_g1
 The adjoint adapter differentiates free-base/hinge state dynamics and body pose
 costs. PR #1535 freezes collision witnesses locally and uses implicit contact
 solver derivatives; it does not differentiate contact-mode changes. The
+adapter also masks the PR’s control VJP at saturated actuator forces; a
+physical saturation regression verifies the zero response. The
 non-foot contact-force penalty participates in candidate acceptance but is
 excluded from the derivative. Random projection rows approximate curvature;
 these modes are not full-Jacobian analytic Gauss-Newton. The implementation

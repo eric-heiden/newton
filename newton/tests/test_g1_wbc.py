@@ -200,6 +200,97 @@ class TestG1WBC(unittest.TestCase):
                 self.assertAlmostEqual(float(costs.numpy()[0]), expected, places=5)
                 self.assertAlmostEqual(float(np.sum(residual.numpy() ** 2)), expected, places=5)
 
+    def test_head_pose_objective_and_measurement(self):
+        """Known head translation and tilt agree with an independent rotation oracle."""
+        import mujoco
+        from scipy.spatial.transform import Rotation
+
+        from newton.examples.robot.wbc_controller import G1_HEAD_OFFSET, measure_head_tracking  # noqa: PLC0415
+        from newton.examples.robot.wbc_mpc import _head_score  # noqa: PLC0415
+
+        actual = Rotation.from_euler("y", 0.6)
+        target = Rotation.from_euler("y", 0.1)
+        origin = np.array([0.1, -0.2, 0.8])
+        desired = np.array([0.0, 0.0, 0.8]) + target.apply(G1_HEAD_OFFSET)
+        position = origin + actual.apply(G1_HEAD_OFFSET)
+        expected = 0.4 * (100 * np.sum((position - desired) ** 2) + 80 * 0.25**2)
+        with wp.ScopedDevice("cpu"):
+            raw = actual.as_quat()[[3, 0, 1, 2]]
+            reference = np.r_[desired, target.as_quat()[[3, 0, 1, 2]]]
+            residual, costs = wp.zeros((1, 6)), wp.zeros(1)
+            wp.launch(
+                _head_score,
+                1,
+                inputs=[
+                    wp.array([[origin]], dtype=wp.vec3),
+                    wp.array([[raw]], dtype=wp.quat),
+                    wp.array(np.tile(reference, (2, 1)), dtype=float),
+                    0,
+                    wp.vec3(*G1_HEAD_OFFSET),
+                    wp.zeros(1),
+                    30.0,
+                    0.0,
+                    100.0,
+                    80.0,
+                    0.4,
+                    0,
+                    True,
+                    residual,
+                ],
+                outputs=[costs],
+            )
+            self.assertAlmostEqual(float(costs.numpy()[0]), expected, places=5)
+            self.assertAlmostEqual(float(np.sum(residual.numpy() ** 2)), expected, places=5)
+        model = mujoco.MjModel.from_xml_string(
+            '<mujoco><worldbody><body name="torso_link"><freejoint/><geom size=".1"/></body></worldbody></mujoco>'
+        )
+        qr, qa = model.qpos0.copy(), model.qpos0.copy()
+        qr[:3], qr[3:7] = [0, 0, 0.8], reference[3:]
+        qa[:3], qa[3:7] = origin, raw
+        ref = self.reference_type(model, np.tile(qr, (2, 1)))
+        metrics = measure_head_tracking(model, ref, [0, 0.01], [qa, qa])
+        self.assertAlmostEqual(metrics["head_position_rmse"], np.linalg.norm(position - desired), places=6)
+        self.assertAlmostEqual(metrics["head_rotation_rms_deg"], np.rad2deg(0.5), places=6)
+        self.assertAlmostEqual(metrics["head_downward_bias_deg"], np.rad2deg(0.5), places=6)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Gauss-Newton requires CUDA")
+    def test_head_graph_residuals_and_futures(self):
+        """The head task enters the full graph cost and records a rotated local point."""
+        import mujoco
+
+        from newton.examples.robot.wbc_controller import G1_HEAD_OFFSET  # noqa: PLC0415
+        from newton.examples.robot.wbc_mpc_gn import WholeBodyGaussNewton  # noqa: PLC0415
+        from newton.examples.robot.wbc_rollouts import RolloutTraces  # noqa: PLC0415
+
+        model = mujoco.MjModel.from_xml_string(
+            """<mujoco><worldbody><body name="torso_link" pos="0 0 .8"><freejoint/><geom size=".1" mass="10"/><body><joint name="j" armature=".01" actuatorfrcrange="-20 20"/><geom pos=".2 0 0" size=".05" mass="1"/></body></body></worldbody><actuator><motor joint="j"/></actuator></mujoco>"""
+        )
+        model.qpos0[3:7] = [np.cos(0.3), 0, np.sin(0.3), 0]
+        ref = self.reference_type(model, np.tile(model.qpos0, (2, 1)))
+        with wp.ScopedDevice("cuda:0"):
+            mpc = WholeBodyGaussNewton(
+                model,
+                np.array([30.0]),
+                np.array([3.0]),
+                ref,
+                horizon=0.03,
+                rounds=1,
+                head_position=100,
+                head_rotation=300,
+                hand_weight=0,
+                nonfoot_weight=0,
+            )
+            mpc.traces = RolloutTraces(mpc, ("head",), horizon=0.03, stride=1)
+            mpc.capture(wp.array(model.qpos0[None], dtype=float), wp.zeros((1, model.nv)), wp.zeros(1))
+            mpc.solve()
+            np.testing.assert_allclose(np.sum(mpc.residual.numpy() ** 2, axis=1), mpc.diff_costs.numpy(), rtol=1e-4)
+            data = mujoco.MjData(model)
+            for world, q in enumerate(mpc.diff_data.qpos.numpy()):
+                data.qpos[:] = q
+                mujoco.mj_kinematics(model, data)
+                expected = data.xpos[1] + data.xmat[1].reshape(3, 3) @ G1_HEAD_OFFSET
+                np.testing.assert_allclose(mpc.traces.positions.numpy()[world, -1, 0], expected, atol=1e-6)
+
     @unittest.skipUnless(wp.is_cuda_available(), "Gauss-Newton requires CUDA")
     def test_gauss_newton_graph_solve(self):
         """Check the captured damped solve against independent NumPy algebra."""

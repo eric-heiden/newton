@@ -7,6 +7,41 @@ import numpy as np
 from scipy import sparse
 from scipy.signal import butter, sosfiltfilt
 
+# Center of the G1 head mesh in the torso frame (metres). The head has no neck joint.
+G1_HEAD_OFFSET = (0.00765, 0.0, 0.38513)
+
+
+def measure_head_tracking(model, reference, times, poses):
+    """Head-center position, full rotation angle, and signed forward-axis tilt."""
+    bodies = [i for i in range(model.nbody) if model.body(i).name.endswith("torso_link")]
+    if not bodies:
+        return {}
+    body = bodies[0]
+    data = mujoco.MjData(model)
+    positions, rotations = [], []
+    for configurations in (poses, [reference.sample(t)[0] for t in times]):
+        p, r = [], []
+        for q in configurations:
+            data.qpos[:] = q
+            mujoco.mj_kinematics(model, data)
+            matrix = data.xmat[body].reshape(3, 3).copy()
+            p.append(data.xpos[body] + matrix @ G1_HEAD_OFFSET)
+            r.append(matrix)
+        positions.append(np.asarray(p))
+        rotations.append(np.asarray(r))
+    relative = np.einsum("tji,tjk->tik", rotations[1], rotations[0])
+    angles = np.arccos(np.clip((np.trace(relative, axis1=1, axis2=2) - 1) / 2, -1, 1))
+    # Positive depression means that the head's forward (+x) axis points down.
+    tilt = [np.arcsin(np.clip(-r[:, 2, 0], -1, 1)) for r in rotations]
+    error = np.rad2deg(tilt[0] - tilt[1])
+    return {
+        "head_position_rmse": float(np.sqrt(np.mean(np.sum((positions[0] - positions[1]) ** 2, axis=1)))),
+        "head_rotation_rms_deg": float(np.sqrt(np.mean(np.rad2deg(angles) ** 2))),
+        "head_rotation_p95_deg": float(np.percentile(np.rad2deg(angles), 95)),
+        "head_downward_bias_deg": float(np.mean(error)),
+        "head_tilt_rms_deg": float(np.sqrt(np.mean(error**2))),
+    }
+
 
 class MotionReference:
     """Sample a z-up MuJoCo qpos CSV (root quaternion is wxyz) in seconds."""

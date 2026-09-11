@@ -9,6 +9,8 @@ import mujoco_warp as mjw
 import numpy as np
 import warp as wp
 
+from newton.examples.robot.wbc_controller import G1_HEAD_OFFSET
+
 
 @wp.func
 def reference_value(values: wp.array2d[float], t: float, fps: float, column: int):
@@ -291,6 +293,47 @@ def _score(
 
 
 @wp.kernel
+def _head_score(
+    xpos: wp.array2d[wp.vec3],
+    xquat: wp.array2d[wp.quat],
+    headref: wp.array2d[float],
+    body: int,
+    local: wp.vec3,
+    clock: wp.array[float],
+    fps: float,
+    elapsed: float,
+    position_weight: float,
+    rotation_weight: float,
+    weight: float,
+    column: int,
+    record: bool,
+    residual: wp.array2d[float],
+    costs: wp.array[float],
+):
+    world = wp.tid()
+    t = clock[0] + elapsed
+    raw = xquat[world, body]
+    rotation = wp.quat(raw[1], raw[2], raw[3], raw[0])
+    position = xpos[world, body] + wp.quat_rotate(rotation, local)
+    target = wp.quat(
+        reference_value(headref, t, fps, 4),
+        reference_value(headref, t, fps, 5),
+        reference_value(headref, t, fps, 6),
+        reference_value(headref, t, fps, 3),
+    )
+    error = rotation_error(rotation, wp.normalize(target))
+    cost = float(0.0)
+    for j in range(3):
+        value = wp.sqrt(position_weight) * (position[j] - reference_value(headref, t, fps, j))
+        cost += residual_term(value, world, column + j, weight, record, residual)
+        value = wp.sqrt(rotation_weight) * error[j]
+        cost += residual_term(value, world, column + 3 + j, weight, record, residual)
+    if not wp.isfinite(cost):
+        cost = 1.0e20
+    costs[world] += weight * cost
+
+
+@wp.kernel
 def _min_cost(costs: wp.array[float], overflow: wp.array[int], statistics: wp.array[int], minimum: wp.array[float]):
     i = wp.tid()
     wp.atomic_min(minimum, 0, costs[i])
@@ -416,6 +459,8 @@ class WholeBodyMPC:
         hand_rotation=0.0,
         joint_velocity=0.0,
         arm_velocity_scale=1.0,
+        head_position=0.0,
+        head_rotation=0.0,
         iterations=20,
         temperature=0.2,
         nonfoot_weight=1000.0,
@@ -441,6 +486,8 @@ class WholeBodyMPC:
                 hand_rotation,
                 joint_velocity,
                 arm_velocity_scale,
+                head_position,
+                head_rotation,
             ]
         )
         if not np.isfinite(scales).all() or noise < 0 or joint_scale <= 0 or np.any(scales[4:] < 0) or iterations < 1:
@@ -471,6 +518,12 @@ class WholeBodyMPC:
         self.arm_velocity_scale = arm_velocity_scale
         self.hand_position, self.hand_rotation, self.joint_velocity = hand_position, hand_rotation, joint_velocity
         self.hand_clearance = hand_clearance
+        self.head_position, self.head_rotation = head_position, head_rotation
+        head_bodies = [i for i in range(m.nbody) if m.body(i).name.endswith("torso_link")]
+        self.head_body = head_bodies[0] if head_bodies else -1
+        self.track_head = bool(head_position or head_rotation)
+        if self.track_head and self.head_body < 0:
+            raise ValueError("Head tracking requires the G1 torso body")
         self.root_scale, self.rotation_scale = root_scale, rotation_scale
         self.sole_tracking = sole_tracking
         self.nonfoot_weight = nonfoot_weight
@@ -485,12 +538,18 @@ class WholeBodyMPC:
         bodyref = np.zeros((len(reference.qpos), 3 * len(tracked)))
         rotationref = np.zeros((len(reference.qpos), 4 * len(tracked)))
         self.state_width = 2 * m.nu + 12 + 6 * min(2, len(tracked)) + 7 * max(0, len(tracked) - 2)
+        self.head_column = self.state_width
+        self.state_width += 6 * self.track_head
         self.residual_width = self.state_width + m.nbody
+        headref = np.zeros((len(reference.qpos), 7))
         for i, q in enumerate(reference.qpos):
             data.qpos[:] = q
             mujoco.mj_kinematics(m, data)
             bodyref[i] = data.xpos[tracked].ravel()
             rotationref[i] = data.xquat[tracked].ravel()
+            if self.track_head:
+                headref[i, :3] = data.xpos[self.head_body] + data.xmat[self.head_body].reshape(3, 3) @ G1_HEAD_OFFSET
+                headref[i, 3:] = data.xquat[self.head_body]
             if sole_tracking:
                 local = np.array([[x, y, -0.035] for x in (-0.05, 0.12) for y in (-0.025, 0.025)])
                 for k, body in enumerate(tracked[:2]):
@@ -504,6 +563,7 @@ class WholeBodyMPC:
             self.vref = wp.array(reference.velocity, dtype=float)
             self.bodyref = wp.array(bodyref, dtype=float)
             self.rotationref = wp.array(rotationref, dtype=float)
+            self.headref = wp.array(headref, dtype=float)
             self.residual = wp.zeros((1, 0))
             self.body_force = wp.zeros((samples, m.nbody))
             self.tracked = wp.array(tracked, dtype=int)
@@ -603,6 +663,7 @@ class WholeBodyMPC:
                 or self.hand_position
                 or self.hand_rotation
                 or self.record_traces
+                or self.track_head
             ):
                 mjw.kinematics(self.model, self.data)
             if self.record_traces:
@@ -650,6 +711,28 @@ class WholeBodyMPC:
                 ],
                 outputs=[self.costs],
             )
+            if self.track_head:
+                wp.launch(
+                    _head_score,
+                    self.samples,
+                    inputs=[
+                        self.data.xpos,
+                        self.data.xquat,
+                        self.headref,
+                        self.head_body,
+                        wp.vec3(*G1_HEAD_OFFSET),
+                        clock,
+                        self.fps,
+                        (step + 1) * self.dt,
+                        self.head_position,
+                        self.head_rotation,
+                        weight,
+                        step * self.residual_width + self.head_column,
+                        self.save_residuals,
+                        self.residual,
+                    ],
+                    outputs=[self.costs],
+                )
             self.body_force.zero_()
             if self.nonfoot_weight and self.tracked.shape[0] >= 2:
                 wp.launch(

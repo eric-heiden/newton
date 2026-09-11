@@ -29,6 +29,7 @@ from newton.examples.robot.wbc_controller import (
     MotionReference,
     WholeBodyQP,
     measure_foot_tracking,
+    measure_head_tracking,
     measure_motion_tracking,
 )
 from newton.examples.robot.wbc_mpc import WholeBodyMPC, audit_step
@@ -57,6 +58,8 @@ class Example:
             "angular_weight": (0.0, 0.2),
             "hand_position": (0.0, 300.0),
             "hand_rotation": (0.0, 3.0),
+            "head_position": (0.0, 300.0),
+            "head_rotation": (0.0, 300.0),
             "joint_velocity": (0.0, 0.02),
             "arm_velocity_scale": (1.0, 5.0),
             "prediction_dt": (0.01, 0.005),
@@ -208,6 +211,8 @@ class Example:
                 hand_rotation=args.hand_rotation,
                 joint_velocity=args.joint_velocity,
                 arm_velocity_scale=args.arm_velocity_scale,
+                head_position=args.head_position,
+                head_rotation=args.head_rotation,
                 iterations=args.prediction_iterations,
                 device=self.model.device,
                 prediction_dt=args.prediction_dt,
@@ -218,7 +223,7 @@ class Example:
             if args.show_rollouts:
                 self.mpc.traces = RolloutTraces(
                     self.mpc,
-                    G1_TRACE_BODIES if args.rollout_torso else G1_TRACE_BODIES[:4],
+                    G1_TRACE_BODIES if args.rollout_torso else G1_TRACE_BODIES[:-1],
                     horizon=args.rollout_horizon,
                     stride=args.rollout_stride,
                 )
@@ -495,6 +500,7 @@ class Example:
         }
         summary.update(measure_foot_tracking(self.mj, self.motion, rows[:, 0], self.poses, self.points))
         summary.update(measure_motion_tracking(self.mj, self.motion, rows[:, 0], self.poses))
+        summary.update(measure_head_tracking(self.mj, self.motion, rows[:, 0], self.poses))
         Path(f"{path}.json").write_text(json.dumps(summary, indent=2) + "\n")
         traces = {}
         if self.trace_frames:
@@ -519,7 +525,7 @@ class Example:
             "--rollout-horizon", type=float, default=0.4, help="Displayed prediction duration in seconds"
         )
         parser.add_argument("--rollout-stride", type=int, default=4, help="Record every Nth prediction step")
-        parser.add_argument("--rollout-torso", action=argparse.BooleanOptionalAction, default=True)
+        parser.add_argument("--rollout-torso", action=argparse.BooleanOptionalAction, default=False)
         parser.add_argument("--motion", type=str, default=None, help="Kimodo G1 MuJoCo qpos CSV")
         parser.add_argument("--motion-fps", type=float, default=30.0)
         parser.add_argument("--slowdown", type=float, default=1.0)
@@ -558,6 +564,8 @@ class Example:
             "--hand-position", type=float, help="Wrist position tracking weight in inverse metres squared"
         )
         parser.add_argument("--hand-rotation", type=float, help="Wrist half-angle rotation tracking weight")
+        parser.add_argument("--head-position", type=float, help="Head-center position tracking weight")
+        parser.add_argument("--head-rotation", type=float, help="Head half-angle rotation tracking weight")
         parser.add_argument("--joint-velocity", type=float, help="Per-joint velocity tracking weight")
         parser.add_argument("--arm-velocity-scale", type=float, help="G1 arm multiplier for joint-velocity tracking")
         parser.add_argument("--hand-clearance", type=float, default=0.2)

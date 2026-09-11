@@ -41,6 +41,8 @@ The resolved configuration is included in every output JSON.
 | `--angular-weight` | 0.2 | 0 |
 | `--hand-position` | 300 | 0 |
 | `--hand-rotation` | 3 | 0 |
+| `--head-position` | 300 | 0 |
+| `--head-rotation` | 300 | 0 |
 | `--joint-velocity` | 0.02 | 0 |
 | `--arm-velocity-scale` | 5 | 1 |
 
@@ -50,6 +52,16 @@ multiplies derivative gains; torque bounds remain unchanged. Rotation costs
 use half of the shortest SO(3) logarithm. The default `--foot-task sole` penalizes the horizontal sole center and
 minimum sole-corner height; `--foot-task ankle` uses ankle-body origins.
 Reported foot metrics always use the four sole corners.
+
+The G1 head is rigidly attached to the torso; there is no actuated neck.
+`--head-position` tracks the head mesh center at torso-local coordinates
+(0.00765, 0, 0.38513) m. `--head-rotation` tracks its orientation using the
+half-angle SO(3) residual. These six residuals enter the same scalar cost and
+Gauss-Newton Jacobian as the other tasks. Set both weights to zero for the
+previous objective. Head metrics report center-position RMS, full rotation
+angle RMS/p95 in degrees, and signed downward tilt error of the forward axis.
+The target follows the reference even during inversion; this is not an upright
+head constraint.
 
 The `--hand-position`, `--hand-rotation` and `--joint-velocity`
 weights add world-frame wrist position, wrist rotation, and per-joint velocity
@@ -100,7 +112,7 @@ uv run --extra wbc -m newton.examples robot_g1_wbc \
 
 Solid lines show the selected plan; muted dashed lines show three alternative
 predictions. Blue/green mark left/right ankle origins, cyan/orange mark
-left/right wrist origins, and yellow marks the torso origin. These are body
+left/right wrist origins, and yellow marks the head center. These are body
 origins, not sole-clearance measurements. `--rollout-count 1` shows only the
 selected plan; `--rollout-count 4` includes three alternatives, chosen for
 spatial diversity from valid candidates. This display subset is not a
@@ -111,7 +123,7 @@ path follows whichever batch actually supplied the command.
 `--rollout-horizon 0.4` trims the displayed future without changing the 0.5 s
 optimization horizon. `--rollout-stride 4` records every fourth prediction step
 (20 ms at the default 5 ms step), including both endpoints. Use
-`--no-rollout-torso` to remove the torso trace. Already elapsed segments are
+`--rollout-torso` to add a torso-origin trace; the head path remains visible. Already elapsed segments are
 clipped in the live viewer. Predictions are in world coordinates and start at
 the live planning state; they are not histories or the later realized motion.
 

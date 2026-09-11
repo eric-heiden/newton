@@ -6,21 +6,36 @@ import mujoco_warp as mjw
 import numpy as np
 import warp as wp
 
-# Left foot, right foot, left hand, right hand, torso. Positions are body origins.
+from newton.examples.robot.wbc_controller import G1_HEAD_OFFSET
+
+# Body origins, plus a virtual head center rigidly attached to the torso.
 G1_TRACE_BODIES = (
     "left_ankle_roll_link",
     "right_ankle_roll_link",
     "left_wrist_yaw_link",
     "right_wrist_yaw_link",
+    "head",
     "torso_link",
 )
-TRACE_COLORS = np.array([(0.2, 0.55, 1.0), (0.3, 0.9, 0.35), (0.1, 0.9, 0.95), (1.0, 0.4, 0.18), (0.95, 0.8, 0.3)])
+TRACE_COLORS = np.array(
+    [(0.2, 0.55, 1.0), (0.3, 0.9, 0.35), (0.1, 0.9, 0.95), (1.0, 0.4, 0.18), (0.95, 0.8, 0.3), (0.8, 0.8, 0.85)]
+)
 
 
 @wp.kernel
-def _record(xpos: wp.array2d[wp.vec3], bodies: wp.array[int], offset: int, step: int, positions: wp.array3d[wp.vec3]):
+def _record(
+    xpos: wp.array2d[wp.vec3],
+    xquat: wp.array2d[wp.quat],
+    bodies: wp.array[int],
+    local: wp.array[wp.vec3],
+    offset: int,
+    step: int,
+    positions: wp.array3d[wp.vec3],
+):
     world, body = wp.tid()
-    positions[offset + world, step, body] = xpos[world, bodies[body]]
+    raw = xquat[world, bodies[body]]
+    rotation = wp.quat(raw[1], raw[2], raw[3], raw[0])
+    positions[offset + world, step, body] = xpos[world, bodies[body]] + wp.quat_rotate(rotation, local[body])
 
 
 @wp.kernel
@@ -58,12 +73,14 @@ class RolloutTraces:
         if not np.isfinite(horizon) or horizon <= 0 or stride < 1:
             raise ValueError("Trace horizon and stride must be positive")
         self.names = tuple(bodies)
-        ids = []
+        ids, local = [], []
         for name in bodies:
-            matches = [i for i in range(mpc.cpu_model.nbody) if mpc.cpu_model.body(i).name.endswith(name)]
+            target = "torso_link" if name == "head" else name
+            matches = [i for i in range(mpc.cpu_model.nbody) if mpc.cpu_model.body(i).name.endswith(target)]
             if len(matches) != 1:
                 raise ValueError(f"Expected one trace body matching {name!r}")
             ids.append(matches[0])
+            local.append(G1_HEAD_OFFSET if name == "head" else (0.0, 0.0, 0.0))
         if not ids:
             raise ValueError("At least one trace body is required")
         last = min(mpc.steps, max(1, int(np.floor(horizon / mpc.dt + 1e-6))))
@@ -75,6 +92,7 @@ class RolloutTraces:
         self.coordinate = bool(self.line_offset and mpc.coordinate_search)
         with wp.ScopedDevice(mpc.device):
             self.bodies = wp.array(ids, dtype=int)
+            self.local = wp.array(local, dtype=wp.vec3)
             self.positions = wp.zeros((count, len(indices), len(ids)), dtype=wp.vec3)
             self.costs = wp.zeros(count)
             self.selected = wp.full(1, -1, dtype=int)
@@ -90,7 +108,7 @@ class RolloutTraces:
         wp.launch(
             _record,
             (mpc.samples, len(self.names)),
-            inputs=[mpc.data.xpos, self.bodies, offset, self.step_index[step]],
+            inputs=[mpc.data.xpos, mpc.data.xquat, self.bodies, self.local, offset, self.step_index[step]],
             outputs=[self.positions],
         )
 

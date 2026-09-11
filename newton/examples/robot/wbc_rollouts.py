@@ -87,9 +87,16 @@ class RolloutTraces:
         indices = sorted({0, last, *range(stride, last + 1, stride)})
         self.step_index = {step: i for i, step in enumerate(indices)}
         self.offsets = np.array(indices) * mpc.dt
-        self.line_offset = mpc.diff_proposals.shape[0] if hasattr(mpc, "diff_proposals") else 0
-        count = self.line_offset + 8 if self.line_offset else mpc.samples
-        self.coordinate = bool(self.line_offset and mpc.coordinate_search)
+        self.batches = getattr(mpc, "trace_batches", None)
+        if self.batches is None:
+            self.batches = (
+                ((mpc.diff_data, mpc.diff_costs), (mpc.line_data, mpc.line_costs))
+                if hasattr(mpc, "diff_data")
+                else ((mpc.data, mpc.costs),)
+            )
+        self.line_offset = sum(cost.size for _, cost in self.batches[:-1])
+        count = sum(cost.size for _, cost in self.batches)
+        self.coordinate = bool(self.line_offset and getattr(mpc, "coordinate_search", False))
         with wp.ScopedDevice(mpc.device):
             self.bodies = wp.array(ids, dtype=int)
             self.local = wp.array(local, dtype=wp.vec3)
@@ -99,12 +106,18 @@ class RolloutTraces:
             self.qpos = wp.zeros((1, mpc.cpu_model.nq))
             self.time = wp.zeros(1)
 
-    def record(self, mpc, step):
+    def record(self, mpc, step, *, batch_offset=None):
         if step not in self.step_index:
             return
         if step == 0:
             mjw.kinematics(mpc.model, mpc.data)
-        offset = self.line_offset if self.line_offset and mpc.data is mpc.line_data else 0
+        offset = 0
+        for data, costs in self.batches:
+            if data is mpc.data:
+                break
+            offset += costs.size
+        if batch_offset is not None:
+            offset = batch_offset
         wp.launch(
             _record,
             (mpc.samples, len(self.names)),
@@ -113,16 +126,17 @@ class RolloutTraces:
         )
 
     def finish(self, mpc, q, clock):
-        if self.line_offset:
-            wp.copy(self.costs, mpc.diff_costs)
-        wp.copy(self.costs, mpc.costs, dest_offset=self.line_offset)
+        offset = 0
+        for _, costs in self.batches:
+            wp.copy(self.costs, costs, dest_offset=offset)
+            offset += costs.size
         wp.launch(
             _selection,
             1,
             inputs=[
                 self.costs,
                 mpc.best,
-                mpc.difference_best if self.line_offset else mpc.best,
+                mpc.difference_best if self.coordinate else mpc.best,
                 self.line_offset,
                 self.coordinate,
             ],

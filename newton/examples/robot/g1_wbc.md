@@ -22,10 +22,54 @@ preprocessing, recording and visualization are outside that graph.
 selects the inexpensive native MuJoCo CPU inverse-dynamics baseline. The QP
 works for standing gestures; the tested dynamic motions require preview.
 
+Additional comparisons share the head, wrist, sole, PD, and prediction defaults
+of `mpc-gn`:
+
+- `--controller mpc-dial`: DIAL-MPC horizon and iteration annealing, normalized
+  softmax averaging, and a fixed first command knot. Defaults are 1024 samples,
+  two refinement rounds (ten at initialization), noise 0.12 rad, temperature
+  0.06, horizon decay 0.9 and round decay 0.5. This ports the published update
+  onto the shared four **linear PD-offset knots**; it does not reproduce the
+  upstream quadratic spline or normalized action space. The returned mean
+  receives its own physical rollout for measured cost and prediction paths.
+- `--controller mpc-adjoint`: experimental sketched Gauss-Newton using the
+  MuJoCo Warp PR #1535 reverse derivatives. With `--adjoint-sketch 16`, 17
+  identical forward lanes carry 16 residual projections and one exact
+  pose/velocity gradient. Eight additional trajectories evaluate step lengths.
+  The Hessian approximation is `(S J).T @ (S J)` for a Rademacher sketch `S`,
+  while the right-hand side uses the full pose/velocity gradient. This reduces
+  trajectory count, but backward dynamics can cost more than finite differences.
+- `--controller mpc-hybrid`: the same analytic update at four parallel starts;
+  the first is the shifted previous plan and the others add Gaussian offsets.
+  `--adjoint-starts`, `--adjoint-sketch`, and `--adjoint-noise` set this budget.
+  Every start receives a local solve and physical line search before selection.
+
+DIAL works with the normal dependency. Analytic modes require the experimental
+branch, pinned here without replacing the normal installed package:
+
+```bash
+git clone https://github.com/google-deepmind/mujoco_warp.git ../mujoco-warp-adjoint
+git -C ../mujoco-warp-adjoint fetch origin pull/1535/head
+git -C ../mujoco-warp-adjoint checkout 357a75d60a56d67d476942a1b6e54b3045ee8e87
+PYTHONPATH=../mujoco-warp-adjoint uv run --extra wbc -m newton.examples robot_g1_wbc \
+  --controller mpc-adjoint --motion walk.csv --show-rollouts
+```
+
+The adjoint adapter differentiates free-base/hinge state dynamics and body pose
+costs. PR #1535 freezes collision witnesses locally and uses implicit contact
+solver derivatives; it does not differentiate contact-mode changes. The
+non-foot contact-force penalty participates in candidate acceptance but is
+excluded from the derivative. Random projection rows approximate curvature;
+these modes are not full-Jacobian analytic Gauss-Newton. The implementation
+stores forward states and reuses their caches in reverse. Both passes, the
+linear solve, and the line searches execute in one CUDA graph. `--seed` affects
+DIAL, the analytic sketch, and hybrid starts. The adapter is experimental and
+currently assumes a G1-style free root followed by scalar hinge joints.
+
 The following defaults are chosen by controller; explicit flags override them.
 The resolved configuration is included in every output JSON.
 
-| Option | Gauss-Newton | Sampling / CPU baselines |
+| Option | GN / DIAL / analytic | Legacy sampling / CPU baselines |
 | --- | ---: | ---: |
 | `--mpc-rounds` | 1 | 2 |
 | `--prediction-dt` | 0.005 | 0.01 |
@@ -86,7 +130,7 @@ most 127 parameters. The default uses one iteration (241 trajectories per update
 tracking relative to two iterations with 10 ms prediction steps at similar
 compute cost. `--mpc-rounds 2` spends more compute; improvement is not guaranteed.
 Sampling uses `--mpc-samples 1024`, `--noise 0.12` and
-`--temperature 0.2`. `--seed` affects sampling only; Gauss-Newton has no random
+`--temperature 0.2`. `--seed` affects stochastic modes; finite-difference Gauss-Newton has no random
 search. Floating-point contact reductions can affect repeatability in either
 mode. Increasing samples, gains, weights, or iteration counts need not improve
 closed-loop tracking.

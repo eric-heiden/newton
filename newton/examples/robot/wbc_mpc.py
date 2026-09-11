@@ -668,104 +668,111 @@ class WholeBodyMPC:
                 mjw.kinematics(self.model, self.data)
             if self.record_traces:
                 self.traces.record(self, step + 1)
-            weight = 1.0 / self.steps + float(step == self.steps - 1)
+            self.score(clock, step)
+
+    def score(self, clock, step, *, pose_only=False, residual_step=None):
+        """Accumulate one stage using the shared task and acceptance objective."""
+        weight = 1.0 / self.steps + float(step == self.steps - 1)
+        column_step = step if residual_step is None else residual_step
+        wp.launch(
+            _score,
+            self.samples,
+            inputs=[
+                self.data.qpos,
+                self.data.qvel,
+                self.data.xpos,
+                self.data.xquat,
+                self.qref,
+                self.vref,
+                self.bodyref,
+                self.rotationref,
+                self.tracked,
+                clock,
+                self.fps,
+                (step + 1) * self.dt,
+                weight,
+                self.joint_scale,
+                self.root_scale,
+                self.rotation_scale,
+                self.foot_weight,
+                self.hand_weight,
+                self.hand_clearance,
+                self.foot_vertical,
+                self.foot_rotation,
+                self.angular_weight,
+                self.sole_tracking,
+                self.hand_position,
+                self.hand_rotation,
+                self.joint_velocity,
+                self.arm_velocity_scale,
+                column_step,
+                self.residual_width,
+                self.save_residuals,
+                self.residual,
+                self.data.overflow,
+                self.data.nefc,
+                self.data.nacon,
+                self.statistics,
+            ],
+            outputs=[self.costs],
+        )
+        if self.track_head:
             wp.launch(
-                _score,
+                _head_score,
                 self.samples,
                 inputs=[
-                    self.data.qpos,
-                    self.data.qvel,
                     self.data.xpos,
                     self.data.xquat,
-                    self.qref,
-                    self.vref,
-                    self.bodyref,
-                    self.rotationref,
-                    self.tracked,
+                    self.headref,
+                    self.head_body,
+                    wp.vec3(*G1_HEAD_OFFSET),
                     clock,
                     self.fps,
                     (step + 1) * self.dt,
+                    self.head_position,
+                    self.head_rotation,
                     weight,
-                    self.joint_scale,
-                    self.root_scale,
-                    self.rotation_scale,
-                    self.foot_weight,
-                    self.hand_weight,
-                    self.hand_clearance,
-                    self.foot_vertical,
-                    self.foot_rotation,
-                    self.angular_weight,
-                    self.sole_tracking,
-                    self.hand_position,
-                    self.hand_rotation,
-                    self.joint_velocity,
-                    self.arm_velocity_scale,
-                    step,
-                    self.residual_width,
+                    column_step * self.residual_width + self.head_column,
                     self.save_residuals,
                     self.residual,
-                    self.data.overflow,
-                    self.data.nefc,
-                    self.data.nacon,
-                    self.statistics,
                 ],
                 outputs=[self.costs],
             )
-            if self.track_head:
-                wp.launch(
-                    _head_score,
-                    self.samples,
-                    inputs=[
-                        self.data.xpos,
-                        self.data.xquat,
-                        self.headref,
-                        self.head_body,
-                        wp.vec3(*G1_HEAD_OFFSET),
-                        clock,
-                        self.fps,
-                        (step + 1) * self.dt,
-                        self.head_position,
-                        self.head_rotation,
-                        weight,
-                        step * self.residual_width + self.head_column,
-                        self.save_residuals,
-                        self.residual,
-                    ],
-                    outputs=[self.costs],
-                )
-            self.body_force.zero_()
-            if self.nonfoot_weight and self.tracked.shape[0] >= 2:
-                wp.launch(
-                    _contact_cost,
-                    self.data.contact.geom.shape[0],
-                    inputs=[
-                        self.data.contact.geom,
-                        self.data.contact.efc_address,
-                        self.data.nacon,
-                        self.data.contact.worldid,
-                        self.data.contact.dim,
-                        self.data.efc.force,
-                        self.model.geom_bodyid,
-                        self.tracked,
-                        int(self.cpu_model.opt.cone),
-                    ],
-                    outputs=[self.body_force],
-                )
+        if pose_only:
+            return
+        self.body_force.zero_()
+        if self.nonfoot_weight and self.tracked.shape[0] >= 2:
             wp.launch(
-                _force_score,
-                self.samples,
+                _contact_cost,
+                self.data.contact.geom.shape[0],
                 inputs=[
-                    self.body_force,
-                    self.nonfoot_weight,
-                    step,
-                    self.residual_width,
-                    self.state_width,
-                    weight,
-                    self.save_residuals,
-                    self.residual,
+                    self.data.contact.geom,
+                    self.data.contact.efc_address,
+                    self.data.nacon,
+                    self.data.contact.worldid,
+                    self.data.contact.dim,
+                    self.data.efc.force,
+                    self.model.geom_bodyid,
+                    self.tracked,
+                    int(self.cpu_model.opt.cone),
                 ],
-                outputs=[self.costs],
+                outputs=[self.body_force],
             )
+        wp.launch(
+            _force_score,
+            self.samples,
+            inputs=[
+                self.body_force,
+                self.nonfoot_weight,
+                step,
+                self.residual_width,
+                self.state_width,
+                weight,
+                self.save_residuals,
+                self.residual,
+            ],
+            outputs=[self.costs],
+        )
 
     def capture(self, q, v, clock):
         with wp.ScopedDevice(self.device):

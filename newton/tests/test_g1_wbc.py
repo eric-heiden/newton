@@ -32,6 +32,78 @@ class TestG1WBC(unittest.TestCase):
           </body></worldbody><actuator><motor joint="hinge"/></actuator>
         </mujoco>""")
 
+    def test_dial_annealing_and_normalized_update(self):
+        """Check horizon annealing and softmax refinement against independent algebra."""
+        from newton.examples.robot.wbc_mpc_dial import (  # noqa: PLC0415
+            _dial_moments,
+            _dial_propose,
+            _dial_update,
+            _dial_weights,
+        )
+
+        with wp.ScopedDevice("cpu"):
+            center = wp.zeros((4, 2))
+            base, annealed = wp.zeros((10, 4, 2)), wp.zeros((10, 4, 2))
+            iteration = wp.zeros(1, dtype=int)
+            for output, horizon, decay in [(base, 1.0, 1.0), (annealed, 0.5, 0.25)]:
+                wp.launch(
+                    _dial_propose,
+                    output.shape,
+                    inputs=[center, iteration, 42, 2, 0.01, horizon, decay],
+                    outputs=[output],
+                )
+            expected = base.numpy() * (0.5 ** np.arange(3, -1, -1))[None, :, None] * 0.25**2
+            np.testing.assert_allclose(annealed.numpy(), expected, atol=1e-8)
+            np.testing.assert_array_equal(base.numpy()[:, 0], 0)
+            costs = wp.array([4.0, 6.0, 8.0, 1e20], dtype=float)
+            minimum, moments, weights = wp.array([4.0], dtype=float), wp.zeros(3), wp.zeros(4)
+            values = np.arange(16, dtype=np.float32).reshape(4, 2, 2)
+            result = wp.zeros((2, 2))
+            wp.launch(_dial_moments, 4, inputs=[costs, minimum], outputs=[moments])
+            wp.launch(_dial_weights, 4, inputs=[costs, minimum, moments, 0.5], outputs=[weights])
+            wp.launch(_dial_update, (2, 2), inputs=[wp.array(values), weights], outputs=[result])
+            expected_weights = np.exp(-np.array([0, 2, 4]) / (np.std([4, 6, 8]) * 0.5))
+            expected = np.einsum("i,ijk->jk", expected_weights / expected_weights.sum(), values[:3])
+            np.testing.assert_allclose(result.numpy(), expected, rtol=1e-6)
+            self.assertEqual(weights.numpy()[-1], 0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "DIAL-MPC requires CUDA")
+    def test_dial_graph_and_mean_future(self):
+        """Verify the executed DIAL mean has its own native-matching physical future."""
+        import mujoco
+
+        from newton.examples.robot.wbc_mpc_dial import WholeBodyDial  # noqa: PLC0415
+        from newton.examples.robot.wbc_rollouts import RolloutTraces  # noqa: PLC0415
+
+        model = mujoco.MjModel.from_xml_string(
+            """<mujoco><worldbody><body name="base" pos="0 0 .8"><freejoint/><geom size=".1" mass="10"/><body><joint name="j" armature=".01" actuatorfrcrange="-20 20"/><geom pos=".2 0 0" size=".05" mass="1"/></body></body></worldbody><actuator><motor joint="j"/></actuator></mujoco>"""
+        )
+        reference = self.reference_type(model, np.tile(model.qpos0, (3, 1)))
+        with wp.ScopedDevice("cuda:0"):
+            mpc = WholeBodyDial(
+                model,
+                np.array([30.0]),
+                np.array([3.0]),
+                reference,
+                samples=8,
+                horizon=0.02,
+                rounds=2,
+                initial_rounds=3,
+                hand_weight=0,
+                nonfoot_weight=0,
+            )
+            mpc.traces = RolloutTraces(mpc, ("base",), horizon=0.02, stride=1)
+            mpc.capture(wp.array(model.qpos0[None], dtype=float), wp.zeros((1, model.nv)), wp.zeros(1))
+            for _ in range(2):
+                mpc.solve()
+                self.assertEqual(mpc.traces.selected.numpy()[0], 8)
+                np.testing.assert_allclose(mpc.minimum.numpy(), mpc.mean_costs.numpy())
+                data = mujoco.MjData(mpc.cpu_model)
+                data.qpos[:] = mpc.mean_data.qpos.numpy()[0]
+                mujoco.mj_kinematics(mpc.cpu_model, data)
+                np.testing.assert_allclose(mpc.traces.positions.numpy()[8, -1, 0], data.xpos[1], atol=1e-6)
+                self.assertTrue(np.isfinite(mpc.plan.numpy()).all())
+
     def test_reference_shortest_rotation_and_endpoint(self):
         """Verify quaternion sign continuity and the held endpoint."""
         q = np.tile(self.model.qpos0, (3, 1))
@@ -47,6 +119,72 @@ class TestG1WBC(unittest.TestCase):
         for fps in (0, -1, np.nan, np.inf):
             with self.assertRaises(ValueError):
                 self.reference_type(self.model, q, fps=fps)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Analytic MPC requires CUDA")
+    def test_adjoint_multistep_gradient_and_graph(self):
+        """Compare repeated adjoints with physical finite differences, then test descent."""
+        import mujoco
+        import mujoco_warp as mjw
+
+        from newton.examples.robot.wbc_mpc_adjoint import WholeBodyAdjoint  # noqa: PLC0415
+        from newton.examples.robot.wbc_rollouts import RolloutTraces  # noqa: PLC0415
+
+        if not hasattr(mjw, "enable_grad"):
+            self.skipTest("Requires the optional MuJoCo Warp PR #1535")
+        model = mujoco.MjModel.from_xml_string(
+            '<mujoco><worldbody><body name="base" pos="0 0 .8"><freejoint/>'
+            '<geom size=".1" mass="10"/><body name="torso_link" pos=".2 0 0">'
+            '<joint name="j" armature=".01" actuatorfrcrange="-20 20"/>'
+            '<geom pos=".2 0 0" size=".05" mass="1"/></body></body></worldbody>'
+            '<actuator><motor joint="j"/></actuator></mujoco>'
+        )
+        poses = np.tile(model.qpos0, (31, 1))
+        poses[:, -1] = 0.3
+        reference = self.reference_type(model, poses)
+        with wp.ScopedDevice("cuda:0"):
+            mpc = WholeBodyAdjoint(
+                model,
+                np.array([30.0]),
+                np.array([3.0]),
+                reference,
+                sketch=4,
+                starts=2,
+                horizon=0.03,
+                rounds=1,
+                head_position=100,
+                head_rotation=300,
+                hand_weight=0,
+                nonfoot_weight=0,
+            )
+            q = wp.array(model.qpos0[None], dtype=float)
+            v, clock = wp.zeros((1, model.nv)), wp.zeros(1)
+            mpc.traces = RolloutTraces(mpc, ("head",), horizon=0.03, stride=1)
+            mpc.capture(q, v, clock)
+            mpc.record_traces = False
+            center = np.full(mpc.plan.shape, 0.05, dtype=np.float32)
+            mpc.gradient_proposals.assign(np.broadcast_to(center, mpc.gradient_proposals.shape).copy())
+            mpc.differentiate(q, v, clock)
+            first = mpc.gradient.numpy().copy()
+            mpc.differentiate(q, v, clock)
+            np.testing.assert_allclose(mpc.gradient.numpy(), first, atol=1e-5, rtol=1e-4)
+            direction = np.array([[0.1], [-0.7], [0.5], [0.2]], dtype=np.float32)
+            epsilon = 0.003
+            plans = np.broadcast_to(center, mpc.line_proposals.shape).copy()
+            plans[1] += epsilon * direction
+            plans[2] -= epsilon * direction
+            mpc.data, mpc.proposals, mpc.costs = mpc.line_data, mpc.line_proposals, mpc.line_costs
+            mpc.samples = mpc.line_proposals.shape[0]
+            mpc.line_proposals.assign(plans)
+            mpc.rollout(q, v, clock)
+            costs = mpc.line_costs.numpy()
+            finite_difference = (costs[1] - costs[2]) / (2 * epsilon)
+            analytic = np.sum(first[mpc.sketch] * direction)
+            np.testing.assert_allclose(analytic, finite_difference, rtol=0.02, atol=1e-3)
+            mpc.solve()
+            self.assertLess(float(mpc.minimum.numpy()[0]), float(mpc.line_costs.numpy()[0]) - 1e-5)
+            selected = int(mpc.traces.selected.numpy()[0])
+            self.assertGreaterEqual(selected, mpc.gradient_proposals.shape[0])
+            self.assertTrue(np.isfinite(mpc.traces.positions.numpy()[selected]).all())
 
     def test_foot_clearance_measurement(self):
         """A known suppressed swing must be distinguished from pose matching."""

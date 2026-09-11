@@ -33,6 +33,8 @@ from newton.examples.robot.wbc_controller import (
     measure_motion_tracking,
 )
 from newton.examples.robot.wbc_mpc import WholeBodyMPC, audit_step
+from newton.examples.robot.wbc_mpc_adjoint import WholeBodyAdjoint
+from newton.examples.robot.wbc_mpc_dial import WholeBodyDial
 from newton.examples.robot.wbc_mpc_gn import WholeBodyGaussNewton
 from newton.examples.robot.wbc_rollouts import G1_TRACE_BODIES, RolloutTraces, draw_rollouts
 
@@ -40,7 +42,7 @@ from newton.examples.robot.wbc_rollouts import G1_TRACE_BODIES, RolloutTraces, d
 class Example:
     def __init__(self, viewer, args):
         self.viewer, self.args = viewer, args
-        if args.show_rollouts and args.controller not in ("mpc", "mpc-gn"):
+        if args.show_rollouts and args.controller not in ("mpc", "mpc-gn", "mpc-dial", "mpc-adjoint", "mpc-hybrid"):
             raise ValueError("Rollout visualization requires an MPC controller")
         if args.rollout_count < 1 or args.rollout_count > 16:
             raise ValueError("Display between 1 and 16 rollout candidates")
@@ -67,14 +69,22 @@ class Example:
             "actuation": ("torque", "pd"),
             "gn_coordinate_search": (False, True),
         }
+        if args.controller == "mpc-dial" and args.mpc_rounds is None:
+            args.mpc_rounds = 2
         for name, values in defaults.items():
             if getattr(args, name) is None:
-                setattr(args, name, values[int(args.controller == "mpc-gn")])
+                setattr(args, name, values[int(args.controller in ("mpc-gn", "mpc-dial", "mpc-adjoint", "mpc-hybrid"))])
         if not np.isfinite(args.slowdown) or args.slowdown <= 0:
             raise ValueError("slowdown must be finite and positive")
         self.fps = 50
         self.step_rate = max(args.control_rate, self.fps)
-        if args.control_rate < self.fps and args.controller not in ("mpc", "mpc-gn"):
+        if args.control_rate < self.fps and args.controller not in (
+            "mpc",
+            "mpc-gn",
+            "mpc-dial",
+            "mpc-adjoint",
+            "mpc-hybrid",
+        ):
             raise ValueError("Replanning below 50 Hz is supported by the GPU MPC modes")
         self.frame_dt = 1 / self.fps
         self.sim_time = 0.0
@@ -113,7 +123,13 @@ class Example:
             raise ValueError("gain-scale must be finite and positive")
         self.kp *= args.gain_scale
         self.kd *= np.sqrt(args.gain_scale)
-        self.native_pd = args.actuation == "pd" and args.controller in ("mpc", "mpc-gn")
+        self.native_pd = args.actuation == "pd" and args.controller in (
+            "mpc",
+            "mpc-gn",
+            "mpc-dial",
+            "mpc-adjoint",
+            "mpc-hybrid",
+        )
         if self.native_pd:
             builder.joint_target_ke[6:] = self.kp.tolist()
             builder.joint_target_kd[6:] = self.kd.tolist()
@@ -128,7 +144,7 @@ class Example:
                 (-limit, limit) for limit in builder.joint_effort_limit[6:]
             ]
         # The MJCF already supplies the textured ground plane.
-        self.gpu = args.controller in ("mpc", "mpc-gn")
+        self.gpu = args.controller in ("mpc", "mpc-gn", "mpc-dial", "mpc-adjoint", "mpc-hybrid")
         if self.gpu and not wp.get_device(args.device or "cuda:0").is_cuda:
             raise ValueError("MPC requires CUDA; use --controller qp for the CPU baseline")
         self.model = builder.finalize(device=(args.device or "cuda:0") if self.gpu else "cpu")
@@ -175,7 +191,13 @@ class Example:
         qpos[:, 2] += self.floor_shift
         self.mpc = None
         if self.gpu:
-            controller = WholeBodyGaussNewton if args.controller == "mpc-gn" else WholeBodyMPC
+            controller = {
+                "mpc": WholeBodyMPC,
+                "mpc-gn": WholeBodyGaussNewton,
+                "mpc-dial": WholeBodyDial,
+                "mpc-adjoint": WholeBodyAdjoint,
+                "mpc-hybrid": WholeBodyAdjoint,
+            }[args.controller]
             extra = (
                 {
                     "epsilon": args.gn_epsilon,
@@ -186,6 +208,23 @@ class Example:
                 if args.controller == "mpc-gn"
                 else {}
             )
+            if args.controller == "mpc-dial":
+                extra = {
+                    "horizon_decay": args.dial_horizon_decay,
+                    "round_decay": args.dial_round_decay,
+                    "initial_rounds": args.dial_initial_rounds,
+                    "dial_temperature": args.dial_temperature,
+                }
+            if args.controller in ("mpc-adjoint", "mpc-hybrid"):
+                if args.adjoint_starts is None:
+                    args.adjoint_starts = 4 if args.controller == "mpc-hybrid" else 1
+                extra = {
+                    "sketch": args.adjoint_sketch,
+                    "starts": args.adjoint_starts,
+                    "start_noise": args.adjoint_noise,
+                    "damping": args.gn_damping,
+                    "trust": args.gn_trust,
+                }
             self.mpc = controller(
                 self.mj,
                 self.kp,
@@ -462,6 +501,11 @@ class Example:
         if self.gpu:
             timing = timing[timing > 0]
         timing = timing[min(10, len(timing) - 1) :]
+        # Include physics-only subframes when comparing with a replan deadline.
+        period = self.step_rate // self.args.control_rate
+        wall = np.add.reduceat(rows[:, 8], np.arange(0, len(rows), period)) if self.gpu else None
+        if wall is not None:
+            wall = wall[min(10, len(wall) - 1) :]
         d = mujoco.MjData(self.mj)
         d.qpos[:] = self.q
         mujoco.mj_kinematics(self.mj, d)
@@ -489,7 +533,11 @@ class Example:
             "plant_peak_constraints": self.max_plant_constraints,
             "plant_peak_contacts": self.max_plant_contacts,
             "backend": "mujoco_warp_cuda_graph" if self.gpu else "mujoco_cpu",
-            "control_wall_ms_median": float(np.median(rows[min(10, len(rows) - 1) :, 8])) if self.gpu else None,
+            "control_wall_ms_median": float(np.median(wall)) if self.gpu else None,
+            "control_wall_ms_p95": float(np.percentile(wall, 95)) if self.gpu else None,
+            "control_period_deadline_miss_fraction": (
+                float(np.mean(wall > 1000 / self.args.control_rate)) if self.gpu else None
+            ),
             "final_height": float(self.q[2]),
             "final_up": final_up,
             "recovered": bool(self.q[2] > 0.55 and final_up > 0.7),
@@ -529,7 +577,11 @@ class Example:
         parser.add_argument("--motion", type=str, default=None, help="Kimodo G1 MuJoCo qpos CSV")
         parser.add_argument("--motion-fps", type=float, default=30.0)
         parser.add_argument("--slowdown", type=float, default=1.0)
-        parser.add_argument("--controller", choices=("qp", "pd", "mpc", "mpc-gn"), default="mpc-gn")
+        parser.add_argument(
+            "--controller",
+            choices=("qp", "pd", "mpc", "mpc-gn", "mpc-dial", "mpc-adjoint", "mpc-hybrid"),
+            default="mpc-gn",
+        )
         parser.add_argument("--actuation", choices=("torque", "pd"))
         parser.add_argument(
             "--gn-coordinate-search",
@@ -540,6 +592,13 @@ class Example:
         parser.add_argument("--gn-epsilon", type=float, default=0.03)
         parser.add_argument("--gn-damping", type=float, default=0.1)
         parser.add_argument("--gn-trust", type=float, default=0.2)
+        parser.add_argument("--adjoint-sketch", type=int, default=16)
+        parser.add_argument("--adjoint-starts", type=int)
+        parser.add_argument("--adjoint-noise", type=float, default=0.05)
+        parser.add_argument("--dial-temperature", type=float, default=0.06)
+        parser.add_argument("--dial-horizon-decay", type=float, default=0.9)
+        parser.add_argument("--dial-round-decay", type=float, default=0.5)
+        parser.add_argument("--dial-initial-rounds", type=int, default=10)
         parser.add_argument("--mpc-samples", type=int, default=1024)
         parser.add_argument("--mpc-rounds", type=int, help="Search iterations; compute cost scales with this count")
         parser.add_argument("--prediction-dt", type=float)

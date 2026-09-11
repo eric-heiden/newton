@@ -5526,6 +5526,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 mj_contact.dim,
                 mj_contact.geom,
                 mj_contact.efc_address,
+                getattr(mj_contact, "adhesion", mj_contact.dist),
                 mj_contact.worldid,
                 mj_data.efc.force,
                 self.mjw_model.geom_bodyid,

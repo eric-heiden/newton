@@ -62,6 +62,8 @@ def initialize_step(
     x = particle_q[particle]
     x_previous[particle] = x
     x_current[particle] = x
+    if not wp.isfinite(wp.length(x)) or not wp.isfinite(wp.length(particle_qd[particle])):
+        wp.atomic_max(invalid, 0, 1)
 
     mass = particle_mass[particle]
     active = (particle_flags[particle] & ParticleFlags.ACTIVE) != 0 and mass > 0.0
@@ -70,6 +72,8 @@ def initialize_step(
         x_predictor[particle] = (
             x + particle_qd[particle] * dt + (gravity[world] + particle_f[particle] / mass) * (dt * dt)
         )
+        if not wp.isfinite(wp.length(x_predictor[particle])):
+            wp.atomic_max(invalid, 0, 1)
         static_diagonal[particle] = mass / (dt * dt) + pd_diagonal[particle]
 
         gap = wp.dot(normal, x) - plane_offset - minimum_separation
@@ -191,6 +195,63 @@ def bending_weight(cotangent: wp.vec4):
     )
 
 
+@wp.func
+def membrane_metric(x0: wp.vec3, x1: wp.vec3, x2: wp.vec3, pose: wp.mat22, stiffness: wp.vec3, area: float):
+    """Form PSD stretch blocks and a Gauss-Newton shear factor."""
+    fu, fv = triangle_deformation_gradient(x0, x1, x2, pose)
+    du = wp.vec3(-pose[0, 0] - pose[1, 0], pose[0, 0], pose[1, 0])
+    dv = wp.vec3(-pose[0, 1] - pose[1, 1], pose[0, 1], pose[1, 1])
+    lu, lv = wp.length(fu), wp.length(fv)
+    nu, nv = wp.normalize(fu), wp.normalize(fv)
+    tangent_u = wp.max(0.0, 1.0 - 1.0 / wp.max(lu, 1.0e-8))
+    tangent_v = wp.max(0.0, 1.0 - 1.0 / wp.max(lv, 1.0e-8))
+    hu = area * stiffness[0] * (tangent_u * wp.identity(3, float) + (1.0 - tangent_u) * wp.outer(nu, nu))
+    hv = area * stiffness[1] * (tangent_v * wp.identity(3, float) + (1.0 - tangent_v) * wp.outer(nv, nv))
+    shear = wp.mat33(0.0)
+    scale = wp.sqrt(wp.max(0.0, area * stiffness[2]))
+    for i in range(3):
+        shear[i] = scale * (du[i] * fv + dv[i] * fu)
+    return du, dv, hu, hv, shear
+
+
+@wp.kernel
+def add_membrane_diagonal(
+    x: wp.array[wp.vec3],
+    triangles: wp.array2d[int],
+    poses: wp.array[wp.mat22],
+    stiffness: wp.array[wp.vec3],
+    areas: wp.array[float],
+    diagonal: wp.array[wp.mat33],
+):
+    t = wp.tid()
+    ids = wp.vec3i(triangles[t, 0], triangles[t, 1], triangles[t, 2])
+    du, dv, hu, hv, shear = membrane_metric(x[ids[0]], x[ids[1]], x[ids[2]], poses[t], stiffness[t], areas[t])
+    for i in range(3):
+        wp.atomic_add(diagonal, ids[i], du[i] * du[i] * hu + dv[i] * dv[i] * hv + wp.outer(shear[i], shear[i]))
+
+
+@wp.kernel
+def multiply_membrane_metric(
+    x: wp.array[wp.vec3],
+    triangles: wp.array2d[int],
+    poses: wp.array[wp.mat22],
+    stiffness: wp.array[wp.vec3],
+    areas: wp.array[float],
+    vector: wp.array[wp.vec3],
+    result: wp.array[wp.vec3],
+):
+    t = wp.tid()
+    ids = wp.vec3i(triangles[t, 0], triangles[t, 1], triangles[t, 2])
+    du, dv, hu, hv, shear = membrane_metric(x[ids[0]], x[ids[1]], x[ids[2]], poses[t], stiffness[t], areas[t])
+    pu, pv, ps = wp.vec3(0.0), wp.vec3(0.0), float(0.0)
+    for i in range(3):
+        pu += du[i] * vector[ids[i]]
+        pv += dv[i] * vector[ids[i]]
+        ps += wp.dot(shear[i], vector[ids[i]])
+    for i in range(3):
+        wp.atomic_add(result, ids[i], du[i] * (hu * pu) + dv[i] * (hv * pv) + shear[i] * ps)
+
+
 @wp.kernel
 def add_bending_forces(
     x: wp.array[wp.vec3],
@@ -268,7 +329,10 @@ def mask_rhs(
 def maximum_residual_squared(rhs: wp.array[wp.vec3], residual_squared: wp.array[float]):
     """Reduce the particle force residual with an infinity-over-blocks norm."""
     particle = wp.tid()
-    wp.atomic_max(residual_squared, 0, wp.dot(rhs[particle], rhs[particle]))
+    value = wp.dot(rhs[particle], rhs[particle])
+    if not wp.isfinite(value):
+        value = wp.inf
+    wp.atomic_max(residual_squared, 0, value)
 
 
 @wp.kernel
@@ -351,11 +415,16 @@ def update_convergence(
     solve_active: wp.array[int],
     status: wp.array[int],
     converged_status: int,
+    breakdown_status: int,
 ):
     if solve_active[0] == 0:
         return
     value = wp.sqrt(wp.max(residual_squared[0], 0.0))
     residual[0] = value
+    if not wp.isfinite(value):
+        solve_active[0] = 0
+        status[0] = breakdown_status
+        return
     if newton_iterations[0] == 0:
         reference_residual[0] = value
     tolerance = absolute_tolerance + relative_tolerance * reference_residual[0]

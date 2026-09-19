@@ -40,6 +40,7 @@ Newton Physics
    Collisions and Contacts <concepts/collisions>
    Simulation Tuning <concepts/simulation_tuning>
    Coupled Solvers <concepts/coupling>
+   Experimental IPC Cloth <concepts/solver_ipc>
    Actuators <concepts/actuators>
 
 .. toctree::

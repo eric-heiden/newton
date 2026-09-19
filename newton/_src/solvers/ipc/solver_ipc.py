@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, fields
 from enum import IntEnum
 
 import warp as wp
@@ -16,6 +17,7 @@ from ..style3d.kernels import deactivate_zero_mass_particles_kernel
 from ..style3d.linear_solver import PcgSolver, SparseMatrixELL
 from ..style3d.solver_style3d import SolverStyle3D
 from . import kernels
+from .self_contact import SelfContact, invert_blocks
 
 
 @dataclass
@@ -64,12 +66,12 @@ class SolverIPC(SolverBase):
     r"""Experimental incremental-potential-contact solver for cloth and particles.
 
     The solver minimizes a backward-Euler objective for Style3D cloth with the
-    normalized logarithmic IPC barrier. Its current collision scope is one
-    fixed plane and finite particle-plane separation. A conservative linear
-    CCD bound and Armijo line search keep every accepted iterate feasible.
+    normalized logarithmic IPC barrier, a fixed plane, and finite-thickness
+    triangle-surface self-contact. Swept BVH queries and conservative advancement
+    bound every search step; Armijo search evaluates the actual barrier energy.
 
     This API is experimental and may change without the normal deprecation
-    period. Point-triangle and edge-edge self-contact, friction, tetrahedra,
+    period. Friction, tetrahedra,
     dynamic rigid bodies, multiple worlds, and differentiation are not yet
     supported. The ``contacts`` argument to :meth:`step` must be ``None``;
     contact geometry is owned by this solver rather than Newton's reduced
@@ -82,11 +84,17 @@ class SolverIPC(SolverBase):
     :func:`newton.solvers.style3d.add_cloth_mesh` to populate the required
     anisotropic cloth data.
 
-    The nonlinear solve uses a fixed sparse projective-dynamics search
-    operator plus a matrix-free positive-semidefinite barrier Hessian. The
-    default block preconditioner applies the exact Sherman-Morrison inverse of
-    each scalar-plus-rank-one particle block; ``"dense"`` is provided as a
-    validation and benchmarking alternative.
+    The nonlinear solve uses a fixed sparse bending operator, state-dependent
+    positive-semidefinite membrane blocks, and matrix-free barrier factors.
+    Cloth uses assembled 3x3 block-Jacobi inverses; plane-only particle blocks
+    retain the Sherman-Morrison fast path. Edge barriers are mollified near
+    parallelism. Contact discretization remains mesh-dependent, and there is
+    no strain-limiting energy. Initialize with nonintersecting surfaces whose
+    nonincident primitive gaps exceed the configured thickness and guard.
+
+    CUDA uses swept BVHs; CPU uses an exhaustive reference broad phase. CCD
+    evaluates distances in float64 and reserves a scale-aware float32 rounding
+    allowance. This is not an interval-arithmetic collision certificate.
     """
 
     class Status(IntEnum):
@@ -97,20 +105,24 @@ class SolverIPC(SolverBase):
         CONVERGED = 1
         """The objective converged and the output state was committed."""
         INVALID_INITIAL_STATE = 2
-        """An active particle started at or behind the configured plane."""
+        """Initial plane separation, surface separation, or intersections are invalid."""
         LINEAR_BREAKDOWN = 3
         """The linear solve did not produce a finite descent direction."""
         LINE_SEARCH_EXHAUSTED = 4
         """No feasible Armijo step was found within the line-search budget."""
         NEWTON_EXHAUSTED = 5
         """The nonlinear residual did not converge within the iteration budget."""
+        CONTACT_OVERFLOW = 6
+        """A contact query exceeded prepared capacity; the step was rolled back."""
 
     @dataclass
     class Config:
         """Configuration for :class:`SolverIPC`.
 
         A floating-point configuration value is fixed when a CUDA graph is
-        recorded. Recapture after changing the configuration or time step.
+        recorded. Recapture after changing scalar tolerances or the time step.
+        Reconstruct after changing topology, self-contact enablement/capacity,
+        or ``use_projective_hessian`` because these determine prepared storage.
         """
 
         plane_normal: tuple[float, float, float] = (0.0, 0.0, 1.0)
@@ -144,9 +156,25 @@ class SolverIPC(SolverBase):
         velocity_damping: float = 0.998
         """Velocity multiplier applied after a converged step."""
         preconditioner: str = "rank_one"
-        """Block factorization: ``"rank_one"`` or reference ``"dense"``."""
+        """Plane-only block inverse: ``"rank_one"`` or ``"dense"``; cloth uses full blocks."""
         graph_mode: str = "conditional"
         """Use nested device-conditional loops or a fixed unrolled schedule."""
+        enable_self_contact: bool = True
+        """Enable point-triangle and edge-edge barriers on triangle surfaces."""
+        self_contact_thickness: float = 0.001
+        """Minimum nonincident surface-primitive separation [m]."""
+        self_contact_distance: float = 0.005
+        """Self-contact barrier activation distance above thickness [m]."""
+        self_contact_stiffness: float = 0.001
+        """Normalized barrier energy scale per primitive stencil [J]."""
+        self_contact_capacity: int = 0
+        """Maximum stored pairs per query; zero selects a topology-sized estimate."""
+        self_contact_guard: float = 1.0e-6
+        """Additional spatial safety allowance for float32 trial rounding [m]."""
+        self_contact_ccd_iterations: int = 64
+        """Conservative advancement budget; exhaustion retains only a safe prefix."""
+        use_projective_hessian: bool = False
+        """Use the legacy fixed membrane metric instead of state-dependent PSD blocks."""
 
     def __init__(self, model: Model, *, config: Config | None = None):
         """Prepare fixed cloth topology and graph-stable solve storage.
@@ -214,9 +242,29 @@ class SolverIPC(SolverBase):
             failed_steps=wp.zeros(1, dtype=int, device=self.device),
         )
         """Device arrays describing convergence, feasibility, and iteration counts."""
+        self._self_contact = (
+            SelfContact(model, self.config) if self.config.enable_self_contact and model.tri_count else None
+        )
+        self._metric_diagonal = (
+            self._self_contact.diagonal
+            if self._self_contact is not None
+            else wp.zeros(count, dtype=wp.mat33, device=self.device)
+        )
 
     def _validate_configuration(self) -> None:
         config = self.config
+        for field in fields(config):
+            value = getattr(config, field.name)
+            if isinstance(value, (int, float)) and not math.isfinite(value):
+                raise ValueError(f"{field.name} must be finite")
+        if not all(math.isfinite(value) for value in config.plane_normal):
+            raise ValueError("plane_normal must be finite")
+        if config.self_contact_thickness < 0.0 or config.self_contact_capacity < 0:
+            raise ValueError("self-contact thickness and capacity must be nonnegative")
+        if min(config.self_contact_distance, config.self_contact_stiffness, config.self_contact_guard) <= 0.0:
+            raise ValueError("self-contact distance, stiffness, and guard must be positive")
+        if config.self_contact_ccd_iterations < 1:
+            raise ValueError("self_contact_ccd_iterations must be >= 1")
         normal_length = sum(component * component for component in config.plane_normal) ** 0.5
         if normal_length <= 0.0:
             raise ValueError("plane_normal must be nonzero")
@@ -260,7 +308,7 @@ class SolverIPC(SolverBase):
 
     def _precompute_cloth_operator(self) -> None:
         builder = PDMatrixBuilder(self.model.particle_count)
-        if self.model.tri_count > 0:
+        if self.model.tri_count > 0 and self.config.use_projective_hessian:
             builder.add_stretch_constraints(
                 self.model.tri_indices.numpy().tolist(),
                 self.model.tri_poses.numpy().tolist(),
@@ -308,7 +356,9 @@ class SolverIPC(SolverBase):
                 device=self.device,
             )
 
-    def _accumulate_energy(self, x: wp.array, energy: wp.array, dt: float) -> None:
+    def _accumulate_energy(self, x: wp.array, energy: wp.array, dt: float, *, swept: bool = False) -> None:
+        if self._self_contact is not None:
+            self._self_contact.energy(x, energy, self._invalid, swept=swept)
         wp.launch(
             kernels.add_particle_energy,
             dim=self.model.particle_count,
@@ -364,6 +414,23 @@ class SolverIPC(SolverBase):
             outputs=[self._barrier_product],
             device=self.device,
         )
+        if self._self_contact is not None:
+            self._self_contact.multiply(vector, self._barrier_product)
+        if self.model.tri_count and not self.config.use_projective_hessian:
+            wp.launch(
+                kernels.multiply_membrane_metric,
+                dim=self.model.tri_count,
+                inputs=[
+                    self._x_current,
+                    self.model.tri_indices,
+                    self.model.tri_poses,
+                    self.model.style3d.tri_aniso_ke,
+                    self.model.tri_areas,
+                    vector,
+                    self._barrier_product,
+                ],
+                device=self.device,
+            )
         return self._barrier_product
 
     def _array_inner(self, a: wp.array, b: wp.array, output: wp.array) -> None:
@@ -398,8 +465,8 @@ class SolverIPC(SolverBase):
         """
         del control
         if contacts is not None:
-            raise ValueError("SolverIPC owns plane collision queries; contacts must be None")
-        if dt <= 0.0:
+            raise ValueError("SolverIPC owns primitive collision queries; contacts must be None")
+        if not math.isfinite(dt) or dt <= 0.0:
             raise ValueError("dt must be > 0")
 
         self._refresh_particle_flags()
@@ -439,6 +506,12 @@ class SolverIPC(SolverBase):
             ],
             device=self.device,
         )
+        if self._self_contact is not None:
+            self._self_contact.query(self._x_current)
+            self._self_contact.validate_initial(self._x_current, self._invalid)
+            self._self_contact.minimum.fill_(1.0e30)
+            self._self_contact.scratch_energy.zero_()
+            self._self_contact.energy(self._x_current, self._self_contact.scratch_energy, self._invalid)
         wp.launch(
             kernels.finish_initialization,
             dim=1,
@@ -451,6 +524,9 @@ class SolverIPC(SolverBase):
             ],
             device=self.device,
         )
+
+        if self._self_contact is not None:
+            self._self_contact.check_overflow(self._solve_active, self.diagnostics.status)
 
         def run_line_search_iteration():
             wp.launch(
@@ -486,7 +562,7 @@ class SolverIPC(SolverBase):
                 device=self.device,
             )
             self._candidate_energy.zero_()
-            self._accumulate_energy(self._x_candidate, self._candidate_energy, dt)
+            self._accumulate_energy(self._x_candidate, self._candidate_energy, dt, swept=True)
             wp.launch(
                 kernels.accept_candidate,
                 dim=1,
@@ -516,6 +592,9 @@ class SolverIPC(SolverBase):
             )
 
         def run_newton_iteration():
+            if self._self_contact is not None:
+                self._self_contact.query(self._x_current)
+                self._self_contact.check_overflow(self._solve_active, self.diagnostics.status)
             wp.launch(
                 kernels.initialize_rhs,
                 dim=self.model.particle_count,
@@ -531,6 +610,23 @@ class SolverIPC(SolverBase):
                 device=self.device,
             )
             self._add_elastic_forces()
+            self._metric_diagonal.zero_()
+            if self._self_contact is not None:
+                self._self_contact.assemble(self._x_current, self._solve_active, self._rhs)
+            if self.model.tri_count and not self.config.use_projective_hessian:
+                wp.launch(
+                    kernels.add_membrane_diagonal,
+                    dim=self.model.tri_count,
+                    inputs=[
+                        self._x_current,
+                        self.model.tri_indices,
+                        self.model.tri_poses,
+                        self.model.style3d.tri_aniso_ke,
+                        self.model.tri_areas,
+                        self._metric_diagonal,
+                    ],
+                    device=self.device,
+                )
             wp.launch(
                 kernels.add_barrier_forces,
                 dim=self.model.particle_count,
@@ -577,6 +673,7 @@ class SolverIPC(SolverBase):
                     self._solve_active,
                     self.diagnostics.status,
                     int(self.Status.CONVERGED),
+                    int(self.Status.LINEAR_BREAKDOWN),
                 ],
                 device=self.device,
             )
@@ -606,6 +703,19 @@ class SolverIPC(SolverBase):
                 outputs=[self._inverse_diagonal],
                 device=self.device,
             )
+            if self._self_contact is not None or (self.model.tri_count and not self.config.use_projective_hessian):
+                wp.launch(
+                    invert_blocks,
+                    dim=self.model.particle_count,
+                    inputs=[
+                        self._metric_diagonal,
+                        self._static_diagonal,
+                        self._contact_hessian,
+                        self._plane_normal,
+                        self._inverse_diagonal,
+                    ],
+                    device=self.device,
+                )
             self._linear_solver.solve(
                 self.pd_non_diagonals,
                 self._static_diagonal,
@@ -636,8 +746,11 @@ class SolverIPC(SolverBase):
                 device=self.device,
             )
 
+            if self._self_contact is not None:
+                self._self_contact.query(self._x_current, self._direction)
+                self._self_contact.check_overflow(self._solve_active, self.diagnostics.status, swept=True)
             self._current_energy.zero_()
-            self._accumulate_energy(self._x_current, self._current_energy, dt)
+            self._accumulate_energy(self._x_current, self._current_energy, dt, swept=True)
             self._alpha.fill_(self.config.initial_step_size)
             wp.launch(
                 kernels.bound_plane_step,
@@ -656,6 +769,8 @@ class SolverIPC(SolverBase):
                 outputs=[self._alpha],
                 device=self.device,
             )
+            if self._self_contact is not None:
+                self._self_contact.bound(self._x_current, self._direction, self._solve_active, self._alpha)
             wp.launch(
                 kernels.begin_line_search,
                 dim=1,

@@ -59,7 +59,7 @@ class Example:
                 max_line_search_iterations=10,
                 absolute_tolerance=1.0e-2,
                 relative_tolerance=2.0e-3,
-                energy_tolerance=1.0e-5,
+                energy_tolerance=1.0e-8,
                 initial_step_size=1.0,
             ),
         )

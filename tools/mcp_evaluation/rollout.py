@@ -89,7 +89,7 @@ def main() -> None:
     process_start = time.perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=SPECS, required=True)
-    parser.add_argument("--variant", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--variant", type=int, default=0)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("metrics.json"))
     parser.add_argument("--live", action="store_true")
@@ -97,6 +97,11 @@ def main() -> None:
     parser.add_argument("--observe", action="store_true")
     parser.add_argument("--reference", type=Path)
     args = parser.parse_args()
+    if args.scenario == "panda_calibration":
+        if args.variant < 0:
+            parser.error("calibration variant must be nonnegative")
+    elif args.variant not in (0, 1):
+        parser.error("variant must be 0 or 1 for this scenario")
     config = runpy.run_path(str(args.config))["CONFIG"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with (args.output.parent / "process_events.jsonl").open("a") as stream:

@@ -3,6 +3,7 @@
 """Check synthetic calibration physics without embedding study answers."""
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,7 +14,7 @@ from .calibration import CalibrationScenario
 from .recording import digest
 from .rollout import make_session
 from .run_agents import _calibration_verification, prepare
-from .scenarios import MENAGERIE
+from .scenarios import MENAGERIE, ROOT
 
 
 class TestCalibrationInputs(unittest.TestCase):
@@ -101,6 +102,52 @@ class TestCalibrationInputs(unittest.TestCase):
 @unittest.skipUnless((MENAGERIE / "franka_emika_panda/panda_nohand.xml").exists(), "local Menagerie asset required")
 class TestCalibrationPhysics(unittest.TestCase):
     """Check exact payload construction and live-versus-fresh trajectories."""
+
+    def test_cli_accepts_calibration_variant_two_only(self):
+        """Run calibration variant 2 while rejecting invalid original-task variants."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            config = output / "config.py"
+            config.write_text("CONFIG = " + repr(CalibrationScenario.initial) + "\n")
+            reference = output / "reference.npz"
+            np.savez(reference, episodes=[0, 1], q=np.zeros((2, 1500, 7)))
+            command = [
+                "uv",
+                "run",
+                "--no-sync",
+                "python",
+                "-m",
+                "tools.mcp_evaluation.rollout",
+                "--config",
+                str(config),
+                "--output",
+                str(output / "metrics.json"),
+            ]
+            completed = subprocess.run(
+                [*command, "--scenario", "panda_calibration", "--variant", "2", "--reference", str(reference)],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            metrics = json.loads((output / "metrics.json").read_text())
+            self.assertEqual(metrics["variant"], 2)
+            self.assertEqual(metrics["frames"], 3000)
+            self.assertTrue(metrics["finite"])
+            for scenario, variant in (("panda", "2"), ("panda_calibration", "-1")):
+                with self.subTest(scenario=scenario, variant=variant):
+                    invalid = subprocess.run(
+                        [*command, "--scenario", scenario, "--variant", variant],
+                        cwd=ROOT,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                    )
+                    self.assertEqual(invalid.returncode, 2, invalid.stdout + invalid.stderr)
+                    self.assertIn("variant", invalid.stderr)
 
     def test_live_physical_edit_matches_fresh(self):
         """Require mass, inertia and joint-loss notifications to preserve physics."""

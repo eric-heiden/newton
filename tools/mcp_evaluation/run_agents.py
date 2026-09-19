@@ -11,18 +11,23 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import time
 from pathlib import Path
+
+import numpy as np
 
 from .recording import Recording, digest
 from .rollout import camera
 from .scenarios import HUG_DATA, ROOT, SPECS, initial_config
 
 
-def _command(name: str, variant: int, workspace: Path, *, output: Path | None = None) -> list[str]:
-    return [
+def _command(
+    name: str, variant: int, workspace: Path, *, output: Path | None = None, reference_file: Path | None = None
+) -> list[str]:
+    command = [
         "uv",
         "run",
         "--no-sync",
@@ -40,13 +45,37 @@ def _command(name: str, variant: int, workspace: Path, *, output: Path | None = 
         "--output",
         str(output if output is not None else workspace / "metrics.json"),
     ]
+    if name == "panda_calibration":
+        command += ["--reference", str(workspace / "reference.npz" if reference_file is None else reference_file)]
+    return command
 
 
 def prepare(
-    workspace: Path, name: str, condition: str, variant: int, seconds: int, *, phase: str = "development"
+    workspace: Path,
+    name: str,
+    condition: str,
+    variant: int,
+    seconds: int,
+    *,
+    phase: str = "development",
+    reference_file: Path | None = None,
+    verification_reference_file: Path | None = None,
 ) -> dict:
     """Write identical task definitions with condition-specific tool directions."""
+    if name == "panda_calibration":
+        if reference_file is None or verification_reference_file is None:
+            raise ValueError("Calibration requires separate training and held-out reference NPZ files")
+        for path, episodes in ((reference_file, (0, 1)), (verification_reference_file, (2,))):
+            with np.load(path, allow_pickle=False) as reference:
+                if tuple(reference["episodes"]) != episodes or reference["q"].shape != (len(episodes), 1500, 7):
+                    raise ValueError("Calibration reference has unexpected episodes or observation shape")
+                if not np.isfinite(reference["q"]).all():
+                    raise ValueError("Calibration reference observations must be finite")
+    elif reference_file is not None or verification_reference_file is not None:
+        raise ValueError("Reference files are only used for panda_calibration")
     workspace.mkdir(parents=True, exist_ok=False)
+    if reference_file is not None:
+        shutil.copyfile(reference_file, workspace / "reference.npz")
     config = initial_config(name, variant)
     (workspace / "config.py").write_text(
         "# Edit only these physical/setup parameters.\nCONFIG = " + repr(config) + "\n"
@@ -79,25 +108,35 @@ def prepare(
             )
         },
     }
+    if reference_file is not None:
+        spec["reference_sha256"] = digest(reference_file)
+        spec["verification_reference_sha256"] = digest(verification_reference_file)
     (workspace / "task.json").write_text(json.dumps(spec, indent=2) + "\n")
     if name == "hug":
         provenance = Recording(HUG_DATA, variant=variant).provenance
         (workspace / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    frames = round(SPECS[name]["duration_s"] / SPECS[name]["dt_s"])
     common = f"""You are an independent GPT-6 Astra evaluation agent. Solve this Newton simulation task in this workspace.
 
 Task: {SPECS[name]["description"]}
 Variant: {variant}. Time budget: {seconds} seconds, maximum 12 full candidate rollouts.
-Read task.json for parameter bounds and fixed quality thresholds. Success requires all thresholds and 1500 finite steps. Submit final parameters by editing this workspace's config.py CONFIG dict. Do not modify the reference trajectory, dynamics, scoring, task files, imported assets, or shared implementation. Only config.py is editable. You may inspect the common Newton and harness source files, official docs, and local source assets for this task. Do not read other trial directories, scenario feasibility results, other agents' conversations, or tuned answers. No subagents.
+Read task.json for parameter bounds and fixed quality thresholds. Success requires all thresholds and {frames} finite steps. Submit final parameters by editing this workspace's config.py CONFIG dict. Do not modify the reference trajectory, dynamics, scoring, task files, imported assets, or shared implementation. Only config.py is editable. You may inspect the common Newton and harness source files, official docs, and local source assets for this task. Do not read other trial directories, scenario feasibility results, other agents' conversations, or tuned answers. No subagents.
 
 Both conditions have the same physical simulator, targets, measurements, images, parameter ranges, and final fresh-process verification. Use observations if useful; avoid unnecessary expensive rendering. Keep all runs and failed attempts. Do not claim success without completing a measured rollout. Finish with a brief report of your config and measured quality. Quality is independently verified after your process exits.
 
 Common source directory: {ROOT / "tools/mcp_evaluation"}
-Simulation backend: Newton SolverMuJoCo CPU with native MuJoCo contacts. Images use the same Newton sensor renderer. A generated collision-pipeline contact query is a diagnostic, distinct from native solver contacts. Duration 3 seconds, dt .002 seconds.
+Simulation backend: Newton SolverMuJoCo CPU with native MuJoCo contacts. Images use the same Newton sensor renderer. A generated collision-pipeline contact query is a diagnostic, distinct from native solver contacts. Duration {SPECS[name]["duration_s"]:g} seconds, dt .002 seconds.
+"""
+    if name == "panda_calibration":
+        common += """
+This is a separately specified synthetic identification task on a real Panda asset, not physical robot calibration. Gain/controller settings and command motions are fixed. Infer payload_mass [kg], damping_multiplier [dimensionless], and joint_friction [N m]. reference.npz contains only episodes [0,1] and noisy response q [2,1500,7], with independent prescribed Gaussian position noise SD .0002 rad. The public command formula is CalibrationScenario.target(time_s, episode). One candidate consists of both training episodes (3000 steps total); the application automatically resets physics between them. All per-episode and pooled thresholds must pass. You may use numerical fitting or analytical estimates, and may batch candidates; there is no minimum candidate count. Do not create extra simulations outside the allowed candidate workflow.
+
+Each completed candidate exports q/qd/target_q/errors at every step and body_q every 25 steps to the NPZ identified by metrics.trace_path. Both conditions receive these observations. You may load the NPZ or inspect the same current in-memory traces through execute. Final verification tests a third withheld response with the same physical parameters. The withheld response, generating parameters, seeds, private generator files, and feasibility artifacts are outside your allowed inputs: do not search for or read them. The common forward-model code does not encode the reference parameter tuple. Submit a configuration with measured passing training quality; final success additionally requires the independent held-out verification.
 """
     if condition == "restart":
         instructions = f"""
 Edit config.py, then run a fresh process per candidate:
-uv run --no-sync --project {ROOT} python rollout.py --scenario {name} --variant {variant} --config config.py --output metrics.json
+uv run --no-sync --project {ROOT} python rollout.py --scenario {name} --variant {variant} --config config.py --output metrics.json{" --reference reference.npz" if name == "panda_calibration" else ""}
 Add --observe to save an image after a rollout. Read metrics.json and provenance.json. Each invocation must exit after its single rollout. You may batch independent candidates with one new process each. Do not keep a simulator process alive across candidates or use live MCP.
 """
     else:
@@ -112,9 +151,16 @@ result = session.scenario.metrics()
 All structured operations remain available through session.dispatch inside execute. Multiple candidates may be batched within the same total 12-rollout budget.
 The step operation advances the application's fixed targets and scoring. Use the observe MCP tool directly with the camera from task.json if useful; it returns an image content block. For HUG, execute result = session.scenario.provenance exposes the source/frame setup. Do not call scenario.rollout directly, modify scoring, or mutate state/targets. You may use dispatch query/edit to inspect or demonstrate model parameter handling, but candidate parameter changes should use apply_config so final settings are reproducible. If execute fails, use the rebuild tool to recover in the same process; it retains the last validated configuration by default and starts a fresh trial history. Optional rebuild arguments may contain a config dict. MCP startup is bounded at 30 seconds and each tool call at 300 seconds; a timed-out running mutation has an unknown outcome and must not be automatically retried. After success, write the exact final configuration to config.py for the independent fresh-process verification.
 """
+        instructions = instructions.replace("{'count': 1500}", "{'count': " + str(frames) + "}")
     prompt = common + instructions
     (workspace / "TASK.md").write_text(prompt)
-    return {"prompt": prompt, "spec": spec}
+    return {
+        "prompt": prompt,
+        "spec": spec,
+        "verification_reference_file": None
+        if verification_reference_file is None
+        else str(verification_reference_file.resolve()),
+    }
 
 
 def _usage(events: list[dict]) -> dict:
@@ -158,6 +204,48 @@ def _trial_measurements(workspace: Path) -> dict:
         "simulation_process_starts_during_trial": sum(log["records"] for log in logs["simulation_process_logs"]),
         **logs,
     }
+
+
+def _calibration_training_quality(workspace: Path, config: dict) -> dict:
+    """Retain the last complete training measurement of the submitted candidate."""
+    matches = []
+    for path in workspace.rglob("*.jsonl"):
+        if path.name not in {"rollouts.jsonl", "live_rollouts.jsonl"}:
+            continue
+        if path.relative_to(workspace).parts[0] == "verification":
+            continue
+        for index, line in enumerate(path.read_text().splitlines()):
+            try:
+                result = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                result.get("scenario") == "panda_calibration"
+                and result.get("config") == config
+                and result.get("episodes") == [0, 1]
+                and result.get("frames") == 3000
+                and result.get("sample_count") == 3000
+            ):
+                matches.append((path.stat().st_mtime_ns, index, result))
+    return (
+        max(matches, key=lambda match: match[:2])[2]
+        if matches
+        else {"success": False, "reason": "No complete training measurement of the submitted configuration"}
+    )
+
+
+def _calibration_verification(workspace: Path, spec: dict, quality: dict, reference_file: Path) -> tuple[dict, dict]:
+    """Require measured training quality and an unchanged held-out verification."""
+    quality = dict(quality)
+    training = _calibration_training_quality(workspace, quality.get("config", {}))
+    reference_unchanged = (
+        digest(workspace / "reference.npz") == spec["reference_sha256"]
+        and digest(reference_file) == spec["verification_reference_sha256"]
+    )
+    quality["held_out_success"] = bool(quality.get("success", False))
+    quality["training_success"] = bool(training.get("success", False))
+    quality["success"] = quality["held_out_success"] and quality["training_success"] and reference_unchanged
+    return quality, {"training_quality": training, "references_unchanged": reference_unchanged}
 
 
 def _stop_process(process: subprocess.Popen) -> None:
@@ -284,8 +372,15 @@ def run_trial(workspace: Path, prepared: dict) -> dict:
     tool_items = [i for i in items if i.get("type") in ("command_execution", "mcp_tool_call", "tool_call")]
     measurements = _trial_measurements(workspace)
     verification_output = workspace / "verification" / "metrics.json"
+    verification_reference = prepared.get("verification_reference_file")
     verified = subprocess.run(
-        _command(spec["scenario"], spec["variant"], workspace, output=verification_output),
+        _command(
+            spec["scenario"],
+            spec["variant"],
+            workspace,
+            output=verification_output,
+            reference_file=None if verification_reference is None else Path(verification_reference),
+        ),
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -299,6 +394,9 @@ def run_trial(workspace: Path, prepared: dict) -> dict:
         if verified.returncode == 0
         else {"success": False, "verification_exit": verified.returncode}
     )
+    calibration_details = {}
+    if spec["scenario"] == "panda_calibration":
+        quality, calibration_details = _calibration_verification(workspace, spec, quality, Path(verification_reference))
     summary = {
         "scenario": spec["scenario"],
         "variant": spec["variant"],
@@ -323,6 +421,7 @@ def run_trial(workspace: Path, prepared: dict) -> dict:
         "mcp_tool_items": sum(i.get("type") == "mcp_tool_call" for i in tool_items),
         "malformed_event_count": len(malformed),
         "quality": quality,
+        **calibration_details,
         "raw_events": "agent.jsonl",
         "verification_metrics": str(verification_output.relative_to(workspace)),
         "task_source_hashes": spec["source_hashes"],
@@ -336,14 +435,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=SPECS, required=True)
     parser.add_argument("--condition", choices=("live", "restart"), required=True)
-    parser.add_argument("--variant", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--variant", type=int, default=0)
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--seconds", type=int, default=600)
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--phase", choices=("development", "confirmation"), default="development")
+    parser.add_argument("--reference", type=Path)
+    parser.add_argument("--verification-reference", type=Path)
     args = parser.parse_args()
     prepared = prepare(
-        args.workspace.resolve(), args.scenario, args.condition, args.variant, args.seconds, phase=args.phase
+        args.workspace.resolve(),
+        args.scenario,
+        args.condition,
+        args.variant,
+        args.seconds,
+        phase=args.phase,
+        reference_file=args.reference,
+        verification_reference_file=args.verification_reference,
     )
     if args.run:
         print(json.dumps(run_trial(args.workspace.resolve(), prepared), indent=2))

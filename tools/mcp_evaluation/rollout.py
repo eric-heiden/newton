@@ -17,6 +17,19 @@ import numpy as np
 from .scenarios import SPECS, Scenario
 
 
+def make_scenario(name: str, config: dict, *, variant: int = 0, reference_file: Path | None = None):
+    """Construct an original task or the separately specified calibration task."""
+    if name == "panda_calibration":
+        from .calibration import CalibrationScenario  # noqa: PLC0415
+
+        if reference_file is None:
+            raise ValueError("panda_calibration requires a supplied reference NPZ")
+        return CalibrationScenario(config, reference_file=reference_file, variant=variant)
+    if reference_file is not None:
+        raise ValueError("A reference NPZ is only used for panda_calibration")
+    return Scenario(name, config, variant=variant)
+
+
 def make_session(scenario: Scenario, directory: Path):
     """Bind the same application-owned simulation to the public live API."""
     from newton.mcp import SimulationSession  # noqa: PLC0415
@@ -37,7 +50,9 @@ def make_session(scenario: Scenario, directory: Path):
         values = dict(previous.config)
         if config is not None:
             values.update(config)
-        replacement = Scenario(scenario.name, values, variant=scenario.variant)
+        replacement = make_scenario(
+            scenario.name, values, variant=scenario.variant, reference_file=getattr(previous, "reference_file", None)
+        )
         if hasattr(previous, "rollout_log"):
             replacement.rollout_log = previous.rollout_log
         session.scenario = replacement
@@ -62,7 +77,7 @@ def make_session(scenario: Scenario, directory: Path):
 
 def camera(name: str) -> dict:
     """Return a prespecified camera shared by both conditions."""
-    if name == "panda":
+    if name in ("panda", "panda_calibration"):
         return {"eye": [1.2, -1.2, 0.85], "target": [0, 0, 0.45], "up": [0, 0, 1]}
     if name == "allegro":
         return {"eye": [0.4, -0.45, 0.53], "target": [0, 0, 0.32], "up": [0, 0, 1]}
@@ -80,6 +95,7 @@ def main() -> None:
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--connection-file", type=Path, default=Path("connection.json"))
     parser.add_argument("--observe", action="store_true")
+    parser.add_argument("--reference", type=Path)
     args = parser.parse_args()
     config = runpy.run_path(str(args.config))["CONFIG"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -95,7 +111,7 @@ def main() -> None:
             )
             + "\n"
         )
-    scenario = Scenario(args.scenario, config, variant=args.variant)
+    scenario = make_scenario(args.scenario, config, variant=args.variant, reference_file=args.reference)
     (args.output.parent / "provenance.json").write_text(json.dumps(scenario.provenance, indent=2) + "\n")
     if args.live:
         from newton.mcp import SimulationServer  # noqa: PLC0415
@@ -122,6 +138,9 @@ def main() -> None:
     result = scenario.rollout()
     result["pid"] = os.getpid()
     result["process_seconds_after_import"] = time.perf_counter() - process_start
+    if args.scenario == "panda_calibration":
+        scenario.save_trace(args.output.with_suffix(".npz"))
+        result["trace_path"] = scenario.last_trace_path
     if args.observe:
         session = make_session(scenario, args.output.parent / "observations")
         observation = session.dispatch("observe", {**camera(args.scenario), "width": 640, "height": 480})
@@ -130,14 +149,15 @@ def main() -> None:
         observation["image_path"] = str(image_path)
         result["observation"] = observation
     args.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
-    np.savez_compressed(
-        args.output.with_suffix(".npz"),
-        body_q=np.asarray(scenario.pose_trace),
-        target_q=np.asarray(scenario.target_trace),
-        errors=np.asarray(scenario.errors),
-        dt=scenario.dt,
-        trace_step_interval=25,
-    )
+    if args.scenario != "panda_calibration":
+        np.savez_compressed(
+            args.output.with_suffix(".npz"),
+            body_q=np.asarray(scenario.pose_trace),
+            target_q=np.asarray(scenario.target_trace),
+            errors=np.asarray(scenario.errors),
+            dt=scenario.dt,
+            trace_step_interval=25,
+        )
     with (args.output.parent / "rollouts.jsonl").open("a") as stream:
         stream.write(json.dumps(result, default=str) + "\n")
     print(json.dumps(result, default=str), flush=True)

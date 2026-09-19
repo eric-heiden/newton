@@ -16,6 +16,7 @@ import warp as wp
 import newton
 import newton.solvers
 
+from .calibration import CALIBRATION_SPEC
 from .recording import Recording, digest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,6 +25,7 @@ HUG_DATA = Path(os.environ.get("NEWTON_EVAL_HUG_DATA", "/home/horde/repos/manosi
 MANOSIM = Path(os.environ.get("NEWTON_EVAL_MANOSIM", "/home/horde/repos/manosim"))
 
 SPECS = {
+    "panda_calibration": CALIBRATION_SPEC,
     "panda": {
         "description": "Track a smooth seven-joint motion under gravity with the Menagerie Panda arm.",
         "initial": {"kp": 35.0, "kd": 0.2},
@@ -95,6 +97,10 @@ def _without_actuators(path: Path) -> str:
 def initial_config(name: str, variant: int = 0) -> dict[str, float]:
     """Return prespecified poor initial gains for one of two paired variants."""
     values = dict(SPECS[name]["initial"])
+    if name == "panda_calibration":
+        if variant < 0:
+            raise ValueError("calibration variant must be nonnegative")
+        return values
     if variant == 1:
         for key in values:
             values[key] *= 0.75 if "kp" in key else 1.25

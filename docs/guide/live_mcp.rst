@@ -169,5 +169,8 @@ Warp, and GL cannot safely be preempted. A connection failure during execution
 has an unknown outcome; do not automatically retry mutations.
 
 The transport uses TCP and ordinary Python threads for portability. Runtime,
-CPU/GPU rendering, and official SDK interoperability have been tested on Linux;
-Windows execution has not been verified in this prototype.
+CPU/CUDA sensor rendering, attached CPU ViewerGL capture, and official SDK
+interoperability have been tested on Linux. Windows CPU runtime, sensor
+rendering, and official SDK interoperability passed the
+`Windows CI tests <https://github.com/eric-heiden/newton/actions/runs/35434465266>`_.
+Windows CUDA execution and attached ViewerGL capture remain unverified.

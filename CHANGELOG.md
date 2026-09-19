@@ -9,6 +9,7 @@
 ### Added
 
 - Add public `newton.geometry.ParticleSurface` and `extract_particle_surface()` APIs for sparse-volume particle surface extraction, including robust anisotropic reconstruction, graph-capturable topology rebuilds, compact multi-world meshes, optional SDF redistancing, MPM collider extrapolation, and an `mpm_water_dam_break` example with optional multi-world visualization. Add composable CUDA-OpenGL interoperability flags for `ViewerGL` render-geometry buffers. ([#2909](https://github.com/newton-physics/newton/issues/2909))
+- Add experimental `newton.mcp` sessions for live simulation inspection, validated edits, stepping, camera observations, recording, and opt-in trusted Python through an authenticated local MCP bridge.
 - Add opt-in unified compliant ALM for experimental `SolverVBD` rigid contacts, structural joints, drives, and limits with `rigid_compliant_alm=True`. Authored finite stiffness controls physical compliance while `SolverVBD` selects numerical conditioning automatically. Values used with legacy hard constraints may require retuning for the desired deformation. ([#3333](https://github.com/newton-physics/newton/issues/3333))
 - Add review guidelines for contributors and review agents. ([#3509](https://github.com/newton-physics/newton/issues/3509))
 - Import MJCF `jointinparent` actuator transmissions. ([#3743](https://github.com/newton-physics/newton/issues/3743))
@@ -100,6 +101,7 @@
 ### Fixed
 
 - Prevent `SolverXPBD` restitution from gaining unbounded energy by using integrated pre-solve velocities and avoiding in-place writes to autodiff-recorded arrays. ([#1289](https://github.com/newton-physics/newton/issues/1289))
+- Refresh live actuator gains, actuator parameters, and shape materials in `SolverMuJoCo` CPU mode after model changes.
 - Render `newton.Gaussian` splat shapes in `ViewerViser`; `log_gaussian()` no longer silently omits Gaussian assets when using `--viewer viser`. ([#2099](https://github.com/newton-physics/newton/issues/2099))
 - Stop ground-plane and plane-shape grids from flickering in `ViewerViser` when their pose changes. ([#2099](https://github.com/newton-physics/newton/issues/2099))
 - Keep triangle areas and custom attributes aligned when bulk triangle creation filters degenerate elements. ([#3450](https://github.com/newton-physics/newton/issues/3450))

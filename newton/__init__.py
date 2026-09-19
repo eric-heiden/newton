@@ -133,6 +133,7 @@ __all__ += [
     "geometry",
     "ik",
     "math",
+    "mcp",
     "selection",
     "sensors",
     "solvers",
@@ -140,3 +141,13 @@ __all__ += [
     "utils",
     "viewer",
 ]
+
+
+def __getattr__(name: str):
+    if name == "mcp":
+        from importlib import import_module  # noqa: PLC0415
+
+        module = import_module(".mcp", __name__)
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

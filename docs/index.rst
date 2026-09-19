@@ -18,6 +18,7 @@ Newton Physics
    guide/installation
    guide/compatibility
    guide/visualization
+   guide/live_mcp
    guide/tutorials
    Development <guide/development>
    Source Code Guidelines <guide/source_code_guidelines>

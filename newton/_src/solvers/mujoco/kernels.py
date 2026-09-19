@@ -2041,15 +2041,18 @@ def update_solver_options_kernel(
 def update_axis_properties_kernel(
     mjc_actuator_ctrl_source: wp.array[wp.int32],
     mjc_actuator_to_newton_idx: wp.array[wp.int32],
+    actuator_uses_joint_effort_limit: wp.array[wp.bool],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
     joint_target_mode: wp.array[wp.int32],
+    joint_effort_limit: wp.array[float],
     dofs_per_world: wp.int32,
     # outputs
     actuator_bias: wp.array2d[vec10],
     actuator_gain: wp.array2d[vec10],
+    actuator_forcerange: wp.array2d[wp.vec2],
 ):
-    """Update MuJoCo actuator gains from Newton per-DOF arrays.
+    """Update MuJoCo actuator gains and ball-axis limits from Newton DOF arrays.
 
     Only updates JOINT_TARGET actuators. CTRL_DIRECT actuators keep their gains
     from custom attributes.
@@ -2067,9 +2070,11 @@ def update_axis_properties_kernel(
     Args:
         mjc_actuator_ctrl_source: 0=JOINT_TARGET, 1=CTRL_DIRECT
         mjc_actuator_to_newton_idx: Index into Newton array (sign-encoded for JOINT_TARGET)
+        actuator_uses_joint_effort_limit: Ball-axis actuators without authored force ranges
         joint_target_ke: Per-DOF position gains (kp)
         joint_target_kd: Per-DOF velocity/damping gains (kd)
         joint_target_mode: Per-DOF target mode from Model.joint_target_mode
+        joint_effort_limit: Per-DOF effort limits [N or N·m]
         dofs_per_world: Number of DOFs per world
     """
     world, actuator = wp.tid()
@@ -2103,6 +2108,12 @@ def update_axis_properties_kernel(
         kd = joint_target_kd[world_dof]
         actuator_bias[world, actuator][2] = -kd
         actuator_gain[world, actuator][0] = kd
+
+    # Ball joints use per-axis actuator clamps; authored ranges retain precedence.
+    if actuator_uses_joint_effort_limit[actuator]:
+        axis = idx if idx >= 0 else -(idx + 2)
+        effort_limit = joint_effort_limit[world * dofs_per_world + axis]
+        actuator_forcerange[world, actuator] = wp.vec2(-effort_limit, effort_limit)
 
 
 @wp.kernel

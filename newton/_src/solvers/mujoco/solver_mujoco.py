@@ -3924,6 +3924,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         The control kernel uses this to read the current world's child-anchor rotation from
         ``joint_X_c[world * joints_per_world + jnt % joints_per_world]``.
         Shape ``[nu]``, dtype ``int32``."""
+        self._actuator_uses_joint_effort_limit: wp.array[wp.bool] | None = None
         self.mjc_eq_to_newton_eq: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, eq] to Newton equality constraint index.
 
@@ -4301,14 +4302,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     ],
                     device=self.model.device,
                 )
-                # Without sleeping, the default update interval propagates the
-                # reset on the next step. Otherwise push it now so it is not
-                # lost before the next sync. The sleeping path synchronizes
-                # below before rebuilding its cached data.
-                if self.update_data_interval != 1 and not self.enable_sleeping:
-                    data = self.mj_data if self.use_mujoco_cpu else self.mjw_data
-                    if data is not None and native_template_world_selected:
-                        self._update_mjc_data(data, self.model, state, world_mask=world_mask)
+        # Sparse synchronization must also propagate supplied checkpoint state
+        # when flags=NONE preserves its joint coordinates.
+        if self.update_data_interval != 1 and not self.enable_sleeping:
+            data = self.mj_data if self.use_mujoco_cpu else self.mjw_data
+            if data is not None and native_template_world_selected:
+                self._update_mjc_data(data, self.model, state, world_mask=world_mask)
 
         # Clear the internal buffers that persist between steps.
         if self.use_mujoco_cpu:
@@ -4893,8 +4892,35 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.mj_model.jnt_margin[:] = self.mjw_model.jnt_margin.numpy()[0]
                 self.mj_model.jnt_range[:] = self.mjw_model.jnt_range.numpy()[0]
                 self.mj_model.jnt_actfrcrange[:] = self.mjw_model.jnt_actfrcrange.numpy()[0]
+            if flags & (ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.ACTUATOR_PROPERTIES):
+                self.mj_model.actuator_gainprm[:] = self.mjw_model.actuator_gainprm.numpy()[0]
+                self.mj_model.actuator_biasprm[:] = self.mjw_model.actuator_biasprm.numpy()[0]
+                self.mj_model.actuator_forcerange[:] = self.mjw_model.actuator_forcerange.numpy()[0]
             if flags & ModelFlags.ACTUATOR_PROPERTIES:
-                self.mj_model.actuator_ctrlrange[:] = self.mjw_model.actuator_ctrlrange.numpy()[0]
+                for name in (
+                    "actuator_dynprm",
+                    "actuator_ctrlrange",
+                    "actuator_actrange",
+                    "actuator_gear",
+                    "actuator_cranklength",
+                ):
+                    getattr(self.mj_model, name)[:] = getattr(self.mjw_model, name).numpy()[0]
+            if flags & ModelFlags.SHAPE_PROPERTIES:
+                for name in (
+                    "geom_friction",
+                    "geom_solref",
+                    "geom_size",
+                    "geom_pos",
+                    "geom_quat",
+                    "geom_solimp",
+                    "geom_solmix",
+                    "geom_gap",
+                    "geom_margin",
+                    "site_pos",
+                    "site_quat",
+                ):
+                    getattr(self.mj_model, name)[:] = getattr(self.mjw_model, name).numpy()[0]
+                self.mj_model.site_size[:] = self.mjw_model.site_size.numpy()
             if need_length_range or need_const_fixed or need_const_0:
                 self._set_const_0_with_physical_meaninertia()
             if need_solref_update:
@@ -7521,6 +7547,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         )
 
         actuator_custom_attr_idx = np.full(len(mjc_actuator_ctrl_source_list), -1, dtype=np.int32)
+        actuator_uses_joint_effort_limit = np.zeros(len(mjc_actuator_ctrl_source_list), dtype=bool)
         for actuator, (ctrl_source, newton_idx) in enumerate(
             zip(mjc_actuator_ctrl_source_list, mjc_actuator_to_newton_idx_list, strict=True)
         ):
@@ -7531,6 +7558,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 if ball_joint >= 0:
                     dof = int(joint_qd_start[ball_joint])
                 info = joint_target_ranges.get((dof, is_position))
+                actuator_uses_joint_effort_limit[actuator] = ball_joint >= 0 and (
+                    info is None or not info["has_forcerange"]
+                )
                 if info is not None:
                     actuator_custom_attr_idx[actuator] = info["actuator_idx"]
             elif newton_idx >= 0:
@@ -7568,6 +7598,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 dtype=wp.int32,
                 device=model.device,
             )
+            self._actuator_uses_joint_effort_limit = wp.array(
+                actuator_uses_joint_effort_limit, dtype=wp.bool, device=model.device
+            )
         else:
             self.mjc_actuator_ctrl_source = None
             self.mjc_actuator_to_newton_idx = None
@@ -7575,6 +7608,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self.mjc_actuator_to_target_q_axis_idx = None
             self.mjc_actuator_to_newton_ball_jnt = None
             self.mjc_actuator_to_newton_actuator_idx = None
+            self._actuator_uses_joint_effort_limit = None
 
         dampratio_actuators = [
             (actuator.id, actuator.biasprm[2])
@@ -8488,14 +8522,17 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 inputs=[
                     self.mjc_actuator_ctrl_source,
                     self.mjc_actuator_to_newton_idx,
+                    self._actuator_uses_joint_effort_limit,
                     self.model.joint_target_ke,
                     self.model.joint_target_kd,
                     self.model.joint_target_mode,
+                    self.model.joint_effort_limit,
                     dofs_per_world,
                 ],
                 outputs=[
                     self.mjw_model.actuator_biasprm,
                     self.mjw_model.actuator_gainprm,
+                    self.mjw_model.actuator_forcerange,
                 ],
                 device=self.model.device,
             )

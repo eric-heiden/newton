@@ -52,7 +52,7 @@ jobs:
       - name: Test MCP transport, SDK interoperability, and CPU observations
         shell: pwsh
         run: |
-          uv run --locked --python 3.12 --extra dev --extra sim --with mcp==1.26.0 python -m unittest -v newton.tests.test_mcp newton.tests.test_mcp_observation 2>&1 | Tee-Object -FilePath mcp-windows-cpu.log -Append
+          uv run --locked --python 3.12 --extra dev --extra sim --with mcp==1.26.0 python -m unittest -v newton.tests.test_mcp newton.tests.test_mcp_executor newton.tests.test_mcp_observation 2>&1 | Tee-Object -FilePath mcp-windows-cpu.log -Append
           exit $LASTEXITCODE
       - name: Upload Windows test log
         if: always()

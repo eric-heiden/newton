@@ -201,8 +201,21 @@ TOOLS = [
     ),
     _tool(
         "execute",
-        "Run trusted unrestricted Python only if the embedding application enabled it. Available globals: session, model, solver, state, control, wp, np. Use session.dispatch(operation, arguments) for structured operations listed by describe. Assign JSON-compatible result. stdout/stderr are bounded. This is NOT a sandbox, cannot preempt running Python, and a failure invalidates the scene until rebuild.",
-        {"code": {"type": "string", "maxLength": 65536}},
+        "Run trusted unrestricted Python in a persistent workspace. Imports, functions and variables survive calls and physical resets; rebuilding clears them. Live globals session/model/solver/state/state_next/control/contacts/viewer/wp/np refresh after managed state changes. The last expression is returned (opaque or oversized values use bounded summaries without user repr); explicit result= takes precedence, and _ retains the last value. Use session.dispatch(operation, arguments) for structured operations. Runtime errors preserve partial work but pause/invalidate the scene: recovery='inspect' permits diagnosis while invalid; recovery='acknowledge' explicitly accepts caller-verified/repaired coherence after successful code, always paused. There is no rollback or automatic proof of safety. Compile errors do not execute. Source history and output are bounded; full Python is not a sandbox and cannot be preempted.",
+        {
+            "code": {"type": "string", "maxLength": 65536},
+            "reset_namespace": {
+                "type": "boolean",
+                "default": False,
+                "description": "Clear variables, imports, functions and source history before executing. Does not reset or repair physics.",
+            },
+            "recovery": {
+                "type": "string",
+                "enum": ["none", "inspect", "acknowledge"],
+                "default": "none",
+                "description": "Explicit trusted recovery while invalid. Inspect does not automatically resume; acknowledge accepts responsibility for model/solver coherence after successful code and leaves playback paused. No rollback.",
+            },
+        },
         ("code",),
     ),
     _tool(
@@ -242,7 +255,7 @@ class _Protocol:
                 "protocolVersion": version if version in versions else versions[0],
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "newton-live", "version": "0.1.0"},
-                "instructions": "Experimental live Newton session. Use newton_describe to discover bindings and capabilities when needed. Physics and rendering run on the simulation owner thread. In the code profile, use newton_execute with session.dispatch(operation, arguments) for structured operations; describe lists operation names. Rebuild remains a separate tool for recovery after execution failure. Profiles change tool presentation, not permissions.",
+                "instructions": "Experimental live Newton session. Use newton_describe to discover bindings and capabilities when needed. Physics and rendering run on the simulation owner thread. In the code profile, use newton_execute with session.dispatch(operation, arguments) for structured operations; describe lists operation names. Python variables persist across calls. Runtime failures require explicit inspect/acknowledge recovery or rebuilding; successful code alone is not proof of solver coherence. Profiles change tool presentation, not permissions.",
             }
         elif method == "ping":
             result = {}

@@ -2,10 +2,51 @@
 
 These tools compare an independent GPT-6 Astra agent using live Newton MCP
 with an independent agent editing a Python configuration and starting a new
-Newton process for every candidate. Both conditions use the same dynamics,
+Newton process for every candidate, or an independent agent using the upstream
+IPython MCP server and a persistent IPython kernel. Conditions use the same dynamics,
 targets, physical limits, quality measurements and optional sensor images.
 Nothing here assumes the live agent will win. Keep failures and report raw
 usage and final independently verified quality.
+
+The [real measured Panda identification task](REAL_ROBOT.md) adds full seven-link
+dynamic identification from physical robot data, starting from homogeneous
+placeholders. Its separate runner uses numeric JSON submissions, equal offline
+fitting access, and fresh training plus held-out verification.
+
+## IPython comparison
+
+Install the external experiment dependencies into the same Newton environment:
+
+```bash
+git clone https://github.com/gabiteodoru/ipython-mcp.git /path/to/ipython-mcp
+git -C /path/to/ipython-mcp checkout c2fa8d6fdafe15d7ebbaebb2d32f2e41882227d0
+uv pip install --python .venv/bin/python mcp==1.26.0 ipykernel==6.31.0 jupyter-client==8.6.3 /path/to/ipython-mcp
+```
+
+These are optional evaluation dependencies, with actual resolved versions
+recorded per IPython trial; they are not required by Newton. IPython MCP is
+MIT-licensed, IPython/ipykernel/jupyter-client use BSD licenses, and the MCP
+SDK is MIT-licensed.
+
+Select `--condition ipython` with the same scenario, variant, references,
+budget, and fresh workspace as the other conditions. The runner constructs
+the application in a kernel using the same Python environment. The agent
+connects through the actual upstream `connect_to_kernel` and `execute_code`
+MCP tools. It shares the scenario and `SimulationSession` lifecycle helpers,
+but does not use Newton's MCP transport or Python executor. This keeps the
+physics and application interface identical while comparing code execution
+interfaces. User variables persist; application aliases refresh between cells.
+
+Kernel and application construction are included in startup-inclusive timing.
+The MCP bridge startup and agent-initiated kernel connection are inside agent
+time. The kernel is stopped before independent fresh-process verification.
+The connection file contains temporary credentials and must not be published.
+
+The pinned upstream executor has a 30-second shell-reply wait. The separate
+`ipython_fixed` sensitivity control corrects stale-reply attribution and
+increases that wait; see [the exact patch and attribution](patches/README.md).
+Keep both conditions clearly labeled and retain upstream failures rather than
+silently replacing their results with corrected-server measurements.
 
 Obtain the model sources from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie)
 and [ManoSim](https://github.com/KevinyWu/manosim), using the exact revisions below:
@@ -65,8 +106,10 @@ implementation and prompts. The live harness selects the optional four-tool
 `--profile code` interface: describe, execute, observe, and rebuild. Discovery
 is optional; structured operations remain callable through `session.dispatch`
 inside execute. Call observe directly for MCP image content. After an execution
-failure, rebuild restores the same scenario and last validated configuration
-with fresh state and measurements. A rebuild may also receive a `config` dict.
+failure, explicit trusted inspect/acknowledge recovery can preserve the workspace
+while the caller verifies or repairs solver coherence. Rebuild restores the same
+scenario and last validated configuration with fresh state and measurements,
+clearing the Python workspace. A rebuild may also receive a `config` dict.
 The public adapter's default profile still exposes all structured tools.
 
 Final verification writes `verification/metrics.json` and its companion NPZ,

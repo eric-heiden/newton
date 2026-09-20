@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add experimental `newton.mcp` sessions for live simulation inspection, validated edits, stepping, camera observations, recording, and opt-in trusted Python through an authenticated local MCP bridge.
+- Add a persistent trusted Python workspace to live MCP sessions, with Warp kernel support, bounded result summaries, and explicit error recovery.
+
 <!-- towncrier release notes start -->
 
 ## [1.6.0] - 2026-09-10
@@ -9,7 +14,6 @@
 ### Added
 
 - Add public `newton.geometry.ParticleSurface` and `extract_particle_surface()` APIs for sparse-volume particle surface extraction, including robust anisotropic reconstruction, graph-capturable topology rebuilds, compact multi-world meshes, optional SDF redistancing, MPM collider extrapolation, and an `mpm_water_dam_break` example with optional multi-world visualization. Add composable CUDA-OpenGL interoperability flags for `ViewerGL` render-geometry buffers. ([#2909](https://github.com/newton-physics/newton/issues/2909))
-- Add experimental `newton.mcp` sessions for live simulation inspection, validated edits, stepping, camera observations, recording, and opt-in trusted Python through an authenticated local MCP bridge.
 - Add opt-in unified compliant ALM for experimental `SolverVBD` rigid contacts, structural joints, drives, and limits with `rigid_compliant_alm=True`. Authored finite stiffness controls physical compliance while `SolverVBD` selects numerical conditioning automatically. Values used with legacy hard constraints may require retuning for the desired deformation. ([#3333](https://github.com/newton-physics/newton/issues/3333))
 - Add review guidelines for contributors and review agents. ([#3509](https://github.com/newton-physics/newton/issues/3509))
 - Import MJCF `jointinparent` actuator transmissions. ([#3743](https://github.com/newton-physics/newton/issues/3743))

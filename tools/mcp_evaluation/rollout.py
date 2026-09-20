@@ -19,6 +19,12 @@ from .scenarios import SPECS, Scenario
 
 def make_scenario(name: str, config: dict, *, variant: int = 0, reference_file: Path | None = None):
     """Construct an original task or the separately specified calibration task."""
+    if name == "panda_real":
+        from .real_robot import RealRobotScenario  # noqa: PLC0415
+
+        if reference_file is None:
+            raise ValueError("panda_real requires supplied measured reference data")
+        return RealRobotScenario(config, reference_file=reference_file, variant=variant)
     if name == "panda_calibration":
         from .calibration import CalibrationScenario  # noqa: PLC0415
 
@@ -77,7 +83,7 @@ def make_session(scenario: Scenario, directory: Path):
 
 def camera(name: str) -> dict:
     """Return a prespecified camera shared by both conditions."""
-    if name in ("panda", "panda_calibration"):
+    if name in ("panda", "panda_calibration", "panda_real"):
         return {"eye": [1.2, -1.2, 0.85], "target": [0, 0, 0.45], "up": [0, 0, 1]}
     if name == "allegro":
         return {"eye": [0.4, -0.45, 0.53], "target": [0, 0, 0.32], "up": [0, 0, 1]}

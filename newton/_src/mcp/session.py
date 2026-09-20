@@ -5,16 +5,22 @@
 
 from __future__ import annotations
 
+import ast
+import builtins
 import contextlib
 import io
 import json
+import linecache
 import math
 import queue
+import sys
 import tempfile
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 from typing import Any, ClassVar
 
 import numpy as np
@@ -71,6 +77,72 @@ def _json(value: Any) -> Any:
     raise ValueError(f"Unsupported result type {type(value).__name__}; return JSON-compatible data")
 
 
+def _result_json(value: Any) -> Any:
+    """Bound trusted Python output without invoking user-defined conversion callbacks."""
+    remaining = [16384, 65536]
+
+    def convert(item: Any, depth: int = 0) -> Any:
+        remaining[0] -= 1
+        remaining[1] -= 2
+        if remaining[0] < 0 or depth > 64:
+            raise ValueError("result exceeds the 16384 component budget or 64-level nesting budget")
+        if remaining[1] < 0:
+            raise ValueError("result exceeds 65536 characters")
+        kind = type(item)
+        if kind is str:
+            remaining[1] -= len(item)
+            if remaining[1] < 0:
+                raise ValueError("result exceeds 65536 characters")
+            return item
+        if item is None or kind is bool:
+            return item
+        if kind is int:
+            remaining[1] -= item.bit_length() * 30103 // 100000 + 2
+            if remaining[1] < 0:
+                raise ValueError("result exceeds the integer display budget")
+            return item
+        if kind is float:
+            remaining[1] -= 24
+            return item if math.isfinite(item) else None
+        if issubclass(kind, np.generic):
+            return convert(np.generic.item(item), depth + 1)
+        if kind is np.ndarray:
+            if item.size > remaining[0] or item.nbytes > 1048576:
+                raise ValueError(
+                    "result exceeds the 16384 component budget or 1 MiB array conversion budget; select a smaller slice"
+                )
+            return convert(item.tolist(), depth + 1)
+        if kind is list or kind is tuple:
+            if len(item) > remaining[0]:
+                raise ValueError("result exceeds the 16384 component budget")
+            return [convert(element, depth + 1) for element in item]
+        if kind is dict:
+            if 2 * len(item) > remaining[0]:
+                raise ValueError("result exceeds the 16384 component budget")
+            result = {}
+            for key, element in item.items():
+                if not any(type(key) is allowed for allowed in (str, bool, int, float, type(None))):
+                    raise ValueError("Dictionary result keys must be built-in JSON scalar types")
+                convert(key, depth + 1)
+                result[str(key)] = convert(element, depth + 1)
+            return result
+        raise ValueError("Unsupported result type; return built-in JSON data or NumPy values")
+
+    return convert(value)
+
+
+def _result_summary(value: Any) -> str:
+    """Describe an opaque value without calling its repr or iterating its contents."""
+    kind = type(value)
+    if kind is np.ndarray:
+        return f"<numpy.ndarray shape={value.shape} dtype={value.dtype.name}; inspect a slice of _>"
+    if any(kind is allowed for allowed in (str, list, tuple, dict)):
+        return f"<{kind.__name__} length={len(value)}; inspect a slice or selected entries of _>"
+    name = type.__getattribute__(kind, "__name__") if type(kind) is type else "Python"
+    name = name[:128] if type(name) is str else "Python"
+    return f"<{name} object; inspect selected attributes of _>"
+
+
 class SimulationSession:
     """Own the live bindings and serialize simulation operations on one thread.
 
@@ -79,7 +151,11 @@ class SimulationSession:
         This entire class may change without a deprecation period. Applications
         must explicitly embed a session and pump it on their simulation thread.
         Hidden solver state is reset, not checkpointed, so restore does not
-        promise bitwise replay. Trusted execution is full Python, not a sandbox.
+        promise bitwise replay. Trusted execution uses a persistent Python
+        workspace, not a sandbox. It survives physical resets and is cleared
+        by scene replacement. Explicit recovery acknowledgement accepts the
+        caller's assessment of model/solver coherence; it does not prove safety
+        or roll back mutations.
 
     Args:
         model: Finalized model.
@@ -98,7 +174,9 @@ class SimulationSession:
             after restoring arrays, solver caches, and session time.
         rebuild_callback: Optional ``callback(session, **arguments)`` returning
             keyword bindings for :meth:`replace`.
-        allow_execute: Enable trusted, unrestricted Python execution.
+        allow_execute: Enable trusted, unrestricted Python execution in a
+            persistent workspace. Runtime failures require rebuilding or
+            explicit inspection and acknowledgement of repaired/verified state.
         artifact_directory: Directory for observation and recording artifacts.
     """
 
@@ -165,6 +243,14 @@ class SimulationSession:
         self._closed = False
         self._renderer = None
         self._checkpoints = {}
+        self._workspace = {}
+        self._workspace_name = f"_newton_mcp_{id(self):x}"
+        self._workspace_module = None
+        self._workspace_warp_module = None
+        self._workspace_sources = []
+        self._workspace_generation = 0
+        self._cell_count = 0
+        self._execution_error = None
         self.artifact_directory = Path(artifact_directory or tempfile.mkdtemp(prefix="newton-mcp-"))
         self.dt = self._timestep(dt)
         self.step_callback = step_callback
@@ -207,8 +293,10 @@ class SimulationSession:
     ) -> None:
         """Replace all scene bindings and discard old snapshots in this process.
 
-        Topology changes require a newly built model and matching solver. Any
-        application CUDA graphs must be rebuilt by the application too.
+        Topology changes require a newly built model and matching solver. The
+        Python workspace, source history, and its Warp definitions are cleared.
+        Any escaped references or application CUDA graphs must be rebuilt by
+        the application too.
 
         Args:
             model: New finalized model.
@@ -247,6 +335,7 @@ class SimulationSession:
         self.last_error: str | None = None
         self._requires_rebuild = False
         self.valid = True
+        self._clear_workspace()
 
     def _snapshot(self) -> dict:
         total_bytes = 0
@@ -290,6 +379,7 @@ class SimulationSession:
         self.valid = True
         self.revision += 1
         self.last_error = None
+        self._refresh_workspace()
         return self._status()
 
     def enqueue(self, operation: str, arguments: dict, *, timeout: float = 30.0) -> _Request:
@@ -383,6 +473,9 @@ class SimulationSession:
                 request.done.set()
         if self._renderer is not None:
             self._renderer.close()
+        self._clear_workspace()
+        if self._workspace_module is not None and sys.modules.get(self._workspace_name) is self._workspace_module:
+            del sys.modules[self._workspace_name]
 
     def _status(self) -> dict:
         return {
@@ -393,6 +486,7 @@ class SimulationSession:
             "valid": self.valid,
             "closed": self._closed,
             "last_error": self.last_error,
+            "requires_rebuild": self._requires_rebuild,
         }
 
     def _bindings(self, entry: str | list[str] | None = None) -> tuple:
@@ -453,6 +547,7 @@ class SimulationSession:
             ],
             "model_flags": {flag.name: int(flag) for flag in ModelFlags},
             "editable_model_fields": sorted(self._EDIT_FLAGS),
+            "workspace": self._workspace_info(),
             "capabilities": {
                 "execute": self.allow_execute,
                 "rebuild": self.rebuild_callback is not None,
@@ -510,8 +605,16 @@ class SimulationSession:
         }
         if operation not in operations:
             raise ValueError(f"Unknown operation {operation!r}")
-        if not self.valid and operation not in {"describe", "query", "pause", "reset", "restore", "rebuild"}:
-            raise RuntimeError("Session is invalid after a failed mutation; reset or rebuild before continuing")
+        recovery_execution = operation == "execute" and args.get("recovery") in ("inspect", "acknowledge")
+        if (
+            not self.valid
+            and not recovery_execution
+            and operation not in {"describe", "query", "pause", "reset", "restore", "rebuild"}
+        ):
+            raise RuntimeError(
+                "Session is invalid after a failed mutation; reset or rebuild, or use trusted execute "
+                "with recovery='inspect' to diagnose and recovery='acknowledge' only after verifying coherence"
+            )
         if self._requires_rebuild and operation in {"reset", "restore"}:
             raise RuntimeError("Model/solver coherence is unknown after a failed mutation; rebuild the scene")
         return operations[operation](**args)
@@ -539,6 +642,7 @@ class SimulationSession:
                 self.time += dt
                 self.frame += 1
                 self.revision += 1
+                self._refresh_workspace()
                 if self._renderer is not None:
                     self._renderer.after_step()
         except Exception:
@@ -590,43 +694,189 @@ class SimulationSession:
     def _record(self, **kwargs) -> dict:
         return self._renderer_get().record(**kwargs)
 
-    def _execute(self, *, code: str) -> dict:
+    _WORKSPACE_BINDINGS: ClassVar[tuple[str, ...]] = (
+        "session",
+        "model",
+        "solver",
+        "state",
+        "state_next",
+        "control",
+        "contacts",
+        "viewer",
+        "np",
+        "wp",
+    )
+    _EXPRESSION_RESULT = "__newton_expression_result__"
+
+    def _refresh_workspace(self) -> None:
+        if self._workspace_module is None or self._closed:
+            return
+        self._workspace.update(
+            {name: getattr(self, name) for name in self._WORKSPACE_BINDINGS if name not in ("session", "np", "wp")}
+        )
+        self._workspace.update(
+            session=self,
+            np=np,
+            wp=wp,
+            __name__=self._workspace_name,
+            __package__=None,
+            __loader__=None,
+            __spec__=None,
+            __builtins__=builtins.__dict__,
+        )
+
+    def _clear_workspace(self) -> None:
+        for filename in self._workspace_sources:
+            linecache.cache.pop(filename, None)
+        self._workspace_sources.clear()
+        self._workspace.clear()
+        self._workspace_generation += 1
+        self._execution_error = None
+        if self._workspace_warp_module is not None:
+            # This module contains only executor-owned definitions. Escaped
+            # references and captured graphs remain the application's responsibility.
+            self._workspace_warp_module.unload()
+            self._workspace_warp_module.kernels.clear()
+            self._workspace_warp_module.functions.clear()
+            self._workspace_warp_module.structs.clear()
+        self._refresh_workspace()
+
+    def _workspace_info(self) -> dict:
+        reserved = {*self._WORKSPACE_BINDINGS, "result", "_"}
+        variables = sorted(
+            name
+            for name in self._workspace
+            if isinstance(name, str) and name not in reserved and not name.startswith("__")
+        )
+        return {
+            "generation": self._workspace_generation,
+            "cell_count": self._cell_count,
+            "variables": [name[:128] for name in variables[:100]],
+            "variable_count": len(variables),
+            "variables_truncated": len(variables) > 100 or any(len(name) > 128 for name in variables[:100]),
+            "source_cells": len(self._workspace_sources),
+            "last_error": self._execution_error,
+        }
+
+    def _cache_cell_source(self, filename: str, code: str) -> None:
+        lines = code.splitlines(keepends=True)
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        linecache.cache[filename] = (len(code), None, lines, filename)
+        self._workspace_sources.append(filename)
+        if len(self._workspace_sources) > 64:
+            linecache.cache.pop(self._workspace_sources.pop(0), None)
+
+    def _execution_diagnostic(self, error: BaseException, filename: str) -> dict:
+        frames = [
+            {"cell": frame.filename, "line": frame.lineno, "function": frame.name, "source": (frame.line or "")[:200]}
+            for frame in traceback.extract_tb(error.__traceback__)
+            if frame.filename.startswith(f"<{self._workspace_name}:")
+        ][-8:]
+        line = getattr(error, "lineno", None) or (frames[-1]["line"] if frames else None)
+        return {
+            "type": type(error).__name__,
+            "message": str(error)[:4096],
+            "cell": filename,
+            "line": line,
+            "frames": frames,
+        }
+
+    def _execute(self, *, code: str, reset_namespace: bool = False, recovery: str = "none") -> dict:
         if not self.allow_execute:
             raise PermissionError("Trusted Python execution was not enabled by the embedding application")
         if not isinstance(code, str) or len(code) > 65536:
             raise ValueError("code must be a string of at most 65536 characters")
-        compiled = compile(code, "<newton-mcp>", "exec")
+        if not isinstance(reset_namespace, bool):
+            raise ValueError("reset_namespace must be a boolean")
+        if not isinstance(recovery, str) or recovery not in ("none", "inspect", "acknowledge"):
+            raise ValueError("recovery must be none, inspect, or acknowledge")
+        self._cell_count += 1
+        filename = f"<{self._workspace_name}:cell-{self._cell_count}>"
+        try:
+            tree = ast.parse(code, filename=filename, mode="exec")
+            if tree.body and isinstance(tree.body[-1], ast.Expr):
+                expression = tree.body[-1]
+                tree.body[-1] = ast.copy_location(
+                    ast.Assign(targets=[ast.Name(id=self._EXPRESSION_RESULT, ctx=ast.Store())], value=expression.value),
+                    expression,
+                )
+                ast.fix_missing_locations(tree)
+            compiled = compile(tree, filename, "exec")
+        except SyntaxError as error:
+            self._execution_error = self._execution_diagnostic(error, filename)
+            self.last_error = f"Python did not execute: {error}"[:4096]
+            raise
+        if reset_namespace:
+            self._clear_workspace()
+        if self._workspace_module is None:
+            self._workspace_module = ModuleType(self._workspace_name)
+            self._workspace_module.__dict__.update(self._workspace)
+            self._workspace = self._workspace_module.__dict__
+            sys.modules[self._workspace_name] = self._workspace_module
+            self._workspace_warp_module = wp.get_module(self._workspace_name)
+        self._refresh_workspace()
+        self._cache_cell_source(filename, code)
+        scope = self._workspace
+        scope.pop("result", None)
+        scope.pop(self._EXPRESSION_RESULT, None)
         output = self._Output(16384)
-        scope = {
-            "session": self,
-            "model": self.model,
-            "solver": self.solver,
-            "state": self.state,
-            "control": self.control,
-            "np": np,
-            "wp": wp,
-        }
         try:
             with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
                 exec(compiled, scope)
         except Exception as error:
             self._invalidate(requires_rebuild=True)
+            self._execution_error = self._execution_diagnostic(error, filename)
+            diagnostic = self._execution_error
+            self.last_error = f"Python {diagnostic['type']} at line {diagnostic['line']}: {diagnostic['message']}"[
+                :4096
+            ]
             raise RuntimeError(
-                f"Execution failed and may have mutated the scene: {str(error)[:4096]}; stdout={''.join(output.parts)!r}"
+                f"{self.last_error}. Execution may have mutated the scene; paused and invalid, no rollback. "
+                "Workspace variables remain available. Use recovery='inspect' for diagnosis; acknowledge only "
+                "after verifying or repairing model/solver coherence, or rebuild. "
+                f"frames={json.dumps(diagnostic['frames'])}; stdout={''.join(output.parts)!r}"
             ) from error
+        finally:
+            self._refresh_workspace()
         self.revision += 1
+        if recovery == "acknowledge":
+            self.paused = True
+            self.valid = True
+            self._requires_rebuild = False
+        if self.valid:
+            self.last_error = None
+            self._execution_error = None
         if self._renderer is not None:
             self._renderer.invalidate()
+        explicit_result = "result" in scope
+        value = scope.get("result") if explicit_result else scope.pop(self._EXPRESSION_RESULT, None)
+        if value is not None:
+            scope["_"] = value
+        representation = None
         try:
-            result = _json(scope.get("result"))
-            if len(json.dumps(result)) > 65536:
-                raise ValueError("result exceeds 65536 characters")
+            try:
+                result = _result_json(value)
+                if len(json.dumps(result)) > 65536:
+                    raise ValueError("result exceeds 65536 characters")
+            except (ValueError, TypeError, RecursionError):
+                if explicit_result:
+                    raise
+                result = None
+                representation = _result_summary(value)
         except Exception as error:
             raise RuntimeError(
                 f"Python completed; result cannot be returned: {str(error)[:4096]}. "
-                "The scene remains valid; do not retry the mutation. Query a smaller result."
+                "Validity is unchanged; do not retry the mutation. Query a smaller result from _ or saved variables."
             ) from error
-        return {**self._status(), "result": result, "stdout": "".join(output.parts), "truncated": output.truncated}
+        return {
+            **self._status(),
+            "result": result,
+            "result_repr": representation,
+            "stdout": "".join(output.parts),
+            "truncated": output.truncated,
+            "workspace": self._workspace_info(),
+        }
 
     def _rebuild(self, **kwargs) -> dict:
         if self.rebuild_callback is None:

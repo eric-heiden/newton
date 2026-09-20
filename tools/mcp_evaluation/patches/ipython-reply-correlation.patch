@@ -1,0 +1,36 @@
+diff --git a/ipython_mcp/server.py b/ipython_mcp/server.py
+index 29df3fd..598ffb7 100644
+--- a/ipython_mcp/server.py
++++ b/ipython_mcp/server.py
+@@ -226,8 +226,22 @@ def execute_code(code: str) -> str:
+         # Execute code using high-level API
+         msg_id = kernel_client.execute(code)
+         
+-        # Get the reply
+-        reply = kernel_client.get_shell_msg(timeout=30)
++        # A previous timed-out request may still have a reply in this queue.
++        # Never attribute that reply to a later execution.
++        timeout = float(os.environ.get("IPYTHON_MCP_EXECUTION_TIMEOUT", "300"))
++        deadline = time.monotonic() + timeout
++        while True:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise TimeoutError("Execution may still be running; do not repeat mutations automatically")
++            try:
++                reply = kernel_client.get_shell_msg(timeout=remaining)
++            except Exception as error:
++                raise TimeoutError(
++                    "Execution may still be running; do not repeat mutations automatically"
++                ) from error
++            if reply.get("parent_header", {}).get("msg_id") == msg_id:
++                break
+         
+         # Collect output from IOPub
+         output_parts = []
+@@ -449,4 +463,4 @@ def main():
+ 
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()

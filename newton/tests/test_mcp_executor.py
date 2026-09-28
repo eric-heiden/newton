@@ -4,9 +4,11 @@
 """Exercise persistent trusted Python cells and explicit failure recovery."""
 
 import asyncio
+import base64
 import contextlib
 import importlib.util
 import io
+import json
 import linecache
 import sys
 import tempfile
@@ -20,6 +22,17 @@ import warp as wp
 
 import newton
 from newton.mcp import SimulationServer, SimulationSession
+
+
+def _decode(data: str) -> np.ndarray:
+    from newton._src.mcp.imaging import decode_png  # noqa: PLC0415
+
+    return decode_png(base64.b64decode(data))
+
+
+def _payload(result) -> dict:
+    """Decode the compact JSON text that accompanies every MCP tool result."""
+    return json.loads(result.content[0].text)
 
 
 class TestMcpExecutor(unittest.TestCase):
@@ -75,13 +88,17 @@ class TestMcpExecutor(unittest.TestCase):
         self.assertEqual(result["result"], [[3], True, 0])
         self.assertEqual(result["workspace"]["generation"], generation)
 
-    def test_rebuild_and_explicit_namespace_reset_clear_user_variables(self):
-        """Discard scene aliases and closures on replacement and explicit workspace reset."""
+    def test_replacement_keeps_workspace_and_refreshes_bindings(self):
+        """Keep user definitions across scene replacement unless explicitly cleared."""
         result = self.execute("old_state = state\nhelper = lambda captured=state: captured\nvalue = 7")
         generation = result["workspace"]["generation"]
         self.session.replace(self.session.model, newton.solvers.SolverXPBD(self.session.model))
-        result = self.execute("[name in globals() for name in ['old_state', 'helper', 'value']]")
-        self.assertEqual(result["result"], [False, False, False])
+        result = self.execute("[value, old_state is state, state is session.state, helper() is old_state]")
+        self.assertEqual(result["result"], [7, False, True, True])
+        self.assertEqual(result["workspace"]["generation"], generation)
+        self.session.replace(self.session.model, self.session.solver, keep_workspace=False)
+        result = self.execute("'value' in globals()")
+        self.assertFalse(result["result"])
         self.assertGreater(result["workspace"]["generation"], generation)
         self.execute("value = 8")
         result = self.execute("['value' in globals(), state is session.state]", reset_namespace=True)
@@ -308,6 +325,72 @@ values = wp.array([1.0, 2.0, 3.0], dtype=float, device='cpu')
         with self.assertRaises(PermissionError):
             self.execute("value = 1", recovery="acknowledge")
 
+    def test_show_returns_inline_images(self):
+        """Attach arrays, observations, and figures to the execute response as PNG images."""
+        result = self.execute(
+            "show(np.zeros((8, 12, 3), dtype=np.uint8), 'black')\n"
+            "show(np.ones((4, 4)))\n"
+            "show(session.dispatch('observe', {'width': 16, 'height': 12}))"
+        )
+        images = result["images"]
+        self.assertEqual(len(images), 3)
+        shapes = [_decode(image["image_base64"]).shape for image in images]
+        self.assertEqual(shapes, [(8, 12, 3), (4, 4, 3), (12, 16, 3)])
+        self.assertEqual(images[0]["label"], "black")
+        self.assertTrue(np.all(_decode(images[1]["image_base64"]) == 255))
+        self.assertNotIn("images", self.execute("1 + 1"))
+        with self.assertRaisesRegex(RuntimeError, "At most 8 images"):
+            self.execute("for _ in range(9):\n    show(np.zeros((2, 2, 3)))")
+        with self.assertRaisesRegex(RuntimeError, "only available"):
+            self.session.show(np.zeros((2, 2, 3)))
+
+    @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "Requires matplotlib")
+    def test_show_matplotlib_figure(self):
+        """Render matplotlib figures without a display."""
+        result = self.execute(
+            "import matplotlib\nmatplotlib.use('Agg')\nimport matplotlib.pyplot as plt\n"
+            "figure, axis = plt.subplots(figsize=(2, 1), dpi=50)\naxis.plot([0, 1], [1, 0])\nshow(figure)"
+        )
+        self.assertEqual(_decode(result["images"][0]["image_base64"]).shape, (50, 100, 3))
+
+    def test_application_namespace_and_guide(self):
+        """Expose application objects as refreshed globals and return the application guide."""
+        marker = object()
+        self.session.namespace["task"] = marker
+        self.session.guide = "Call task.run()."
+        self.assertTrue(self.execute("task is session.namespace['task']")["result"])
+        self.assertNotIn("task", self.session.dispatch("describe")["workspace"]["variables"])
+        self.assertEqual(self.session.dispatch("guide"), {"guide": "Call task.run()."})
+        self.execute("task = None")
+        self.assertTrue(self.execute("task is session.namespace['task']")["result"])
+
+    def test_protocol_emits_shown_images_and_compact_text(self):
+        """Return shown images as MCP image content with a compact JSON status."""
+        from newton._src.mcp.protocol import _Protocol  # noqa: PLC0415
+
+        session = self.session
+
+        class Client:
+            def request(self, operation, **arguments):
+                return session.dispatch(operation, arguments)
+
+        protocol = _Protocol(Client(), profile="code")
+        protocol.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        response = protocol.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "newton_execute", "arguments": {"code": "show(np.zeros((2, 3, 3)))\n7"}},
+            }
+        )["result"]
+        self.assertEqual([item["type"] for item in response["content"]], ["text", "image"])
+        self.assertNotIn("structuredContent", response)
+        payload = json.loads(response["content"][0]["text"])
+        self.assertEqual(payload["result"], 7)
+        self.assertNotIn("workspace", payload)
+        self.assertNotIn("images", payload)
+
     @unittest.skipUnless(importlib.util.find_spec("mcp"), "Requires optional MCP SDK for interoperability validation")
     def test_official_sdk_workspace_and_recovery(self):
         """Exercise persistent Python cells and explicit recovery through the real stdio MCP bridge."""
@@ -338,7 +421,7 @@ values = wp.array([1.0, 2.0, 3.0], dtype=float, device='cpu')
                     "newton_execute", {"code": "session.dispatch('step', {'count': 1})\nsample()"}
                 )
                 self.assertFalse(second.isError)
-                self.assertEqual(second.structuredContent["result"], [3, True])
+                self.assertEqual(_payload(second)["result"], [3, True])
                 defined = await client.call_tool(
                     "newton_execute",
                     {
@@ -351,20 +434,21 @@ values = wp.array([1.0, 2.0, 3.0], dtype=float, device='cpu')
                     {"code": "wp.launch(increment, dim=2, inputs=[data], device='cpu')\ndata.numpy().tolist()"},
                 )
                 self.assertFalse(launched.isError)
-                self.assertEqual(launched.structuredContent["result"], [1, 1])
+                self.assertEqual(_payload(launched)["result"], [1, 1])
                 failed = await client.call_tool("newton_execute", {"code": "saved = 19\nmissing_name"})
                 self.assertTrue(failed.isError)
                 self.assertIn("line 2", failed.content[0].text)
                 inspected = await client.call_tool("newton_execute", {"code": "saved", "recovery": "inspect"})
-                self.assertEqual(inspected.structuredContent["result"], 19)
-                self.assertFalse(inspected.structuredContent["valid"])
+                self.assertEqual(_payload(inspected)["result"], 19)
+                self.assertFalse(_payload(inspected)["valid"])
                 acknowledged = await client.call_tool("newton_execute", {"code": "", "recovery": "acknowledge"})
-                self.assertTrue(acknowledged.structuredContent["valid"])
-                self.assertTrue(acknowledged.structuredContent["paused"])
+                # Compact responses omit the flag for valid scenes.
+                self.assertNotIn("valid", _payload(acknowledged))
+                self.assertTrue(self.session.paused)
                 cleared = await client.call_tool(
                     "newton_execute", {"code": "'saved' in globals()", "reset_namespace": True}
                 )
-                self.assertFalse(cleared.structuredContent["result"])
+                self.assertFalse(_payload(cleared)["result"])
 
         def worker():
             try:

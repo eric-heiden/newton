@@ -33,7 +33,19 @@ _FILTER = {
     }
     for name in ("world", "body", "shape", "joint")
 }
+_CAMERA_NOTE = "Omit eye/target/pose to auto-frame the scene from the view preset."
+_VIEW = {"type": "string", "enum": ["iso", "front", "back", "left", "right", "top"], "description": _CAMERA_NOTE}
+_VIEWS = {
+    "type": "array",
+    "minItems": 1,
+    "maxItems": 16,
+    "items": {
+        "oneOf": [_VIEW, {"type": "object", "description": "Per-view camera settings, e.g. eye/target/fov_y/label."}]
+    },
+    "description": "Render several cameras into one labeled grid (presets or camera objects).",
+}
 _OBSERVE = {
+    "view": _VIEW,
     "backend": {"type": "string", "enum": ["sensor", "viewer"], "default": "sensor"},
     "eye": {
         "type": "array",
@@ -80,6 +92,7 @@ _OBSERVE = {
         "items": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
     },
 }
+_LABEL = {"type": ["boolean", "string"], "description": "Caption tiles (default on for grids)."}
 
 
 def _tool(name: str, description: str, properties: dict | None = None, required: tuple = (), *, read_only=False):
@@ -185,8 +198,40 @@ TOOLS = [
     ),
     _tool(
         "observe",
-        "Render a bounded camera observation and return an MCP PNG image with metadata. Sensor is default and requires no GL. Viewer backend requires an attached ViewerGL. Backend settings are explicit; unsupported settings fail. Optional raw depth/IDs and pixel picking preserve numeric values.",
-        _OBSERVE,
+        "Render the current state as an inline PNG. Omit the camera to auto-frame the scene (view preset, default iso). "
+        "views=[...] renders several cameras into one labeled grid. reference='photo.png' (or a list aligned with views) "
+        "renders with the same size and returns simulated | reference | mismatch panels plus pixel statistics. "
+        "Sensor backend needs no GL; optional raw depth/IDs and pixel picking preserve numeric values.",
+        {
+            **_OBSERVE,
+            "views": _VIEWS,
+            "reference": {
+                "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": ["string", "null"]}}],
+                "description": "Reference image path(s) taken with the same camera.",
+            },
+            "label": _LABEL,
+        },
+    ),
+    _tool(
+        "filmstrip",
+        "Advance the simulation and return ONE labeled image grid (columns = times, rows = views): the fastest way to "
+        "see a motion. Give absolute times [s] (use reset=true to start from t=0, or restore='checkpoint'), or count "
+        "frames every_steps apart. references=[[paths per time] per view] adds reference and mismatch rows. "
+        "Default tiles 320x240; state stays at the last time.",
+        {
+            "times": {"type": "array", "items": {"type": "number"}, "minItems": 1, "maxItems": 32},
+            "count": {"type": "integer", "minimum": 1, "maximum": 32},
+            "every_steps": {"type": "integer", "minimum": 1},
+            "reset": {"type": "boolean", "default": False},
+            "restore": {"type": "string"},
+            "views": {**_VIEWS, "maxItems": 4},
+            "references": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+            **{
+                k: v
+                for k, v in _OBSERVE.items()
+                if k in ("view", "eye", "target", "up", "fov_y", "width", "height", "world_id", "channel", "shadows")
+            },
+        },
     ),
     _tool(
         "record",
@@ -201,7 +246,14 @@ TOOLS = [
     ),
     _tool(
         "execute",
-        "Run trusted unrestricted Python in a persistent workspace. Imports, functions and variables survive calls and physical resets; rebuilding clears them. Live globals session/model/solver/state/state_next/control/contacts/viewer/wp/np refresh after managed state changes. The last expression is returned (opaque or oversized values use bounded summaries without user repr); explicit result= takes precedence, and _ retains the last value. Use session.dispatch(operation, arguments) for structured operations. Runtime errors preserve partial work but pause/invalidate the scene: recovery='inspect' permits diagnosis while invalid; recovery='acknowledge' explicitly accepts caller-verified/repaired coherence after successful code, always paused. There is no rollback or automatic proof of safety. Compile errors do not execute. Source history and output are bounded; full Python is not a sandbox and cannot be preempted.",
+        "Run trusted Python in the live application process. Variables, imports and functions persist across calls "
+        "(and across reset/rebuild). Globals: session, model, state, control, solver, contacts, np, wp, show, plus "
+        "application objects listed in the server instructions. The last expression is returned (large/opaque values "
+        "are summarized; _ keeps the value). show(img, label) returns images inline: numpy arrays, matplotlib figures, "
+        "PNG paths, or observe/filmstrip results. Batch many evaluations per call and print compact numbers. "
+        "session.dispatch(op, args) runs structured operations (observe, filmstrip, step, reset, checkpoint, restore, "
+        "query, edit). Runtime errors keep variables but pause/invalidate the scene: fix with recovery='inspect' "
+        "then 'acknowledge', or rebuild. Not a sandbox.",
         {
             "code": {"type": "string", "maxLength": 65536},
             "reset_namespace": {
@@ -220,10 +272,37 @@ TOOLS = [
     ),
     _tool(
         "rebuild",
-        "Invoke the application rebuild callback for topology/solver changes within the same process. Callback arguments are application-specific and new bindings replace the scene, contacts, render caches and checkpoints.",
-        {"arguments": {"type": "object"}},
+        "Invoke the application rebuild callback for topology/solver changes within the same process. Callback arguments are application-specific and new bindings replace the scene, contacts, render caches and checkpoints. Python variables survive unless reset_namespace=true.",
+        {"arguments": {"type": "object"}, "reset_namespace": {"type": "boolean", "default": False}},
     ),
 ]
+
+
+_INSTRUCTIONS = """Live Newton simulation running in another process; its Python state persists between calls.
+Efficient workflow:
+- newton_observe() returns an inline image; omit the camera to auto-frame (view='iso'|'front'|'left'|'right'|'top'). views=[...] gives a multi-view grid in one image. reference='photo.png' renders at the photo's size with the same camera and adds reference and mismatch panels plus pixel statistics.
+- newton_filmstrip(times=[...], reset=true) runs forward and returns one labeled grid of frames; references=[[...]] compares each frame with reference images.
+- newton_execute runs Python in the app: batch several parameter candidates in one call, compute numeric comparisons, and call show(image_or_figure, label) to see custom plots or composites inline. Prefer one larger call over many small ones.
+- session.dispatch('checkpoint', {'name': ...}) / ('restore', ...) branches from a saved state instead of re-simulating.
+Runtime Python errors pause and invalidate the scene; use execute(recovery='inspect') to diagnose and 'acknowledge' after repair, or rebuild."""
+
+
+def _compact(data: dict, *, full: bool = False) -> dict:
+    """Drop default-valued status fields so responses stay short for language models."""
+    if full:
+        return data
+    result = {}
+    for key, value in data.items():
+        if key == "workspace":
+            continue
+        if (key, value) in (("closed", False), ("valid", True), ("requires_rebuild", False), ("truncated", False)):
+            continue
+        if key in ("last_error", "result_repr", "stdout", "result") and value in (None, ""):
+            continue
+        if key in ("revision", "paused"):
+            continue
+        result[key] = value
+    return result
 
 
 class _Protocol:
@@ -232,7 +311,7 @@ class _Protocol:
             raise ValueError("profile must be full or code")
         self.client = client
         self.initialized = False
-        names = {"newton_describe", "newton_execute", "newton_observe", "newton_rebuild"}
+        names = {"newton_describe", "newton_execute", "newton_observe", "newton_filmstrip", "newton_rebuild"}
         self.tools = TOOLS if profile == "full" else [tool for tool in TOOLS if tool["name"] in names]
         self.profile = profile
 
@@ -255,7 +334,7 @@ class _Protocol:
                 "protocolVersion": version if version in versions else versions[0],
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "newton-live", "version": "0.1.0"},
-                "instructions": "Experimental live Newton session. Use newton_describe to discover bindings and capabilities when needed. Physics and rendering run on the simulation owner thread. In the code profile, use newton_execute with session.dispatch(operation, arguments) for structured operations; describe lists operation names. Python variables persist across calls. Runtime failures require explicit inspect/acknowledge recovery or rebuilding; successful code alone is not proof of solver coherence. Profiles change tool presentation, not permissions.",
+                "instructions": self._instructions(),
             }
         elif method == "ping":
             result = {}
@@ -273,9 +352,11 @@ class _Protocol:
                 return self._error(request_id, -32602, "Tool arguments must be an object")
             try:
                 if name == "newton_rebuild":
+                    reset_namespace = arguments.get("reset_namespace", False)
                     arguments = arguments.get("arguments", {})
                     if not isinstance(arguments, dict):
                         raise ValueError("Rebuild arguments must be an object")
+                    arguments = {**arguments, "reset_namespace": reset_namespace}
                 data = dict(self.client.request(name.removeprefix("newton_"), **arguments))
                 content = []
                 if "image_base64" in data:
@@ -286,13 +367,28 @@ class _Protocol:
                             "mimeType": data.pop("mime_type", "image/png"),
                         }
                     )
-                content.append({"type": "text", "text": json.dumps(data, allow_nan=False)})
-                result = {"content": content, "structuredContent": data, "isError": False}
+                for image in data.pop("images", None) or []:
+                    content.append({"type": "image", "data": image["image_base64"], "mimeType": image["mime_type"]})
+                text = json.dumps(
+                    _compact(data, full=name == "newton_describe"), allow_nan=False, separators=(",", ":")
+                )
+                content.insert(0, {"type": "text", "text": text})
+                result = {"content": content, "isError": False}
             except Exception as error:
                 result = {"content": [{"type": "text", "text": f"{type(error).__name__}: {error}"}], "isError": True}
         else:
             return self._error(request_id, -32601, "Method not found")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+    def _instructions(self) -> str:
+        text = _INSTRUCTIONS
+        try:
+            guide = self.client.request("guide").get("guide")
+        except Exception:
+            guide = None
+        if guide:
+            text += "\n\nApplication guide:\n" + str(guide)[:8192]
+        return text
 
     @staticmethod
     def _error(request_id, code, message):

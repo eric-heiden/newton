@@ -324,6 +324,74 @@ class TestMcpObservation(unittest.TestCase):
         self.assertEqual((viewer.renderer.draw_shadows, viewer.renderer.draw_wireframe), settings)
         self.assertIsNone(viewer._visible_worlds)
 
+    def test_auto_framing_centers_scene(self):
+        """Frame the scene from view presets when no camera is given."""
+        transforms = self.session.state.body_q.numpy()
+        transforms[0, :3] = [2.0, -1.0, 0.5]
+        self.session.state.body_q.assign(transforms)
+        for view in ("iso", "top", "front"):
+            result = self.renderer.observe(channel="shape_index", width=64, height=64, view=view)
+            ys, xs = np.nonzero(np.any(_decode_png(result), axis=-1))
+            self.assertAlmostEqual(float(xs.mean()), 31.5, delta=3)
+            self.assertAlmostEqual(float(ys.mean()), 31.5, delta=3)
+            # The sphere should fill a sizeable but not overflowing part of the image.
+            self.assertGreater(len(xs), 64 * 64 * 0.05)
+            self.assertLess(len(xs), 64 * 64 * 0.9)
+            self.assertEqual(result["camera"]["auto_framed"]["view"], view)
+        with self.assertRaises(ValueError):
+            self.renderer.observe(view="diagonal")
+
+    def test_multi_view_grid_and_reference_comparison(self):
+        """Tile several views in one image and compare a render against a reference photo."""
+        grid = self.renderer.observe(views=["top", {"label": "custom", **self.camera}], width=40, height=30)
+        self.assertEqual(len(grid["views"]), 2)
+        self.assertEqual(_decode_png(grid).shape[:2], (30 + 4 + 65, 65))
+        single = self.renderer.observe(**self.camera)
+        reference = Path(self.directory.name) / "reference.png"
+        reference.write_bytes(base64.b64decode(single["image_base64"]))
+        camera = {k: v for k, v in self.camera.items() if k not in ("width", "height")}
+        same = self.renderer.observe(reference=str(reference), **camera)
+        self.assertEqual(same["reference"]["mismatch_fraction"], 0.0)
+        self.assertEqual(_decode_png(same).shape, (65, 3 * 65 + 2 * 4, 3))
+        transforms = self.session.state.body_q.numpy()
+        transforms[0, 0] = 0.4
+        self.session.state.body_q.assign(transforms)
+        moved = self.renderer.observe(reference=str(reference), **camera)
+        self.assertGreater(moved["reference"]["mismatch_fraction"], 0.05)
+        with self.assertRaises(ValueError):
+            self.renderer.observe(reference=[str(reference)])
+
+    def test_filmstrip_advances_and_compares(self):
+        """Capture labeled frames at simulation times and compare them with reference images."""
+        builder = newton.ModelBuilder()
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 2.0), wp.quat_identity()))
+        builder.add_shape_sphere(body, radius=0.2)
+        model = builder.finalize(device="cpu")
+        session = SimulationSession(model, SolverXPBD(model), dt=0.01, artifact_directory=self.directory.name)
+        self.addCleanup(session.close)
+        camera = {"eye": [0.0, -6.0, 1.0], "target": [0.0, 0.0, 1.0], "width": 48, "height": 32}
+        strip = session.dispatch("filmstrip", {"times": [0.0, 0.1, 0.3], **camera})
+        self.assertEqual(strip["times"], [0.0, 0.1, 0.3])
+        self.assertEqual(strip["steps_advanced"], 30)
+        self.assertAlmostEqual(session.time, 0.3)
+        self.assertEqual(_decode_png(strip).shape[:2], (32, 3 * 48 + 2 * 4))
+        paths = []
+        for index, t in enumerate((0.0, 0.1, 0.3)):
+            session.dispatch("reset")
+            session.dispatch("step", {"count": round(t / 0.01)}) if t else None
+            frame = session.dispatch("observe", camera)
+            paths.append(str(Path(self.directory.name) / f"frame-{index}.png"))
+            Path(paths[-1]).write_bytes(base64.b64decode(frame["image_base64"]))
+        compared = session.dispatch(
+            "filmstrip", {"times": [0.0, 0.1, 0.3], "reset": True, "references": [paths], **camera}
+        )
+        self.assertEqual([row["mismatch_fraction"] for row in compared["mismatch"]], [0.0, 0.0, 0.0])
+        self.assertEqual(_decode_png(compared).shape[0], 3 * 32 + 2 * 4)
+        counted = session.dispatch("filmstrip", {"count": 2, "every_steps": 5, "reset": True, "view": "front"})
+        self.assertEqual(counted["times"], [0.0, 0.05])
+        with self.assertRaisesRegex(ValueError, "precede"):
+            session.dispatch("filmstrip", {"times": [0.0]})
+
 
 if __name__ == "__main__":
     unittest.main()

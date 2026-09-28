@@ -26,6 +26,11 @@ from newton.solvers import SolverMuJoCo, SolverXPBD
 from newton.solvers.experimental.coupled import SolverCoupled
 
 
+def _payload(result) -> dict:
+    """Decode the compact JSON text that accompanies every MCP tool result."""
+    return json.loads(result.content[0].text)
+
+
 class TestMcp(unittest.TestCase):
     def setUp(self):
         """Build a small CPU scene with real rigid-body dynamics."""
@@ -398,7 +403,7 @@ class TestMcp(unittest.TestCase):
 
     @unittest.skipUnless(importlib.util.find_spec("mcp"), "Requires optional MCP SDK for interoperability validation")
     def test_official_sdk_code_profile(self):
-        """Expose four code-profile tools and retain structured execution and rebuild recovery."""
+        """Expose five code-profile tools and retain structured execution and rebuild recovery."""
         from mcp import ClientSession, StdioServerParameters  # noqa: PLC0415
         from mcp.client.stdio import stdio_client  # noqa: PLC0415
         from mcp.shared.exceptions import McpError  # noqa: PLC0415
@@ -418,22 +423,23 @@ class TestMcp(unittest.TestCase):
                 listing = await client.list_tools()
                 self.assertEqual(
                     {tool.name for tool in listing.tools},
-                    {"newton_describe", "newton_execute", "newton_observe", "newton_rebuild"},
+                    {"newton_describe", "newton_execute", "newton_observe", "newton_filmstrip", "newton_rebuild"},
                 )
                 description = await client.call_tool("newton_describe", {})
-                self.assertIn("step", description.structuredContent["operations"])
+                self.assertIn("step", _payload(description)["operations"])
                 result = await client.call_tool(
                     "newton_execute", {"code": "result = session.dispatch('step', {'count': 2})"}
                 )
                 self.assertFalse(result.isError)
-                self.assertEqual(result.structuredContent["result"]["frame"], 2)
+                self.assertEqual(_payload(result)["result"]["frame"], 2)
                 with self.assertRaises(McpError):
                     await client.call_tool("newton_step", {"count": 1})
                 result = await client.call_tool("newton_execute", {"code": "raise ValueError('trial failure')"})
                 self.assertTrue(result.isError)
                 result = await client.call_tool("newton_rebuild", {})
                 self.assertFalse(result.isError)
-                self.assertTrue(result.structuredContent["valid"])
+                # Compact responses omit the flag for valid scenes.
+                self.assertNotIn("valid", _payload(result))
 
         def worker():
             try:
@@ -485,8 +491,8 @@ class TestMcp(unittest.TestCase):
                 result = await client.call_tool("newton_step", {"count": 2})
                 self.assertFalse(result.isError)
                 result = await client.call_tool("newton_query", {"field": "body_q", "limit": 1})
-                self.assertEqual(result.structuredContent["frame"], 2)
-                self.assertEqual(result.structuredContent["values"][0][2], 1)
+                self.assertEqual(_payload(result)["frame"], 2)
+                self.assertEqual(_payload(result)["values"][0][2], 1)
                 result = await client.call_tool(
                     "newton_observe",
                     {

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import builtins
 import contextlib
 import io
@@ -178,6 +179,10 @@ class SimulationSession:
             persistent workspace. Runtime failures require rebuilding or
             explicit inspection and acknowledgement of repaired/verified state.
         artifact_directory: Directory for observation and recording artifacts.
+        namespace: Extra application objects exposed as globals in trusted
+            execution, refreshed before every cell.
+        guide: Application-specific usage notes; MCP clients receive them in
+            the server instructions.
     """
 
     class _Request:
@@ -236,6 +241,8 @@ class SimulationSession:
         rebuild_callback: Callable | None = None,
         allow_execute: bool = False,
         artifact_directory: str | Path | None = None,
+        namespace: dict[str, Any] | None = None,
+        guide: str | None = None,
     ):
         self._owner = threading.get_ident()
         self._queue = queue.Queue(maxsize=64)
@@ -251,6 +258,11 @@ class SimulationSession:
         self._workspace_generation = 0
         self._cell_count = 0
         self._execution_error = None
+        self._shown_images = None
+        self.namespace = dict(namespace or {})
+        """Extra names available in trusted execution, refreshed before each cell."""
+        self.guide = guide
+        """Application usage notes appended to the MCP server instructions."""
         self.artifact_directory = Path(artifact_directory or tempfile.mkdtemp(prefix="newton-mcp-"))
         self.dt = self._timestep(dt)
         self.step_callback = step_callback
@@ -290,13 +302,15 @@ class SimulationSession:
         collision_pipeline: Any = None,
         contacts: Any = None,
         viewer: Any = None,
+        keep_workspace: bool = True,
     ) -> None:
         """Replace all scene bindings and discard old snapshots in this process.
 
-        Topology changes require a newly built model and matching solver. The
-        Python workspace, source history, and its Warp definitions are cleared.
-        Any escaped references or application CUDA graphs must be rebuilt by
-        the application too.
+        Topology changes require a newly built model and matching solver. By
+        default, Python variables and functions survive and the live bindings
+        (``model``, ``state``, ...) refresh; user references to old scene
+        objects remain stale until reassigned. Any escaped references or
+        application CUDA graphs must be rebuilt by the application too.
 
         Args:
             model: New finalized model.
@@ -307,6 +321,8 @@ class SimulationSession:
             collision_pipeline: New collision pipeline, or one constructed here.
             contacts: Contact buffers, or buffers from the pipeline.
             viewer: Viewer to bind to the replacement model.
+            keep_workspace: Keep Python variables, functions, and source
+                history. ``False`` clears them and the workspace Warp module.
         """
         self._assert_owner()
         self.paused = True
@@ -335,7 +351,10 @@ class SimulationSession:
         self.last_error: str | None = None
         self._requires_rebuild = False
         self.valid = True
-        self._clear_workspace()
+        if keep_workspace:
+            self._refresh_workspace()
+        else:
+            self._clear_workspace()
 
     def _snapshot(self) -> dict:
         total_bytes = 0
@@ -541,10 +560,12 @@ class SimulationSession:
                 "checkpoint",
                 "restore",
                 "observe",
+                "filmstrip",
                 "record",
                 "execute",
                 "rebuild",
             ],
+            "guide": self.guide,
             "model_flags": {flag.name: int(flag) for flag in ModelFlags},
             "editable_model_fields": sorted(self._EDIT_FLAGS),
             "workspace": self._workspace_info(),
@@ -599,7 +620,9 @@ class SimulationSession:
             "checkpoint": self._checkpoint,
             "restore": self._restore_named,
             "observe": self._observe,
+            "filmstrip": self._filmstrip,
             "record": self._record,
+            "guide": self._guide,
             "execute": self._execute,
             "rebuild": self._rebuild,
         }
@@ -609,7 +632,7 @@ class SimulationSession:
         if (
             not self.valid
             and not recovery_execution
-            and operation not in {"describe", "query", "pause", "reset", "restore", "rebuild"}
+            and operation not in {"describe", "guide", "query", "pause", "reset", "restore", "rebuild"}
         ):
             raise RuntimeError(
                 "Session is invalid after a failed mutation; reset or rebuild, or use trusted execute "
@@ -694,6 +717,49 @@ class SimulationSession:
     def _record(self, **kwargs) -> dict:
         return self._renderer_get().record(**kwargs)
 
+    def _filmstrip(self, **kwargs) -> dict:
+        return self._renderer_get().filmstrip(**kwargs)
+
+    def _guide(self) -> dict:
+        return {"guide": self.guide}
+
+    _MAX_SHOWN_IMAGES: ClassVar[int] = 8
+
+    def show(self, image: Any, label: str | None = None) -> None:
+        """Attach an image to the current trusted-execution response.
+
+        Accepts HxW/HxWx3/HxWx4 arrays (uint8, or floats in [0, 1]), Pillow
+        images, matplotlib figures, PNG bytes, image file paths, or an
+        ``observe``/``filmstrip`` result. At most eight images of up to four
+        megapixels each are returned per call; MCP clients see them inline.
+
+        Args:
+            image: Image-like object to display.
+            label: Optional caption drawn on the image and returned as text.
+        """
+        from .imaging import draw_label, encode_png, to_rgb  # noqa: PLC0415
+
+        if self._shown_images is None:
+            raise RuntimeError("show() is only available during trusted execution")
+        if len(self._shown_images) >= self._MAX_SHOWN_IMAGES:
+            raise ValueError(f"At most {self._MAX_SHOWN_IMAGES} images can be shown per execute call")
+        if isinstance(image, dict) and "image_base64" in image:
+            rgb = to_rgb(base64.b64decode(image["image_base64"]))
+        else:
+            rgb = to_rgb(image)
+        if rgb.shape[0] * rgb.shape[1] > 4_194_304:
+            raise ValueError("Shown images are limited to four megapixels; downsample first")
+        if label:
+            rgb = rgb.copy()
+            draw_label(rgb, str(label))
+        self._shown_images.append(
+            {
+                "image_base64": base64.b64encode(encode_png(rgb)).decode("ascii"),
+                "mime_type": "image/png",
+                "label": label,
+            }
+        )
+
     _WORKSPACE_BINDINGS: ClassVar[tuple[str, ...]] = (
         "session",
         "model",
@@ -705,6 +771,7 @@ class SimulationSession:
         "viewer",
         "np",
         "wp",
+        "show",
     )
     _EXPRESSION_RESULT = "__newton_expression_result__"
 
@@ -712,10 +779,16 @@ class SimulationSession:
         if self._workspace_module is None or self._closed:
             return
         self._workspace.update(
-            {name: getattr(self, name) for name in self._WORKSPACE_BINDINGS if name not in ("session", "np", "wp")}
+            {
+                name: getattr(self, name)
+                for name in self._WORKSPACE_BINDINGS
+                if name not in ("session", "np", "wp", "show")
+            }
         )
+        self._workspace.update(self.namespace)
         self._workspace.update(
             session=self,
+            show=self.show,
             np=np,
             wp=wp,
             __name__=self._workspace_name,
@@ -742,7 +815,7 @@ class SimulationSession:
         self._refresh_workspace()
 
     def _workspace_info(self) -> dict:
-        reserved = {*self._WORKSPACE_BINDINGS, "result", "_"}
+        reserved = {*self._WORKSPACE_BINDINGS, *self.namespace, "result", "_"}
         variables = sorted(
             name
             for name in self._workspace
@@ -821,10 +894,12 @@ class SimulationSession:
         scope.pop("result", None)
         scope.pop(self._EXPRESSION_RESULT, None)
         output = self._Output(16384)
+        self._shown_images = []
         try:
             with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
                 exec(compiled, scope)
         except Exception as error:
+            self._shown_images = None
             self._invalidate(requires_rebuild=True)
             self._execution_error = self._execution_diagnostic(error, filename)
             diagnostic = self._execution_error
@@ -849,6 +924,7 @@ class SimulationSession:
             self._execution_error = None
         if self._renderer is not None:
             self._renderer.invalidate()
+        images, self._shown_images = self._shown_images, None
         explicit_result = "result" in scope
         value = scope.get("result") if explicit_result else scope.pop(self._EXPRESSION_RESULT, None)
         if value is not None:
@@ -876,16 +952,17 @@ class SimulationSession:
             "stdout": "".join(output.parts),
             "truncated": output.truncated,
             "workspace": self._workspace_info(),
+            **({"images": images} if images else {}),
         }
 
-    def _rebuild(self, **kwargs) -> dict:
+    def _rebuild(self, *, reset_namespace: bool = False, **kwargs) -> dict:
         if self.rebuild_callback is None:
             raise ValueError("No rebuild callback was registered")
         try:
             bindings = self.rebuild_callback(self, **kwargs)
             if not isinstance(bindings, dict):
                 raise ValueError("Rebuild callback must return replacement keyword bindings")
-            self.replace(**bindings)
+            self.replace(**bindings, keep_workspace=not reset_namespace)
         except Exception:
             self._invalidate(requires_rebuild=True)
             raise

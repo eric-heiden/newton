@@ -9,10 +9,8 @@ import base64
 import copy
 import json
 import math
-import struct
 import threading
 import uuid
-import zlib
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +18,10 @@ import numpy as np
 import warp as wp
 
 from newton.sensors import SensorTiledCamera
+
+from .imaging import compare as _compare_images
+from .imaging import encode_png as _png
+from .imaging import load_image, tile
 
 
 def _integer(name: str, value: int, minimum: int, maximum: int) -> int:
@@ -35,7 +37,26 @@ def _vector(name: str, value: Any, size: int) -> np.ndarray:
     return result
 
 
-def _camera_pose(eye, target, up, pose, up_axis: int) -> tuple[np.ndarray, np.ndarray, list[float]]:
+# View directions from the target toward the camera in a Z-up frame.
+VIEW_PRESETS = {
+    "iso": (1.0, -1.0, 0.8),
+    "front": (0.0, -1.0, 0.3),
+    "back": (0.0, 1.0, 0.3),
+    "right": (1.0, 0.0, 0.3),
+    "left": (-1.0, 0.0, 0.3),
+    "top": (0.0, -0.001, 1.0),
+}
+
+
+def _from_z_up(vector, up_axis: int) -> np.ndarray:
+    x, y, z = vector
+    return np.asarray({2: (x, y, z), 1: (x, z, -y), 0: (z, x, y)}[up_axis], dtype=np.float64)
+
+
+def _camera_pose(eye, target, up, pose, up_axis: int, frame=None, view=None, fov_y: float = 60.0):
+    """Return eye, camera rotation, and pose; ``frame`` = (center, radius) enables auto-framing."""
+    if view is not None and view not in VIEW_PRESETS:
+        raise ValueError(f"view must be one of {sorted(VIEW_PRESETS)}")
     if pose is not None:
         if any(value is not None for value in (eye, target, up)):
             raise ValueError("pose and eye/target/up are mutually exclusive")
@@ -46,6 +67,16 @@ def _camera_pose(eye, target, up, pose, up_axis: int) -> tuple[np.ndarray, np.nd
         quaternion = pose[3:] / norm
         rotation = np.asarray(wp.quat_to_matrix(wp.quat(*quaternion)), dtype=np.float64).reshape(3, 3)
         return pose[:3], rotation, [*pose[:3].tolist(), *quaternion.tolist()]
+    if eye is None and frame is not None:
+        center, radius = frame
+        center = center if target is None else _vector("target", target, 3)
+        direction = _from_z_up(VIEW_PRESETS[view or "iso"], up_axis)
+        direction /= np.linalg.norm(direction)
+        distance = 1.15 * max(radius, 1.0e-3) / math.sin(math.radians(fov_y) / 2.0)
+        eye = center + direction * distance
+        target = center
+        if (view or "iso") == "top" and up is None:
+            up = _from_z_up((0.0, 1.0, 0.0), up_axis)
     eye = _vector("eye", (3.0, -3.0, 2.0) if eye is None else eye, 3)
     target = _vector("target", (0.0, 0.0, 0.0) if target is None else target, 3)
     up = _vector("up", np.eye(3)[up_axis] if up is None else up, 3)
@@ -60,23 +91,6 @@ def _camera_pose(eye, target, up, pose, up_axis: int) -> tuple[np.ndarray, np.nd
     rotation = np.column_stack((right, np.cross(right, forward), -forward))
     quaternion = wp.quat_from_matrix(wp.mat33(*rotation.flatten()))
     return eye, rotation, [*eye.tolist(), *list(quaternion)]
-
-
-def _png(rgb: np.ndarray) -> bytes:
-    """Encode top-left RGB bytes without an optional imaging dependency."""
-    height, width, _ = rgb.shape
-
-    def chunk(kind: bytes, data: bytes) -> bytes:
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
-
-    scanlines = np.zeros((height, width * 3 + 1), dtype=np.uint8)
-    scanlines[:, 1:] = rgb.reshape(height, width * 3)
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-        + chunk(b"IDAT", zlib.compress(scanlines.tobytes()))
-        + chunk(b"IEND", b"")
-    )
 
 
 class ObservationRenderer:
@@ -154,9 +168,10 @@ class ObservationRenderer:
         self._sensor = self._sensor_model = self._buffer_key = self._rays = self._transforms = None
         self._outputs = {}
 
-    def observe(
+    def _single(
         self,
         *,
+        view: str | None = None,
         backend: str = "sensor",
         channel: str = "color",
         width: int = 640,
@@ -224,7 +239,10 @@ class ObservationRenderer:
                 f"Observation needs {aggregate_pixels} aggregate pixels (worlds x cameras x width x height); "
                 f"limit is {self.MAX_PIXELS}. Reduce resolution."
             )
-        eye, rotation, camera_pose = _camera_pose(eye, target, up, pose, int(model.up_axis))
+        frame = self._scene_frame(world_id) if pose is None and eye is None else None
+        eye, rotation, camera_pose = _camera_pose(
+            eye, target, up, pose, int(model.up_axis), frame=frame, view=view, fov_y=float(fov_y)
+        )
         metadata = {
             "backend": backend,
             "channel": channel,
@@ -273,9 +291,257 @@ class ObservationRenderer:
             artifact = directory / f"observation-{uuid.uuid4().hex}.npz"
             np.savez_compressed(artifact, **arrays, camera_pose=camera_pose, fov_y=fov_y)
             metadata["raw_artifact"] = str(artifact)
-        metadata["image_base64"] = base64.b64encode(_png(rgb)).decode("ascii")
+        if frame is not None:
+            metadata["camera"]["auto_framed"] = {
+                "view": view or "iso",
+                "target": [round(float(v), 4) for v in frame[0]],
+            }
+        return rgb, metadata
+
+    def observe(self, *, views=None, reference=None, label=None, **options) -> dict:
+        """Render one camera, a labeled multi-view grid, or a comparison against a reference image.
+
+        Omitting ``eye``/``target``/``pose`` frames the current scene
+        automatically from the ``view`` preset (default ``"iso"``). ``views`` is
+        a list of preset names or per-view camera dictionaries sharing the other
+        options. ``reference`` is an image path (a list aligned with ``views``)
+        taken with the same camera; the result adds the reference and a
+        mismatch panel (magenta = pixels differing by more than 24/255) plus
+        pixel statistics. Width/height default to the reference size.
+        """
+        self._check_thread()
+        if views is None:
+            if isinstance(reference, list):
+                raise ValueError("A reference list requires views; use one reference path for a single view")
+            spec = dict(options)
+            if isinstance(label, str):
+                spec["label"] = label
+            rows, labels, metadata = self._rows([spec], [reference], bool(label) or reference is not None)
+            single = metadata["views"][0]
+            image = rows[0][0] if reference is None and not label else tile(rows, labels)
+            single["image_base64"] = base64.b64encode(_png(image)).decode("ascii")
+            single["mime_type"] = "image/png"
+            if reference is not None:
+                single["layout"] = "simulated | reference | mismatch"
+            return single
+        if not isinstance(views, list) or not 1 <= len(views) <= 16:
+            raise ValueError("views must be a list of 1 to 16 presets or camera dictionaries")
+        specs = []
+        for item in views:
+            spec = dict(options)
+            if isinstance(item, str):
+                spec.update(view=item, eye=None, target=None, pose=None)
+            elif isinstance(item, dict):
+                spec.update(item)
+            else:
+                raise ValueError("Each view must be a preset name or a camera dictionary")
+            specs.append(spec)
+        references = reference if isinstance(reference, list) else [reference] * len(specs)
+        if reference is not None and (not isinstance(reference, list) or len(reference) != len(specs)):
+            raise ValueError("reference must be a list aligned with views")
+        rows, labels, metadata = self._rows(specs, references, label is None or bool(label))
+        metadata["image_base64"] = base64.b64encode(_png(tile(rows, labels))).decode("ascii")
         metadata["mime_type"] = "image/png"
+        metadata["layout"] = "one row per view" + (
+            ": simulated | reference | mismatch" if reference is not None else ""
+        )
         return metadata
+
+    def _rows(self, specs, references, label):
+        rows, labels, views = [], [], []
+        total_pixels = 0
+        for index, (view_spec, reference) in enumerate(zip(specs, references, strict=True)):
+            spec = dict(view_spec)
+            name = spec.pop("label", None)
+            name = name if isinstance(name, str) else None
+            reference_rgb = None
+            if reference is not None:
+                if not isinstance(reference, str):
+                    raise ValueError("reference must be an image file path")
+                reference_rgb = load_image(reference)
+                spec.setdefault("height", reference_rgb.shape[0])
+                spec.setdefault("width", reference_rgb.shape[1])
+            rgb, metadata = self._single(**spec)
+            total_pixels += rgb.shape[0] * rgb.shape[1] * (1 if reference_rgb is None else 3)
+            if total_pixels > self.MAX_PIXELS:
+                raise ValueError(f"Combined image exceeds {self.MAX_PIXELS} pixels; reduce width/height or views")
+            name = (
+                name
+                or spec.get("view")
+                or ("auto" if spec.get("eye") is None and spec.get("pose") is None else f"view {index}")
+            )
+            row, row_labels = [rgb], [f"{name} t={self.session.time:.3f}" if label else ""]
+            if reference_rgb is not None:
+                panel, stats = _compare_images(rgb, reference_rgb)
+                row += [reference_rgb, panel]
+                row_labels += ["reference", f"mismatch {100 * stats['mismatch_fraction']:.1f}%"] if label else ["", ""]
+                metadata["reference"] = {"path": reference, **stats}
+            rows.append(row)
+            labels.append(row_labels)
+            views.append(metadata)
+        summary = {
+            "time": float(self.session.time),
+            "frame": int(getattr(self.session, "frame", 0)),
+            "revision": int(getattr(self.session, "revision", 0)),
+            "views": views,
+        }
+        return rows, labels, summary
+
+    def _scene_frame(self, world_id: int) -> tuple[np.ndarray, float]:
+        """Bounding sphere [m] of non-plane shapes and particles in one world."""
+        from ..geometry.types import GeoType  # noqa: PLC0415
+
+        model, state = self.session.model, self.session.state
+        points, radii = [], []
+        if model.shape_count:
+            shape_type = model.shape_type.numpy()
+            shape_body = model.shape_body.numpy()
+            shape_world = model.shape_world.numpy()
+            transforms = model.shape_transform.numpy()
+            radius = model.shape_collision_radius.numpy()
+            body_q = state.body_q.numpy() if state.body_q is not None and model.body_count else None
+            for i in range(model.shape_count):
+                if shape_type[i] == GeoType.PLANE or shape_world[i] not in (world_id, -1):
+                    continue
+                local = transforms[i]
+                position = local[:3]
+                if shape_body[i] >= 0 and body_q is not None:
+                    pose = wp.transform(*body_q[shape_body[i]])
+                    position = np.asarray(wp.transform_point(pose, wp.vec3(*local[:3])))
+                points.append(position)
+                radii.append(float(min(radius[i], 1.0e3)))
+        if model.particle_count and state.particle_q is not None:
+            particles = state.particle_q.numpy()
+            worlds = model.particle_world.numpy() if model.particle_world is not None else None
+            if worlds is not None:
+                particles = particles[(worlds == world_id) | (worlds == -1)]
+            particles = particles[np.isfinite(particles).all(axis=1)]
+            if len(particles):
+                points += [particles.min(axis=0), particles.max(axis=0)]
+                radii += [0.0, 0.0]
+        if not points:
+            return np.zeros(3), 1.0
+        points, radii = np.asarray(points, dtype=np.float64), np.asarray(radii)
+        finite = np.isfinite(points).all(axis=1)
+        points, radii = points[finite], radii[finite]
+        lower = (points - radii[:, None]).min(axis=0)
+        upper = (points + radii[:, None]).max(axis=0)
+        return 0.5 * (lower + upper), float(0.5 * np.linalg.norm(upper - lower))
+
+    def filmstrip(
+        self,
+        *,
+        times=None,
+        every_steps: int | None = None,
+        count: int | None = None,
+        reset: bool = False,
+        restore: str | None = None,
+        views=None,
+        references=None,
+        **options,
+    ) -> dict:
+        """Advance the simulation and return one labeled grid of frames over time.
+
+        Columns are capture times; rows are views. ``times`` are absolute
+        simulation times [s] at or after the current time (after the optional
+        ``reset``/``restore``). Alternatively capture ``count`` frames every
+        ``every_steps`` steps, starting with the current state. ``references``
+        holds reference image paths per view row, one per time, adding
+        reference and mismatch rows beneath each simulated row.
+        """
+        self._check_thread()
+        session = self.session
+        if reset and restore is not None:
+            raise ValueError("Use either reset or restore")
+        if reset:
+            session.dispatch("reset")
+        elif restore is not None:
+            session.dispatch("restore", {"name": restore})
+        if times is not None:
+            if not isinstance(times, list) or not 1 <= len(times) <= 32:
+                raise ValueError("times must list 1 to 32 simulation times [s]")
+            targets = sorted(float(t) for t in times)
+            if targets[0] < session.time - 1.0e-9:
+                raise ValueError(f"times must not precede the current time {session.time}; pass reset=true")
+        else:
+            count = _integer("count", 6 if count is None else count, 1, 32)
+            every_steps = _integer("every_steps", 10 if every_steps is None else every_steps, 1, 100_000)
+            targets = None
+        view_specs = (
+            views
+            if views is not None
+            else [dict(options) if any(k in options for k in ("eye", "pose")) else options.get("view", "iso")]
+        )
+        if not isinstance(view_specs, list) or not 1 <= len(view_specs) <= 4:
+            raise ValueError("views must list 1 to 4 presets or camera dictionaries")
+        options = (
+            {k: v for k, v in options.items() if k not in ("eye", "target", "up", "pose", "view")}
+            if views is None
+            else options
+        )
+        options.setdefault("width", 320)
+        options.setdefault("height", 240)
+        if references is not None:
+            if len(view_specs) == 1 and references and isinstance(references[0], str):
+                references = [references]
+            if len(references) != len(view_specs):
+                raise ValueError("references must hold one list of image paths per view")
+        columns, captured_times, statistics = [], [], []
+        steps = 0
+        for index in range(len(targets) if targets is not None else count):
+            if targets is not None:
+                while session.time < targets[index] - 0.5 * session.dt:
+                    session.dispatch("step", {"count": 1})
+                    steps += 1
+            elif index:
+                session.dispatch("step", {"count": every_steps})
+                steps += every_steps
+            column = []
+            for row, spec in enumerate(view_specs):
+                camera = dict(options)
+                if isinstance(spec, str):
+                    camera.update(view=spec)
+                else:
+                    camera.update(spec)
+                camera.pop("label", None)
+                reference = None if references is None else references[row][index]
+                if reference is not None:
+                    reference_rgb = load_image(reference)
+                    camera["height"], camera["width"] = reference_rgb.shape[:2]
+                rgb, _ = self._single(**camera)
+                column.append((rgb, None if reference is None else reference_rgb))
+            columns.append(column)
+            captured_times.append(float(session.time))
+        grid, labels = [], []
+        for row, spec in enumerate(view_specs):
+            name = spec if isinstance(spec, str) else spec.get("label", f"view {row}")
+            grid.append([column[row][0] for column in columns])
+            labels.append([f"{name} t={t:.3f}" for t in captured_times])
+            if references is not None:
+                grid.append([column[row][1] for column in columns])
+                labels.append([f"reference t={t:.3f}" for t in captured_times])
+                panels = []
+                for column, t in zip(columns, captured_times, strict=True):
+                    panel, stats = _compare_images(column[row][0], column[row][1])
+                    panels.append(panel)
+                    statistics.append({"view": name, "time": round(t, 6), **stats})
+                grid.append(panels)
+                labels.append([f"mismatch {100 * s['mismatch_fraction']:.1f}%" for s in statistics[-len(panels) :]])
+        image = tile(grid, labels)
+        if image.shape[0] * image.shape[1] > self.MAX_PIXELS:
+            raise ValueError("Filmstrip exceeds the pixel budget; reduce width/height, times, or views")
+        result = {
+            "time": float(session.time),
+            "frame": int(session.frame),
+            "times": [round(t, 6) for t in captured_times],
+            "steps_advanced": steps,
+            "layout": "columns = times; rows = views" + (" (simulated, reference, mismatch)" if references else ""),
+            "image_base64": base64.b64encode(_png(image)).decode("ascii"),
+            "mime_type": "image/png",
+        }
+        if statistics:
+            result["mismatch"] = statistics
+        return result
 
     def _render_sensor(self, width, height, fov_y, pose, world_id, channel, shadows, textures, contacts, pick):
         model, state = self.session.model, self.session.state

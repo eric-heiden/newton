@@ -65,7 +65,7 @@ file path when the MCP client's working directory differs:
 
 The default ``--profile full`` advertises every structured tool. Add
 ``--profile code`` to advertise only ``newton_describe``, ``newton_execute``,
-``newton_observe``, and ``newton_rebuild``. This reduces tool-schema context for
+``newton_observe``, ``newton_filmstrip``, and ``newton_rebuild``. This reduces tool-schema context for
 clients that prefer Python. The profile changes presentation, not permissions:
 trusted execution still requires ``allow_execute=True``. Python can call
 ``session.dispatch(operation, arguments)`` for every structured operation listed
@@ -76,6 +76,11 @@ modes remain available through ``newton_execute`` as described below.
 This adapter implements newline-delimited JSON-RPC initialization and tools,
 following the `MCP stdio transport specification
 <https://modelcontextprotocol.io/specification/2025-11-25/basic/transports>`_.
+Tool results carry a compact JSON text block (default-valued status fields are
+omitted) followed by any images. The server instructions include a short
+workflow guide, followed by application notes passed as
+``SimulationSession(..., guide=...)``.
+
 Its authenticated TCP connection to the embedded session is an internal
 loopback attachment protocol, not an HTTP MCP endpoint. The official Python
 MCP SDK is used only for optional interoperability tests.
@@ -159,6 +164,23 @@ of ``[x, y]`` image coordinates. ``backend="viewer"`` captures an attached
 backend settings fail explicitly. Recording writes bounded PNG sequences with
 simulation timestamps and a manifest, without requiring ffmpeg.
 
+Omitting ``eye``, ``target``, and ``pose`` frames the current scene
+automatically: the camera looks at the bounding sphere of non-plane shapes and
+particles in the selected world from a ``view`` preset (``iso``, ``front``,
+``back``, ``left``, ``right``, or ``top``). ``views`` renders several presets
+or camera dictionaries into one labeled grid image. ``reference`` names an
+image file taken with the same camera; the render uses the reference size and
+the response shows simulated, reference, and mismatch panels, with magenta
+marking pixels whose largest channel difference exceeds 24/255, plus the mean
+absolute difference and mismatch fraction.
+
+``filmstrip`` advances the simulation and returns one labeled grid whose
+columns are capture times and whose rows are views. Give absolute ``times``
+(optionally after ``reset=True`` or ``restore=<checkpoint>``) or ``count``
+frames ``every_steps`` apart. ``references`` adds reference and mismatch rows
+per view, one reference image per time. Stepping uses the normal step path,
+so application callbacks and recordings behave as in ``step``.
+
 Persistent Python workspace
 ---------------------------
 
@@ -171,8 +193,10 @@ functions, and ``@wp.func`` / ``@wp.kernel`` definitions that can be launched
 in later calls. IPython magics and top-level ``await`` are not implemented.
 
 The reserved names ``session``, ``model``, ``solver``, ``state``, ``state_next``,
-``control``, ``contacts``, ``viewer``, ``wp``, and ``np`` refresh before each call
-and after managed state changes. Functions that read these globals see the
+``control``, ``contacts``, ``viewer``, ``wp``, ``np``, and ``show`` refresh before
+each call and after managed state changes. Objects passed as
+``SimulationSession(..., namespace={...})`` are also refreshed before each
+call, so applications can expose their own controllers or task objects. Functions that read these globals see the
 current state after an odd number of buffer swaps, including steps initiated
 inside the same cell. User-created aliases and captured default arguments are
 ordinary Python references and do not automatically follow buffer swaps.
@@ -189,6 +213,12 @@ ordinary Python references and do not automatically follow buffer swaps.
    math.fsum(samples) / len(samples)
    """)
    print(result["result"])
+
+``show(image, label=None)`` attaches up to eight images to the response of the
+current call. It accepts arrays (``HxW``, ``HxWx3``, or ``HxWx4``; floats in
+``[0, 1]``), Pillow images, matplotlib figures, PNG bytes, image paths, and
+``observe``/``filmstrip`` results. MCP clients receive them as image content,
+so custom plots and composites need no file round trip.
 
 The last expression produces the returned value. Explicit ``result = ...``
 retains its previous behavior and takes precedence; it is cleared before the
@@ -210,8 +240,10 @@ Inspect ``_[:10]`` or another saved variable rather than repeating a mutation.
 functions, classes, previous results, and source history before running the
 new cell. It does not reset or repair simulation state. Compilation happens
 before this clear, so a syntax error preserves the existing workspace.
-Scene ``replace``/``rebuild`` always clears the workspace to drop old scene
-aliases and closures. Closing the session removes its Python module registration
+Scene ``replace``/``rebuild`` keeps Python variables and refreshes the reserved
+bindings; user references to old scene objects stay stale until reassigned.
+Pass ``replace(..., keep_workspace=False)`` or ``rebuild(reset_namespace=True)``
+to clear the workspace as well. Closing the session removes its Python module registration
 and cached cell sources. Clearing or closing unloads the workspace's Warp module
 and drops its registered definitions. Escaped references, separately named Warp
 modules, and captured CUDA graphs remain application-owned; Warp's ordinary

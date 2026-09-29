@@ -28,3 +28,4 @@ this changes tool presentation, not permissions.
    SimulationClient
    SimulationServer
    SimulationSession
+   WorkerPool

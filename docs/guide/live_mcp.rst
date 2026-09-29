@@ -256,6 +256,29 @@ include workspace generation, cell count, a bounded list of variable names,
 and the most recent execution diagnostic. Diagnostics identify the exception,
 cell, source line, and up to eight user-code stack frames.
 
+Parallel worker sessions
+------------------------
+
+Every request to one session runs on its owner thread, so candidate
+evaluations issued through one live application run one after another.
+Script-based workflows can instead run several simulator processes at once.
+To recover that parallelism without giving up persistent state, pass the
+connection files of sibling sessions (typically more instances of the same
+application) as ``SimulationSession(..., workers=[...])``. Trusted execution
+then receives a :class:`newton.mcp.WorkerPool` named ``workers``:
+
+.. code-block:: python
+
+   workers.broadcast("def evaluate(p):\n    task.set_params(p)\n    ...\n    return loss")
+   losses = workers.map("result = evaluate(args)", candidates)
+
+``broadcast`` runs a cell on every worker, ``map`` spreads one cell per
+argument over idle workers and returns results in input order, and ``submit``
+returns a future. Each worker keeps its own scene and Python workspace.
+Worker jobs run with ``recovery="acknowledge"`` so a failed job does not block
+that worker; ``map`` returns ``{"error": ...}`` for the failed item. Rebuild or
+reset a worker whose scene a failed job may have left inconsistent.
+
 Explicit recovery after an execution error
 ------------------------------------------
 

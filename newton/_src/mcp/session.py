@@ -514,15 +514,19 @@ class SimulationSession:
                 request.done.set()
         return count
 
-    def run(self) -> None:
-        """Pump requests and advance playback until closed or interrupted.
+    def run(self, until: Callable[[], bool] | None = None) -> None:
+        """Pump requests and advance playback until closed, interrupted, or ``until()`` is true.
 
         Playback uses the configured timestep [s] without wall-clock pacing.
         Embed :meth:`pump` in an application loop for custom rendering/pacing.
+
+        Args:
+            until: Optional predicate checked between requests; returning ``True``
+                stops the loop and closes the session.
         """
         self._assert_owner()
         try:
-            while not self._closed:
+            while not self._closed and not (until is not None and until()):
                 self.pump()
                 if not self.paused:
                     try:

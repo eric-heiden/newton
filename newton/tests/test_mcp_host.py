@@ -6,6 +6,8 @@
 import base64
 import tempfile
 import textwrap
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -259,6 +261,32 @@ class TestMcpHelpers(unittest.TestCase):
         """Provide newton and the helper functions without imports."""
         result = self.session.dispatch("execute", {"code": "(newton.__name__, callable(rollout), health()['ok'])"})
         self.assertEqual(result["result"], ["newton", True, True])
+
+    def test_client_follows_a_restarted_server(self):
+        """Re-read the connection file when the server behind it restarts with a new port and token."""
+        from newton.mcp import SimulationClient, SimulationServer  # noqa: PLC0415
+
+        connection = Path(self.directory.name) / "restart.json"
+
+        def call(client):
+            # Requests execute on the session's owner thread, so pump here while a thread waits.
+            result = {}
+            thread = threading.Thread(target=lambda: result.update(client.request("describe")))
+            thread.start()
+            while thread.is_alive():
+                self.session.pump()
+                time.sleep(0.005)
+            return result
+
+        first = SimulationServer(self.session, connection_file=connection)
+        first.start()
+        client = SimulationClient(connection, timeout=5)
+        self.assertEqual(call(client)["frame"], 0)
+        first.close()
+        second = SimulationServer(self.session, connection_file=connection)
+        second.start()
+        self.addCleanup(second.close)
+        self.assertEqual(call(client)["frame"], 0)
 
 
 class TestMcpLeanProfile(unittest.TestCase):

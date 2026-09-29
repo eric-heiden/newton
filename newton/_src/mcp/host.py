@@ -81,6 +81,47 @@ class _NoSolver:
         pass
 
 
+def _install_solver_warmup() -> None:
+    """Give every SolverMuJoCo built in this host process one eager step on scratch states.
+
+    SolverMuJoCo allocates buffers during its first step. Examples capture that step in a
+    CUDA graph, which makes the buffers graph-owned, and a later capture around the same
+    solver (a live rollout helper, a recapture after edits) then corrupts memory. One
+    eager step at construction, followed by a solver reset, keeps those buffers outside
+    any graph. Only the dedicated host process installs this.
+    """
+    import newton  # noqa: PLC0415
+
+    solver_class = newton.solvers.SolverMuJoCo
+    if getattr(solver_class, "_newton_mcp_warmup", False):
+        return
+    original = solver_class.__init__
+
+    def __init__(self, model, *args, **kwargs):
+        original(self, model, *args, **kwargs)
+        if (
+            not model.device.is_cuda
+            or getattr(self, "use_mujoco_cpu", False)
+            or wp.get_device(model.device).is_capturing
+        ):
+            return
+        try:
+            state, scratch, control = model.state(), model.state(), model.control()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+            contacts = (
+                None if getattr(self, "_use_mujoco_contacts", True) else newton.CollisionPipeline(model).contacts()
+            )
+            self.step(state, scratch, control, contacts, 1.0e-4)
+            self.reset(state)
+            self._step = 0
+            self._newton_mcp_warmed = True
+        except Exception:
+            pass
+
+    solver_class.__init__ = __init__
+    solver_class._newton_mcp_warmup = True
+
+
 class ExampleHost:
     """Construct and serve a Newton ``Example`` script.
 
@@ -105,6 +146,7 @@ class ExampleHost:
         self._retired_graphs: list = []
         self._captured_solver = None
         self._no_solver = _NoSolver()
+        self.restart_requested = False
 
     def build(self, argv: list[str] | None = None) -> Any:
         """(Re)load the script from disk and construct its example with a null viewer."""
@@ -153,7 +195,8 @@ class ExampleHost:
         graphs = [value for value in vars(example).values() if isinstance(value, wp.Graph)]
         if not graphs:
             return False
-        if id(getattr(example, "solver", None)) == self._captured_solver:
+        solver = getattr(example, "solver", None)
+        if id(solver) == self._captured_solver and not getattr(solver, "_newton_mcp_warmed", False):
             raise RuntimeError(
                 "Recapturing CUDA graphs around the same solver instance is unsafe; assign a new solver to "
                 "example.solver first, or write the change into the script and newton_rebuild"
@@ -287,6 +330,7 @@ class ExampleHost:
 - Helpers (preloaded with newton, np, wp): rollout(frames or seconds=..., record={{'name': 'expr' or fn}}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the parameters the solver actually integrates and which shape's material decided them; health() flags NaNs, runaway velocities, deep penetration, and full solver buffers.
 - Observations (session.dispatch('observe'/'filmstrip', ...), shown with show()) draw the model's visible shapes plus meshes the example logs in its own render() (e.g. extracted surfaces), auto-framed.
 - Python errors in a cell are reported but keep the scene valid; statements before the failing line keep their effects.
+- newton_rebuild(arguments={{"restart": true}}) restarts the whole host process (fresh CUDA context, same script and arguments; Python variables are lost, and the next call waits for the new process). Use it only if the process is broken, e.g. after a CUDA error.
 - After editing the script on disk, newton_rebuild reloads and reconstructs it in this process (Python variables survive; pass arguments={{"argv": [...]}} to change example arguments). Rebuild once to confirm the edited script reproduces your live result."""
         if workers:
             text += f"""
@@ -308,7 +352,11 @@ class ExampleHost:
             session.state_next = getattr(host.example, "state_1", None) or session.state_next
             host._fingerprint = host.fingerprint()
 
-        def rebuild(session, argv=None, **_):
+        def rebuild(session, argv=None, restart=False, **_):
+            if restart:
+                # The host process re-executes itself once this response has been sent.
+                host.restart_requested = True
+                return host.bindings()
             host.build(argv)
             session.namespace.update(example=host.example, module=host.module)
             session.dt = getattr(host.example, "frame_dt", session.dt)
@@ -351,6 +399,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv[:split])
     example_args = argv[split + 1 :]
     started = time.perf_counter()
+    _install_solver_warmup()
     # Kernel-load messages would otherwise flood every execute result.
     if hasattr(wp, "LOG_WARNING"):
         wp.config.log_level = wp.LOG_WARNING
@@ -399,8 +448,16 @@ def main(argv: list[str] | None = None) -> None:
     marker.write_text(json.dumps({"pid": os.getpid(), "startup_seconds": time.perf_counter() - started}))
     print(f"READY: {args.connection_file}", flush=True)
     try:
-        session.run()
+        session.run(until=lambda: host.restart_requested)
     finally:
+        if host.restart_requested:
+            time.sleep(0.5)  # let the transport thread deliver the rebuild response
         server.close()
         for child in children:
             child.terminate()
+        for child in children:
+            child.wait(timeout=30)
+    if host.restart_requested:
+        marker.unlink(missing_ok=True)
+        print("RESTART: re-executing the host process", flush=True)
+        os.execv(sys.executable, [sys.executable, "-m", "newton.mcp", "host", *argv])

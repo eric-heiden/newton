@@ -12,6 +12,7 @@ import secrets
 import socket
 import socketserver
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -218,6 +219,9 @@ class SimulationClient:
         ):
             raise ValueError("timeout must be in (0, 300] seconds")
         self.timeout = timeout
+        self._descriptor = self._load_descriptor()
+
+    def _load_descriptor(self) -> dict:
         if self.connection_file.stat().st_size > 4096:
             raise ValueError("Connection descriptor is too large")
         descriptor = json.loads(self.connection_file.read_text(encoding="utf-8"))
@@ -228,7 +232,21 @@ class SimulationClient:
             raise ValueError("Invalid port in descriptor")
         if not isinstance(token, str) or len(token) != 64:
             raise ValueError("Invalid token in descriptor")
-        self._descriptor = descriptor
+        return descriptor
+
+    def _reconnect(self) -> bool:
+        """Wait for a restarted server's new descriptor; returns whether one appeared."""
+        deadline = time.monotonic() + max(self.timeout, 120.0)
+        while time.monotonic() < deadline:
+            try:
+                descriptor = self._load_descriptor()
+            except (OSError, ValueError):
+                descriptor = None
+            if descriptor is not None and descriptor["token"] != self._descriptor["token"]:
+                self._descriptor = descriptor
+                return True
+            time.sleep(0.25)
+        return False
 
     def request(self, operation: str, **arguments: Any) -> dict:
         """Call a structured operation through the simulation thread.
@@ -240,6 +258,28 @@ class SimulationClient:
         Returns:
             JSON-compatible result from the live simulation.
         """
+        try:
+            response = self._send(operation, arguments)
+            closing = "error" in response and "Session closed" in str(response["error"].get("message", ""))
+        except (ConnectionRefusedError, ConnectionResetError):
+            closing = True
+        if closing:
+            # A hosted application may be restarting itself with a new port and token.
+            if not self._reconnect():
+                raise ConnectionRefusedError("Simulation server closed and did not restart")
+            response = self._send(operation, arguments)
+        if "error" in response:
+            error = response["error"]
+            kind = {
+                "TimeoutError": TimeoutError,
+                "PermissionError": PermissionError,
+                "ValueError": ValueError,
+                "KeyError": KeyError,
+            }.get(error["type"], RuntimeError)
+            raise kind(error["message"])
+        return response["result"]
+
+    def _send(self, operation: str, arguments: dict) -> dict:
         data = _encode(
             {
                 "token": self._descriptor["token"],
@@ -253,14 +293,4 @@ class SimulationClient:
             connection.sendall(data)
             connection.settimeout(None)
             with connection.makefile("rb") as stream:
-                response = _read(stream, _MAX_RESPONSE)
-        if "error" in response:
-            error = response["error"]
-            kind = {
-                "TimeoutError": TimeoutError,
-                "PermissionError": PermissionError,
-                "ValueError": ValueError,
-                "KeyError": KeyError,
-            }.get(error["type"], RuntimeError)
-            raise kind(error["message"])
-        return response["result"]
+                return _read(stream, _MAX_RESPONSE)

@@ -323,7 +323,7 @@ class _Protocol:
         "lean": {"newton_execute", "newton_rebuild"},
     }
 
-    def __init__(self, client: SimulationClient, *, profile: str = "full"):
+    def __init__(self, client: SimulationClient, *, profile: str = "full", app_guide: bool = True):
         if profile not in self._PROFILES:
             raise ValueError(f"profile must be one of {sorted(self._PROFILES)}")
         self.client = client
@@ -331,6 +331,7 @@ class _Protocol:
         names = self._PROFILES[profile]
         self.tools = TOOLS if names is None else [tool for tool in TOOLS if tool["name"] in names]
         self.profile = profile
+        self.app_guide = app_guide
 
     def handle(self, message: dict) -> dict | None:
         request_id = message.get("id")
@@ -399,6 +400,8 @@ class _Protocol:
 
     def _instructions(self) -> str:
         text = _INSTRUCTIONS_LEAN if self.profile == "lean" else _INSTRUCTIONS
+        if not self.app_guide:
+            return text
         try:
             guide = self.client.request("guide").get("guide")
         except Exception:
@@ -422,8 +425,15 @@ def main() -> None:
         default="full",
         help="Advertise all tools, five code-oriented tools, or only execute and rebuild; this does not change permissions",
     )
+    parser.add_argument(
+        "--no-app-guide",
+        action="store_true",
+        help="Omit the application guide from the server instructions (e.g. when the client prompt already has it)",
+    )
     args = parser.parse_args()
-    protocol = _Protocol(SimulationClient(args.connect, timeout=args.timeout), profile=args.profile)
+    protocol = _Protocol(
+        SimulationClient(args.connect, timeout=args.timeout), profile=args.profile, app_guide=not args.no_app_guide
+    )
     source, output = sys.stdin.buffer, sys.stdout.buffer
     while True:
         line = source.readline(_MAX_REQUEST + 1)

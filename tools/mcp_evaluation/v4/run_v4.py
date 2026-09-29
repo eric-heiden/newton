@@ -212,7 +212,11 @@ def run_trial(workspace: Path, prepared: dict) -> dict:
         startup = time.perf_counter() - before
         mcp = {
             "command": str(PYTHON),
-            "args": ["-m", "newton.mcp", "--connect", str(connection), "--profile", PROFILE, "--timeout", "300"],
+            # The task prompt already carries the host guide, so the server instructions omit it.
+            "args": [
+                *("-m", "newton.mcp", "--connect", str(connection), "--profile", PROFILE, "--timeout", "300"),
+                "--no-app-guide",
+            ],
             # Load the Newton tools up front instead of behind a tool-search round trip (Claude Code only).
             "alwaysLoad": True,
         }

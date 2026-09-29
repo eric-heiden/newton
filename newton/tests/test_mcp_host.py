@@ -186,13 +186,16 @@ class TestMcpLeanProfile(unittest.TestCase):
 
         class Client:
             def request(self, operation, **_):
-                return {"guide": "hosted"} if operation == "guide" else {}
+                return {"guide": "guide-marker"} if operation == "guide" else {}
 
         protocol = _Protocol(Client(), profile="lean")
         initialized = protocol.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         instructions = initialized["result"]["instructions"]
         self.assertIn("session.dispatch('observe'", instructions)
-        self.assertTrue(instructions.endswith("hosted"))
+        self.assertTrue(instructions.endswith("guide-marker"))
+        bare = _Protocol(Client(), profile="lean", app_guide=False)
+        instructions = bare.handle({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {}})["result"]
+        self.assertNotIn("guide-marker", instructions["instructions"])
         listed = protocol.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         self.assertEqual([tool["name"] for tool in listed["result"]["tools"]], ["newton_execute", "newton_rebuild"])
 

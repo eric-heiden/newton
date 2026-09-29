@@ -38,6 +38,8 @@ DESCRIPTIONS = {
 
 
 UNAVAILABLE = "NEWTON_TOOLS_UNAVAILABLE"
+WORKERS = 3
+"""Sibling worker applications in the mcp_workers condition (four application processes in total)."""
 
 
 def digest(path: Path) -> str:
@@ -83,8 +85,8 @@ Start by calling newton_describe once to confirm the connection. If no newton to
 
 
 def prepare(workspace: Path, task: str, condition: str, model: str, seconds: int, *, phase: str) -> dict:
-    if condition not in ("mcp", "mcp_v2", "restart"):
-        raise ValueError("condition must be mcp, mcp_v2, or restart")
+    if condition not in ("mcp", "mcp_workers", "mcp_v2", "restart"):
+        raise ValueError("condition must be mcp, mcp_workers, mcp_v2, or restart")
     if model not in MODELS:
         raise ValueError(f"model must be one of {sorted(MODELS)}")
     workspace.mkdir(parents=True, exist_ok=False)
@@ -103,6 +105,10 @@ def prepare(workspace: Path, task: str, condition: str, model: str, seconds: int
         from tools.mcp_evaluation.visual.app import guide as make_guide  # noqa: PLC0415
 
         guide = make_guide(cls, workspace)
+        if condition == "mcp_workers":
+            from tools.mcp_evaluation.visual.app import worker_guide  # noqa: PLC0415
+
+            guide += worker_guide(WORKERS)
         if condition == "mcp_v2":
             guide = (
                 "This MCP version has no application globals: first execute `task = session.task`.\n"
@@ -305,7 +311,7 @@ def run_trial(workspace: Path, prepared: dict, *, mcp_root: Path | None = None) 
     startup = 0.0
     mcp = None
     started = time.time()
-    if spec["condition"] in ("mcp", "mcp_v2"):
+    if spec["condition"] in ("mcp", "mcp_workers", "mcp_v2"):
         app_env = dict(env)
         overlay = None
         if spec["condition"] == "mcp_v2":
@@ -328,6 +334,7 @@ def run_trial(workspace: Path, prepared: dict, *, mcp_root: Path | None = None) 
                 str(workspace),
                 "--connection-file",
                 str(connection),
+                *(["--workers", str(WORKERS)] if spec["condition"] == "mcp_workers" else []),
             ],
             cwd=workspace,
             env=app_env,
@@ -494,7 +501,7 @@ def verify(workspace: Path, task: str) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", required=True, choices=sorted(DESCRIPTIONS))
-    parser.add_argument("--condition", required=True, choices=("mcp", "mcp_v2", "restart"))
+    parser.add_argument("--condition", required=True, choices=("mcp", "mcp_workers", "mcp_v2", "restart"))
     parser.add_argument("--model", required=True, choices=sorted(MODELS))
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--seconds", type=int, default=1800)

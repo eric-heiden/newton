@@ -8,10 +8,21 @@ import argparse
 import inspect
 import json
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 from .tasks import task_class
+
+
+def worker_guide(count: int) -> str:
+    """Usage notes for sibling worker applications."""
+    return f"""
+Parallel workers: `workers` is a pool of {count} more copies of this application, each with its own `task` scene and persistent Python state. Use them to evaluate candidates concurrently:
+workers.broadcast("def evaluate(p):\\n    task.set_params(p)\\n    ...\\n    return loss")  # define helpers on every worker once
+losses = workers.map("result = evaluate(args)", [params_1, params_2, ...])  # runs in parallel, results in order
+workers.submit(code, args) returns a future. Worker results must be JSON data; failed jobs return {{"error": ...}}."""
 
 
 def guide(cls, workspace: Path) -> str:
@@ -33,7 +44,7 @@ newton_filmstrip(reset=true, times={times}, views=[<task.camera('{camera.name}')
 (call task.set_episode(...) first for another episode). Write final parameters to {workspace / "params.json"}."""
 
 
-def make_session(task, workspace: Path):
+def make_session(task, workspace: Path, workers: list[Path] | None = None):
     """Bind the task to the public live API, adapting to the embedded MCP version."""
     from newton.mcp import SimulationSession  # noqa: PLC0415
 
@@ -74,7 +85,9 @@ def make_session(task, workspace: Path):
     if "namespace" in parameters:
         options["namespace"] = {"task": task}
     if "guide" in parameters:
-        options["guide"] = guide(type(task), workspace)
+        options["guide"] = guide(type(task), workspace) + (worker_guide(len(workers)) if workers else "")
+    if workers:
+        options["workers"] = workers
     session = SimulationSession(
         **bindings(task),
         dt=task.FRAME_DT,
@@ -119,6 +132,8 @@ def main() -> None:
     parser.add_argument("--task", required=True)
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--connection-file", type=Path, required=True)
+    parser.add_argument("--workers", type=int, default=0, help="Start this many sibling worker applications")
+    parser.add_argument("--ready-file", type=Path, help="Readiness marker (default: server_ready.json)")
     args = parser.parse_args()
     workspace = args.workspace.resolve()
     params_path = workspace / "params.json"
@@ -127,13 +142,42 @@ def main() -> None:
         stream.write(
             json.dumps({"pid": os.getpid(), "event": "live_application_start", "wall_time_unix": time.time()}) + "\n"
         )
+    worker_paths, children = [], []
+    for index in range(args.workers):
+        # Workers share the task and candidate log; each has its own scene and connection.
+        worker_paths.append(workspace / f".worker-{index}.json")
+        children.append(
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "tools.mcp_evaluation.visual.app",
+                    "--task",
+                    args.task,
+                    "--workspace",
+                    str(workspace),
+                    "--connection-file",
+                    str(worker_paths[-1]),
+                    "--ready-file",
+                    str(workspace / f".worker-{index}-ready.json"),
+                ],
+                cwd=workspace,
+                stdout=(workspace / f"worker-{index}.log").open("w"),
+                stderr=subprocess.STDOUT,
+            )
+        )
     task = task_class(args.task)(params)
-    session = make_session(task, workspace)
+    for index, child in enumerate(children):
+        while not (workspace / f".worker-{index}-ready.json").exists():
+            if child.poll() is not None:
+                raise RuntimeError(f"Worker {index} exited; see worker-{index}.log")
+            time.sleep(0.05)
+    session = make_session(task, workspace, worker_paths or None)
     from newton.mcp import SimulationServer  # noqa: PLC0415
 
     server = SimulationServer(session, connection_file=args.connection_file)
     server.start()
-    (workspace / "server_ready.json").write_text(
+    (args.ready_file or workspace / "server_ready.json").write_text(
         json.dumps({"pid": os.getpid(), "startup_seconds": time.perf_counter() - started})
     )
     print(f"READY: {args.connection_file}", flush=True)
@@ -141,6 +185,8 @@ def main() -> None:
         session.run()
     finally:
         server.close()
+        for child in children:
+            child.terminate()
 
 
 if __name__ == "__main__":

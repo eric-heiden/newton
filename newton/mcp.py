@@ -16,11 +16,12 @@ this changes tool presentation, not permissions.
 
 from typing import TYPE_CHECKING
 
-__all__ = ["SimulationClient", "SimulationServer", "SimulationSession"]
+__all__ = ["SimulationClient", "SimulationServer", "SimulationSession", "WorkerPool"]
 
 if TYPE_CHECKING:
     from ._src.mcp.session import SimulationSession
     from ._src.mcp.transport import SimulationClient, SimulationServer
+    from ._src.mcp.workers import WorkerPool
 
 
 def __getattr__(name: str):
@@ -32,6 +33,10 @@ def __getattr__(name: str):
         from ._src.mcp.transport import SimulationClient, SimulationServer  # noqa: PLC0415
 
         return {"SimulationClient": SimulationClient, "SimulationServer": SimulationServer}[name]
+    if name == "WorkerPool":
+        from ._src.mcp.workers import WorkerPool  # noqa: PLC0415
+
+        return WorkerPool
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

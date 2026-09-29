@@ -76,7 +76,15 @@ def main() -> None:
     os.environ["NEWTON_VISUAL_LOG"] = os.devnull
     for workspace in args.workspaces:
         result = score(workspace, args.private, args.limit)
-        print(json.dumps({"workspace": str(workspace), "first_passing_seconds": result["first_passing_seconds"], "scored": result["scored"]}))
+        print(
+            json.dumps(
+                {
+                    "workspace": str(workspace),
+                    "first_passing_seconds": result["first_passing_seconds"],
+                    "scored": result["scored"],
+                }
+            )
+        )
 
 
 if __name__ == "__main__":

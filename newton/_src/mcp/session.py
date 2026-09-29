@@ -183,6 +183,10 @@ class SimulationSession:
             execution, refreshed before every cell.
         guide: Application-specific usage notes; MCP clients receive them in
             the server instructions.
+        workers: Connection files of sibling sessions (usually more instances
+            of the same application). Trusted execution receives a ``workers``
+            pool whose ``broadcast``/``map``/``submit`` run cells on them
+            concurrently.
     """
 
     class _Request:
@@ -243,6 +247,7 @@ class SimulationSession:
         artifact_directory: str | Path | None = None,
         namespace: dict[str, Any] | None = None,
         guide: str | None = None,
+        workers: list[str | Path] | None = None,
     ):
         self._owner = threading.get_ident()
         self._queue = queue.Queue(maxsize=64)
@@ -263,6 +268,13 @@ class SimulationSession:
         """Extra names available in trusted execution, refreshed before each cell."""
         self.guide = guide
         """Application usage notes appended to the MCP server instructions."""
+        self.workers = None
+        """Optional :class:`WorkerPool` of sibling sessions, exposed as ``workers`` in trusted execution."""
+        if workers:
+            from .workers import WorkerPool  # noqa: PLC0415
+
+            self.workers = WorkerPool(workers)
+            self.namespace.setdefault("workers", self.workers)
         self.artifact_directory = Path(artifact_directory or tempfile.mkdtemp(prefix="newton-mcp-"))
         self.dt = self._timestep(dt)
         self.step_callback = step_callback
@@ -571,6 +583,7 @@ class SimulationSession:
             "workspace": self._workspace_info(),
             "capabilities": {
                 "execute": self.allow_execute,
+                "workers": 0 if self.workers is None else self.workers.count,
                 "rebuild": self.rebuild_callback is not None,
                 "observation": {"sensor": True, "viewer": self.viewer is not None},
                 "record": True,

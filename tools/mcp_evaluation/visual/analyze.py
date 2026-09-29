@@ -25,7 +25,9 @@ def rows(directory: Path) -> list[dict]:
             {
                 "trial": workspace.name,
                 "task": s["task"],
-                "model": s["model"],
+                # The spec's "model" holds the provider model ID; the short key is in the trial name.
+                "model": {"claude-opus-5-5": "opus", "gpt-6-astra": "astra"}.get(s["model"], s["model"]),
+                "model_id": s["model"],
                 "condition": s["condition"],
                 "replicate": replicate,
                 "success": s["success"],

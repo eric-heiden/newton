@@ -29,7 +29,7 @@ def _hash_tree(paths) -> dict:
     return {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(paths)}
 
 
-def register(output: Path, private: Path, replicates: int, seed: int, seconds: int) -> dict:
+def register(output: Path, private: Path, replicates: int, seed: int, seconds: int, conditions=CONDITIONS) -> dict:
     blocks = [(task, model, r) for task in TASKS for model in MODELS for r in range(replicates)]
     random.Random(seed).shuffle(blocks)
     commit = subprocess.run(
@@ -49,7 +49,7 @@ def register(output: Path, private: Path, replicates: int, seed: int, seconds: i
         "commit": commit,
         "seed": seed,
         "seconds": seconds,
-        "conditions": list(CONDITIONS),
+        "conditions": list(conditions),
         "pairs": [{"index": i, "task": t, "model": m, "replicate": r} for i, (t, m, r) in enumerate(blocks)],
         "source_sha256": _hash_tree(
             [*(ROOT / "newton/_src/mcp").glob("*.py"), *(ROOT / "tools/mcp_evaluation/visual").glob("*.py")]
@@ -65,9 +65,9 @@ def register(output: Path, private: Path, replicates: int, seed: int, seconds: i
     return registration
 
 
-def _run_pair(pair: dict, directory: Path, seconds: int, ledger: Path) -> None:
+def _run_pair(pair: dict, directory: Path, seconds: int, ledger: Path, conditions=CONDITIONS) -> None:
     processes = []
-    for condition in CONDITIONS:
+    for condition in conditions:
         name = f"{pair['task']}-{pair['model']}-{condition}-{pair['replicate']}"
         workspace = directory / name
         if workspace.exists():
@@ -131,7 +131,7 @@ def run(registration_path: Path, directory: Path, parallel: int) -> None:
     ledger = directory / "ledger.jsonl"
     with ThreadPoolExecutor(max_workers=parallel) as pool:
         for pair in registration["pairs"]:
-            pool.submit(_run_pair, pair, directory, registration["seconds"], ledger)
+            pool.submit(_run_pair, pair, directory, registration["seconds"], ledger, tuple(registration["conditions"]))
             # Stagger starts so concurrent pairs do not start their agents at the same instant.
             time.sleep(5)
 
@@ -145,13 +145,19 @@ def main() -> None:
     reg.add_argument("--replicates", type=int, default=3)
     reg.add_argument("--seed", type=int, default=20260929)
     reg.add_argument("--seconds", type=int, default=1800)
+    reg.add_argument("--conditions", default=",".join(CONDITIONS))
     go = sub.add_parser("run")
     go.add_argument("--registration", type=Path, required=True)
     go.add_argument("--directory", type=Path, required=True)
     go.add_argument("--parallel", type=int, default=1)
     args = parser.parse_args()
     if args.command == "register":
-        print(json.dumps(register(args.output, args.private, args.replicates, args.seed, args.seconds)["pairs"][:3]))
+        conditions = tuple(args.conditions.split(","))
+        print(
+            json.dumps(
+                register(args.output, args.private, args.replicates, args.seed, args.seconds, conditions)["pairs"][:3]
+            )
+        )
     else:
         run(args.registration, args.directory, args.parallel)
 

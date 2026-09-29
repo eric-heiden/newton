@@ -135,7 +135,8 @@ def summarize(table: list[dict]) -> dict:
     for scope in ("all", "opus", "astra", "cloth_drape", "push", "arm_offsets"):
         pairs = []
         for (task, model, condition, replicate), row in index.items():
-            if condition != "mcp" or scope not in ("all", model, task):
+            # Any live-MCP variant (mcp, mcp_workers) is paired with the restart trial of the same case.
+            if not condition.startswith("mcp") or scope not in ("all", model, task):
                 continue
             other = index.get((task, model, "restart", replicate))
             if other is not None:

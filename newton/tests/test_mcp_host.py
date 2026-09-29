@@ -3,6 +3,7 @@
 
 """Exercise hosted example scripts and the trusted-execution helpers."""
 
+import base64
 import tempfile
 import textwrap
 import unittest
@@ -147,6 +148,56 @@ class TestMcpHost(unittest.TestCase):
         session.dispatch("step", {"count": 1})
         session.dispatch("restore", {"name": "two"})
         self.assertEqual(session.dispatch("execute", {"code": "example.moves"})["result"], 2)
+
+    def test_observations_include_meshes_the_example_renders(self):
+        """Composite meshes logged in render() over the model's shapes and frame them."""
+        script = Path(self.directory.name) / "logged.py"
+        script.write_text(
+            textwrap.dedent(
+                """
+                import numpy as np
+                import warp as wp
+
+                import newton
+
+
+                class Example:
+                    def __init__(self, viewer, args):
+                        self.viewer = viewer
+                        builder = newton.ModelBuilder()
+                        builder.add_shape_sphere(-1, radius=0.02)
+                        self.model = builder.finalize(device="cpu")
+                        self.state_0 = self.model.state()
+                        self.frame_dt = 0.1
+                        self.draw = True
+                        points = np.array([[-1, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0]], dtype=np.float32)
+                        self.points = wp.array(points, dtype=wp.vec3, device="cpu")
+                        self.indices = wp.array([0, 1, 2, 0, 2, 3], dtype=wp.int32, device="cpu")
+
+                    def step(self):
+                        pass
+
+                    def render(self):
+                        self.viewer.begin_frame(0.0)
+                        if self.draw:
+                            self.viewer.log_mesh("/quad", self.points, self.indices, backface_culling=False)
+                        self.viewer.end_frame()
+                """
+            )
+        )
+        session = ExampleHost(script).session(artifact_directory=self.directory.name)
+        self.addCleanup(session.close)
+
+        def lit_pixels():
+            camera = {"eye": [0.0, 0.0, 3.0], "target": [0.0, 0.0, 0.0], "up": [0.0, 1.0, 0.0]}
+            result = session.dispatch("observe", {**camera, "width": 64, "height": 64, "shadows": False})
+            from newton._src.mcp.imaging import decode_png  # noqa: PLC0415
+
+            return int((decode_png(base64.b64decode(result["image_base64"])).max(axis=-1) > 0).sum())
+
+        with_quad = lit_pixels()
+        session.dispatch("execute", {"code": "example.draw = False"})
+        self.assertGreater(with_quad, 4 * lit_pixels())
 
 
 class TestMcpHelpers(unittest.TestCase):

@@ -22,6 +22,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import numpy as np
 import warp as wp
 
 
@@ -41,6 +42,33 @@ def _load_module(path: Path, generation: int):
     finally:
         sys.path.remove(str(path.parent))
     return module
+
+
+class _RecordingViewer:
+    """Null-viewer mixin that keeps the meshes an example logs in ``render()`` for MCP observations."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.logged_meshes = {}
+
+    def log_mesh(
+        self,
+        name,
+        points,
+        indices,
+        normals=None,
+        uvs=None,
+        texture=None,
+        hidden=False,
+        backface_culling=True,
+        color=None,
+        *args,
+        **kwargs,
+    ):
+        if hidden or points is None or indices is None:
+            self.logged_meshes.pop(name, None)
+        else:
+            self.logged_meshes[name] = (points, indices, color)
 
 
 class _NoSolver:
@@ -91,7 +119,8 @@ class ExampleHost:
         parser = cls.create_parser() if hasattr(cls, "create_parser") else newton.examples.create_parser()
         args, _ = parser.parse_known_args(self.argv)
         args.viewer = "null"
-        viewer = newton.viewer.ViewerNull(num_frames=1 << 62)
+        viewer_class = type("RecordingViewerNull", (_RecordingViewer, newton.viewer.ViewerNull), {})
+        viewer = viewer_class(num_frames=1 << 62)
         example = cls(viewer, args)
         self.module, self.example, self.args = module, example, args
         self._dynamic_scalars = set()
@@ -193,6 +222,22 @@ class ExampleHost:
         if note and note not in self._notes:
             self._notes.append(note)
 
+    def overlay_meshes(self, session) -> list:
+        """Meshes the example draws itself in ``render()`` (e.g. extracted surfaces), as NumPy arrays."""
+        render = getattr(self.example, "render", None)
+        viewer = getattr(self.example, "viewer", None)
+        if not callable(render) or not hasattr(viewer, "logged_meshes"):
+            return []
+        viewer.logged_meshes.clear()
+        render()
+        meshes = []
+        for name, (points, indices, color) in viewer.logged_meshes.items():
+            vertices = points.numpy() if hasattr(points, "numpy") else np.asarray(points)
+            triangles = indices.numpy() if hasattr(indices, "numpy") else np.asarray(indices)
+            if len(vertices) and len(triangles) >= 3:
+                meshes.append((name, np.asarray(vertices, np.float32).reshape(-1, 3), triangles.reshape(-1), color))
+        return meshes
+
     def after_execute(self, session) -> str | None:
         self.sync(session)
         notes, self._notes = self._notes, []
@@ -240,6 +285,7 @@ class ExampleHost:
 - Checkpoints (session.dispatch('checkpoint'/'restore', {{'name': ...}})) and reset rewind the physics state, the example's own Warp arrays, and the scalar attributes that step() changes (timers, phase counters). Scalar settings you assign (gains, amplitudes, look-ahead) are kept across reset/restore; model arrays you edit are kept too. Other objects (meshes, SDFs, textures, Python containers) are not rewound; newton_rebuild gives a fresh scene. Branch candidates from one checkpoint instead of re-simulating the approach each time.
 - Live edits: change model arrays and call example.solver.notify_model_changed(newton.ModelFlags....) (arrays are read at run time, so this works with CUDA graphs); assign example attributes read by step() in Python (gains, amplitudes); or assign a new solver to example.solver, after which the host re-records the example's CUDA graphs. A `note` in the result warns when a change cannot reach code inside the captured graphs; then write it into the script and newton_rebuild.
 - Helpers (preloaded with newton, np, wp): rollout(frames or seconds=..., record={{'name': 'expr' or fn}}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the parameters the solver actually integrates and which shape's material decided them; health() flags NaNs, runaway velocities, deep penetration, and full solver buffers.
+- Observations (session.dispatch('observe'/'filmstrip', ...), shown with show()) draw the model's visible shapes plus meshes the example logs in its own render() (e.g. extracted surfaces), auto-framed.
 - Python errors in a cell are reported but keep the scene valid; statements before the failing line keep their effects.
 - After editing the script on disk, newton_rebuild reloads and reconstructs it in this process (Python variables survive; pass arguments={{"argv": [...]}} to change example arguments). Rebuild once to confirm the edited script reproduces your live result."""
         if workers:
@@ -283,6 +329,7 @@ class ExampleHost:
             guide=self.guide(len(workers or [])),
             workers=workers,
             execute_callback=self.after_execute,
+            overlay_callback=self.overlay_meshes,
             invalidate_on_error=False,
         )
         session.host = self

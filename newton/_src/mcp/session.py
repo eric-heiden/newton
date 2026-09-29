@@ -273,6 +273,7 @@ class SimulationSession:
         restore_callback: Callable | None = None,
         execute_callback: Callable | None = None,
         invalidate_on_error: bool = True,
+        overlay_callback: Callable | None = None,
     ):
         self._owner = threading.get_ident()
         self._queue = queue.Queue(maxsize=64)
@@ -295,6 +296,9 @@ class SimulationSession:
         """Called as ``execute_callback(session)`` after each successful trusted execution; a returned
         string is added to the execution result as ``note``."""
         self.invalidate_on_error = invalidate_on_error
+        self.overlay_callback = overlay_callback
+        """Returns ``[(name, points, indices, color), ...]`` meshes drawn by the application itself,
+        which color observations composite over the model's shapes."""
         """Invalidate the scene when trusted execution raises. ``False`` reports the error and keeps the
         scene valid; statements before the failing line keep their effects."""
         self.namespace = dict(namespace or {})

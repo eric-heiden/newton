@@ -407,16 +407,37 @@ class ObservationRenderer:
             transforms = model.shape_transform.numpy()
             radius = model.shape_collision_radius.numpy()
             body_q = state.body_q.numpy() if state.body_q is not None and model.body_count else None
+            scales = model.shape_scale.numpy()
+            sources = getattr(model, "shape_source", None) or [None] * model.shape_count
             for i in range(model.shape_count):
                 if shape_type[i] == GeoType.PLANE or shape_world[i] not in (world_id, -1):
                     continue
-                local = transforms[i]
-                position = local[:3]
+                pose = wp.transform(*transforms[i])
                 if shape_body[i] >= 0 and body_q is not None:
-                    pose = wp.transform(*body_q[shape_body[i]])
-                    position = np.asarray(wp.transform_point(pose, wp.vec3(*local[:3])))
-                points.append(position)
+                    pose = wp.transform_multiply(wp.transform(*body_q[shape_body[i]]), pose)
+                vertices = getattr(sources[i], "vertices", None) if shape_type[i] == GeoType.MESH else None
+                if vertices is not None and len(vertices):
+                    # Mesh bounds are much tighter than the collision radius for elongated meshes.
+                    local = np.asarray(vertices, dtype=np.float64) * scales[i]
+                    corners = np.array(
+                        [
+                            [x, y, z]
+                            for x in local[:, 0][[local[:, 0].argmin(), local[:, 0].argmax()]]
+                            for y in (local[:, 1].min(), local[:, 1].max())
+                            for z in (local[:, 2].min(), local[:, 2].max())
+                        ]
+                    )
+                    for corner in corners:
+                        points.append(np.asarray(wp.transform_point(pose, wp.vec3(*corner))))
+                        radii.append(0.0)
+                    continue
+                points.append(np.asarray(wp.transform_get_translation(pose)))
                 radii.append(float(min(radius[i], 1.0e3)))
+        for _, vertices, _, _ in self._overlay_meshes():
+            finite = vertices[np.isfinite(vertices).all(axis=1)]
+            if len(finite):
+                points += [finite.min(axis=0), finite.max(axis=0)]
+                radii += [0.0, 0.0]
         if model.particle_count and state.particle_q is not None:
             particles = state.particle_q.numpy()
             worlds = model.particle_world.numpy() if model.particle_world is not None else None
@@ -566,8 +587,9 @@ class ObservationRenderer:
             self._buffer_key = key
         transform = np.broadcast_to(np.asarray(pose, dtype=np.float32), (1, model.world_count, 7)).copy()
         self._transforms.assign(transform)
+        overlay = self._overlay_meshes() if channel == "color" else []
         needed = {channel}
-        if contacts:
+        if contacts or overlay:
             needed.add("forward_depth")
         if pick is not None:
             needed.add("shape_index")
@@ -587,7 +609,58 @@ class ObservationRenderer:
             render_config=config,
             **{f"{name}_image": output for name, output in self._outputs.items()},
         )
-        return {name: output[world_id, 0].numpy() for name, output in self._outputs.items()}
+        arrays = {name: output[world_id, 0].numpy() for name, output in self._outputs.items()}
+        if overlay:
+            self._composite_overlay(arrays, overlay, width, height, fov_y, pose, shadows)
+        return arrays
+
+    def _overlay_meshes(self) -> list:
+        callback = getattr(self.session, "overlay_callback", None)
+        if callback is None:
+            return []
+        try:
+            return callback(self.session)
+        except Exception:
+            return []
+
+    def _composite_overlay(self, arrays, meshes, width, height, fov_y, pose, shadows):
+        """Draw application-logged meshes with the same camera and keep the nearer surface per pixel."""
+        import newton  # noqa: PLC0415
+
+        model = self.session.model
+        builder = newton.ModelBuilder(up_axis=int(model.up_axis))
+        cfg = newton.ModelBuilder.ShapeConfig(density=0.0, has_shape_collision=False, has_particle_collision=False)
+        for name, points, indices, color in meshes:
+            mesh = newton.Mesh(points, indices, compute_inertia=False)
+            builder.add_shape_mesh(-1, mesh=mesh, cfg=cfg, color=color, label=str(name))
+        overlay = builder.finalize(device=model.device)
+        sensor = SensorTiledCamera(
+            overlay, default_render_config=SensorTiledCamera.RenderConfig(enable_shadows=shadows)
+        )
+        sensor.utils.create_default_light(enable_shadows=shadows)
+        rays = sensor.utils.compute_camera_rays_pinhole(width, height, camera_fovs=math.radians(fov_y))
+        transforms = wp.array(
+            np.asarray(pose, dtype=np.float32).reshape(1, 1, 7), dtype=wp.transform, device=model.device
+        )
+        color = sensor.utils.create_color_image_output(width, height)
+        depth = sensor.utils.create_forward_depth_image_output(width, height)
+        state = overlay.state()
+        overlay.bvh_refit_shapes(state)
+        sensor.update(
+            state,
+            transforms,
+            rays,
+            render_config=SensorTiledCamera.RenderConfig(enable_shadows=shadows),
+            color_image=color,
+            forward_depth_image=depth,
+        )
+        overlay_depth = depth[0, 0].numpy()
+        base_depth = arrays["forward_depth"]
+        hit = np.isfinite(overlay_depth) & (overlay_depth > 0)
+        base_hit = np.isfinite(base_depth) & (base_depth > 0)
+        nearer = hit & (~base_hit | (overlay_depth < base_depth))
+        arrays["color"] = np.where(nearer, color[0, 0].numpy(), arrays["color"])
+        arrays["forward_depth"] = np.where(nearer, overlay_depth, base_depth)
 
     @staticmethod
     def _colorize(values, channel, depth_range):

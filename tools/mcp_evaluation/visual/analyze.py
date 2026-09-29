@@ -14,6 +14,8 @@ from pathlib import Path
 def rows(directory: Path) -> list[dict]:
     result = []
     for summary in sorted(directory.glob("*/summary.json")):
+        if ".infra-failure-" in summary.parent.name:
+            continue
         s = json.loads(summary.read_text())
         workspace = summary.parent
         anytime = workspace / "anytime.json"
@@ -67,7 +69,18 @@ def summarize(table: list[dict]) -> dict:
     groups = {}
     for row in table:
         key = (row["task"], row["model"], row["condition"])
-        g = groups.setdefault(key, {"trials": 0, "successes": 0, "seconds": 0.0, "input_tokens": 0, "output_tokens": 0, "uncached_plus_output": 0, "tool_calls": 0})
+        g = groups.setdefault(
+            key,
+            {
+                "trials": 0,
+                "successes": 0,
+                "seconds": 0.0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "uncached_plus_output": 0,
+                "tool_calls": 0,
+            },
+        )
         g["trials"] += 1
         g["successes"] += int(row["success"])
         for field in ("seconds", "input_tokens", "output_tokens", "uncached_plus_output", "tool_calls"):
@@ -87,8 +100,14 @@ def summarize(table: list[dict]) -> dict:
             "pairs": len(pairs),
             "mcp_successes": sum(a["success"] for a, _ in pairs),
             "restart_successes": sum(b["success"] for _, b in pairs),
-            "all_pairs": {key: _geomean_ratio(pairs, key) for key in ("seconds", "input_tokens", "uncached_plus_output", "tool_calls")},
-            "jointly_successful": {key: _geomean_ratio(success_pairs, key) for key in ("seconds", "input_tokens", "uncached_plus_output", "tool_calls")},
+            "all_pairs": {
+                key: _geomean_ratio(pairs, key)
+                for key in ("seconds", "input_tokens", "uncached_plus_output", "tool_calls")
+            },
+            "jointly_successful": {
+                key: _geomean_ratio(success_pairs, key)
+                for key in ("seconds", "input_tokens", "uncached_plus_output", "tool_calls")
+            },
         }
     return {"groups": {"/".join(k): v for k, v in sorted(groups.items())}, "paired_mcp_over_restart": paired}
 

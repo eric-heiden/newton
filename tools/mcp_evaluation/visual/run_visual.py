@@ -37,6 +37,9 @@ DESCRIPTIONS = {
 }
 
 
+UNAVAILABLE = "NEWTON_TOOLS_UNAVAILABLE"
+
+
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -73,6 +76,7 @@ to simulate the training episodes with params.json. It writes out/compare_<episo
         common
         + f"""
 Workflow: the simulation is already running in a live Newton application, connected through the `newton` MCP server (tools: {tools}). Images returned by MCP tools appear directly in your context, and Python state persists in the application between calls. You may also write and run your own scripts with the same task API (tools/mcp_evaluation/visual in the source tree) when that is more efficient; each script run starts a fresh simulator process.
+Start by calling newton_describe once to confirm the connection. If no newton tools are available to you, reply only with {UNAVAILABLE} and stop.
 {guide}
 """
     )
@@ -193,6 +197,9 @@ def _agent_command(spec: dict, workspace: Path, mcp: dict | None) -> list[str]:
             "mcp_servers.newton.tool_timeout_sec=300",
             "-c",
             "mcp_servers.newton.startup_timeout_sec=60",
+            # Without this, Codex intermittently starts a session before the server's tools are listed.
+            "-c",
+            "mcp_servers.newton.required=true",
         ]
     return [*command, "-"]
 
@@ -377,6 +384,12 @@ def run_trial(workspace: Path, prepared: dict, *, mcp_root: Path | None = None) 
             agent.wait(timeout=spec["budget_seconds"])
         except subprocess.TimeoutExpired:
             timed_out = True
+            # An interrupt lets the CLI flush its final usage record before termination.
+            try:
+                os.killpg(agent.pid, signal.SIGINT)
+                agent.wait(timeout=20)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
         finally:
             _stop(agent)
             reader.join(timeout=10)
@@ -384,6 +397,7 @@ def run_trial(workspace: Path, prepared: dict, *, mcp_root: Path | None = None) 
     if app is not None:
         _stop(app)
     activity = parse_events(workspace / "agent.jsonl", spec["cli"])
+    activity["mcp_available"] = mcp_available(workspace / "agent.jsonl", spec) if mcp is not None else None
     load = os.getloadavg()
     verification = verify(workspace, spec["task"])
     candidates = candidate_summary(workspace / "candidates.jsonl", started)
@@ -406,6 +420,22 @@ def run_trial(workspace: Path, prepared: dict, *, mcp_root: Path | None = None) 
     }
     (workspace / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
+
+
+def mcp_available(path: Path, spec: dict) -> bool:
+    """Whether the agent session exposed the newton MCP tools (Codex occasionally omits them)."""
+    text = path.read_text(errors="replace")
+    if spec["cli"] == "claude":
+        for line in text.splitlines()[:5]:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("subtype") == "init":
+                return any(
+                    s.get("name") == "newton" and s.get("status") == "connected" for s in event.get("mcp_servers", [])
+                )
+    return '"mcp_tool_call"' in text and UNAVAILABLE not in text
 
 
 def candidate_summary(path: Path, started: float) -> dict:
@@ -467,14 +497,26 @@ def main() -> None:
     parser.add_argument("--condition", required=True, choices=("mcp", "mcp_v2", "restart"))
     parser.add_argument("--model", required=True, choices=sorted(MODELS))
     parser.add_argument("--workspace", type=Path, required=True)
-    parser.add_argument("--seconds", type=int, default=1200)
+    parser.add_argument("--seconds", type=int, default=1800)
     parser.add_argument("--phase", choices=("development", "confirmation"), default="development")
     parser.add_argument("--mcp-root", type=Path, help="Newton source root for the mcp_v2 condition")
     parser.add_argument("--run", action="store_true")
     args = parser.parse_args()
     prepared = prepare(args.workspace.resolve(), args.task, args.condition, args.model, args.seconds, phase=args.phase)
     if args.run:
-        print(json.dumps(run_trial(args.workspace.resolve(), prepared, mcp_root=args.mcp_root), indent=2))
+        workspace = args.workspace.resolve()
+        summary = run_trial(workspace, prepared, mcp_root=args.mcp_root)
+        attempt = 1
+        # A session without the MCP tools is an infrastructure failure, not a result; retain it and retry.
+        while summary.get("mcp_available") is False and attempt < 3:
+            failed = workspace.with_name(f"{workspace.name}.infra-failure-{attempt}")
+            workspace.rename(failed)
+            prepared = prepare(workspace, args.task, args.condition, args.model, args.seconds, phase=args.phase)
+            summary = run_trial(workspace, prepared, mcp_root=args.mcp_root)
+            summary["infrastructure_retries"] = attempt
+            (workspace / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+            attempt += 1
+        print(json.dumps(summary, indent=2))
     else:
         print(f"Prepared {args.workspace}")
 

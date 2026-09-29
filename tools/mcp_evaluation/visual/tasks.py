@@ -64,6 +64,17 @@ def measure(task: VisualTask, episodes, times) -> dict[str, np.ndarray]:
     return result
 
 
+PHOTO_NOISE_SD = 2.5
+"""Per-pixel Gaussian sensor noise added to reference photos [8-bit intensity units]."""
+
+
+def photograph(rgb: np.ndarray, seed: int) -> np.ndarray:
+    """Add fixed-seed sensor noise so references, unlike renders, never match pixel for pixel."""
+    rng = np.random.default_rng(seed)
+    noisy = rgb.astype(np.float64) + rng.normal(0.0, PHOTO_NOISE_SD, rgb.shape)
+    return np.clip(np.rint(noisy), 0, 255).astype(np.uint8)
+
+
 def write_reference(name: str, params: dict, output: Path, private: Path, device=None) -> dict:
     """Render public reference photos and record private truth measurements."""
     cls = task_class(name)
@@ -78,15 +89,17 @@ def write_reference(name: str, params: dict, output: Path, private: Path, device
             row, row_labels = [], []
             for t in sorted(frames):
                 filename = f"{episode}_{camera.name}_t{t:.2f}.png"
-                save_png(output / filename, frames[t][camera.name])
+                photo = photograph(frames[t][camera.name], seed=len(index))
+                save_png(output / filename, photo)
                 index.append({"episode": episode, "camera": camera.name, "time_s": t, "file": filename})
-                row.append(frames[t][camera.name])
+                row.append(photo)
                 row_labels.append(f"REFERENCE {episode} {camera.name} t={t:.2f}s")
             tiles.append(row)
             labels.append(row_labels)
         save_png(output / f"sheet_{episode}.png", contact_sheet(tiles, labels))
     spec = cls.public_spec()
     spec["images"] = index
+    spec["photo_noise"] = f"Gaussian sensor noise, standard deviation {PHOTO_NOISE_SD} of 255 per channel"
     (output / "reference.json").write_text(json.dumps(spec, indent=2) + "\n")
     truth = measure(task, cls.TRAIN_EPISODES + cls.HELDOUT_EPISODES, TRUTH_TIMES[name])
     private.mkdir(parents=True, exist_ok=True)

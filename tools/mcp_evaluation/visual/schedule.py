@@ -32,8 +32,16 @@ def _hash_tree(paths) -> dict:
 def register(output: Path, private: Path, replicates: int, seed: int, seconds: int) -> dict:
     blocks = [(task, model, r) for task in TASKS for model in MODELS for r in range(replicates)]
     random.Random(seed).shuffle(blocks)
-    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
-    dirty = subprocess.run(["git", "status", "--porcelain", "--", "newton", "tools/mcp_evaluation/visual"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain", "--", "newton", "tools/mcp_evaluation/visual"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
     if dirty.strip():
         raise RuntimeError("Commit Newton and task sources before registration:\n" + dirty)
     registration = {
@@ -43,7 +51,9 @@ def register(output: Path, private: Path, replicates: int, seed: int, seconds: i
         "seconds": seconds,
         "conditions": list(CONDITIONS),
         "pairs": [{"index": i, "task": t, "model": m, "replicate": r} for i, (t, m, r) in enumerate(blocks)],
-        "source_sha256": _hash_tree([*(ROOT / "newton/_src/mcp").glob("*.py"), *(ROOT / "tools/mcp_evaluation/visual").glob("*.py")]),
+        "source_sha256": _hash_tree(
+            [*(ROOT / "newton/_src/mcp").glob("*.py"), *(ROOT / "tools/mcp_evaluation/visual").glob("*.py")]
+        ),
         "reference_sha256": {
             f"{task}/{p.name}": hashlib.sha256(p.read_bytes()).hexdigest()
             for task in TASKS
@@ -96,12 +106,25 @@ def _run_pair(pair: dict, directory: Path, seconds: int, ledger: Path) -> None:
         summary = directory / name / "summary.json"
         digest = hashlib.sha256(summary.read_bytes()).hexdigest() if summary.exists() else None
         with ledger.open("a") as stream:
-            stream.write(json.dumps({"pair": pair["index"], "trial": name, "finished_unix": time.time(), "exit": process.returncode, "summary_sha256": digest}) + "\n")
+            stream.write(
+                json.dumps(
+                    {
+                        "pair": pair["index"],
+                        "trial": name,
+                        "finished_unix": time.time(),
+                        "exit": process.returncode,
+                        "summary_sha256": digest,
+                    }
+                )
+                + "\n"
+            )
 
 
 def run(registration_path: Path, directory: Path, parallel: int) -> None:
     registration = json.loads(registration_path.read_text())
-    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
+    ).stdout.strip()
     if commit != registration["commit"]:
         raise RuntimeError(f"Source commit {commit} differs from registered {registration['commit']}")
     directory.mkdir(parents=True, exist_ok=True)
@@ -121,7 +144,7 @@ def main() -> None:
     reg.add_argument("--private", type=Path, required=True)
     reg.add_argument("--replicates", type=int, default=3)
     reg.add_argument("--seed", type=int, default=20260929)
-    reg.add_argument("--seconds", type=int, default=1200)
+    reg.add_argument("--seconds", type=int, default=1800)
     go = sub.add_parser("run")
     go.add_argument("--registration", type=Path, required=True)
     go.add_argument("--directory", type=Path, required=True)

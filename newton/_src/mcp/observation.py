@@ -340,11 +340,18 @@ class ObservationRenderer:
         if reference is not None and (not isinstance(reference, list) or len(reference) != len(specs)):
             raise ValueError("reference must be a list aligned with views")
         rows, labels, metadata = self._rows(specs, references, label is None or bool(label))
+        if reference is None:
+            # Without comparison panels, arrange single views in a near-square grid instead of a tall strip.
+            columns = math.ceil(math.sqrt(len(rows)))
+            cells = [row[0] for row in rows]
+            names = [row[0] for row in labels]
+            rows = [cells[i : i + columns] for i in range(0, len(cells), columns)]
+            labels = [names[i : i + columns] for i in range(0, len(names), columns)]
+            metadata["layout"] = f"views in row-major order, {columns} per row"
+        else:
+            metadata["layout"] = "one row per view: simulated | reference | mismatch"
         metadata["image_base64"] = base64.b64encode(_png(tile(rows, labels))).decode("ascii")
         metadata["mime_type"] = "image/png"
-        metadata["layout"] = "one row per view" + (
-            ": simulated | reference | mismatch" if reference is not None else ""
-        )
         return metadata
 
     def _rows(self, specs, references, label):

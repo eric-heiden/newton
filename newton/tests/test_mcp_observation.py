@@ -345,7 +345,10 @@ class TestMcpObservation(unittest.TestCase):
         """Tile several views in one image and compare a render against a reference photo."""
         grid = self.renderer.observe(views=["top", {"label": "custom", **self.camera}], width=40, height=30)
         self.assertEqual(len(grid["views"]), 2)
-        self.assertEqual(_decode_png(grid).shape[:2], (30 + 4 + 65, 65))
+        # Two views sit side by side; the row is as tall as the larger view.
+        self.assertEqual(_decode_png(grid).shape[:2], (65, 40 + 4 + 65))
+        four = self.renderer.observe(views=["iso", "top", "front", "right"], width=40, height=30)
+        self.assertEqual(_decode_png(four).shape[:2], (2 * 30 + 4, 2 * 40 + 4))
         single = self.renderer.observe(**self.camera)
         reference = Path(self.directory.name) / "reference.png"
         reference.write_bytes(base64.b64decode(single["image_base64"]))

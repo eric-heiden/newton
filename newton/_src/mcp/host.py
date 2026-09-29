@@ -180,13 +180,18 @@ class ExampleHost:
         for name, value in data["scalars"].items():
             setattr(self.example, name, value)
 
-    def guide(self) -> str:
-        return f"""Hosted Newton example: {self.script} (class {self.example_class}, args {self.argv}).
+    def guide(self, workers: int = 0) -> str:
+        text = f"""Hosted Newton example: {self.script} (class {self.example_class}, args {self.argv}).
 - `example` is the live Example instance and `module` its script module; one step is one example frame of {getattr(self.example, "frame_dt", "?")} s. Use rollout(...) or session.dispatch('step', {{'count': n}}) rather than example.step() so time, recordings, and bindings stay in sync.
 - Checkpoints (session.dispatch('checkpoint'/'restore', {{'name': ...}})) and reset include the example's own Warp arrays and scalar attributes, so controller phases and timers rewind with the physics state. Branch candidates from one checkpoint instead of re-simulating the approach each time.
 - Live edits: change model arrays and call example.solver.notify_model_changed(newton.ModelFlags....); assign example attributes (gains, amplitudes) or replace example.solver with a new solver. After each cell the host recaptures the example's CUDA graph if any example attribute changed (reported as `note`); call recapture() after in-place changes it cannot see, such as solver option arrays.
+- Helpers (preloaded with newton, np, wp): rollout(frames or seconds=..., record={{'name': 'expr' or fn}}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the parameters the solver actually integrates and which shape's material decided them; health() flags NaNs, runaway velocities, deep penetration, and full solver buffers.
 - Python errors in a cell are reported but keep the scene valid; statements before the failing line keep their effects.
 - After editing the script on disk, newton_rebuild reloads and reconstructs it in this process (Python variables survive; pass arguments={{"argv": [...]}} to change example arguments). Rebuild once to confirm the edited script reproduces your live result."""
+        if workers:
+            text += f"""
+- `workers` holds {workers} sibling live copies of this example (same script and arguments, separate processes and scenes). workers.map(code, [args, ...]) runs a code string once per item in parallel (the item is `args` inside; `example`, `rollout`, ... exist there too) and returns each result; workers.broadcast(code) defines helpers on all of them; workers.submit(code, args) returns a Future at once, so a sweep can run while you keep working here and collect .result() later. Workers do not see this session's Python variables or live edits: send the settings to test in `args`, and rebuild them (workers.broadcast("session.dispatch('rebuild', {{}})")) after editing the script."""
+        return text
 
     def session(self, *, artifact_directory=None, workers=None, allow_execute: bool = True):
         """Create a :class:`SimulationSession` bound to the example on the calling thread."""
@@ -219,7 +224,7 @@ class ExampleHost:
             allow_execute=allow_execute,
             artifact_directory=artifact_directory,
             namespace={"example": self.example, "module": self.module, "recapture": self.recapture},
-            guide=self.guide(),
+            guide=self.guide(len(workers or [])),
             workers=workers,
             execute_callback=self.after_execute,
             invalidate_on_error=False,

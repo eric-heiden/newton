@@ -34,6 +34,10 @@ from tools.mcp_evaluation.visual.run_visual import (
 ROOT = Path(__file__).resolve().parents[3]
 HERE = Path(__file__).resolve().parent
 PYTHON = ROOT / ".venv/bin/python"
+# MCP tool profile: "lean" advertises only execute and rebuild to keep per-turn context small.
+PROFILE = os.environ.get("NEWTON_MCP_PROFILE", "lean")
+# Sibling live copies the MCP condition may use for parallel sweeps.
+WORKERS = int(os.environ.get("NEWTON_MCP_WORKERS", "2"))
 DP_DATA = Path(os.environ.get("NEWTON_DP_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/dp_real_task"))
 
 
@@ -104,8 +108,8 @@ or write your own scripts that import the Example class; each run starts a fresh
     return (
         common
         + f"""
-Workflow: {task["script"]} is already running live, hosted by the Newton MCP (`newton` server: newton_execute, newton_observe, newton_filmstrip, newton_describe, newton_rebuild). Images returned by MCP tools appear directly in your context, and Python state persists between calls. After editing the script on disk, newton_rebuild reloads it in the live process. You may also run scripts ({run}) when that is more efficient; each such run starts a fresh process.
-Start by calling newton_describe once to confirm the connection. If no newton tools are available to you, reply only with {UNAVAILABLE} and stop.
+Workflow: {task["script"]} is already running live, hosted by the Newton MCP (`newton` server tools, e.g. newton_execute and newton_rebuild). Images returned by MCP tools appear directly in your context, and Python state persists between calls. After editing the script on disk, newton_rebuild reloads it in the live process. You may also run scripts ({run}) when that is more efficient; each such run starts a fresh process.
+If no newton tools are available to you, reply only with {UNAVAILABLE} and stop.
 {guide or ""}
 """
     )
@@ -143,7 +147,7 @@ def _host_guide(workspace: Path, task: dict) -> str:
     code = (
         "import sys; from newton.mcp import ExampleHost; "
         f"host = ExampleHost({str(workspace / task['script'])!r}, {task['host_args']!r}); "
-        "host.example = type('E', (), {'frame_dt': '?'})(); print(host.guide())"
+        f"host.example = type('E', (), {{'frame_dt': '?'}})(); print(host.guide({WORKERS}))"
     )
     result = subprocess.run([str(PYTHON), "-c", code], capture_output=True, text=True, cwd=ROOT, check=True)
     return result.stdout.strip()
@@ -159,6 +163,8 @@ def run_trial(workspace: Path, prepared: dict) -> dict:
     host, mcp, startup = None, None, 0.0
     started = time.time()
     if spec["condition"] == "mcp":
+        # Load the five Newton tools up front instead of behind a tool-search round trip.
+        env["ENABLE_TOOL_SEARCH"] = "false"
         connection = workspace / ".connection.json"
         before = time.perf_counter()
         log = (workspace / "host.log").open("w")
@@ -173,6 +179,8 @@ def run_trial(workspace: Path, prepared: dict) -> dict:
                 str(connection),
                 "--artifacts",
                 str(workspace / "observations"),
+                "--workers",
+                str(WORKERS),
                 "--",
                 *task["host_args"],
             ],
@@ -191,7 +199,7 @@ def run_trial(workspace: Path, prepared: dict) -> dict:
         startup = time.perf_counter() - before
         mcp = {
             "command": str(PYTHON),
-            "args": ["-m", "newton.mcp", "--connect", str(connection), "--profile", "code", "--timeout", "300"],
+            "args": ["-m", "newton.mcp", "--connect", str(connection), "--profile", PROFILE, "--timeout", "300"],
         }
     command = _agent_command(spec, workspace, mcp)
     (workspace / "command.json").write_text(json.dumps(command))

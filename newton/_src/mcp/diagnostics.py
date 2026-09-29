@@ -48,10 +48,31 @@ def solver_contacts(session, *, limit: int = 20) -> dict:
         for name in ("ke", "kd", "mu")
         if getattr(model, f"shape_material_{name}", None) is not None
     }
-    priority = None
+    priority = solmix = None
     mujoco_attrs = getattr(model, "mujoco", None)
     if mujoco_attrs is not None and getattr(mujoco_attrs, "geom_priority", None) is not None:
         priority = mujoco_attrs.geom_priority.numpy()
+    if mujoco_attrs is not None and getattr(mujoco_attrs, "geom_solmix", None) is not None:
+        solmix = mujoco_attrs.geom_solmix.numpy()
+
+    def resolution(a: int, b: int) -> dict:
+        """How MuJoCo combines the two shapes' parameters (mirrors mujoco_warp contact_params)."""
+        if priority is None or min(a, b) < 0:
+            return {}
+        pa, pb = int(priority[a]), int(priority[b])
+        if pa != pb:
+            winner = a if pa > pb else b
+            return {
+                "decided_by": f"shape {winner} ({_label(shape_labels, winner)}): higher geom_priority, other side ignored"
+            }
+        wa = float(solmix[a]) if solmix is not None else 1.0
+        wb = float(solmix[b]) if solmix is not None else 1.0
+        weight = 0.5 if wa + wb <= 0.0 else wa / (wa + wb)
+        entry = {"decided_by": f"mixed: {weight:.2f} x shape {a} + {1 - weight:.2f} x shape {b}; friction = max"}
+        if "ke" in material and "kd" in material:
+            entry["mixed_ke"] = weight * float(material["ke"][a]) + (1 - weight) * float(material["ke"][b])
+            entry["mixed_kd"] = weight * float(material["kd"][a]) + (1 - weight) * float(material["kd"][b])
+        return entry
 
     def side(shape: int) -> dict:
         body = int(shape_body[shape]) if 0 <= shape < len(shape_body) else -1
@@ -86,6 +107,7 @@ def solver_contacts(session, *, limit: int = 20) -> dict:
             if row is None:
                 row = pairs[key] = {
                     "shapes": [side(key[0]), side(key[1])],
+                    **resolution(*key),
                     "count": 0,
                     "active": 0,
                     "min_dist": float(dist[i]),
@@ -109,7 +131,16 @@ def solver_contacts(session, *, limit: int = 20) -> dict:
                 row = pairs.setdefault(key, {"shapes": [side(key[0]), side(key[1])], "count": 0})
                 row["count"] += 1
     rows = sorted(pairs.values(), key=lambda r: (-r.get("active", r["count"]), -r["count"]))
-    return {"source": source, "count": count, "pairs": rows[:limit], "pairs_truncated": len(rows) > limit}
+    result = {"source": source, "count": count, "pairs": rows[:limit], "pairs_truncated": len(rows) > limit}
+    if source == "mujoco":
+        result["rules"] = (
+            "solref/solimp/friction are the values MuJoCo integrates. decided_by names the material source: a "
+            "higher geom_priority wins outright, equal priorities mix by solmix. By default each shape's ke/kd map to "
+            "solref = (2 / kd, kd / 2 * sqrt(1 / ke)); force-space shapes combine ke/kd with the effective mass "
+            "(docs/solvers/mujoco.rst, 'Shape-material contact stiffness and damping'). Edit model.shape_material_* "
+            "or model.mujoco.geom_* and call solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)."
+        )
+    return result
 
 
 def health(session) -> dict:

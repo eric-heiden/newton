@@ -114,12 +114,19 @@ class TestMcpHelpers(unittest.TestCase):
     def test_rollout_records_series_and_stops_early(self):
         """Sample expressions and callables, reset first, and stop on a condition."""
         result = self.session.rollout(
-            20, record={"z": "state.body_q.numpy()[0, 2]", "vz": lambda s: s.state.body_qd.numpy()[0, 2]}, every=5
+            20,
+            record={
+                "z": "state.body_q.numpy()[0, 2]",
+                "vz": lambda s: s.state.body_qd.numpy()[0, 2],
+                "frame": lambda: self.session.frame,
+            },
+            every=5,
         )
         self.assertEqual(result["frames"], 20)
         np.testing.assert_allclose(result["t"], [0.0, 0.05, 0.1, 0.15, 0.2], atol=1e-9)
         self.assertLess(result["z"][-1], result["z"][0])
         self.assertLess(result["vz"][-1], 0.0)
+        self.assertEqual(result["frame"].tolist(), [0, 5, 10, 15, 20])
         result = self.session.rollout(
             seconds=1.0, start=True, record={"z": "state.body_q.numpy()[0, 2]"}, until="session.frame >= 10"
         )
@@ -145,6 +152,24 @@ class TestMcpHelpers(unittest.TestCase):
         """Provide newton and the helper functions without imports."""
         result = self.session.dispatch("execute", {"code": "(newton.__name__, callable(rollout), health()['ok'])"})
         self.assertEqual(result["result"], ["newton", True, True])
+
+
+class TestMcpLeanProfile(unittest.TestCase):
+    def test_lean_profile_lists_execute_and_rebuild(self):
+        """Advertise two tools and short instructions that point to Python-side observation."""
+        from newton._src.mcp.protocol import _Protocol  # noqa: PLC0415
+
+        class Client:
+            def request(self, operation, **_):
+                return {"guide": "hosted"} if operation == "guide" else {}
+
+        protocol = _Protocol(Client(), profile="lean")
+        initialized = protocol.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        instructions = initialized["result"]["instructions"]
+        self.assertIn("session.dispatch('observe'", instructions)
+        self.assertTrue(instructions.endswith("hosted"))
+        listed = protocol.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        self.assertEqual([tool["name"] for tool in listed["result"]["tools"]], ["newton_execute", "newton_rebuild"])
 
 
 if __name__ == "__main__":

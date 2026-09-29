@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from typing import ClassVar
 
 from .transport import _MAX_REQUEST, _MAX_RESPONSE, SimulationClient, _encode
 
@@ -252,8 +253,8 @@ TOOLS = [
         "are summarized; _ keeps the value). show(img, label) returns images inline: numpy arrays, matplotlib figures, "
         "PNG paths, or observe/filmstrip results. Batch many evaluations per call and print compact numbers. "
         "session.dispatch(op, args) runs structured operations (observe, filmstrip, step, reset, checkpoint, restore, "
-        "query, edit). Runtime errors keep variables but pause/invalidate the scene: fix with recovery='inspect' "
-        "then 'acknowledge', or rebuild. Not a sandbox.",
+        "query, edit). A runtime error keeps variables and states whether the scene stayed valid; if invalid, fix "
+        "with recovery='inspect' then 'acknowledge', or rebuild. Not a sandbox.",
         {
             "code": {"type": "string", "maxLength": 65536},
             "reset_namespace": {
@@ -288,6 +289,15 @@ Efficient workflow:
 If a cell raises, the error states whether the scene stayed valid. If invalid, use execute(recovery='inspect') to diagnose and 'acknowledge' after repair, or rebuild."""
 
 
+_INSTRUCTIONS_LEAN = """Live Newton simulation running in another process; its Python state persists between calls.
+newton_execute runs Python in it (preloaded: session, model, state, control, solver, newton, np, wp, show, rollout, health, solver_contacts). Batch many evaluations per call and print compact numbers.
+- rollout(frames or seconds=..., record={'name': 'expr' or fn}, start=True|'checkpoint', until='expr', plot=True) steps and returns NumPy series.
+- solver_contacts(): active contacts per shape pair with the parameters the solver integrates and which material decided them. health(): NaNs, runaway velocities, penetration, full solver buffers.
+- Images: show(session.dispatch('observe', {'view': 'iso'})) or show(session.dispatch('filmstrip', {'times': [0.5, 1.0], 'reset': True})); show() also takes arrays and matplotlib figures.
+- session.dispatch('checkpoint' | 'restore' | 'reset' | 'describe', {...}) manage and inspect the scene.
+newton_rebuild reloads the application (for hosted scripts: re-imports the edited file) in the same process."""
+
+
 def _compact(data: dict, *, full: bool = False) -> dict:
     """Drop default-valued status fields so responses stay short for language models."""
     if full:
@@ -307,13 +317,19 @@ def _compact(data: dict, *, full: bool = False) -> dict:
 
 
 class _Protocol:
+    _PROFILES: ClassVar[dict[str, set[str] | None]] = {
+        "full": None,
+        "code": {"newton_describe", "newton_execute", "newton_observe", "newton_filmstrip", "newton_rebuild"},
+        "lean": {"newton_execute", "newton_rebuild"},
+    }
+
     def __init__(self, client: SimulationClient, *, profile: str = "full"):
-        if profile not in {"full", "code"}:
-            raise ValueError("profile must be full or code")
+        if profile not in self._PROFILES:
+            raise ValueError(f"profile must be one of {sorted(self._PROFILES)}")
         self.client = client
         self.initialized = False
-        names = {"newton_describe", "newton_execute", "newton_observe", "newton_filmstrip", "newton_rebuild"}
-        self.tools = TOOLS if profile == "full" else [tool for tool in TOOLS if tool["name"] in names]
+        names = self._PROFILES[profile]
+        self.tools = TOOLS if names is None else [tool for tool in TOOLS if tool["name"] in names]
         self.profile = profile
 
     def handle(self, message: dict) -> dict | None:
@@ -382,7 +398,7 @@ class _Protocol:
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
     def _instructions(self) -> str:
-        text = _INSTRUCTIONS
+        text = _INSTRUCTIONS_LEAN if self.profile == "lean" else _INSTRUCTIONS
         try:
             guide = self.client.request("guide").get("guide")
         except Exception:
@@ -402,9 +418,9 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=30, help="Maximum waiting time before execution begins [s]")
     parser.add_argument(
         "--profile",
-        choices=("full", "code"),
+        choices=("full", "code", "lean"),
         default="full",
-        help="Advertise all tools or four code-oriented tools; this does not change permissions",
+        help="Advertise all tools, five code-oriented tools, or only execute and rebuild; this does not change permissions",
     )
     args = parser.parse_args()
     protocol = _Protocol(SimulationClient(args.connect, timeout=args.timeout), profile=args.profile)

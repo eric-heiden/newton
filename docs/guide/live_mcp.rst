@@ -73,7 +73,9 @@ amplitude, a replacement solver), the host re-records the example's CUDA graphs
 before the next step and reports this as ``note`` in the execution result; call
 ``recapture()`` after in-place changes it cannot detect. Python errors are
 reported without invalidating the scene. ``newton_rebuild`` reloads the edited
-script from disk in the same process.
+script from disk in the same process. ``--workers N`` also hosts ``N`` sibling
+copies of the script and exposes them as ``workers`` (see
+:class:`newton.mcp.WorkerPool`) for parallel parameter sweeps.
 
 Connect an MCP client
 ---------------------
@@ -87,8 +89,12 @@ file path when the MCP client's working directory differs:
 
 The default ``--profile full`` advertises every structured tool. Add
 ``--profile code`` to advertise only ``newton_describe``, ``newton_execute``,
-``newton_observe``, ``newton_filmstrip``, and ``newton_rebuild``. This reduces tool-schema context for
-clients that prefer Python. The profile changes presentation, not permissions:
+``newton_observe``, ``newton_filmstrip``, and ``newton_rebuild``, or ``--profile lean`` to
+advertise only ``newton_execute`` and ``newton_rebuild`` with shorter server
+instructions. Tool schemas and instructions are resent on every model turn, so
+the smaller profiles reduce per-turn context for clients that prefer Python;
+images remain available through ``show(session.dispatch("observe", ...))``.
+The profile changes presentation, not permissions:
 trusted execution still requires ``allow_execute=True``. Python can call
 ``session.dispatch(operation, arguments)`` for every structured operation listed
 by ``describe``. Rebuild remains a separate tool because an invalid session

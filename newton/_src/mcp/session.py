@@ -9,6 +9,7 @@ import ast
 import base64
 import builtins
 import contextlib
+import inspect
 import io
 import json
 import linecache
@@ -130,6 +131,21 @@ def _result_json(value: Any) -> Any:
         raise ValueError("Unsupported result type; return built-in JSON data or NumPy values")
 
     return convert(value)
+
+
+def _session_callable(function: Callable) -> Callable:
+    """Accept both ``fn()`` and ``fn(session)`` for rollout probes."""
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return function
+    positional = [
+        p for p in parameters if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
+    ]
+    variadic = any(p.kind == p.VAR_POSITIONAL for p in parameters)
+    if not positional and not variadic:
+        return lambda _session: function()
+    return function
 
 
 def _result_summary(value: Any) -> str:
@@ -1370,8 +1386,9 @@ class SimulationSession:
         Args:
             frames: Number of steps; alternatively give ``seconds``.
             seconds: Simulated duration [s], rounded to whole steps.
-            record: Series to sample, as ``name: callable(session)`` or a Python
-                expression evaluated in the workspace (``"state.body_q.numpy()[3, 2]"``).
+            record: Series to sample, as ``name: callable`` (taking no arguments or
+                the session) or a Python expression evaluated in the workspace
+                (``"state.body_q.numpy()[3, 2]"``).
             every: Sample every ``every`` steps (the final step is always sampled).
             start: ``True`` resets to the initial state, a string restores that
                 checkpoint, ``False`` continues from the current state.
@@ -1400,8 +1417,8 @@ class SimulationSession:
                 code = compile(probe, f"<rollout:{name}>", "eval")
                 probes[name] = lambda _session, code=code: eval(code, self._eval_scope())
             else:
-                probes[name] = probe
-        stop = until
+                probes[name] = _session_callable(probe)
+        stop = _session_callable(until) if callable(until) else until
         if isinstance(until, str):
             stop_code = compile(until, "<rollout:until>", "eval")
 

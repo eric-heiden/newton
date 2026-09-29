@@ -15,8 +15,9 @@ Experimental live Newton simulation tools and stdio MCP attachment.
 Run ``python -m newton.mcp --connect session.json`` as a stdio MCP server, and
 ``python -m newton.mcp host example.py --connection-file session.json`` to serve
 an unmodified Newton example script live.
-Add ``--profile code`` to advertise only describe, execute, observe, and rebuild;
-this changes tool presentation, not permissions.
+Add ``--profile code`` to advertise only describe, execute, observe, filmstrip,
+and rebuild, or ``--profile lean`` for only execute and rebuild; this changes
+tool presentation, not permissions.
 
 .. py:module:: newton.mcp
 .. currentmodule:: newton.mcp

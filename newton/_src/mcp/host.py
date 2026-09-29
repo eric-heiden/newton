@@ -43,6 +43,16 @@ def _load_module(path: Path, generation: int):
     return module
 
 
+class _NoSolver:
+    """Stand-in for examples that advance without a dynamics solver (e.g. pure collision queries)."""
+
+    def reset(self, *args, **kwargs) -> None:
+        pass
+
+    def notify_model_changed(self, flags) -> None:
+        pass
+
+
 class ExampleHost:
     """Construct and serve a Newton ``Example`` script.
 
@@ -66,6 +76,7 @@ class ExampleHost:
         self._dynamic_scalars: set[str] = set()
         self._retired_graphs: list = []
         self._captured_solver = None
+        self._no_solver = _NoSolver()
 
     def build(self, argv: list[str] | None = None) -> Any:
         """(Re)load the script from disk and construct its example with a null viewer."""
@@ -156,9 +167,10 @@ class ExampleHost:
         )
         previous, self._fingerprint = self._fingerprint, current
         state = getattr(self.example, "state_0", None) or getattr(self.example, "state", None)
-        if session.solver is not self.example.solver or session.state is not state:
-            session.solver, session.state = self.example.solver, state
-            session.state_next = getattr(self.example, "state_1", None)
+        solver = getattr(self.example, "solver", None) or self._no_solver
+        if session.solver is not solver or session.state is not state:
+            session.solver, session.state = solver, state
+            session.state_next = getattr(self.example, "state_1", None) or session.state_next
             session.control = getattr(self.example, "control", session.control)
         if not any(isinstance(value, wp.Graph) for value in vars(self.example).values()):
             return
@@ -191,7 +203,7 @@ class ExampleHost:
         state = getattr(example, "state_0", None) or getattr(example, "state", None)
         return {
             "model": example.model,
-            "solver": example.solver,
+            "solver": getattr(example, "solver", None) or self._no_solver,
             "state": state,
             "state_next": getattr(example, "state_1", None),
             "control": getattr(example, "control", None),
@@ -247,7 +259,7 @@ class ExampleHost:
             host.example.step()
             host._dynamic_scalars.update(k for k, v in host._scalars().items() if before.get(k, v) != v)
             session.state = getattr(host.example, "state_0", None) or getattr(host.example, "state", None)
-            session.state_next = getattr(host.example, "state_1", None)
+            session.state_next = getattr(host.example, "state_1", None) or session.state_next
             host._fingerprint = host.fingerprint()
 
         def rebuild(session, argv=None, **_):

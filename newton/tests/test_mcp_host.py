@@ -117,6 +117,37 @@ class TestMcpHost(unittest.TestCase):
         session.dispatch("rebuild", {})
         self.assertEqual(session.dispatch("execute", {"code": "(example.speed, kept)"})["result"], [3.0, 3])
 
+    def test_hosts_examples_without_solver_or_second_state(self):
+        """Serve kinematic examples that own a single state and no dynamics solver."""
+        script = Path(self.directory.name) / "kinematic.py"
+        script.write_text(
+            textwrap.dedent(
+                """
+                import newton
+
+
+                class Example:
+                    def __init__(self, viewer, args):
+                        builder = newton.ModelBuilder()
+                        builder.add_shape_sphere(builder.add_body(), radius=0.1)
+                        self.model = builder.finalize()
+                        self.state_0 = self.model.state()
+                        self.frame_dt = 0.5
+                        self.moves = 0
+
+                    def step(self):
+                        self.moves += 1
+                """
+            )
+        )
+        session = ExampleHost(script).session(artifact_directory=self.directory.name)
+        self.addCleanup(session.close)
+        session.dispatch("step", {"count": 2})
+        session.dispatch("checkpoint", {"name": "two"})
+        session.dispatch("step", {"count": 1})
+        session.dispatch("restore", {"name": "two"})
+        self.assertEqual(session.dispatch("execute", {"code": "example.moves"})["result"], 2)
+
 
 class TestMcpHelpers(unittest.TestCase):
     def setUp(self):

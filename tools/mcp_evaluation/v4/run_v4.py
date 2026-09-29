@@ -87,6 +87,17 @@ Constraints (checked): keep the two revolute joints, the 0.2 m shoulder-to-elbow
 Goal: calibrate the simulation so it reproduces the real tosses. Verification imports the script's build_model(num_worlds), make_solver(model), make_pipeline(model), and SUBSTEPS, and runs its own open-loop rollout (the same protocol as the script's rollout/evaluate) on 170 held-out tosses of the same cube. The mean over tosses of the time-averaged position error must be at most {position_m} m, and of the orientation error at most {rotation_rad} rad. The starter scores about 0.10 m and 1.07 rad.
 Constraints (checked): keep one cube per world with the measured size, mass, and inertia, and keep gravity. Contact and material parameters, table height, collision settings, solver type and settings, and the number of substeps per frame (1 to 100) may change. Keep the file runnable (`python cube_toss.py --viewer null`).""",
         },
+        "sdf_grind": {
+            "files": {"sdf_grinding.py": HERE / "sdf_grind/sdf_grinding.py"},
+            "script": "sdf_grinding.py",
+            "host_args": [],
+            "verifier": "tools/mcp_evaluation/v4/sdf_grind/verify.py",
+            "seconds": 2700,
+            "goal": """sdf_grinding.py is a Newton scene for machining: a cylindrical grinding wheel is driven kinematically across an ellipsoidal workpiece (a static mesh shape whose collision geometry is a sparse texture SDF built by Mesh.build_sdf), and hydroelastic SDF-SDF collision reports the contact surface and normal load every frame without a dynamics solver. Problem: the wheel passes through the workpiece without removing any material, so the rendered and colliding workpiece never changes.
+
+Goal: add material removal, a capability Newton does not provide out of the box. As the wheel moves, the material it sweeps through must disappear from the workpiece's collision geometry (the SDF attached to the workpiece mesh shape), and the rendered surface must follow. Verification runs the script's Example for the full pass (GRIND_FRAMES + 10 frames) in a fresh process and then checks the workpiece SDF: the removed volume must match the volume swept by the wheel within 15%; points inside the groove must be clear and points 2 cm below it must remain solid (at least 90% each); and with the wheel placed back into the finished groove, the hydroelastic normal load must be at most 25% of the load on an unground workpiece.
+Constraints (checked): keep the workpiece shape, wheel size, tool path (_grinder_pose), GRIND_DEPTH, GRIND_FRAMES, hydroelastic stiffness, and the collision pipeline setup; the removal must act on the geometry the collision pipeline uses. Performance matters less than correctness, but a full pass should stay under a few minutes. Keep the file runnable (`python sdf_grinding.py --viewer null`).""",
+        },
     }
     if name == "cube_toss":
         from tools.mcp_evaluation.v4.cube_toss.verify import THRESHOLDS  # noqa: PLC0415
@@ -130,10 +141,11 @@ If no newton tools are available to you, reply only with {UNAVAILABLE} and stop.
     )
 
 
-def prepare(workspace: Path, name: str, condition: str, model: str, seconds: int, phase: str) -> dict:
+def prepare(workspace: Path, name: str, condition: str, model: str, seconds: int | None, phase: str) -> dict:
     if condition not in ("mcp", "restart"):
         raise ValueError("condition must be mcp or restart")
     task = _task(name)
+    seconds = seconds or task.get("seconds", 1800)
     workspace.mkdir(parents=True, exist_ok=False)
     for target, source in task["files"].items():
         shutil.copyfile(source, workspace / target)
@@ -308,11 +320,13 @@ def verify(workspace: Path, task: dict) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", required=True, choices=("grasp_drift", "g1_track", "dp_real", "cube_toss"))
+    parser.add_argument(
+        "--task", required=True, choices=("grasp_drift", "g1_track", "dp_real", "cube_toss", "sdf_grind")
+    )
     parser.add_argument("--condition", required=True, choices=("mcp", "restart"))
     parser.add_argument("--model", required=True, choices=sorted(MODELS))
     parser.add_argument("--workspace", type=Path, required=True)
-    parser.add_argument("--seconds", type=int, default=1800)
+    parser.add_argument("--seconds", type=int, default=None, help="Budget [s]; defaults to the task's (usually 1800)")
     parser.add_argument("--phase", default="loop")
     parser.add_argument("--run", action="store_true")
     args = parser.parse_args()

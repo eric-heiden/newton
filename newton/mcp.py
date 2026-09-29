@@ -9,16 +9,19 @@
     explicit embedding in the simulation process and owner-thread request
     pumping. Trusted Python is opt-in and is not a security sandbox.
 
-Run ``python -m newton.mcp --connect session.json`` as a stdio MCP server.
+Run ``python -m newton.mcp --connect session.json`` as a stdio MCP server, and
+``python -m newton.mcp host example.py --connection-file session.json`` to serve
+an unmodified Newton example script live.
 Add ``--profile code`` to advertise only describe, execute, observe, and rebuild;
 this changes tool presentation, not permissions.
 """
 
 from typing import TYPE_CHECKING
 
-__all__ = ["SimulationClient", "SimulationServer", "SimulationSession", "WorkerPool"]
+__all__ = ["ExampleHost", "SimulationClient", "SimulationServer", "SimulationSession", "WorkerPool"]
 
 if TYPE_CHECKING:
+    from ._src.mcp.host import ExampleHost
     from ._src.mcp.session import SimulationSession
     from ._src.mcp.transport import SimulationClient, SimulationServer
     from ._src.mcp.workers import WorkerPool
@@ -33,6 +36,10 @@ def __getattr__(name: str):
         from ._src.mcp.transport import SimulationClient, SimulationServer  # noqa: PLC0415
 
         return {"SimulationClient": SimulationClient, "SimulationServer": SimulationServer}[name]
+    if name == "ExampleHost":
+        from ._src.mcp.host import ExampleHost  # noqa: PLC0415
+
+        return ExampleHost
     if name == "WorkerPool":
         from ._src.mcp.workers import WorkerPool  # noqa: PLC0415
 
@@ -41,6 +48,13 @@ def __getattr__(name: str):
 
 
 if __name__ == "__main__":
-    from ._src.mcp.protocol import main
+    import sys
 
-    main()
+    if sys.argv[1:2] == ["host"]:
+        from ._src.mcp.host import main
+
+        main(sys.argv[2:])
+    else:
+        from ._src.mcp.protocol import main
+
+        main()

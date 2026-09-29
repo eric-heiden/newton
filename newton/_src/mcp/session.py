@@ -183,6 +183,11 @@ class SimulationSession:
             execution, refreshed before every cell.
         guide: Application-specific usage notes; MCP clients receive them in
             the server instructions.
+        snapshot_callback: Optional ``callback(session) -> object`` capturing
+            application-owned state (controller phases, timers, targets) with
+            every checkpoint and the initial reset snapshot.
+        restore_callback: Optional ``callback(session, data)`` restoring what
+            ``snapshot_callback`` captured, before ``reset_callback`` runs.
         workers: Connection files of sibling sessions (usually more instances
             of the same application). Trusted execution receives a ``workers``
             pool whose ``broadcast``/``map``/``submit`` run cells on them
@@ -248,6 +253,10 @@ class SimulationSession:
         namespace: dict[str, Any] | None = None,
         guide: str | None = None,
         workers: list[str | Path] | None = None,
+        snapshot_callback: Callable | None = None,
+        restore_callback: Callable | None = None,
+        execute_callback: Callable | None = None,
+        invalidate_on_error: bool = True,
     ):
         self._owner = threading.get_ident()
         self._queue = queue.Queue(maxsize=64)
@@ -264,6 +273,14 @@ class SimulationSession:
         self._cell_count = 0
         self._execution_error = None
         self._shown_images = None
+        self.snapshot_callback = snapshot_callback
+        self.restore_callback = restore_callback
+        self.execute_callback = execute_callback
+        """Called as ``execute_callback(session)`` after each successful trusted execution; a returned
+        string is added to the execution result as ``note``."""
+        self.invalidate_on_error = invalidate_on_error
+        """Invalidate the scene when trusted execution raises. ``False`` reports the error and keeps the
+        scene valid; statements before the failing line keep their effects."""
         self.namespace = dict(namespace or {})
         """Extra names available in trusted execution, refreshed before each cell."""
         self.guide = guide
@@ -391,7 +408,15 @@ class SimulationSession:
                             result[f"{name}.{child}"] = copy_array(array)
             return result
 
-        return {"state": arrays(self.state), "control": arrays(self.control), "time": self.time, "frame": self.frame}
+        snapshot = {
+            "state": arrays(self.state),
+            "control": arrays(self.control),
+            "time": self.time,
+            "frame": self.frame,
+        }
+        if getattr(self, "snapshot_callback", None) is not None:
+            snapshot["application"] = self.snapshot_callback(self)
+        return snapshot
 
     def _restore(self, snapshot: dict) -> dict:
         self.paused = True
@@ -405,6 +430,8 @@ class SimulationSession:
         self.contacts.clear(bump_generation=True)
         self._contact_frame = self._contact_revision = None
         self.time, self.frame = snapshot["time"], snapshot["frame"]
+        if self.restore_callback is not None and "application" in snapshot:
+            self.restore_callback(self, snapshot["application"])
         if self.reset_callback is not None:
             self.reset_callback(self)
         self.valid = True
@@ -784,7 +811,11 @@ class SimulationSession:
         "viewer",
         "np",
         "wp",
+        "newton",
         "show",
+        "rollout",
+        "health",
+        "solver_contacts",
     )
     _EXPRESSION_RESULT = "__newton_expression_result__"
 
@@ -795,15 +826,21 @@ class SimulationSession:
             {
                 name: getattr(self, name)
                 for name in self._WORKSPACE_BINDINGS
-                if name not in ("session", "np", "wp", "show")
+                if name not in ("session", "np", "wp", "newton", "show", "rollout", "health", "solver_contacts")
             }
         )
         self._workspace.update(self.namespace)
+        import newton  # noqa: PLC0415
+
         self._workspace.update(
             session=self,
             show=self.show,
+            rollout=self.rollout,
+            health=self.health,
+            solver_contacts=self.solver_contacts,
             np=np,
             wp=wp,
+            newton=newton,
             __name__=self._workspace_name,
             __package__=None,
             __loader__=None,
@@ -913,12 +950,24 @@ class SimulationSession:
                 exec(compiled, scope)
         except Exception as error:
             self._shown_images = None
-            self._invalidate(requires_rebuild=True)
             self._execution_error = self._execution_diagnostic(error, filename)
             diagnostic = self._execution_error
-            self.last_error = f"Python {diagnostic['type']} at line {diagnostic['line']}: {diagnostic['message']}"[
-                :4096
-            ]
+            message = f"Python {diagnostic['type']} at line {diagnostic['line']}: {diagnostic['message']}"[:4096]
+            if not self.invalidate_on_error and self.valid:
+                self.paused = True
+                self.revision += 1
+                if self._renderer is not None:
+                    self._renderer.invalidate()
+                if self.execute_callback is not None:
+                    with contextlib.suppress(Exception):
+                        self.execute_callback(self)
+                raise RuntimeError(
+                    f"{message}. The scene stays valid; statements before the failing line kept their effects "
+                    "(restore a checkpoint to roll back). "
+                    f"frames={json.dumps(diagnostic['frames'])}; stdout={''.join(output.parts)!r}"
+                ) from error
+            self._invalidate(requires_rebuild=True)
+            self.last_error = message
             raise RuntimeError(
                 f"{self.last_error}. Execution may have mutated the scene; paused and invalid, no rollback. "
                 "Workspace variables remain available. Use recovery='inspect' for diagnosis; acknowledge only "
@@ -937,6 +986,7 @@ class SimulationSession:
             self._execution_error = None
         if self._renderer is not None:
             self._renderer.invalidate()
+        note = self.execute_callback(self) if self.execute_callback is not None and self.valid else None
         images, self._shown_images = self._shown_images, None
         explicit_result = "result" in scope
         value = scope.get("result") if explicit_result else scope.pop(self._EXPRESSION_RESULT, None)
@@ -965,6 +1015,7 @@ class SimulationSession:
             "stdout": "".join(output.parts),
             "truncated": output.truncated,
             "workspace": self._workspace_info(),
+            **({"note": str(note)[:1024]} if note else {}),
             **({"images": images} if images else {}),
         }
 
@@ -1302,6 +1353,131 @@ class SimulationSession:
         self._contact_frame = self.frame
         self._contact_revision = self.revision
         return {**self._status(), "source": "collision_pipeline"}
+
+    def rollout(
+        self,
+        frames: int | None = None,
+        *,
+        seconds: float | None = None,
+        record: dict[str, Callable | str] | None = None,
+        every: int = 1,
+        start: bool | str = False,
+        until: Callable | str | None = None,
+        plot: bool | list[str] = False,
+    ) -> dict:
+        """Step the scene and record time series in one call (trusted execution helper).
+
+        Args:
+            frames: Number of steps; alternatively give ``seconds``.
+            seconds: Simulated duration [s], rounded to whole steps.
+            record: Series to sample, as ``name: callable(session)`` or a Python
+                expression evaluated in the workspace (``"state.body_q.numpy()[3, 2]"``).
+            every: Sample every ``every`` steps (the final step is always sampled).
+            start: ``True`` resets to the initial state, a string restores that
+                checkpoint, ``False`` continues from the current state.
+            until: Stop early once this callable/expression is truthy; the
+                reason is reported in ``stopped``.
+            plot: Show a plot of all (or the named) scalar/vector series.
+
+        Returns:
+            Dictionary with ``t`` [s] and one NumPy array per recorded name
+            (stacked over samples), plus ``frames`` and ``stopped``.
+        """
+        self._assert_owner()
+        if frames is None:
+            if seconds is None:
+                raise ValueError("Give frames or seconds")
+            frames = max(1, round(float(seconds) / self.dt))
+        _integer(frames, "frames", 1, 1_000_000)
+        _integer(every, "every", 1, 1_000_000)
+        if start is True:
+            self._reset()
+        elif isinstance(start, str):
+            self._restore_named(name=start)
+        probes = {}
+        for name, probe in (record or {}).items():
+            if isinstance(probe, str):
+                code = compile(probe, f"<rollout:{name}>", "eval")
+                probes[name] = lambda _session, code=code: eval(code, self._eval_scope())
+            else:
+                probes[name] = probe
+        stop = until
+        if isinstance(until, str):
+            stop_code = compile(until, "<rollout:until>", "eval")
+
+            def stop(_session):
+                return eval(stop_code, self._eval_scope())
+
+        series = {name: [] for name in probes}
+        times, stopped = [], None
+
+        def sample():
+            times.append(self.time)
+            for name, probe in probes.items():
+                value = probe(self)
+                series[name].append(value.numpy() if isinstance(value, wp.array) else np.asarray(value))
+
+        sample()
+        for index in range(frames):
+            self._step(count=1)
+            last = index == frames - 1
+            done = bool(stop(self)) if stop is not None else False
+            if done or last or (index + 1) % every == 0:
+                sample()
+            if done:
+                stopped = f"until at t={self.time:.4g} s"
+                break
+        result = {"t": np.asarray(times), **{name: np.stack(values) for name, values in series.items()}}
+        result.update(frames=index + 1, stopped=stopped)
+        if plot:
+            self._plot_series(result, plot if isinstance(plot, list) else list(series))
+        return result
+
+    def _eval_scope(self) -> dict:
+        if self._workspace_module is not None:
+            return self._workspace
+        # Outside trusted execution, expressions still see the live bindings.
+        return {name: getattr(self, name) for name in ("model", "solver", "state", "control", "contacts")} | {
+            "session": self,
+            "np": np,
+            "wp": wp,
+        }
+
+    def _plot_series(self, result: dict, names: list[str]) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        names = [n for n in names if isinstance(result.get(n), np.ndarray) and result[n].ndim <= 2]
+        if not names:
+            return
+        figure, axes = plt.subplots(len(names), 1, figsize=(6.4, 1.8 * len(names) + 0.4), sharex=True, squeeze=False)
+        for axis, name in zip(axes[:, 0], names, strict=True):
+            values = result[name].reshape(len(result["t"]), -1)
+            for column in range(min(values.shape[1], 8)):
+                axis.plot(result["t"], values[:, column], lw=1.2, label=str(column) if values.shape[1] > 1 else None)
+            axis.set_ylabel(name, fontsize=8)
+            axis.grid(alpha=0.3)
+            if values.shape[1] > 1:
+                axis.legend(fontsize=6, ncol=min(values.shape[1], 8), loc="best")
+        axes[-1, 0].set_xlabel("time [s]")
+        figure.tight_layout()
+        if self._shown_images is not None and len(self._shown_images) < self._MAX_SHOWN_IMAGES:
+            self.show(figure)
+        plt.close(figure)
+
+    def health(self) -> dict:
+        """Check for non-finite state, runaway velocities, deep penetration, and solver buffer overflow."""
+        from .diagnostics import health  # noqa: PLC0415
+
+        return health(self)
+
+    def solver_contacts(self, limit: int = 20) -> dict:
+        """Active solver contacts grouped by shape pair, with the effective solver parameters."""
+        from .diagnostics import solver_contacts  # noqa: PLC0415
+
+        return solver_contacts(self, limit=limit)
 
     def contact_data(
         self,

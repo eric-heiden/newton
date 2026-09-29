@@ -284,7 +284,8 @@ Efficient workflow:
 - newton_filmstrip(times=[...], reset=true) runs forward and returns one labeled grid of frames; references=[[...]] compares each frame with reference images.
 - newton_execute runs Python in the app: batch several parameter candidates in one call, compute numeric comparisons, and call show(image_or_figure, label) to see custom plots or composites inline. Prefer one larger call over many small ones.
 - session.dispatch('checkpoint', {'name': ...}) / ('restore', ...) branches from a saved state instead of re-simulating.
-Runtime Python errors pause and invalidate the scene; use execute(recovery='inspect') to diagnose and 'acknowledge' after repair, or rebuild."""
+- Built-in helpers (no import needed; newton, np, wp are preloaded): rollout(frames or seconds=..., record={'name': 'expr' or fn}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the solver's effective parameters (MuJoCo solref/solimp/friction after priority and mixing) next to the authored materials; health() flags NaNs, runaway velocities, deep penetration, and solver buffer overflow.
+If a cell raises, the error states whether the scene stayed valid. If invalid, use execute(recovery='inspect') to diagnose and 'acknowledge' after repair, or rebuild."""
 
 
 def _compact(data: dict, *, full: bool = False) -> dict:

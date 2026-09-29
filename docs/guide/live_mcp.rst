@@ -53,6 +53,28 @@ Applications that capture CUDA graphs remain responsible for graph lifecycle.
 Parameter edits retain array storage; replacing scene topology requires
 rebuilding graphs and every dependent binding.
 
+Host an example script
+----------------------
+
+Any script that follows the Newton example convention (an ``Example(viewer,
+args)`` class with ``model``, ``solver``, ``state_0``/``state_1``, ``control``,
+and a per-frame ``step()``) can be served without changes:
+
+.. code-block:: bash
+
+   python -m newton.mcp host my_scene.py --connection-file session.json -- --my-arg 3
+
+Arguments after ``--`` go to the script's own parser. The host
+(:class:`newton.mcp.ExampleHost`) enables trusted execution, exposes the live
+``example`` and its ``module``, and includes the example's own Warp arrays and
+scalar attributes in checkpoints so controller phases rewind with the physics.
+After a cell rebinds or changes any example attribute (a gain, a shake
+amplitude, a replacement solver), the host re-records the example's CUDA graphs
+before the next step and reports this as ``note`` in the execution result; call
+``recapture()`` after in-place changes it cannot detect. Python errors are
+reported without invalidating the scene. ``newton_rebuild`` reloads the edited
+script from disk in the same process.
+
 Connect an MCP client
 ---------------------
 
@@ -255,6 +277,23 @@ after their cell is evicted. ``describe`` and successful execution responses
 include workspace generation, cell count, a bounded list of variable names,
 and the most recent execution diagnostic. Diagnostics identify the exception,
 cell, source line, and up to eight user-code stack frames.
+
+Analysis helpers
+----------------
+
+Trusted cells can use these helpers without imports (``newton``, ``np``, and
+``wp`` are preloaded as well):
+
+- :meth:`~newton.mcp.SimulationSession.rollout` steps the scene and samples
+  named series (callables or workspace expressions such as
+  ``"state.body_q.numpy()[3, 2]"``) in one call, optionally resetting or
+  restoring a checkpoint first, stopping on a condition, and plotting the result.
+- :meth:`~newton.mcp.SimulationSession.solver_contacts` groups the solver's
+  active contacts by shape pair and lists the parameters the solver actually
+  integrates, such as MuJoCo ``solref``, ``solimp``, and friction after geom
+  priority and material mixing, next to the authored shape materials.
+- :meth:`~newton.mcp.SimulationSession.health` flags non-finite state, runaway
+  velocities, deep penetration, and full solver contact or constraint buffers.
 
 Parallel worker sessions
 ------------------------

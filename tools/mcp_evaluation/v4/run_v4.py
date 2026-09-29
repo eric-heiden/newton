@@ -87,6 +87,17 @@ Constraints (checked): keep the two revolute joints, the 0.2 m shoulder-to-elbow
 Goal: calibrate the simulation so it reproduces the real tosses. Verification imports the script's build_model(num_worlds), make_solver(model), make_pipeline(model), and SUBSTEPS, and runs its own open-loop rollout (the same protocol as the script's rollout/evaluate) on 170 held-out tosses of the same cube. The mean over tosses of the time-averaged position error must be at most {position_m} m, and of the orientation error at most {rotation_rad} rad. The starter scores about 0.10 m and 1.07 rad.
 Constraints (checked): keep one cube per world with the measured size, mass, and inertia, and keep gravity. Contact and material parameters, table height, collision settings, solver type and settings, and the number of substeps per frame (1 to 100) may change. Keep the file runnable (`python cube_toss.py --viewer null`).""",
         },
+        "g1_hard": {
+            "files": {name: HERE / "g1" / name for name in ("g1_track.py", "wave.csv", "high5.csv")},
+            "script": "g1_track.py",
+            "host_args": ["--motion", "high5.csv"],
+            "verifier": "tools/mcp_evaluation/v4/g1/verify_hard.py",
+            "seconds": 3600,
+            "goal": """g1_track.py simulates a floating-base Unitree G1 humanoid (SolverMuJoCo, 50 Hz frames, 2 ms substeps) that should follow Kimodo reference motions (root pose and 29 joint angles at 30 fps) using position servos with torque limits. Problem: with the current controller the robot falls, and high5.csv, a clip in which the root turns and shifts its weight, defeats plain joint-space PD tuning.
+
+Goal: set up a controller that follows both wave.csv and high5.csv without falling. Verification runs the script in a fresh process on wave.csv, on high5.csv, and on an unseen slower (0.9x) playback of high5.csv: the root must stay upright (height above 0.6 m), root position RMSE at most 4 cm, and joint-angle RMSE at most 0.05 rad on every run. The same controller code must handle every clip (select the clip only through --motion).
+Constraints (checked): do not change the robot model (bodies, masses, armature, torque limits), the timestep, or the motion input and playback, and apply no forces or torques to the floating base. The controller (gains, targets, feedforward, feedback, estimation, anything in the step logic, and additional Python packages already installed) may change. Keep the file runnable as a Newton example (`python g1_track.py --motion high5.csv --viewer null`).""",
+        },
         "sdf_grind": {
             "files": {"sdf_grinding.py": HERE / "sdf_grind/sdf_grinding.py"},
             "script": "sdf_grinding.py",
@@ -321,7 +332,7 @@ def verify(workspace: Path, task: dict) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--task", required=True, choices=("grasp_drift", "g1_track", "dp_real", "cube_toss", "sdf_grind")
+        "--task", required=True, choices=("grasp_drift", "g1_track", "dp_real", "cube_toss", "sdf_grind", "g1_hard")
     )
     parser.add_argument("--condition", required=True, choices=("mcp", "restart"))
     parser.add_argument("--model", required=True, choices=sorted(MODELS))

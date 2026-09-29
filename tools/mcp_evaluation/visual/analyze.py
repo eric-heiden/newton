@@ -11,6 +11,48 @@ import random
 from pathlib import Path
 
 
+def timing(workspace: Path, cli: str) -> dict:
+    """Tool-execution intervals from event arrival times: union, summed duration, and remaining model time."""
+    path = workspace / "agent.times.jsonl"
+    if not path.exists():
+        return {}
+    times = [json.loads(line)["seconds"] for line in path.read_text().splitlines()]
+    events = [json.loads(line) for line in (workspace / "agent.jsonl").read_text(errors="replace").splitlines()]
+    intervals, pending = [], {}
+    for event, t in zip(events, times, strict=False):
+        if cli == "codex":
+            item = event.get("item", {})
+            if event.get("type") == "item.started" and item.get("type") in ("command_execution", "mcp_tool_call"):
+                pending[item.get("id")] = t
+            elif event.get("type") == "item.completed" and item.get("id") in pending:
+                intervals.append((pending.pop(item["id"]), t, item["type"] == "mcp_tool_call"))
+        elif event.get("type") == "assistant":
+            for block in event.get("message", {}).get("content", []):
+                if block.get("type") == "tool_use":
+                    pending[block["id"]] = (t, block["name"].startswith("mcp__"))
+        elif event.get("type") == "user":
+            content = event.get("message", {}).get("content", [])
+            for block in content if isinstance(content, list) else []:
+                if block.get("type") == "tool_result" and block.get("tool_use_id") in pending:
+                    start, is_mcp = pending.pop(block["tool_use_id"])
+                    intervals.append((start, t, is_mcp))
+    total = times[-1] if times else 0.0
+    union, end = 0.0, -1.0
+    for start, stop, _ in sorted(intervals):
+        if stop > end:
+            union += stop - max(start, end)
+            end = stop
+    summed = sum(stop - start for start, stop, _ in intervals)
+    return {
+        "event_seconds": round(total, 2),
+        "tool_union_seconds": round(union, 2),
+        "tool_summed_seconds": round(summed, 2),
+        "mcp_summed_seconds": round(sum(stop - start for start, stop, m in intervals if m), 2),
+        "model_seconds": round(total - union, 2),
+        "tool_parallelism": round(summed / union, 3) if union else None,
+    }
+
+
 def rows(directory: Path) -> list[dict]:
     result = []
     for summary in sorted(directory.glob("*/summary.json")):
@@ -46,6 +88,7 @@ def rows(directory: Path) -> list[dict]:
                 "simulator_processes": s["simulator_processes"],
                 "normalized_worst": s["verification"].get("normalized_worst"),
                 "first_passing_seconds": first,
+                **timing(workspace, s.get("cli", "claude")),
             }
         )
     return result

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -66,7 +67,7 @@ def measure(task: VisualTask, episodes, times) -> dict[str, np.ndarray]:
 def write_reference(name: str, params: dict, output: Path, private: Path, device=None) -> dict:
     """Render public reference photos and record private truth measurements."""
     cls = task_class(name)
-    task = cls(params, device=device, log=False)
+    task = cls(params, device=device)
     output.mkdir(parents=True, exist_ok=True)
     index = []
     for episode in cls.TRAIN_EPISODES:
@@ -150,7 +151,7 @@ def verify(name: str, params: dict, private: Path, device=None) -> dict:
         raise ValueError(f"Submission is missing parameters {missing}")
     with np.load(private / f"{name}_truth.npz") as data:
         truth = {key: data[key] for key in data.files}
-    task = cls(params, device=device, log=False)
+    task = cls(params, device=device)
     measured = measure(task, cls.TRAIN_EPISODES + cls.HELDOUT_EPISODES, TRUTH_TIMES[name])
     heldout = compare(name, measured, truth, cls.HELDOUT_EPISODES)
     training = compare(name, measured, truth, cls.TRAIN_EPISODES)
@@ -185,6 +186,8 @@ def main() -> None:
     check.add_argument("--params", type=Path, required=True)
     check.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    # Reference generation and verification never count as agent candidates.
+    os.environ.setdefault("NEWTON_VISUAL_LOG", os.devnull)
     if args.command == "generate":
         truth = json.loads((args.private / "truth.json").read_text())[args.task]
         spec = write_reference(args.task, truth, args.output, args.private)

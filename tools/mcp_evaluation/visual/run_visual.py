@@ -15,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -71,7 +72,7 @@ to simulate the training episodes with params.json. It writes out/compare_<episo
     return (
         common
         + f"""
-Workflow: the simulation is already running in a live Newton application, connected through the `newton` MCP server (tools: {tools}). Use it for all simulation and rendering; do not start separate simulator processes. Images returned by MCP tools appear directly in your context.
+Workflow: the simulation is already running in a live Newton application, connected through the `newton` MCP server (tools: {tools}). Images returned by MCP tools appear directly in your context, and Python state persists in the application between calls. You may also write and run your own scripts with the same task API (tools/mcp_evaluation/visual in the source tree) when that is more efficient; each script run starts a fresh simulator process.
 {guide}
 """
     )
@@ -344,23 +345,41 @@ def run_trial(workspace: Path, prepared: dict, *, mcp_root: Path | None = None) 
     (workspace / "command.json").write_text(json.dumps(command))
     agent_start = time.perf_counter()
     timed_out = False
-    with (workspace / "agent.jsonl").open("w") as out, (workspace / "agent.stderr").open("w") as err:
+    with (
+        (workspace / "agent.jsonl").open("w") as out,
+        (workspace / "agent.times.jsonl").open("w") as times,
+        (workspace / "agent.stderr").open("w") as err,
+    ):
         agent = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
-            stdout=out,
+            stdout=subprocess.PIPE,
             stderr=err,
             cwd=workspace,
             env=env,
             text=True,
+            bufsize=1,
             start_new_session=True,
         )
+
+        def pump():
+            # Arrival times per event line separate model latency from tool execution time.
+            for number, line in enumerate(agent.stdout):
+                out.write(line)
+                out.flush()
+                times.write(json.dumps({"line": number, "seconds": time.perf_counter() - agent_start}) + "\n")
+
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
         try:
-            agent.communicate(prepared["prompt"], timeout=spec["budget_seconds"])
+            agent.stdin.write(prepared["prompt"])
+            agent.stdin.close()
+            agent.wait(timeout=spec["budget_seconds"])
         except subprocess.TimeoutExpired:
             timed_out = True
         finally:
             _stop(agent)
+            reader.join(timeout=10)
     elapsed = time.perf_counter() - agent_start
     if app is not None:
         _stop(app)

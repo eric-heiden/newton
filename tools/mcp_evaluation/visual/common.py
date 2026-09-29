@@ -160,12 +160,13 @@ class VisualTask:
     SUBSTEPS: ClassVar[int] = 1
     DURATION: ClassVar[float] = 1.0
 
-    def __init__(self, params: dict | None = None, *, episode: str | None = None, device=None, log: bool = True):
+    def __init__(self, params: dict | None = None, *, episode: str | None = None, device=None):
         self.device = wp.get_device(device)
         self.params = self.default_params()
         self.episode = episode or self.TRAIN_EPISODES[0]
         self._check_episode(self.episode)
-        self.log = CandidateLog() if log else None
+        # Every simulation is logged; the evaluation harness chooses the log file.
+        self.log = CandidateLog()
         self.on_rebuild = None
         self.on_state_change = None
         self.live_session = None
@@ -173,8 +174,7 @@ class VisualTask:
         self._graph = None
         self._sim_seconds_unlogged = 0.0
         self.sim_seconds_total = 0.0
-        if log:
-            atexit.register(self._flush_sim_time)
+        atexit.register(self._flush_sim_time)
         if params:
             self._validate(params)
             self.params.update({k: float(v) for k, v in params.items()})

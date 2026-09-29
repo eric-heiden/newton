@@ -36,6 +36,7 @@ _SCRIPT = textwrap.dedent(
             self.state_0, self.state_1 = self.model.state(), self.model.state()
             self.control = self.model.control()
             self.speed = 1.0
+            self.ticks = 0
             self.frame_dt = 0.1
             self.graph = None
             if wp.get_device().is_cuda:
@@ -50,6 +51,7 @@ _SCRIPT = textwrap.dedent(
                 self.state_0, self.state_1 = self.state_1, self.state_0
 
         def step(self):
+            self.ticks += 1
             if self.graph is not None:
                 wp.capture_launch(self.graph)
             else:
@@ -76,6 +78,19 @@ class TestMcpHost(unittest.TestCase):
         result = session.dispatch("execute", {"code": "example.speed = 2.0"})
         if host.example.graph is not None:
             self.assertIn("example.speed", result["note"])
+        session.dispatch("step", {"count": 1})
+        self.assertAlmostEqual(float(session.state.body_q.numpy()[0, 0]) - x0, 0.2, places=4)
+
+    def test_reset_rewinds_step_state_but_keeps_assigned_settings(self):
+        """Rewind scalars that step() advances while keeping settings the agent assigned."""
+        host = ExampleHost(self.script)
+        session = host.session(artifact_directory=self.directory.name)
+        self.addCleanup(session.close)
+        session.dispatch("step", {"count": 3})
+        session.dispatch("execute", {"code": "example.speed = 2.0"})
+        session.dispatch("reset", {})
+        self.assertEqual(session.dispatch("execute", {"code": "(example.ticks, example.speed)"})["result"], [0, 2.0])
+        x0 = float(session.state.body_q.numpy()[0, 0])
         session.dispatch("step", {"count": 1})
         self.assertAlmostEqual(float(session.state.body_q.numpy()[0, 0]) - x0, 0.2, places=4)
 

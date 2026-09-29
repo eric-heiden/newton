@@ -38,6 +38,7 @@ PYTHON = ROOT / ".venv/bin/python"
 PROFILE = os.environ.get("NEWTON_MCP_PROFILE", "lean")
 # Sibling live copies the MCP condition may use for parallel sweeps.
 WORKERS = int(os.environ.get("NEWTON_MCP_WORKERS", "2"))
+CUBE_DATA = Path(os.environ.get("NEWTON_CUBE_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/cube_toss_task"))
 DP_DATA = Path(os.environ.get("NEWTON_DP_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/dp_real_task"))
 
 
@@ -76,7 +77,21 @@ Constraints (checked): do not change the robot model (bodies, masses, armature, 
 Goal: calibrate the model so it predicts the real robot. Verification imports the script's build_model(num_worlds) and make_solver(model) and runs its own multiple-shooting evaluation (the same protocol as the script's rollout/window_errors, 2 ms steps) on two held-out recordings of the same robot: a 20 s excitation run and a 75 s run with full swings. Each 0.5 s window starts from the measured state and is driven open loop by the measured torques. The mean joint-angle RMSE over the windows must be at most {heldout_10_rad} rad on the 20 s run and at most {heldout_11_rad} rad on the 75 s run. The starter scores about 0.14 and 0.34 rad.
 Constraints (checked): keep the two revolute joints, the 0.2 m shoulder-to-elbow offset, gravity, positive masses and valid inertias, and the build_model/make_solver interface. Any physical parameter (masses, centers of mass, inertias, armature, damping, friction, ...) and the solver settings may change, and other Newton modeling features may be used inside build_model/make_solver. Keep the file runnable (`python double_pendulum.py --viewer null`).""",
         },
+        "cube_toss": {
+            "files": {"cube_toss.py": HERE / "cube_toss/cube_toss.py", "tosses.npz": CUBE_DATA / "tosses.npz"},
+            "script": "cube_toss.py",
+            "host_args": [],
+            "verifier": "tools/mcp_evaluation/v4/cube_toss/verify.py",
+            "goal": """cube_toss.py simulates real measurements: an acrylic cube (0.1048 m, 0.37 kg, inertia 0.00081 kg m^2, all measured) tossed by hand onto a wooden table and tracked by cameras at 148 Hz (ContactNets dataset). tosses.npz holds 400 recorded tosses (positions, orientations, and world-frame linear and angular velocities per frame). Each toss is one Newton world that starts from the first measured frame and runs open loop through the impacts, bounces, and slides. Problem: with the current contact model the simulated cubes bounce and slide far from the recordings.
+
+Goal: calibrate the simulation so it reproduces the real tosses. Verification imports the script's build_model(num_worlds), make_solver(model), make_pipeline(model), and SUBSTEPS, and runs its own open-loop rollout (the same protocol as the script's rollout/evaluate) on 170 held-out tosses of the same cube. The mean over tosses of the time-averaged position error must be at most {position_m} m, and of the orientation error at most {rotation_rad} rad. The starter scores about 0.10 m and 1.07 rad.
+Constraints (checked): keep one cube per world with the measured size, mass, and inertia, and keep gravity. Contact and material parameters, table height, collision settings, solver type and settings, and the number of substeps per frame (1 to 100) may change. Keep the file runnable (`python cube_toss.py --viewer null`).""",
+        },
     }
+    if name == "cube_toss":
+        from tools.mcp_evaluation.v4.cube_toss.verify import THRESHOLDS  # noqa: PLC0415
+
+        tasks[name]["goal"] = tasks[name]["goal"].format(**THRESHOLDS)
     if name == "dp_real":
         from tools.mcp_evaluation.v4.dp_real.verify import THRESHOLDS  # noqa: PLC0415
 
@@ -289,7 +304,7 @@ def verify(workspace: Path, task: dict) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", required=True, choices=("grasp_drift", "g1_track", "dp_real"))
+    parser.add_argument("--task", required=True, choices=("grasp_drift", "g1_track", "dp_real", "cube_toss"))
     parser.add_argument("--condition", required=True, choices=("mcp", "restart"))
     parser.add_argument("--model", required=True, choices=sorted(MODELS))
     parser.add_argument("--workspace", type=Path, required=True)

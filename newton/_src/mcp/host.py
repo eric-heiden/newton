@@ -63,6 +63,7 @@ class ExampleHost:
         self.recaptures = 0
         self._fingerprint = None
         self._notes = []
+        self._dynamic_scalars: set[str] = set()
 
     def build(self, argv: list[str] | None = None) -> Any:
         """(Re)load the script from disk and construct its example with a null viewer."""
@@ -80,6 +81,7 @@ class ExampleHost:
         viewer = newton.viewer.ViewerNull(num_frames=1 << 62)
         example = cls(viewer, args)
         self.module, self.example, self.args = module, example, args
+        self._dynamic_scalars = set()
         self.build_seconds = time.perf_counter() - started
         self._fingerprint = self.fingerprint()
         return example
@@ -162,28 +164,33 @@ class ExampleHost:
             "contacts": getattr(example, "contacts", None),
         }
 
+    def _scalars(self) -> dict:
+        return {name: value for name, value in vars(self.example).items() if type(value) in (int, float, bool)}
+
     def snapshot(self, session) -> dict:
         """Capture the example's own Warp arrays and scalar attributes (controller phases, timers)."""
-        arrays, scalars = {}, {}
-        for name, value in vars(self.example).items():
-            if isinstance(value, wp.array) and value.ndim >= 1:
-                arrays[name] = value.numpy().copy()
-            elif type(value) in (int, float, bool):
-                scalars[name] = value
-        return {"arrays": arrays, "scalars": scalars}
+        arrays = {
+            name: value.numpy().copy()
+            for name, value in vars(self.example).items()
+            if isinstance(value, wp.array) and value.ndim >= 1
+        }
+        return {"arrays": arrays, "scalars": self._scalars()}
 
     def restore(self, session, data: dict) -> None:
         for name, value in data["arrays"].items():
             target = getattr(self.example, name, None)
             if isinstance(target, wp.array) and target.shape == value.shape:
                 target.assign(value)
+        # Only scalars that step() advances (timers, phase counters) rewind; settings the
+        # agent assigned (gains, amplitudes) are not state and survive reset/restore.
         for name, value in data["scalars"].items():
-            setattr(self.example, name, value)
+            if name in self._dynamic_scalars:
+                setattr(self.example, name, value)
 
     def guide(self, workers: int = 0) -> str:
         text = f"""Hosted Newton example: {self.script} (class {self.example_class}, args {self.argv}).
 - `example` is the live Example instance and `module` its script module; one step is one example frame of {getattr(self.example, "frame_dt", "?")} s. Use rollout(...) or session.dispatch('step', {{'count': n}}) rather than example.step() so time, recordings, and bindings stay in sync.
-- Checkpoints (session.dispatch('checkpoint'/'restore', {{'name': ...}})) and reset include the example's own Warp arrays and scalar attributes, so controller phases and timers rewind with the physics state. Branch candidates from one checkpoint instead of re-simulating the approach each time.
+- Checkpoints (session.dispatch('checkpoint'/'restore', {{'name': ...}})) and reset rewind the physics state, the example's own Warp arrays, and the scalar attributes that step() changes (timers, phase counters). Scalar settings you assign (gains, amplitudes, look-ahead) are kept across reset/restore; model arrays you edit are kept too. Branch candidates from one checkpoint instead of re-simulating the approach each time.
 - Live edits: change model arrays and call example.solver.notify_model_changed(newton.ModelFlags....); assign example attributes (gains, amplitudes) or replace example.solver with a new solver. After each cell the host recaptures the example's CUDA graph if any example attribute changed (reported as `note`); call recapture() after in-place changes it cannot see, such as solver option arrays.
 - Helpers (preloaded with newton, np, wp): rollout(frames or seconds=..., record={{'name': 'expr' or fn}}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the parameters the solver actually integrates and which shape's material decided them; health() flags NaNs, runaway velocities, deep penetration, and full solver buffers.
 - Python errors in a cell are reported but keep the scene valid; statements before the failing line keep their effects.
@@ -201,7 +208,9 @@ class ExampleHost:
 
         def step(session, dt):
             host.sync(session)
+            before = host._scalars()
             host.example.step()
+            host._dynamic_scalars.update(k for k, v in host._scalars().items() if before.get(k, v) != v)
             session.state = getattr(host.example, "state_0", None) or getattr(host.example, "state", None)
             session.state_next = getattr(host.example, "state_1", None)
             host._fingerprint = host.fingerprint()

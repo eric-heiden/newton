@@ -192,11 +192,11 @@ The same callback API supports all runners:
 from pathlib import Path
 from tools.mcp_evaluation.real_robot import RealRobotScenario
 
-scenario = RealRobotScenario(reference_file=Path('/data/public/training.npz'))
+scenario = RealRobotScenario(reference_file=Path("/data/public/training.npz"))
 metrics = scenario.rollout()
 scenario.apply_config(candidate)
 metrics = scenario.rollout()
-scenario.save_trace(Path('candidate.npz'))
+scenario.save_trace(Path("candidate.npz"))
 ```
 
 The default regressor is the reference sibling `<stem>-regressor.npz`. The default

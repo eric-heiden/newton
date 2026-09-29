@@ -173,6 +173,9 @@ def _agent_command(spec: dict, workspace: Path, mcp: dict | None) -> list[str]:
         config = {"mcpServers": {}}
         if mcp is not None:
             config["mcpServers"]["newton"] = {"command": mcp["command"], "args": mcp["args"]}
+            if mcp.get("alwaysLoad"):
+                # Keep only this server's tools out of tool search; built-in tools stay deferred.
+                config["mcpServers"]["newton"]["alwaysLoad"] = True
         (workspace / ".agent-mcp.json").write_text(json.dumps(config))
         return [*command, "--mcp-config", str(workspace / ".agent-mcp.json")]
     command = [

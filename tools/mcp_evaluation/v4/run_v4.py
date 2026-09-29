@@ -163,8 +163,6 @@ def run_trial(workspace: Path, prepared: dict) -> dict:
     host, mcp, startup = None, None, 0.0
     started = time.time()
     if spec["condition"] == "mcp":
-        # Load the five Newton tools up front instead of behind a tool-search round trip.
-        env["ENABLE_TOOL_SEARCH"] = "false"
         connection = workspace / ".connection.json"
         before = time.perf_counter()
         log = (workspace / "host.log").open("w")
@@ -200,6 +198,8 @@ def run_trial(workspace: Path, prepared: dict) -> dict:
         mcp = {
             "command": str(PYTHON),
             "args": ["-m", "newton.mcp", "--connect", str(connection), "--profile", PROFILE, "--timeout", "300"],
+            # Load the Newton tools up front instead of behind a tool-search round trip (Claude Code only).
+            "alwaysLoad": True,
         }
     command = _agent_command(spec, workspace, mcp)
     (workspace / "command.json").write_text(json.dumps(command))

@@ -67,19 +67,32 @@ class TestMcpHost(unittest.TestCase):
         self.script = Path(self.directory.name) / "push.py"
         self.script.write_text(_SCRIPT)
 
-    def test_hosted_example_applies_attribute_edits_through_captured_graphs(self):
-        """Recapture the example's CUDA graph when a cell changes a scalar baked into it."""
+    def test_hosted_example_graph_edits_are_reported_or_recaptured(self):
+        """Warn when a captured value changes; recapture once the example gets a new solver."""
         host = ExampleHost(self.script)
         session = host.session(artifact_directory=self.directory.name)
         self.addCleanup(session.close)
         result = session.dispatch("execute", {"code": "rollout(1)['t'].tolist()"})
         self.assertEqual(result["result"], [0.0, 0.1])
-        x0 = float(session.state.body_q.numpy()[0, 0])
+        captured = host.example.graph is not None
+
+        def advance():
+            x0 = float(session.state.body_q.numpy()[0, 0])
+            session.dispatch("step", {"count": 1})
+            return float(session.state.body_q.numpy()[0, 0]) - x0
+
         result = session.dispatch("execute", {"code": "example.speed = 2.0"})
-        if host.example.graph is not None:
-            self.assertIn("example.speed", result["note"])
-        session.dispatch("step", {"count": 1})
-        self.assertAlmostEqual(float(session.state.body_q.numpy()[0, 0]) - x0, 0.2, places=4)
+        if captured:
+            # The speed is a kernel argument inside the captured graph, so it cannot change yet.
+            self.assertIn("newton_rebuild", result["note"])
+            self.assertAlmostEqual(advance(), 0.1, places=4)
+            with self.assertRaisesRegex(RuntimeError, "same solver"):
+                session.dispatch("execute", {"code": "recapture()"})
+            result = session.dispatch(
+                "execute", {"code": "example.solver = newton.solvers.SolverSemiImplicit(example.model)"}
+            )
+            self.assertIn("recaptured", result["note"])
+        self.assertAlmostEqual(advance(), 0.2, places=4)
 
     def test_reset_rewinds_step_state_but_keeps_assigned_settings(self):
         """Rewind scalars that step() advances while keeping settings the agent assigned."""
@@ -90,9 +103,6 @@ class TestMcpHost(unittest.TestCase):
         session.dispatch("execute", {"code": "example.speed = 2.0"})
         session.dispatch("reset", {})
         self.assertEqual(session.dispatch("execute", {"code": "(example.ticks, example.speed)"})["result"], [0, 2.0])
-        x0 = float(session.state.body_q.numpy()[0, 0])
-        session.dispatch("step", {"count": 1})
-        self.assertAlmostEqual(float(session.state.body_q.numpy()[0, 0]) - x0, 0.2, places=4)
 
     def test_hosted_errors_keep_scene_valid_and_rebuild_reloads_script(self):
         """Report Python errors without invalidating, and reload the edited script in place."""

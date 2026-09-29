@@ -64,6 +64,8 @@ class ExampleHost:
         self._fingerprint = None
         self._notes = []
         self._dynamic_scalars: set[str] = set()
+        self._retired_graphs: list = []
+        self._captured_solver = None
 
     def build(self, argv: list[str] | None = None) -> Any:
         """(Re)load the script from disk and construct its example with a null viewer."""
@@ -82,6 +84,8 @@ class ExampleHost:
         example = cls(viewer, args)
         self.module, self.example, self.args = module, example, args
         self._dynamic_scalars = set()
+        self._retired_graphs = []
+        self._captured_solver = id(getattr(example, "solver", None))
         self.build_seconds = time.perf_counter() - started
         self._fingerprint = self.fingerprint()
         return example
@@ -89,20 +93,34 @@ class ExampleHost:
     def fingerprint(self) -> dict:
         """Identity of the example's objects and values of its scalars, to detect edits a CUDA graph missed."""
         return {
-            name: value if type(value) in (int, float, bool, str) else id(value)
+            name: ("value", value) if type(value) in (int, float, bool, str) else ("object", id(value))
             for name, value in vars(self.example).items()
             if not isinstance(value, wp.Graph)
         }
 
     def recapture(self) -> bool:
-        """Re-record the example's CUDA graph so it uses the current solver, arrays, and scalar settings.
+        """Re-record the example's CUDA graphs after its solver was replaced.
+
+        Solvers allocate some buffers lazily during their first step. Examples usually
+        capture that first step, so those buffers belong to the first graph, and
+        recording a second graph around the same solver instance corrupts memory.
+        Recapture is therefore only allowed once ``example.solver`` is a new object.
 
         Returns:
             Whether a graph was recaptured.
         """
         example = self.example
-        if not any(isinstance(value, wp.Graph) for value in vars(example).values()):
+        graphs = [value for value in vars(example).values() if isinstance(value, wp.Graph)]
+        if not graphs:
             return False
+        if id(getattr(example, "solver", None)) == self._captured_solver:
+            raise RuntimeError(
+                "Recapturing CUDA graphs around the same solver instance is unsafe; assign a new solver to "
+                "example.solver first, or write the change into the script and newton_rebuild"
+            )
+        # Keep replaced graphs alive: buffers that solvers allocate lazily during their first
+        # captured step belong to that graph, and freeing it would leave dangling pointers.
+        self._retired_graphs.extend(graphs)
         capture_method = next(
             (
                 getattr(example, name)
@@ -125,6 +143,7 @@ class ExampleHost:
             return False
         self.recaptures += 1
         self._fingerprint = self.fingerprint()
+        self._captured_solver = id(getattr(example, "solver", None))
         return True
 
     def sync(self, session) -> None:
@@ -135,16 +154,32 @@ class ExampleHost:
         changed = sorted(
             k for k in current.keys() | self._fingerprint.keys() if current.get(k) != self._fingerprint.get(k)
         )
-        self._fingerprint = current
+        previous, self._fingerprint = self._fingerprint, current
         state = getattr(self.example, "state_0", None) or getattr(self.example, "state", None)
         if session.solver is not self.example.solver or session.state is not state:
             session.solver, session.state = self.example.solver, state
             session.state_next = getattr(self.example, "state_1", None)
             session.control = getattr(self.example, "control", session.control)
-        if self.recapture():
-            note = f"CUDA graph recaptured after changes to example.{', example.'.join(changed[:6])}"
-            if note not in self._notes:
-                self._notes.append(note)
+        if not any(isinstance(value, wp.Graph) for value in vars(self.example).values()):
+            return
+        objects = [k for k in changed if "object" in (current.get(k, ("",))[0], previous.get(k, ("",))[0])]
+        values = [k for k in changed if k not in objects and k not in self._dynamic_scalars]
+        note = None
+        if id(getattr(self.example, "solver", None)) != self._captured_solver:
+            self.recapture()
+            note = f"CUDA graphs recaptured for the new example.solver (changed: {', '.join(changed[:6])})"
+        elif objects:
+            note = (
+                f"example.{', example.'.join(objects[:4])} replaced, but this example replays CUDA graphs captured "
+                "with the old objects; replace example.solver as well to recapture, or newton_rebuild"
+            )
+        elif values:
+            note = (
+                f"example.{', example.'.join(values[:4])} changed: Python code in step() sees it now, but values "
+                "captured inside the example's CUDA graphs keep their captured values until newton_rebuild"
+            )
+        if note and note not in self._notes:
+            self._notes.append(note)
 
     def after_execute(self, session) -> str | None:
         self.sync(session)
@@ -191,7 +226,7 @@ class ExampleHost:
         text = f"""Hosted Newton example: {self.script} (class {self.example_class}, args {self.argv}).
 - `example` is the live Example instance and `module` its script module; one step is one example frame of {getattr(self.example, "frame_dt", "?")} s. Use rollout(...) or session.dispatch('step', {{'count': n}}) rather than example.step() so time, recordings, and bindings stay in sync.
 - Checkpoints (session.dispatch('checkpoint'/'restore', {{'name': ...}})) and reset rewind the physics state, the example's own Warp arrays, and the scalar attributes that step() changes (timers, phase counters). Scalar settings you assign (gains, amplitudes, look-ahead) are kept across reset/restore; model arrays you edit are kept too. Branch candidates from one checkpoint instead of re-simulating the approach each time.
-- Live edits: change model arrays and call example.solver.notify_model_changed(newton.ModelFlags....); assign example attributes (gains, amplitudes) or replace example.solver with a new solver. After each cell the host recaptures the example's CUDA graph if any example attribute changed (reported as `note`); call recapture() after in-place changes it cannot see, such as solver option arrays.
+- Live edits: change model arrays and call example.solver.notify_model_changed(newton.ModelFlags....) (arrays are read at run time, so this works with CUDA graphs); assign example attributes read by step() in Python (gains, amplitudes); or assign a new solver to example.solver, after which the host re-records the example's CUDA graphs. A `note` in the result warns when a change cannot reach code inside the captured graphs; then write it into the script and newton_rebuild.
 - Helpers (preloaded with newton, np, wp): rollout(frames or seconds=..., record={{'name': 'expr' or fn}}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the parameters the solver actually integrates and which shape's material decided them; health() flags NaNs, runaway velocities, deep penetration, and full solver buffers.
 - Python errors in a cell are reported but keep the scene valid; statements before the failing line keep their effects.
 - After editing the script on disk, newton_rebuild reloads and reconstructs it in this process (Python variables survive; pass arguments={{"argv": [...]}} to change example arguments). Rebuild once to confirm the edited script reproduces your live result."""

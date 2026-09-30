@@ -1061,7 +1061,17 @@ class SimulationSession:
         except Exception:
             self._invalidate(requires_rebuild=True)
             raise
-        return self._describe()
+        # Rebuilds repeat often while iterating on a script; the full describe payload (guide,
+        # operation list, limits) would be re-sent into the agent's context every time.
+        return {
+            **self._status(),
+            "dt": self.dt,
+            "counts": {
+                name: int(getattr(self.model, name))
+                for name in ("world_count", "body_count", "shape_count", "joint_count", "joint_dof_count")
+            },
+            "solver": self._describe_solver(self.solver),
+        }
 
     def _query(
         self,

@@ -5,6 +5,7 @@
 
 import base64
 import json
+import math
 import os
 import struct
 import tempfile
@@ -368,6 +369,23 @@ class TestMcpObservation(unittest.TestCase):
         self.assertGreater(
             len(np.unique(rich_image.reshape(-1, 3), axis=0)), len(np.unique(plain_image.reshape(-1, 3), axis=0))
         )
+
+    def test_calibrated_intrinsics_match_pinhole_and_shift_principal_point(self):
+        """Render calibrated OpenCV intrinsics; an ideal camera matches the equivalent fov_y render."""
+        focal = 32.5 / math.tan(math.radians(30.0))
+        ideal = {"fx": focal, "fy": focal, "cx": 32.5, "cy": 32.5}
+        pinhole = self.renderer.observe(channel="depth", raw=True, fov_y=60.0, **self.camera)
+        calibrated = self.renderer.observe(channel="depth", raw=True, intrinsics=ideal, **self.camera)
+        self.assertAlmostEqual(calibrated["camera"]["fov_y"], 60.0, places=4)
+        with np.load(pinhole["raw_artifact"]) as a, np.load(calibrated["raw_artifact"]) as b:
+            np.testing.assert_allclose(a["depth"], b["depth"], atol=1e-4)
+        # Moving the principal point shifts the sphere in the image.
+        shifted = self.renderer.observe(channel="depth", raw=True, intrinsics={**ideal, "cx": 22.5}, **self.camera)
+        with np.load(shifted["raw_artifact"]) as c:
+            hit = np.nonzero(c["depth"][32] > 0)[0]
+        self.assertLess(hit.mean(), 32.0 - 5.0)
+        with self.assertRaises(ValueError):
+            self.renderer.observe(intrinsics={"fx": 1.0}, **self.camera)
 
     def test_multi_view_grid_and_reference_comparison(self):
         """Tile several views in one image and compare a render against a reference photo."""

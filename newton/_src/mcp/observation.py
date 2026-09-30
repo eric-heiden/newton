@@ -124,6 +124,36 @@ def _camera_pose(eye, target, up, pose, up_axis: int, frame=None, view=None, fov
     return eye, rotation, [*eye.tolist(), *list(quaternion)]
 
 
+_DISTORTION = ("k1", "k2", "k3", "k4", "k5", "k6", "p1", "p2", "s1", "s2", "s3", "s4")
+
+
+def _intrinsics(value, width: int, height: int) -> dict | None:
+    """Validate OpenCV pinhole intrinsics; returns keyword arguments for the sensor ray helper."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("intrinsics must be an object with fx, fy, cx, cy")
+    unknown = set(value) - {"fx", "fy", "cx", "cy", "image_width", "image_height", *_DISTORTION}
+    if unknown:
+        raise ValueError(f"Unknown intrinsics keys: {sorted(unknown)}")
+    result = {}
+    for key in ("fx", "fy", "cx", "cy", "image_width", "image_height", *_DISTORTION):
+        if key not in value:
+            continue
+        number = value[key]
+        if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number):
+            raise ValueError(f"intrinsics {key} must be a finite number")
+        result[key] = float(number)
+    missing = {"fx", "fy", "cx", "cy"} - set(result)
+    if missing:
+        raise ValueError(f"intrinsics require {sorted(missing)}")
+    if result["fx"] <= 0.0 or result["fy"] <= 0.0:
+        raise ValueError("intrinsics fx and fy must be positive")
+    result.setdefault("image_width", float(width))
+    result.setdefault("image_height", float(height))
+    return result
+
+
 def _checker_cell(scene_radius: float) -> float:
     """A round checker cell size [m] of roughly a quarter of the scene radius."""
     for cell in (0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0):
@@ -299,6 +329,7 @@ class ObservationRenderer:
         pick=None,
         antialias: bool = True,
         environment: bool = True,
+        intrinsics: dict | None = None,
     ) -> dict:
         """Return a PNG and bounded metadata for the current simulation state.
 
@@ -309,6 +340,10 @@ class ObservationRenderer:
         hash palette and retain uint32 IDs in artifacts (0xFFFFFFFF is a miss).
         Color and albedo are display/sRGB. Contact markers use the midpoint of
         world contact surfaces, including margins, with optional depth occlusion.
+        ``intrinsics`` renders a calibrated OpenCV camera instead of ``fov_y``:
+        ``fx``, ``fy``, ``cx``, ``cy`` [px] for an image of ``image_width`` x
+        ``image_height`` (default: the output size, scaled to it otherwise),
+        plus optional distortion ``k1``-``k6``, ``p1``, ``p2``, ``s1``-``s4``.
         Color images are supersampled (``antialias``) when the pixel budget
         allows, and ``environment`` adds a sky gradient behind the scene and a
         checker of known cell size on ground planes for scale and motion cues.
@@ -336,6 +371,12 @@ class ObservationRenderer:
             raise ValueError("textures must be a boolean or null")
         if not isinstance(fov_y, (int, float)) or isinstance(fov_y, bool) or not 1.0 <= fov_y <= 175.0:
             raise ValueError("fov_y must be finite and in [1, 175] degrees")
+        intrinsics = _intrinsics(intrinsics, width, height)
+        if intrinsics is not None:
+            if backend != "sensor":
+                raise ValueError("intrinsics require the sensor backend")
+            # Framing and overlays use the equivalent vertical field of view.
+            fov_y = math.degrees(2.0 * math.atan(0.5 * intrinsics["image_height"] / intrinsics["fy"]))
         if contact_depth not in ("visible", "always"):
             raise ValueError("contact_depth must be 'visible' or 'always'")
         if depth_range is not None:
@@ -372,6 +413,7 @@ class ObservationRenderer:
             "camera": {
                 "pose": camera_pose,
                 "fov_y": float(fov_y),
+                **({"intrinsics": intrinsics} if intrinsics is not None else {}),
                 "convention": "xyzw, -Z forward, +Y up, top-left",
                 "coordinates": "simulation world coordinates [m]",
             },
@@ -398,6 +440,7 @@ class ObservationRenderer:
                 contacts,
                 pick,
                 supersample=supersample,
+                intrinsics=intrinsics,
                 environment=environment and channel == "color",
             )
             metadata["settings"].update(supersample=supersample, **environment_metadata)
@@ -724,6 +767,7 @@ class ObservationRenderer:
         pick,
         supersample=1,
         environment=False,
+        intrinsics=None,
     ):
         """Render one camera; returns per-pixel arrays at ``width x height`` and environment metadata."""
         base_width, base_height = width, height
@@ -735,10 +779,16 @@ class ObservationRenderer:
             self._sensor = SensorTiledCamera(model, default_render_config=config, load_textures=True)
             self._sensor.utils.create_default_light(enable_shadows=True)
             self._sensor_model = model
-        key = (width, height, fov_y)
+        key = (width, height, fov_y, json.dumps(intrinsics, sort_keys=True))
         if key != self._buffer_key:
             self._outputs = {}
-            self._rays = self._sensor.utils.compute_camera_rays_pinhole(width, height, camera_fovs=math.radians(fov_y))
+            if intrinsics is None:
+                self._rays = self._sensor.utils.compute_camera_rays_pinhole(
+                    width, height, camera_fovs=math.radians(fov_y)
+                )
+            else:
+                # The helper rescales the calibration to the (supersampled) output size.
+                self._rays = self._sensor.utils.compute_camera_rays_pinhole_opencv(width, height, **intrinsics)
             self._transforms = wp.empty((1, 1), dtype=wp.transform, device=model.device)
             self._buffer_key = key
         self._transforms.assign(np.asarray(pose, dtype=np.float32).reshape(1, 1, 7))
@@ -770,7 +820,7 @@ class ObservationRenderer:
         )
         if overlay:
             arrays = {name: output[0, 0].numpy() for name, output in self._outputs.items()}
-            self._composite_overlay(arrays, overlay, width, height, fov_y, pose, shadows)
+            self._composite_overlay(arrays, overlay, width, height, pose, shadows)
             for name, values in arrays.items():
                 self._outputs[name][0, 0].assign(values)
         environment_metadata = {}
@@ -845,7 +895,7 @@ class ObservationRenderer:
         except Exception:
             return []
 
-    def _composite_overlay(self, arrays, meshes, width, height, fov_y, pose, shadows):
+    def _composite_overlay(self, arrays, meshes, width, height, pose, shadows):
         """Draw application-logged meshes with the same camera and keep the nearer surface per pixel."""
         import newton  # noqa: PLC0415
 
@@ -860,7 +910,7 @@ class ObservationRenderer:
             overlay, default_render_config=SensorTiledCamera.RenderConfig(enable_shadows=shadows)
         )
         sensor.utils.create_default_light(enable_shadows=shadows)
-        rays = sensor.utils.compute_camera_rays_pinhole(width, height, camera_fovs=math.radians(fov_y))
+        rays = self._rays  # the same camera rays as the main render, including any intrinsics
         transforms = wp.array(
             np.asarray(pose, dtype=np.float32).reshape(1, 1, 7), dtype=wp.transform, device=model.device
         )

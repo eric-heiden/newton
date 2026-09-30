@@ -3967,7 +3967,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self.body_free_qd_start: wp.array[wp.int32] | None = None
         """Per-body mapping to the free-joint qd_start index (or -1 if not free)."""
 
-        # --- Conditional/lazy mappings ---
+        # --- Conditional mappings ---
         self.newton_shape_to_mjc_geom: wp.array[wp.int32] | None = None
         """Inverse mapping from Newton shape index to MuJoCo geom index. Only created when use_mujoco_contacts=False. Shape [nshape], dtype int32."""
 
@@ -4154,6 +4154,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 skip_visual_only_geoms=skip_visual_only_geoms,
             )
         if not use_mujoco_cpu and not use_mujoco_contacts:
+            # Persistent mappings must be initialized outside step(), which may
+            # first run inside a CUDA graph that is discarded without replay.
+            self._create_inverse_shape_mapping()
             self._contact_tid_to_cid = wp.full(self.mjw_data.naconmax, -1, dtype=wp.int32, device=self.device)
         self._initial_model_sync = False
         self.update_data_interval = update_data_interval
@@ -4630,10 +4633,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         )
 
     def _convert_contacts_to_mjwarp(self, model: Model, state_in: State, contacts: Contacts):
-        # Ensure the inverse shape mapping exists (lazy creation)
-        if self.newton_shape_to_mjc_geom is None:
-            self._create_inverse_shape_mapping()
-
         # The kernel only produces valid output for tid < naconmax (the full
         # path clamps count and rejects cid >= naconmax).  Launching more
         # threads than naconmax wastes GPU resources, so cap the grid size.
@@ -5045,10 +5044,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         )
 
     def _create_inverse_shape_mapping(self):
-        """
-        Create the inverse shape mapping (Newton shape -> MuJoCo [world, geom]).
-        This is lazily created only when use_mujoco_contacts=False.
-        """
+        """Create the Newton shape to MuJoCo geom mapping for external contacts."""
         nworld = self.mjc_geom_to_newton_shape.shape[0]
         ngeom = self.mjc_geom_to_newton_shape.shape[1]
 
@@ -6521,6 +6517,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         uservert=mesh_src.vertices.flatten(),
                         userface=mesh_src.indices.flatten(),
                         maxhullvert=mesh_src.maxhullvert,
+                        # Newton supplies body inertia, so MuJoCo need not compute volume inertia.
+                        inertia=mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL,
                     )
                     geom_params["meshname"] = name
                 elif stype == GeoType.MESH or stype == GeoType.CONVEX_MESH:
@@ -6568,6 +6566,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         uservert=vertices.flatten(),
                         userface=indices.flatten(),
                         maxhullvert=maxhullvert,
+                        # Newton supplies body inertia, so MuJoCo need not compute volume inertia.
+                        inertia=mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL,
                     )
                     geom_params["meshname"] = name
                 geom_params["pos"] = tf.p

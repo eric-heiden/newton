@@ -1,0 +1,1 @@
+Fix `ViewerRTX` with ovrtx 0.5 (screenshots failed to find the LdrColor output and deformable meshes crashed) and keep headless OVRTX renderers from attaching to the X display, which made the first frame hang on displays without NVIDIA GLX.

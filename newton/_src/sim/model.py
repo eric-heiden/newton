@@ -1498,7 +1498,8 @@ class Model:
                 are ``"sah"``, ``"median"``, ``"lbvh"``, or ``None`` to use
                 Warp's device-dependent default.
             shape_flags: Mask of :class:`~newton.ShapeFlags`; a shape is
-                included in the BVH if any of its flags are set in the mask.
+                included in the BVH if any of its flags are set in the mask
+                and its :attr:`shape_opacity` is positive.
         """
         from ..geometry.bvh import (  # noqa: PLC0415
             SHAPE_BOUNDS_BLOCK_DIM,
@@ -1539,6 +1540,7 @@ class Model:
                 self.shape_type,
                 self.shape_flags,
                 int(shape_flags),
+                self.shape_opacity,
                 self.bvh_shape_enabled,
                 num_enabled,
             ],

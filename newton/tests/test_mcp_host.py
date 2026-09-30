@@ -242,6 +242,13 @@ class TestMcpHelpers(unittest.TestCase):
         self.session.state.body_q.assign(body_q)
         self.assertFalse(self.session.health()["ok"])
 
+    def test_status_reports_time_left_when_a_deadline_is_set(self):
+        """Report the remaining wall-clock budget so agents can pace themselves."""
+        self.assertNotIn("time_left_s", self.session.dispatch("describe", {}))
+        self.session.deadline = time.time() + 100.0
+        left = self.session.dispatch("execute", {"code": "1"})["time_left_s"]
+        self.assertTrue(95 <= left <= 100)
+
     def test_workspace_preloads_newton_and_helpers(self):
         """Provide newton and the helper functions without imports."""
         result = self.session.dispatch("execute", {"code": "(newton.__name__, callable(rollout), health()['ok'])"})

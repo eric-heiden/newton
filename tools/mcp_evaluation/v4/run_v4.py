@@ -130,7 +130,7 @@ Newton source tree (read-only reference, including docs and examples): {ROOT}
 
 {task["goal"]}
 
-Deliverable: the edited {task["script"]} in the workspace, then a brief report. You have {seconds // 60} minutes; working efficiently matters. Do not modify files outside the workspace, do not look for other trials or hidden verification data, and do not use subagents.
+Deliverable: the edited {task["script"]} in the workspace, then a brief report. You have {seconds // 60} minutes, starting {time.strftime("%H:%M:%S UTC", time.gmtime())} (check with `date -u`); working efficiently matters. Do not modify files outside the workspace, do not look for other trials or hidden verification data, and do not use subagents.
 """
     run = f"uv run --no-sync --project {ROOT} python {task['script']} --viewer null --num-frames <N> {' '.join(task['host_args'])}".rstrip()
     if condition == "restart":
@@ -217,6 +217,8 @@ def run_trial(workspace: Path, prepared: dict) -> dict:
                 str(workspace / "observations"),
                 "--workers",
                 str(WORKERS),
+                "--deadline",
+                str(time.time() + spec["budget_seconds"]),
                 "--",
                 *task["host_args"],
             ],

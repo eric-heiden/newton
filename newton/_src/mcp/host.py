@@ -257,6 +257,7 @@ class ExampleHost:
 - Live edits: change model arrays and call example.solver.notify_model_changed(newton.ModelFlags....) (arrays are read at run time, so this works with CUDA graphs); assign example attributes (gains, amplitudes) or a new example.solver. After such a cell the host re-records the example's CUDA graphs so captured kernel arguments pick up the change (reported as `note`); call recapture() after in-place changes it cannot see.
 - Helpers (preloaded with newton, np, wp): rollout(frames or seconds=..., record={{'name': 'expr' or fn}}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the parameters the solver actually integrates and which shape's material decided them; health() flags NaNs, runaway velocities, deep penetration, and full solver buffers.
 - Observations (session.dispatch('observe'/'filmstrip', ...), shown with show()) draw the model's visible shapes plus meshes the example logs in its own render() (e.g. extracted surfaces), auto-framed.
+- When results include `time_left_s`, it is the wall-clock time left in your task budget; plan around it.
 - Python errors in a cell are reported but keep the scene valid; statements before the failing line keep their effects.
 - newton_rebuild(arguments={{"restart": true}}) restarts the whole host process (fresh CUDA context, same script and arguments; Python variables are lost, and the next call waits for the new process). Use it only if the process is broken, e.g. after a CUDA error.
 - After editing the script on disk, newton_rebuild reloads and reconstructs it in this process (Python variables survive; pass arguments={{"argv": [...]}} to change example arguments). Rebuild once to confirm the edited script reproduces your live result."""
@@ -265,7 +266,7 @@ class ExampleHost:
 - `workers` holds {workers} sibling live copies of this example (same script and arguments, separate processes and scenes). For a sweep, one call to workers.map(code, [args, ...]) runs a code string once per item in parallel (the item is `args` inside; `example`, `rollout`, ... exist there too) and returns all results in the same response; workers.broadcast(code) defines helpers on all of them. workers.submit(code, args) returns a Future instead; use it only when you will do other work in this call before collecting .result(), since polling costs an extra turn. Workers do not see this session's Python variables or live edits: send the settings to test in `args`, and rebuild them (workers.broadcast("session.dispatch('rebuild', {{}})")) after editing the script."""
         return text
 
-    def session(self, *, artifact_directory=None, workers=None, allow_execute: bool = True):
+    def session(self, *, artifact_directory=None, workers=None, allow_execute: bool = True, deadline=None):
         """Create a :class:`SimulationSession` bound to the example on the calling thread."""
         from .session import SimulationSession  # noqa: PLC0415
 
@@ -306,6 +307,7 @@ class ExampleHost:
             workers=workers,
             execute_callback=self.after_execute,
             overlay_callback=self.overlay_meshes,
+            deadline=deadline,
             invalidate_on_error=False,
         )
         session.host = self
@@ -321,6 +323,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--workers", type=int, default=0, help="Also host this many sibling copies as a worker pool")
     parser.add_argument("--ready-file", type=Path)
+    parser.add_argument("--deadline", type=float, help="Unix time [s] when the client's task budget ends")
     argv = list(sys.argv[1:] if argv is None else argv)
     # Everything after "--" belongs to the example's own argument parser.
     split = argv.index("--") if "--" in argv else len(argv)
@@ -366,7 +369,7 @@ def main(argv: list[str] | None = None) -> None:
             if child.poll() is not None:
                 raise RuntimeError(f"Worker {index} exited during startup")
             time.sleep(0.05)
-    session = host.session(artifact_directory=args.artifacts, workers=worker_files or None)
+    session = host.session(artifact_directory=args.artifacts, workers=worker_files or None, deadline=args.deadline)
     from .transport import SimulationServer  # noqa: PLC0415
 
     server = SimulationServer(session, connection_file=args.connection_file)

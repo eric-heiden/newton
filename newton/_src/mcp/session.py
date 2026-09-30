@@ -274,6 +274,7 @@ class SimulationSession:
         execute_callback: Callable | None = None,
         invalidate_on_error: bool = True,
         overlay_callback: Callable | None = None,
+        deadline: float | None = None,
     ):
         self._owner = threading.get_ident()
         self._queue = queue.Queue(maxsize=64)
@@ -297,6 +298,8 @@ class SimulationSession:
         string is added to the execution result as ``note``."""
         self.invalidate_on_error = invalidate_on_error
         self.overlay_callback = overlay_callback
+        self.deadline = deadline
+        """Optional Unix time [s] by which the client's task must finish; results then report ``time_left_s``."""
         """Returns ``[(name, points, indices, color), ...]`` meshes drawn by the application itself,
         which color observations composite over the model's shapes."""
         """Invalidate the scene when trusted execution raises. ``False`` reports the error and keeps the
@@ -560,7 +563,7 @@ class SimulationSession:
             del sys.modules[self._workspace_name]
 
     def _status(self) -> dict:
-        return {
+        status = {
             "time": self.time,
             "frame": self.frame,
             "revision": self.revision,
@@ -570,6 +573,10 @@ class SimulationSession:
             "last_error": self.last_error,
             "requires_rebuild": self._requires_rebuild,
         }
+        if self.deadline is not None:
+            # Agents cannot see a wall clock; the remaining budget helps them pace their work.
+            status["time_left_s"] = max(0, round(self.deadline - time.time()))
+        return status
 
     def _bindings(self, entry: str | list[str] | None = None) -> tuple:
         model, solver, state, contacts = self.model, self.solver, self.state, self.contacts

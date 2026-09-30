@@ -14,6 +14,7 @@ import argparse
 import importlib.util
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -40,15 +41,30 @@ def load(path: Path):
     return module
 
 
+def time_scaled_clip(clip: Path, speed: float, directory: Path) -> Path:
+    """Write ``clip`` played ``speed`` times faster as an ordinary 30 fps clip."""
+    qpos = np.loadtxt(clip, delimiter=",")
+    if speed == 1.0:
+        return clip
+    source = np.arange(len(qpos)) / 30.0
+    times = np.arange(0.0, source[-1] / speed + 1.0e-9, 1.0 / 30.0) * speed
+    scaled = np.stack([np.interp(times, source, qpos[:, j]) for j in range(qpos.shape[1])], axis=1)
+    scaled[:, 3:7] /= np.linalg.norm(scaled[:, 3:7], axis=1, keepdims=True)
+    path = directory / f"{clip.stem}_x{speed:g}.csv"
+    np.savetxt(path, scaled, delimiter=",")
+    return path
+
+
 def run_case(module, clip: Path, speed: float) -> dict:
-    parser = module.Example.create_parser()
-    args, _ = parser.parse_known_args(["--motion", str(clip)])
-    args.viewer = "null"
-    example = module.Example(newton.viewer.ViewerNull(num_frames=1 << 30), args)
-    reference_motion = np.loadtxt(clip, delimiter=",")
-    # Playback speed is applied to the clip itself, so the controller sees an ordinary, faster motion.
-    example.motion.fps = 30.0 * speed
-    example.motion.duration = (len(example.motion.qpos) - 1) / example.motion.fps
+    # The speed change is baked into the clip file itself, so a controller sees an ordinary
+    # clip through --motion, exactly like a user would provide one.
+    with tempfile.TemporaryDirectory() as directory:
+        clip = time_scaled_clip(clip, speed, Path(directory))
+        reference_motion = np.loadtxt(clip, delimiter=",")
+        parser = module.Example.create_parser()
+        args, _ = parser.parse_known_args(["--motion", str(clip)])
+        args.viewer = "null"
+        example = module.Example(newton.viewer.ViewerNull(num_frames=1 << 30), args)
     armature = example.model.joint_armature.numpy()[6:]
     checks = {
         "motion_input": bool(np.allclose(example.motion.qpos, reference_motion)),

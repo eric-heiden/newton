@@ -40,6 +40,7 @@ PROFILE = os.environ.get("NEWTON_MCP_PROFILE", "lean")
 WORKERS = int(os.environ.get("NEWTON_MCP_WORKERS", "2"))
 CUBE_DATA = Path(os.environ.get("NEWTON_CUBE_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/cube_toss_task"))
 DP_DATA = Path(os.environ.get("NEWTON_DP_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/dp_real_task"))
+ABC_DATA = Path(os.environ.get("NEWTON_ABC_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_twin_task"))
 
 
 def _task(name: str) -> dict:
@@ -109,7 +110,26 @@ Constraints (checked): do not change the robot model (bodies, masses, armature, 
 Goal: add material removal, a capability Newton does not provide out of the box. As the wheel moves, the material it sweeps through must disappear from the workpiece's collision geometry (the SDF attached to the workpiece mesh shape), and the rendered surface must follow. Verification runs the script's Example for the full pass (GRIND_FRAMES + 10 frames) in a fresh process and then checks the workpiece SDF: the removed volume must match the volume swept by the wheel within 15%; points inside the groove must be clear and points 2 cm below it must remain solid (at least 90% each); and with the wheel placed back into the finished groove, the hydroelastic normal load must be at most 25% of the load on an unground workpiece.
 Constraints (checked): keep the workpiece shape, wheel size, tool path (_grinder_pose), GRIND_DEPTH, GRIND_FRAMES, hydroelastic stiffness, and the collision pipeline setup; the removal must act on the geometry the collision pipeline uses. Performance matters less than correctness, but a full pass should stay under a few minutes. Keep the file runnable (`python sdf_grinding.py --viewer null`).""",
         },
+        "abc_twin": {
+            "files": {
+                "station_twin.py": HERE / "abc_twin/station_twin.py",
+                "twin_render.py": HERE / "abc_twin/twin_render.py",
+                **{name: ABC_DATA / name for name in ("camera.json", "joint_log.npz", "frames", "station")},
+            },
+            "script": "station_twin.py",
+            "host_args": [],
+            "verifier": "tools/mcp_evaluation/v4/abc_twin/verify.py",
+            "seconds": 2700,
+            "goal": """station_twin.py is a digital twin of a real robot station from the ABC-130k dataset (https://abc.bot): two YAM arms with parallel grippers in a white enclosure, filmed from above by a RealSense D405. joint_log.npz holds the measured joint positions for 43 frames (30 Hz) of an episode in which the arms move and the objects on the table stay still; frames/ holds six recorded top-camera frames (640x480) of that window, and camera.json the camera's calibrated intrinsics and distortion. twin_render.py poses the robot from the log and renders the model through that camera; the verifier uses the same renderer. Problem: the twin is the nominal CAD station. The camera mount is off, the enclosure does not match the real one, the table is empty, and colors and lighting do not match the recording.
+
+Goal: make the twin reproduce the recording. Verification imports build_model, CAMERA_POSITION, CAMERA_ROTATION, and LOOK, renders 5 held-out frames of the same window (between the given ones) with the robot posed from the log, and scores them against the recorded frames with twin_render.score: the mean edge_ncc must be at least {edge_ncc}, ssim at least {ssim}, and color_psnr_db at least {color_psnr_db}. The starter scores about 0.37, 0.53, and 14.0 dB.
+Constraints (checked): keep one world and the station's arm kinematics (link 1 to link 6 of each arm), and add at most 60 shapes. twin_render.py is fixed (the verifier uses its own copy), and build_model runs without the recorded frames. The camera pose, arm base placement, enclosure and table, objects (static shapes; any Newton geometry), shape colors, and LOOK may change. Keep the file runnable (`python station_twin.py --viewer null`).""",
+        },
     }
+    if name == "abc_twin":
+        from tools.mcp_evaluation.v4.abc_twin.verify import THRESHOLDS  # noqa: PLC0415
+
+        tasks[name]["goal"] = tasks[name]["goal"].format(**THRESHOLDS)
     if name == "cube_toss":
         from tools.mcp_evaluation.v4.cube_toss.verify import THRESHOLDS  # noqa: PLC0415
 
@@ -159,7 +179,10 @@ def prepare(workspace: Path, name: str, condition: str, model: str, seconds: int
     seconds = seconds or task.get("seconds", 1800)
     workspace.mkdir(parents=True, exist_ok=False)
     for target, source in task["files"].items():
-        shutil.copyfile(source, workspace / target)
+        if Path(source).is_dir():
+            shutil.copytree(source, workspace / target)
+        else:
+            shutil.copyfile(source, workspace / target)
     guide = None
     if condition == "mcp":
         guide = _host_guide(workspace, task)
@@ -173,7 +196,9 @@ def prepare(workspace: Path, name: str, condition: str, model: str, seconds: int
         "phase": phase,
         "budget_seconds": seconds,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-        "starter_sha256": {target: digest(workspace / target) for target in task["files"]},
+        "starter_sha256": {
+            target: digest(workspace / target) for target in task["files"] if (workspace / target).is_file()
+        },
         "harness_version": os.environ.get("NEWTON_HARNESS_VERSION", "unversioned"),
     }
     (workspace / "spec.json").write_text(json.dumps(spec, indent=2) + "\n")
@@ -334,7 +359,9 @@ def verify(workspace: Path, task: dict) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--task", required=True, choices=("grasp_drift", "g1_track", "dp_real", "cube_toss", "sdf_grind", "g1_hard")
+        "--task",
+        required=True,
+        choices=("grasp_drift", "g1_track", "dp_real", "cube_toss", "sdf_grind", "g1_hard", "abc_twin"),
     )
     parser.add_argument("--condition", required=True, choices=("mcp", "restart"))
     parser.add_argument("--model", required=True, choices=sorted(MODELS))

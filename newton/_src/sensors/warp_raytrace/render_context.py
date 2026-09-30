@@ -84,6 +84,12 @@ class RenderContext:
         self.lights_cast_shadow: wp.array[wp.bool] | None = None
         self.lights_position: wp.array[wp.vec3f] | None = None
         self.lights_orientation: wp.array[wp.vec3f] | None = None
+        self.lights_color: wp.array[wp.vec3f] | None = None
+        """Linear RGB intensity per light; ``None`` means white at unit intensity."""
+        self.ambient_sky_color = wp.vec3f(0.2, 0.2, 0.225)
+        """Linear RGB ambient radiance from above (surfaces facing the up axis)."""
+        self.ambient_ground_color = wp.vec3f(0.05, 0.05, 0.06)
+        """Linear RGB ambient radiance from below (surfaces facing away from the up axis)."""
 
     def init_from_model(self, model: Model, load_textures: bool = True):
         """Initialize render context state from a Newton simulation model.
@@ -398,6 +404,10 @@ class RenderContext:
                     self.lights_cast_shadow,
                     self.lights_position,
                     self.lights_orientation,
+                    self.__light_colors(),
+                    wp.vec3f(self.ambient_sky_color),
+                    wp.vec3f(self.ambient_ground_color),
+                    wp.vec3f(*(float(i == int(self.up_axis)) for i in range(3))),
                     # Outputs
                     color_image,
                     depth_image,
@@ -410,6 +420,15 @@ class RenderContext:
                 device=self.device,
                 block_dim=kernel_block_dim,
             )
+
+    def __light_colors(self) -> wp.array[wp.vec3f] | None:
+        count = self.light_count
+        if self.lights_color is not None and self.lights_color.shape[0] == count:
+            return self.lights_color
+        if count == 0:
+            return None
+        self.lights_color = wp.full(count, wp.vec3f(1.0), dtype=wp.vec3f, device=self.device)
+        return self.lights_color
 
     @property
     def light_count(self) -> int:

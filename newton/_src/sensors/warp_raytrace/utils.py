@@ -1497,13 +1497,16 @@ class Utils:
         self,
         enable_shadows: bool = True,
         direction: wp.vec3f | None = None,
+        color: wp.vec3f | None = None,
     ):
-        """Create a default directional light oriented at ``(-1, 1, -1)``.
+        """Create a default directional light shining down at an angle.
 
         Args:
             enable_shadows: Enable shadow casting for this light.
             direction: Normalized light direction. If ``None``, defaults to
-                (normalized ``(-1, 1, -1)``).
+                normalized ``(-1, 1, -1)`` for Z-up models and the same direction
+                rotated to the model's up axis otherwise (``(-1, -1, -1)`` for Y-up).
+            color: Linear RGB light intensity. If ``None``, white at unit intensity.
         """
         if self.__render_config is not None:
             if self.__render_config.enable_shadows != enable_shadows:
@@ -1520,10 +1523,38 @@ class Utils:
             [wp.vec3f(0.0)], dtype=wp.vec3f, device=self.__render_context.device
         )
         self.__render_context.lights_orientation = wp.array(
-            [direction if direction is not None else wp.vec3f(-0.57735026, 0.57735026, -0.57735026)],
+            [direction if direction is not None else self.__default_light_direction()],
             dtype=wp.vec3f,
             device=self.__render_context.device,
         )
+        self.__render_context.lights_color = wp.array(
+            [color if color is not None else wp.vec3f(1.0)], dtype=wp.vec3f, device=self.__render_context.device
+        )
+
+    def __default_light_direction(self) -> wp.vec3f:
+        c = 0.57735026
+        up_axis = int(self.__render_context.up_axis)
+        if up_axis == 0:
+            return wp.vec3f(-c, -c, c)
+        if up_axis == 1:
+            return wp.vec3f(-c, -c, -c)
+        return wp.vec3f(-c, c, -c)
+
+    def set_ambient_light(self, sky_color: wp.vec3f, ground_color: wp.vec3f | None = None):
+        """Set the hemispheric ambient light used when ambient lighting is enabled.
+
+        Surfaces facing up (along the model's up axis) receive *sky_color*,
+        surfaces facing down receive *ground_color*, and other orientations
+        blend linearly between the two.
+        The defaults are ``(0.2, 0.2, 0.225)`` and ``(0.05, 0.05, 0.06)``.
+
+        Args:
+            sky_color: Linear RGB ambient radiance from above.
+            ground_color: Linear RGB ambient radiance from below. If ``None``,
+                uses *sky_color* (uniform ambient light).
+        """
+        self.__render_context.ambient_sky_color = wp.vec3f(sky_color)
+        self.__render_context.ambient_ground_color = wp.vec3f(sky_color if ground_color is None else ground_color)
 
     def assign_checkerboard_material(
         self,

@@ -286,7 +286,7 @@ def image_metrics(simulated: np.ndarray, reference: np.ndarray, mask: np.ndarray
     eb = eb - (eb * weights).sum() / weights.sum()
     denominator = np.sqrt((ea * ea * weights).sum() * (eb * eb * weights).sum())
     edge_ncc = float((ea * eb * weights).sum() / denominator) if denominator > 0 else 0.0
-    return {"psnr_db": round(psnr, 3), "ssim": round(ssim, 4), "edge_ncc": round(edge_ncc, 4)}
+    return {"psnr_db": round(float(psnr), 3), "ssim": round(float(ssim), 4), "edge_ncc": round(float(edge_ncc), 4)}
 
 
 def comparison_panel(simulated: np.ndarray, reference: np.ndarray, kind: str = "mismatch", threshold: int = 24):

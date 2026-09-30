@@ -162,6 +162,24 @@ class TestImportMjcfBasic(unittest.TestCase):
         self.assertTrue(flags["floor_visibility/worldbody/link/link_visual"] & ShapeFlags.VISIBLE)
         self.assertFalse(flags["floor_visibility/worldbody/link/link_collision"] & ShapeFlags.VISIBLE)
 
+    def test_builtin_texture_sets_mean_color(self):
+        """Procedural checker textures color their geoms with the mean of both checker colors."""
+        mjcf = """
+<mujoco model="builtin_texture">
+    <asset>
+        <texture type="2d" name="grid" builtin="checker" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" width="8" height="8"/>
+        <material name="grid" texture="grid" rgba="1 1 0.5 1"/>
+    </asset>
+    <worldbody>
+        <geom name="floor" type="plane" size="0 0 0.05" material="grid"/>
+    </worldbody>
+</mujoco>
+"""
+        builder = newton.ModelBuilder()
+        builder.add_mjcf(mjcf)
+        floor = builder.shape_label.index("builtin_texture/worldbody/floor")
+        np.testing.assert_allclose(builder.shape_color[floor], (0.15, 0.25, 0.175), atol=1e-6)
+
     def test_collision_only_import_keeps_colliders_visible(self):
         """Collision-only MJCF assets must remain visible by default."""
         mjcf = """

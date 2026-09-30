@@ -21,6 +21,7 @@ import warp as wp
 from newton.sensors import SensorTiledCamera
 
 from .imaging import compare as _compare_images
+from .imaging import comparison_panel as _comparison_panel
 from .imaging import encode_png as _png
 from .imaging import load_image, tile
 
@@ -490,7 +491,7 @@ class ObservationRenderer:
             }
         return rgb, metadata
 
-    def observe(self, *, views=None, reference=None, label=None, **options) -> dict:
+    def observe(self, *, views=None, reference=None, label=None, comparison="mismatch", **options) -> dict:
         """Render one camera, a labeled multi-view grid, or a comparison against a reference image.
 
         Omitting ``eye``/``target``/``pose`` frames the current scene
@@ -499,7 +500,9 @@ class ObservationRenderer:
         options. ``reference`` is an image path (a list aligned with ``views``)
         taken with the same camera; the result adds the reference and a
         mismatch panel (magenta = pixels differing by more than 24/255) plus
-        pixel statistics. Width/height default to the reference size.
+        pixel statistics and PSNR, SSIM, and edge NCC. ``comparison="edges"``
+        (simulated edges magenta, reference edges green, overlap white) or
+        ``"blend"`` suits real photos better than pixel mismatch. Width/height default to the reference size.
         """
         self._check_thread()
         if views is None:
@@ -508,13 +511,13 @@ class ObservationRenderer:
             spec = dict(options)
             if isinstance(label, str):
                 spec["label"] = label
-            rows, labels, metadata = self._rows([spec], [reference], bool(label) or reference is not None)
+            rows, labels, metadata = self._rows([spec], [reference], bool(label) or reference is not None, comparison)
             single = metadata["views"][0]
             image = rows[0][0] if reference is None and not label else tile(rows, labels)
             single["image_base64"] = base64.b64encode(_png(image)).decode("ascii")
             single["mime_type"] = "image/png"
             if reference is not None:
-                single["layout"] = "simulated | reference | mismatch"
+                single["layout"] = f"simulated | reference | {comparison}"
             return single
         if not isinstance(views, list) or not 1 <= len(views) <= 16:
             raise ValueError("views must be a list of 1 to 16 presets or camera dictionaries")
@@ -531,7 +534,7 @@ class ObservationRenderer:
         references = reference if isinstance(reference, list) else [reference] * len(specs)
         if reference is not None and (not isinstance(reference, list) or len(reference) != len(specs)):
             raise ValueError("reference must be a list aligned with views")
-        rows, labels, metadata = self._rows(specs, references, label is None or bool(label))
+        rows, labels, metadata = self._rows(specs, references, label is None or bool(label), comparison)
         if reference is None:
             # Without comparison panels, arrange single views in a near-square grid instead of a tall strip.
             columns = math.ceil(math.sqrt(len(rows)))
@@ -541,12 +544,12 @@ class ObservationRenderer:
             labels = [names[i : i + columns] for i in range(0, len(names), columns)]
             metadata["layout"] = f"views in row-major order, {columns} per row"
         else:
-            metadata["layout"] = "one row per view: simulated | reference | mismatch"
+            metadata["layout"] = f"one row per view: simulated | reference | {comparison}"
         metadata["image_base64"] = base64.b64encode(_png(tile(rows, labels))).decode("ascii")
         metadata["mime_type"] = "image/png"
         return metadata
 
-    def _rows(self, specs, references, label):
+    def _rows(self, specs, references, label, comparison="mismatch"):
         rows, labels, views = [], [], []
         total_pixels = 0
         for index, (view_spec, reference) in enumerate(zip(specs, references, strict=True)):
@@ -571,9 +574,15 @@ class ObservationRenderer:
             )
             row, row_labels = [rgb], [f"{name} t={self.session.time:.3f}" if label else ""]
             if reference_rgb is not None:
-                panel, stats = _compare_images(rgb, reference_rgb)
+                stats = _compare_images(rgb, reference_rgb)[1]
+                panel = _comparison_panel(rgb, reference_rgb, comparison)
+                caption = {
+                    "mismatch": f"mismatch {100 * stats['mismatch_fraction']:.1f}%",
+                    "edges": f"edges ncc {stats['edge_ncc']:.2f}",
+                    "blend": f"blend ssim {stats['ssim']:.2f}",
+                }[comparison]
                 row += [reference_rgb, panel]
-                row_labels += ["reference", f"mismatch {100 * stats['mismatch_fraction']:.1f}%"] if label else ["", ""]
+                row_labels += ["reference", caption] if label else ["", ""]
                 metadata["reference"] = {"path": reference, **stats}
             rows.append(row)
             labels.append(row_labels)

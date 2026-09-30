@@ -232,6 +232,86 @@ def tile(images: list[list[np.ndarray | None]], labels: list[list[str]] | None =
     return sheet
 
 
+def _gray(image: np.ndarray) -> np.ndarray:
+    return image[..., :3].astype(np.float64) @ np.array([0.299, 0.587, 0.114])
+
+
+def _box_mean(values: np.ndarray, radius: int) -> np.ndarray:
+    """Mean over a (2 radius + 1)^2 window, clamped at the borders, via summed-area tables."""
+    padded = np.pad(values, radius + 1, mode="edge")
+    table = padded.cumsum(axis=0).cumsum(axis=1)
+    size = 2 * radius + 1
+    window = table[size:, size:] - table[:-size, size:] - table[size:, :-size] + table[:-size, :-size]
+    return window[: values.shape[0], : values.shape[1]] / (size * size)
+
+
+def _edges(gray: np.ndarray) -> np.ndarray:
+    """Sobel gradient magnitude."""
+    padded = np.pad(gray, 1, mode="edge")
+    gx = (padded[:-2, 2:] + 2 * padded[1:-1, 2:] + padded[2:, 2:]) - (
+        padded[:-2, :-2] + 2 * padded[1:-1, :-2] + padded[2:, :-2]
+    )
+    gy = (padded[2:, :-2] + 2 * padded[2:, 1:-1] + padded[2:, 2:]) - (
+        padded[:-2, :-2] + 2 * padded[:-2, 1:-1] + padded[:-2, 2:]
+    )
+    return np.hypot(gx, gy)
+
+
+def image_metrics(simulated: np.ndarray, reference: np.ndarray, mask: np.ndarray | None = None) -> dict:
+    """Similarity of two equally sized RGB images, optionally restricted to ``mask``.
+
+    Returns PSNR [dB] of RGB, SSIM of luminance (7 x 7 windows), and edge NCC, the normalized
+    cross-correlation of Sobel gradient magnitudes, which tracks geometric alignment under
+    lighting and material differences. Higher is better for all three.
+    """
+    if simulated.shape[:2] != reference.shape[:2]:
+        raise ValueError(f"Image sizes differ: simulated {simulated.shape}, reference {reference.shape}")
+    weights = np.ones(simulated.shape[:2]) if mask is None else np.asarray(mask, dtype=np.float64)
+    if weights.shape != simulated.shape[:2] or weights.sum() <= 0:
+        raise ValueError("mask must match the image size and select at least one pixel")
+    a = simulated[..., :3].astype(np.float64)
+    b = reference[..., :3].astype(np.float64)
+    mse = float((((a - b) ** 2).mean(axis=-1) * weights).sum() / weights.sum())
+    psnr = float("inf") if mse == 0 else 10.0 * np.log10(255.0**2 / mse)
+    ga, gb = _gray(a), _gray(b)
+    mu_a, mu_b = _box_mean(ga, 3), _box_mean(gb, 3)
+    var_a = _box_mean(ga * ga, 3) - mu_a**2
+    var_b = _box_mean(gb * gb, 3) - mu_b**2
+    cov = _box_mean(ga * gb, 3) - mu_a * mu_b
+    c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+    ssim_map = ((2 * mu_a * mu_b + c1) * (2 * cov + c2)) / ((mu_a**2 + mu_b**2 + c1) * (var_a + var_b + c2))
+    ssim = float((ssim_map * weights).sum() / weights.sum())
+    ea, eb = _edges(ga), _edges(gb)
+    ea = ea - (ea * weights).sum() / weights.sum()
+    eb = eb - (eb * weights).sum() / weights.sum()
+    denominator = np.sqrt((ea * ea * weights).sum() * (eb * eb * weights).sum())
+    edge_ncc = float((ea * eb * weights).sum() / denominator) if denominator > 0 else 0.0
+    return {"psnr_db": round(psnr, 3), "ssim": round(ssim, 4), "edge_ncc": round(edge_ncc, 4)}
+
+
+def comparison_panel(simulated: np.ndarray, reference: np.ndarray, kind: str = "mismatch", threshold: int = 24):
+    """A third panel for simulated-versus-reference views.
+
+    ``mismatch`` tints pixels differing by more than ``threshold`` magenta (for synthetic references),
+    ``edges`` draws simulated edges in magenta and reference edges in green over the dimmed reference
+    (overlap appears white; for real photos), and ``blend`` averages both images.
+    """
+    if kind == "mismatch":
+        return compare(simulated, reference, threshold)[0]
+    if kind == "blend":
+        return ((simulated[..., :3].astype(np.uint16) + reference[..., :3].astype(np.uint16)) // 2).astype(np.uint8)
+    if kind == "edges":
+        panel = np.repeat((0.35 * _gray(reference))[..., None], 3, axis=-1)
+        sim_edges, ref_edges = _edges(_gray(simulated)), _edges(_gray(reference))
+        strong_sim = sim_edges > max(np.percentile(sim_edges, 90), 1.0)
+        strong_ref = ref_edges > max(np.percentile(ref_edges, 90), 1.0)
+        panel[strong_ref] = (60, 220, 60)
+        panel[strong_sim] = (230, 40, 200)
+        panel[strong_sim & strong_ref] = (255, 255, 255)
+        return panel.astype(np.uint8)
+    raise ValueError("comparison must be 'mismatch', 'edges', or 'blend'")
+
+
 def compare(simulated: np.ndarray, reference: np.ndarray, threshold: int = 24) -> tuple[np.ndarray, dict]:
     """Return a mismatch panel and pixel statistics for equally sized images.
 
@@ -249,5 +329,6 @@ def compare(simulated: np.ndarray, reference: np.ndarray, threshold: int = 24) -
         "mean_abs_difference": round(float(np.abs(simulated.astype(np.int16) - reference.astype(np.int16)).mean()), 3),
         "mismatch_fraction": round(float(mismatch.mean()), 5),
         "mismatch_threshold": threshold,
+        **image_metrics(simulated, reference),
     }
     return panel, stats

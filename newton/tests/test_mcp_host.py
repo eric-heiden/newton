@@ -250,6 +250,29 @@ class TestMcpHelpers(unittest.TestCase):
         left = self.session.dispatch("execute", {"code": "1"})["time_left_s"]
         self.assertTrue(95 <= left <= 100)
 
+    def test_render_and_compare_images(self):
+        """Render arrays directly and score them against references with image metrics."""
+        camera = {"eye": [1.5, -1.5, 1.0], "target": [0.0, 0.0, 0.3], "width": 64, "height": 48}
+        image = self.session.render(**camera)
+        self.assertEqual(image.shape, (48, 64, 3))
+        self.assertEqual(image.dtype, np.uint8)
+        same = self.session.compare_images(image, image)
+        self.assertEqual(same["psnr_db"], float("inf"))
+        self.assertAlmostEqual(same["ssim"], 1.0, places=4)
+        self.assertAlmostEqual(same["edge_ncc"], 1.0, places=4)
+        shifted = self.session.compare_images(np.roll(image, 6, axis=1), image)
+        self.assertLess(shifted["edge_ncc"], 0.9)
+        self.assertLess(shifted["ssim"], same["ssim"])
+        mask = np.zeros(image.shape[:2], dtype=bool)
+        mask[:, :10] = True
+        self.assertIn("psnr_db", self.session.compare_images(image, image, mask=mask))
+        result = self.session.dispatch(
+            "execute",
+            {"code": f"a = render(**{camera!r})\ncompare_images(a, np.flipud(a), panel='edges')['edge_ncc']"},
+        )
+        self.assertLess(result["result"], 0.99)
+        self.assertEqual(len(result["images"]), 1)
+
     def test_workspace_preloads_newton_and_helpers(self):
         """Provide newton and the helper functions without imports."""
         result = self.session.dispatch("execute", {"code": "(newton.__name__, callable(rollout), health()['ok'])"})

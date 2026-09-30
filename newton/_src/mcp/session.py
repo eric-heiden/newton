@@ -847,6 +847,8 @@ class SimulationSession:
         "rollout",
         "health",
         "solver_contacts",
+        "render",
+        "compare_images",
     )
     _EXPRESSION_RESULT = "__newton_expression_result__"
 
@@ -857,7 +859,19 @@ class SimulationSession:
             {
                 name: getattr(self, name)
                 for name in self._WORKSPACE_BINDINGS
-                if name not in ("session", "np", "wp", "newton", "show", "rollout", "health", "solver_contacts")
+                if name
+                not in (
+                    "session",
+                    "np",
+                    "wp",
+                    "newton",
+                    "show",
+                    "rollout",
+                    "health",
+                    "solver_contacts",
+                    "render",
+                    "compare_images",
+                )
             }
         )
         self._workspace.update(self.namespace)
@@ -869,6 +883,8 @@ class SimulationSession:
             rollout=self.rollout,
             health=self.health,
             solver_contacts=self.solver_contacts,
+            render=self.render,
+            compare_images=self.compare_images,
             np=np,
             wp=wp,
             newton=newton,
@@ -1514,6 +1530,59 @@ class SimulationSession:
         from .diagnostics import health  # noqa: PLC0415
 
         return health(self)
+
+    def render(self, *, metadata: bool = False, **options):
+        """Render the current state to an RGB array without PNG encoding (trusted execution helper).
+
+        Accepts the camera and rendering options of ``observe`` (``view``, ``eye``/``target``,
+        ``pose``, ``fov_y`` or ``intrinsics``, ``width``/``height``, ``world_id``, ``backend``,
+        ``channel``, ``environment``, ...), which makes it the fast path for fitting loops.
+
+        Args:
+            metadata: Also return the observation metadata (camera pose, settings).
+
+        Returns:
+            ``uint8`` array of shape ``(height, width, 3)``, or ``(image, metadata)``.
+        """
+        self._assert_owner()
+        image, info = self._renderer_get()._single(**options)
+        return (image, info) if metadata else image
+
+    def compare_images(
+        self, simulated, reference, *, mask=None, panel: str | None = None, label: str | None = None
+    ) -> dict:
+        """Compare two images with PSNR [dB], SSIM, and edge NCC (trusted execution helper).
+
+        Args:
+            simulated: Image array, PNG/JPEG path, PIL image, or ``observe`` result.
+            reference: Image of the same size in any of those forms.
+            mask: Optional boolean array selecting the pixels to score.
+            panel: Also show ``simulated | reference | panel`` inline, with ``panel`` one of
+                ``"edges"``, ``"blend"``, or ``"mismatch"``.
+            label: Caption for the shown panel row.
+
+        Returns:
+            Metrics ``psnr_db``, ``ssim``, ``edge_ncc`` (higher is better), and
+            ``mean_abs_difference``.
+        """
+        from .imaging import comparison_panel, image_metrics, tile, to_rgb  # noqa: PLC0415
+
+        def rgb(value):
+            if isinstance(value, dict) and "image_base64" in value:
+                value = base64.b64decode(value["image_base64"])
+            return to_rgb(value)
+
+        a, b = rgb(simulated), rgb(reference)
+        result = image_metrics(a, b, mask)
+        result["mean_abs_difference"] = round(float(np.abs(a.astype(np.int16) - b.astype(np.int16)).mean()), 3)
+        if panel is not None:
+            names = [["simulated", "reference", f"{panel} {label or ''}".strip()]]
+            image = tile([[a, b, comparison_panel(a, b, panel)]], names)
+            if self._shown_images is not None:
+                self.show(image)
+            else:
+                result["panel_image"] = image
+        return result
 
     def solver_contacts(self, limit: int = 20) -> dict:
         """Active solver contacts grouped by shape pair, with the effective solver parameters."""

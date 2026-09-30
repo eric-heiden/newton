@@ -341,6 +341,28 @@ class TestMcpObservation(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.renderer.observe(view="diagonal")
 
+    def test_color_is_antialiased_and_environment_is_drawn(self):
+        """Supersample color edges, draw a sky behind the scene, and checker ground planes."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()))
+        builder.add_shape_sphere(body, radius=0.5, color=(1.0, 0.0, 0.0))
+        self.session.model = builder.finalize(device="cpu")
+        self.session.state = self.session.model.state()
+        camera = {"eye": [3.0, -3.0, 1.0], "target": [0.0, 0.0, 0.5], "width": 96, "height": 64, "shadows": False}
+        plain = self.renderer.observe(**camera, antialias=False, environment=False)
+        rich = self.renderer.observe(**camera)
+        self.assertEqual(rich["settings"]["supersample"], 2)
+        self.assertIn("ground checker cells", rich["settings"]["environment"])
+        plain_image, rich_image = _decode_png(plain).astype(int), _decode_png(rich).astype(int)
+        # The top rows show sky instead of the clear color.
+        self.assertGreater(rich_image[0, :, 2].mean(), rich_image[0, :, 0].mean())
+        self.assertFalse(np.array_equal(plain_image[0], rich_image[0]))
+        # Anti-aliasing produces intermediate colors along the sphere silhouette.
+        self.assertGreater(
+            len(np.unique(rich_image.reshape(-1, 3), axis=0)), len(np.unique(plain_image.reshape(-1, 3), axis=0))
+        )
+
     def test_multi_view_grid_and_reference_comparison(self):
         """Tile several views in one image and compare a render against a reference photo."""
         grid = self.renderer.observe(views=["top", {"label": "custom", **self.camera}], width=40, height=30)

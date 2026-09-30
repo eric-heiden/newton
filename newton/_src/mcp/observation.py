@@ -53,8 +53,17 @@ def _from_z_up(vector, up_axis: int) -> np.ndarray:
     return np.asarray({2: (x, y, z), 1: (x, z, -y), 0: (z, x, y)}[up_axis], dtype=np.float64)
 
 
-def _camera_pose(eye, target, up, pose, up_axis: int, frame=None, view=None, fov_y: float = 60.0):
-    """Return eye, camera rotation, and pose; ``frame`` = (center, radius) enables auto-framing."""
+def _fit_distance(points, target, forward, right, up, tan_x, tan_y, margin=1.08):
+    """Camera distance [m] from ``target`` along ``-forward`` that keeps all ``points`` inside the frustum."""
+    rel = points - target
+    lateral_x = np.abs(rel @ right) * margin / tan_x
+    lateral_y = np.abs(rel @ up) * margin / tan_y
+    toward_camera = rel @ -forward
+    return float(np.max(toward_camera + np.maximum(lateral_x, lateral_y)))
+
+
+def _camera_pose(eye, target, up, pose, up_axis: int, frame=None, view=None, fov_y: float = 60.0, aspect=4.0 / 3.0):
+    """Return eye, camera rotation, and pose; ``frame`` = (center, radius[, points]) enables auto-framing."""
     if view is not None and view not in VIEW_PRESETS:
         raise ValueError(f"view must be one of {sorted(VIEW_PRESETS)}")
     if pose is not None:
@@ -68,15 +77,37 @@ def _camera_pose(eye, target, up, pose, up_axis: int, frame=None, view=None, fov
         rotation = np.asarray(wp.quat_to_matrix(wp.quat(*quaternion)), dtype=np.float64).reshape(3, 3)
         return pose[:3], rotation, [*pose[:3].tolist(), *quaternion.tolist()]
     if eye is None and frame is not None:
-        center, radius = frame
+        center, radius = frame[0], frame[1]
+        points = frame[2] if len(frame) > 2 else None
         center = center if target is None else _vector("target", target, 3)
         direction = _from_z_up(VIEW_PRESETS[view or "iso"], up_axis)
         direction /= np.linalg.norm(direction)
-        distance = 1.15 * max(radius, 1.0e-3) / math.sin(math.radians(fov_y) / 2.0)
-        eye = center + direction * distance
-        target = center
         if (view or "iso") == "top" and up is None:
             up = _from_z_up((0.0, 1.0, 0.0), up_axis)
+        distance = 1.15 * max(radius, 1.0e-3) / math.sin(math.radians(fov_y) / 2.0)
+        if points is not None and len(points) and target is None:
+            # Fit the projected extent of the scene rather than its bounding sphere, which
+            # leaves elongated scenes (arms, humanoids) small in the frame.
+            view_up = up if up is not None else np.eye(3)[up_axis]
+            forward = -direction
+            right = np.cross(forward, view_up)
+            right /= np.linalg.norm(right)
+            cam_up = np.cross(right, forward)
+            tan_y = math.tan(math.radians(fov_y) / 2.0)
+            tan_x = tan_y * aspect
+            for _ in range(2):
+                distance = _fit_distance(points, center, forward, right, cam_up, tan_x, tan_y)
+                depth = distance - (points - center) @ -forward
+                x = ((points - center) @ right) / np.maximum(depth, 1.0e-6)
+                y = ((points - center) @ cam_up) / np.maximum(depth, 1.0e-6)
+                center = (
+                    center
+                    + right * 0.5 * (x.max() + x.min()) * distance
+                    + cam_up * 0.5 * (y.max() + y.min()) * distance
+                )
+            distance = max(_fit_distance(points, center, forward, right, cam_up, tan_x, tan_y), 1.0e-3)
+        eye = center + direction * distance
+        target = center
     eye = _vector("eye", (3.0, -3.0, 2.0) if eye is None else eye, 3)
     target = _vector("target", (0.0, 0.0, 0.0) if target is None else target, 3)
     up = _vector("up", np.eye(3)[up_axis] if up is None else up, 3)
@@ -91,6 +122,82 @@ def _camera_pose(eye, target, up, pose, up_axis: int, frame=None, view=None, fov
     rotation = np.column_stack((right, np.cross(right, forward), -forward))
     quaternion = wp.quat_from_matrix(wp.mat33(*rotation.flatten()))
     return eye, rotation, [*eye.tolist(), *list(quaternion)]
+
+
+def _checker_cell(scene_radius: float) -> float:
+    """A round checker cell size [m] of roughly a quarter of the scene radius."""
+    for cell in (0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0):
+        if cell >= 0.25 * scene_radius:
+            return cell
+    return 10.0
+
+
+@wp.func
+def _srgb_to_linear(c: float) -> float:
+    if c <= 0.04045:
+        return c / 12.92
+    return wp.pow((c + 0.055) / 1.055, 2.4)
+
+
+@wp.func
+def _linear_to_srgb(c: float) -> float:
+    c = wp.clamp(c, 0.0, 1.0)
+    if c <= 0.0031308:
+        return c * 12.92
+    return 1.055 * wp.pow(c, 1.0 / 2.4) - 0.055
+
+
+@wp.kernel(enable_backward=False)
+def _finish_color(
+    color: wp.array2d[wp.uint32],
+    shape_index: wp.array2d[wp.uint32],
+    depth: wp.array2d[wp.float32],
+    rays: wp.array3d[wp.vec3f],
+    rotation: wp.mat33f,
+    eye: wp.vec3f,
+    up: wp.vec3f,
+    plane_inverse: wp.array[wp.transformf],
+    plane_flag: wp.array[wp.int32],
+    cell: float,
+    environment: int,
+    factor: int,
+    out: wp.array2d[wp.uint32],
+):
+    """Sky for misses, checker on planes, then box-average ``factor`` x ``factor`` samples in linear light."""
+    y, x = wp.tid()
+    total = wp.vec3f(0.0)
+    for sy in range(factor):
+        for sx in range(factor):
+            py = y * factor + sy
+            px = x * factor + sx
+            packed = color[py, px]
+            c = wp.vec3f(
+                _srgb_to_linear(float(packed & wp.uint32(255)) / 255.0),
+                _srgb_to_linear(float((packed >> wp.uint32(8)) & wp.uint32(255)) / 255.0),
+                _srgb_to_linear(float((packed >> wp.uint32(16)) & wp.uint32(255)) / 255.0),
+            )
+            if environment != 0:
+                direction = wp.normalize(rotation * rays[py, px, 1])
+                shape = shape_index[py, px]
+                if shape == wp.uint32(0xFFFFFFFF):
+                    elevation = wp.dot(direction, up)
+                    horizon = wp.vec3f(0.62, 0.68, 0.76)
+                    if elevation >= 0.0:
+                        c = horizon + (wp.vec3f(0.22, 0.38, 0.66) - horizon) * wp.sqrt(wp.min(elevation, 1.0))
+                    else:
+                        c = horizon + (wp.vec3f(0.30, 0.29, 0.28) - horizon) * wp.min(-elevation * 4.0, 1.0)
+                elif int(shape) < plane_flag.shape[0]:
+                    if plane_flag[int(shape)] != 0:
+                        local = wp.transform_point(plane_inverse[int(shape)], eye + direction * depth[py, px])
+                        parity = int(wp.floor(local[0] / cell) + wp.floor(local[1] / cell)) % 2
+                        if parity != 0:
+                            c = c * 0.78
+            total = total + c
+    total = total / float(factor * factor)
+    r = wp.uint32(wp.round(_linear_to_srgb(total[0]) * 255.0))
+    g = wp.uint32(wp.round(_linear_to_srgb(total[1]) * 255.0))
+    b = wp.uint32(wp.round(_linear_to_srgb(total[2]) * 255.0))
+    out[y, x] = r | (g << wp.uint32(8)) | (b << wp.uint32(16)) | wp.uint32(0xFF000000)
 
 
 class ObservationRenderer:
@@ -190,6 +297,8 @@ class ObservationRenderer:
         depth_range=None,
         raw: bool = False,
         pick=None,
+        antialias: bool = True,
+        environment: bool = True,
     ) -> dict:
         """Return a PNG and bounded metadata for the current simulation state.
 
@@ -200,6 +309,9 @@ class ObservationRenderer:
         hash palette and retain uint32 IDs in artifacts (0xFFFFFFFF is a miss).
         Color and albedo are display/sRGB. Contact markers use the midpoint of
         world contact surfaces, including margins, with optional depth occlusion.
+        Color images are supersampled (``antialias``) when the pixel budget
+        allows, and ``environment`` adds a sky gradient behind the scene and a
+        checker of known cell size on ground planes for scale and motion cues.
         """
         self._check_thread()
         model = self.session.model
@@ -210,7 +322,14 @@ class ObservationRenderer:
             raise ValueError("backend must be 'sensor' or 'viewer'")
         if channel not in self.CHANNELS:
             raise ValueError(f"channel must be one of {self.CHANNELS}")
-        for name, value in (("shadows", shadows), ("wireframe", wireframe), ("contacts", contacts), ("raw", raw)):
+        for name, value in (
+            ("shadows", shadows),
+            ("wireframe", wireframe),
+            ("contacts", contacts),
+            ("raw", raw),
+            ("antialias", antialias),
+            ("environment", environment),
+        ):
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be a boolean")
         if textures is not None and not isinstance(textures, bool):
@@ -241,7 +360,7 @@ class ObservationRenderer:
             )
         frame = self._scene_frame(world_id) if pose is None and eye is None else None
         eye, rotation, camera_pose = _camera_pose(
-            eye, target, up, pose, int(model.up_axis), frame=frame, view=view, fov_y=float(fov_y)
+            eye, target, up, pose, int(model.up_axis), frame=frame, view=view, fov_y=float(fov_y), aspect=width / height
         )
         metadata = {
             "backend": backend,
@@ -264,9 +383,23 @@ class ObservationRenderer:
         if backend == "sensor":
             if wireframe:
                 raise ValueError("SensorTiledCamera does not support mesh wireframe; use an attached ViewerGL backend")
-            arrays = self._render_sensor(
-                width, height, fov_y, camera_pose, world_id, channel, shadows, bool(textures), contacts, pick
+            # Supersample color 2x2 when the budget allows; other channels stay exact per pixel.
+            supersample = 2 if antialias and channel == "color" and 4 * aggregate_pixels <= self.MAX_PIXELS else 1
+            arrays, environment_metadata = self._render_sensor(
+                width,
+                height,
+                fov_y,
+                camera_pose,
+                world_id,
+                channel,
+                shadows,
+                bool(textures),
+                contacts,
+                pick,
+                supersample=supersample,
+                environment=environment and channel == "color",
             )
+            metadata["settings"].update(supersample=supersample, **environment_metadata)
             rgb, channel_metadata = self._colorize(arrays[channel], channel, depth_range)
             metadata.update(channel_metadata)
             if pick is not None:
@@ -394,8 +527,8 @@ class ObservationRenderer:
         }
         return rows, labels, summary
 
-    def _scene_frame(self, world_id: int) -> tuple[np.ndarray, float]:
-        """Bounding sphere [m] of non-plane shapes and particles in one world."""
+    def _scene_frame(self, world_id: int) -> tuple[np.ndarray, float, np.ndarray]:
+        """Center, bounding radius [m], and extent points of non-plane shapes and particles in one world."""
         from ..geometry.types import GeoType  # noqa: PLC0415
 
         model, state = self.session.model, self.session.state
@@ -448,13 +581,18 @@ class ObservationRenderer:
                 points += [particles.min(axis=0), particles.max(axis=0)]
                 radii += [0.0, 0.0]
         if not points:
-            return np.zeros(3), 1.0
+            return np.zeros(3), 1.0, np.zeros((1, 3))
         points, radii = np.asarray(points, dtype=np.float64), np.asarray(radii)
         finite = np.isfinite(points).all(axis=1)
         points, radii = points[finite], radii[finite]
         lower = (points - radii[:, None]).min(axis=0)
         upper = (points + radii[:, None]).max(axis=0)
-        return 0.5 * (lower + upper), float(0.5 * np.linalg.norm(upper - lower))
+        # Each shape contributes points on its bounding sphere (axes and diagonals), which trace
+        # its silhouette under perspective without the slack of one scene-wide bounding sphere.
+        diagonals = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]) / math.sqrt(3.0)
+        offsets = np.concatenate([np.eye(3), -np.eye(3), diagonals])
+        extent = (points[:, None, :] + radii[:, None, None] * offsets[None]).reshape(-1, 3)
+        return 0.5 * (lower + upper), float(0.5 * np.linalg.norm(upper - lower)), extent
 
     def filmstrip(
         self,
@@ -571,7 +709,24 @@ class ObservationRenderer:
             result["mismatch"] = statistics
         return result
 
-    def _render_sensor(self, width, height, fov_y, pose, world_id, channel, shadows, textures, contacts, pick):
+    def _render_sensor(
+        self,
+        width,
+        height,
+        fov_y,
+        pose,
+        world_id,
+        channel,
+        shadows,
+        textures,
+        contacts,
+        pick,
+        supersample=1,
+        environment=False,
+    ):
+        """Render one camera; returns per-pixel arrays at ``width x height`` and environment metadata."""
+        base_width, base_height = width, height
+        width, height = width * supersample, height * supersample
         model, state = self.session.model, self.session.state
         if self._sensor is None or self._sensor_model is not model:
             self.invalidate()
@@ -591,8 +746,10 @@ class ObservationRenderer:
         needed = {channel}
         if contacts or overlay:
             needed.add("forward_depth")
-        if pick is not None:
+        if pick is not None or environment:
             needed.add("shape_index")
+        if environment:
+            needed.add("depth")
         # Retain only this request's outputs so channel changes cannot grow the cache without bound.
         self._outputs = {name: value for name, value in self._outputs.items() if name in needed}
         for name in needed:
@@ -609,10 +766,73 @@ class ObservationRenderer:
             render_config=config,
             **{f"{name}_image": output for name, output in self._outputs.items()},
         )
-        arrays = {name: output[world_id, 0].numpy() for name, output in self._outputs.items()}
         if overlay:
+            arrays = {name: output[world_id, 0].numpy() for name, output in self._outputs.items()}
             self._composite_overlay(arrays, overlay, width, height, fov_y, pose, shadows)
-        return arrays
+            for name, values in arrays.items():
+                self._outputs[name][world_id, 0].assign(values)
+        environment_metadata = {}
+        if channel == "color" and (environment or supersample > 1):
+            color, environment_metadata = self._finish_color(
+                pose, world_id, supersample, environment, base_width, base_height
+            )
+        arrays = {}
+        for name, output in self._outputs.items():
+            values = output[world_id, 0].numpy()
+            arrays[name] = values[supersample // 2 :: supersample, supersample // 2 :: supersample][
+                :base_height, :base_width
+            ]
+        if channel == "color" and (environment or supersample > 1):
+            arrays["color"] = color
+        return arrays, environment_metadata
+
+    def _finish_color(self, pose, world_id, supersample, environment, width, height):
+        """Sky, ground checker, and supersample resolve on the device; returns packed color and metadata."""
+        from ..geometry.types import GeoType  # noqa: PLC0415
+
+        model = self.session.model
+        device = model.device
+        metadata = {}
+        plane_flag = np.zeros(max(model.shape_count, 1), dtype=np.int32)
+        plane_inverse = np.zeros((max(model.shape_count, 1), 7), dtype=np.float32)
+        cell = 1.0
+        if environment:
+            metadata["environment"] = "sky gradient behind the scene"
+            if model.shape_count:
+                types = model.shape_type.numpy()
+                planes = np.flatnonzero(types == int(GeoType.PLANE))
+                if len(planes):
+                    plane_flag[planes] = 1
+                    transforms = model.shape_transform.numpy()
+                    for index in planes:
+                        plane_inverse[index] = np.asarray(wp.transform_inverse(wp.transform(*transforms[index])))
+                    cell = _checker_cell(self._scene_frame(world_id)[1])
+                    metadata["environment"] += f"; ground checker cells {cell:g} m"
+        rotation = np.asarray(wp.quat_to_matrix(wp.quat(*pose[3:7])), dtype=np.float32).reshape(3, 3)
+        dummy = wp.zeros((1, 1), dtype=wp.uint32, device=device)
+        dummy_depth = wp.zeros((1, 1), dtype=wp.float32, device=device)
+        out = wp.empty((height, width), dtype=wp.uint32, device=device)
+        wp.launch(
+            _finish_color,
+            dim=(height, width),
+            inputs=[
+                self._outputs["color"][world_id, 0],
+                self._outputs["shape_index"][world_id, 0] if environment else dummy,
+                self._outputs["depth"][world_id, 0] if environment else dummy_depth,
+                self._rays[0],
+                wp.mat33f(*rotation.flatten()),
+                wp.vec3f(*np.asarray(pose[:3], dtype=np.float32)),
+                wp.vec3f(*np.eye(3, dtype=np.float32)[int(model.up_axis)]),
+                wp.array(plane_inverse, dtype=wp.transformf, device=device),
+                wp.array(plane_flag, dtype=wp.int32, device=device),
+                float(cell),
+                int(environment),
+                int(supersample),
+            ],
+            outputs=[out],
+            device=device,
+        )
+        return out.numpy(), metadata
 
     def _overlay_meshes(self) -> list:
         callback = getattr(self.session, "overlay_callback", None)
@@ -661,6 +881,9 @@ class ObservationRenderer:
         nearer = hit & (~base_hit | (overlay_depth < base_depth))
         arrays["color"] = np.where(nearer, color[0, 0].numpy(), arrays["color"])
         arrays["forward_depth"] = np.where(nearer, overlay_depth, base_depth)
+        if "shape_index" in arrays:
+            # Mark overlay pixels as hits that are not model shapes, so the sky pass keeps them.
+            arrays["shape_index"] = np.where(nearer, np.uint32(0xFFFFFFFE), arrays["shape_index"])
 
     @staticmethod
     def _colorize(values, channel, depth_range):

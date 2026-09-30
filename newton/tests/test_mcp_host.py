@@ -177,7 +177,8 @@ class TestMcpHost(unittest.TestCase):
 
         def lit_pixels():
             camera = {"eye": [0.0, 0.0, 3.0], "target": [0.0, 0.0, 0.0], "up": [0.0, 1.0, 0.0]}
-            result = session.dispatch("observe", {**camera, "width": 64, "height": 64, "shadows": False})
+            options = {"width": 64, "height": 64, "shadows": False, "environment": False}
+            result = session.dispatch("observe", {**camera, **options})
             from newton._src.mcp.imaging import decode_png  # noqa: PLC0415
 
             return int((decode_png(base64.b64decode(result["image_base64"])).max(axis=-1) > 0).sum())

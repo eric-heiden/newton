@@ -10,6 +10,7 @@ import copy
 import json
 import math
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -53,7 +54,7 @@ def _from_z_up(vector, up_axis: int) -> np.ndarray:
     return np.asarray({2: (x, y, z), 1: (x, z, -y), 0: (z, x, y)}[up_axis], dtype=np.float64)
 
 
-def _fit_distance(points, target, forward, right, up, tan_x, tan_y, margin=1.08):
+def _fit_distance(points, target, forward, right, up, tan_x, tan_y, margin=1.15):
     """Camera distance [m] from ``target`` along ``-forward`` that keeps all ``points`` inside the frustum."""
     rel = points - target
     lateral_x = np.abs(rel @ right) * margin / tan_x
@@ -294,6 +295,7 @@ class ObservationRenderer:
         self._outputs = {}
         self._recording = None
         self._last_recording = {"active": False, "frame_count": 0}
+        self._rtx = self._rtx_model = self._rtx_colors = self._rtx_world = None
 
     def _check_thread(self):
         if threading.get_ident() != self._owner_thread:
@@ -330,6 +332,7 @@ class ObservationRenderer:
         antialias: bool = True,
         environment: bool = True,
         intrinsics: dict | None = None,
+        samples: int = 16,
     ) -> dict:
         """Return a PNG and bounded metadata for the current simulation state.
 
@@ -353,8 +356,9 @@ class ObservationRenderer:
         width = _integer("width", width, 1, 2048)
         height = _integer("height", height, 1, 2048)
         world_id = _integer("world_id", world_id, 0, model.world_count - 1)
-        if backend not in ("sensor", "viewer"):
-            raise ValueError("backend must be 'sensor' or 'viewer'")
+        if backend not in ("sensor", "viewer", "rtx"):
+            raise ValueError("backend must be 'sensor', 'viewer', or 'rtx'")
+        samples = _integer("samples", samples, 1, 256)
         if channel not in self.CHANNELS:
             raise ValueError(f"channel must be one of {self.CHANNELS}")
         for name, value in (
@@ -449,6 +453,17 @@ class ObservationRenderer:
             if pick is not None:
                 metadata["picks"] = self._pick(arrays["shape_index"], pick)
             depth = arrays.get("forward_depth")
+        elif backend == "rtx":
+            if channel != "color" or raw or pick is not None or wireframe:
+                raise ValueError("The rtx backend renders color only; raw channels, picking and wireframe need sensor")
+            if contacts and contact_depth != "always":
+                raise ValueError("rtx contact overlays require contact_depth='always'; sensor supports occlusion")
+            started = time.perf_counter()
+            rgb, rtx_metadata = self._render_rtx(width, height, fov_y, camera_pose, world_id, samples)
+            metadata.update(rtx_metadata)
+            metadata["render_seconds"] = round(time.perf_counter() - started, 3)
+            depth = None
+            arrays = {}
         else:
             if channel != "color" or textures is not None or raw or pick is not None:
                 raise ValueError(
@@ -886,6 +901,50 @@ class ObservationRenderer:
         )
         return out.numpy(), metadata
 
+    def _render_rtx(self, width, height, fov_y, pose, world_id, samples):
+        """Path-trace the observed world with a lazily created, headless ViewerRTX."""
+        model, state = self.session.model, self.session.state
+        colors = model.shape_color.numpy() if getattr(model, "shape_color", None) is not None else None
+        rebuilt = False
+        if (
+            self._rtx is None
+            or self._rtx_model is not model
+            or (colors is not None and not np.array_equal(colors, self._rtx_colors))
+        ):
+            # Materials are baked when the renderer is built, so appearance edits need a rebuild.
+            self._close_rtx()
+            try:
+                import newton.viewer  # noqa: PLC0415
+
+                viewer = newton.viewer.ViewerRTX(width=width, height=height, headless=True, async_rendering=False)
+            except ImportError as error:
+                raise ValueError(
+                    "backend='rtx' needs the ovrtx package (pip install newton[rtx]) and an RTX GPU"
+                ) from error
+            viewer.set_model(model)
+            if model.world_count > 1:
+                viewer.set_world_offsets((0.0, 0.0, 0.0))
+            self._rtx, self._rtx_model, self._rtx_colors, self._rtx_world = viewer, model, colors, None
+            rebuilt = True
+        if model.world_count > 1 and self._rtx_world != world_id:
+            self._rtx.set_visible_worlds([world_id])
+            self._rtx_world = world_id
+        overlay = self._overlay_meshes()
+        rgb = self._rtx._render_offscreen(state, pose, fov_y, width, height, samples=samples, meshes=overlay)
+        return np.ascontiguousarray(rgb[..., :3], dtype=np.uint8), {
+            "renderer": "OVRTX path tracer",
+            "samples": samples,
+            "renderer_rebuilt": rebuilt,
+        }
+
+    def _close_rtx(self):
+        viewer, self._rtx = getattr(self, "_rtx", None), None
+        if viewer is not None:
+            try:
+                viewer.close()
+            except Exception:
+                pass
+
     def _overlay_meshes(self) -> list:
         callback = getattr(self.session, "overlay_callback", None)
         if callback is None:
@@ -1142,3 +1201,4 @@ class ObservationRenderer:
         if self._recording is not None:
             self._finish_recording("session_closed")
         self.invalidate()
+        self._close_rtx()

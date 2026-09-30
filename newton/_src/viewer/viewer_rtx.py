@@ -456,6 +456,9 @@ void main() {
 
     def _compute_camera_matrix(self):
         """Return a 4x4 row-major world-transform for the camera prim (USD convention)."""
+        override = getattr(self, "_camera_matrix_override", None)
+        if override is not None:
+            return override
         fwd = np.array(self.camera.get_front(), dtype=np.float64)
         right = np.array(self.camera.get_right(), dtype=np.float64)
         up = np.array(self.camera.get_up(), dtype=np.float64)
@@ -466,6 +469,82 @@ void main() {
         mat[2, :3] = -fwd  # USD cameras look along local -Z
         mat[3, :3] = np.array(self.camera.pos, dtype=np.float64)
         return mat
+
+    def _render_offscreen(
+        self, state, camera_pose, fov_y: float, width: int, height: int, samples: int = 16, meshes=()
+    ) -> np.ndarray:
+        """Path-trace one image from an explicit camera, independent of the interactive camera.
+
+        Args:
+            state: Simulation state to render.
+            camera_pose: Camera position [m] and xyzw quaternion; the camera looks along local -Z
+                with +Y up.
+            fov_y: Vertical field of view [deg].
+            width: Image width [px].
+            height: Image height [px].
+            samples: Renderer steps to accumulate after resetting the accumulation buffer.
+            meshes: Extra ``(name, points, indices, color)`` triangle meshes to draw this frame.
+
+        Returns:
+            RGB image of shape ``(height, width, 3)``, dtype ``uint8``.
+        """
+        pose = np.asarray(camera_pose, dtype=np.float64)
+        rotation = np.asarray(wp.quat_to_matrix(wp.quat(*pose[3:7])), dtype=np.float64).reshape(3, 3)
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[0, :3], matrix[1, :3], matrix[2, :3], matrix[3, :3] = (
+            rotation[:, 0],
+            rotation[:, 1],
+            rotation[:, 2],
+            pose[:3],
+        )
+        self._camera_matrix_override = matrix
+        self._camera_dirty = True
+        if self._rtx is None:
+            self.camera.fov, self.camera.width, self.camera.height = float(fov_y), int(width), int(height)
+        self.begin_frame(0.0)
+        self.log_state(state)
+        for name, points, indices, color in meshes:
+            self.log_mesh(
+                name,
+                wp.array(np.asarray(points, dtype=np.float32), dtype=wp.vec3, device=self.device),
+                wp.array(np.asarray(indices, dtype=np.int32), dtype=wp.int32, device=self.device),
+                color=color,
+                backface_culling=False,
+            )
+        self.end_frame()  # the first frame exports the stage and creates the renderer
+        rtx = self._rtx
+        if float(fov_y) != self.camera.fov or (int(width), int(height)) != (self.camera.width, self.camera.height):
+            self.camera.fov, self.camera.width, self.camera.height = float(fov_y), int(width), int(height)
+            focal = 20.955 / (2.0 * math.tan(math.radians(fov_y) / 2.0))
+            rtx.write_attribute(
+                prim_paths=[self._camera_prim_path],
+                attribute_name="focalLength",
+                tensor=np.array([focal], dtype=np.float32),
+            )
+            rtx.write_attribute(
+                prim_paths=[self._camera_prim_path],
+                attribute_name="horizontalAperture",
+                tensor=np.array([20.955 * width / max(height, 1)], dtype=np.float32),
+            )
+            rtx.write_attribute(
+                prim_paths=[self._render_product_path],
+                attribute_name="resolution",
+                tensor=np.array([[int(width), int(height)]], dtype=np.int32),
+            )
+        from ovrtx import Device
+
+        # A camera cut invalidates temporal accumulation; restart it and let it converge.
+        rtx.reset(time=0.0)
+        products = None
+        for _ in range(max(int(samples), 1)):
+            products = rtx.step(render_products={self._render_product_path}, delta_time=0.0)
+        for product in products.values():
+            for frame in product.frames:
+                ldr_color = _ldr_color_var(frame)
+                if ldr_color is not None:
+                    with ldr_color.map(device=Device.CPU) as mapping:
+                        return np.array(np.from_dlpack(mapping), copy=True)[..., :3]
+        raise RuntimeError("OVRTX produced no LdrColor output")
 
     def _to_framebuffer_coords(self, x: float, y: float) -> tuple[float, float]:
         """Map a window-space mouse point to render-target pixel coordinates.

@@ -4,6 +4,7 @@
 """Exercise real CPU sensor observations and optional attached OpenGL capture."""
 
 import base64
+import importlib.util
 import json
 import math
 import os
@@ -386,6 +387,34 @@ class TestMcpObservation(unittest.TestCase):
         self.assertLess(hit.mean(), 32.0 - 5.0)
         with self.assertRaises(ValueError):
             self.renderer.observe(intrinsics={"fx": 1.0}, **self.camera)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("ovrtx") is not None and wp.is_cuda_available(), "requires ovrtx and CUDA"
+    )
+    def test_rtx_backend_renders_selected_world(self):
+        """Path-trace one world with the rtx backend and rebuild after a color edit."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()))
+        builder.add_shape_sphere(body, radius=0.3, color=(0.9, 0.1, 0.1))
+        self.session.model = builder.finalize(device="cuda:0")
+        self.session.state = self.session.model.state()
+        camera = {"eye": [2.0, -2.0, 1.2], "target": [0.0, 0.0, 0.4], "width": 64, "height": 48, "samples": 4}
+        first = self.renderer.observe(backend="rtx", **camera)
+        image = _decode_png(first).astype(int)
+        self.assertEqual(image.shape, (48, 64, 3))
+        self.assertTrue(first["renderer_rebuilt"])
+        center = image[20:28, 28:36].mean(axis=(0, 1))
+        self.assertGreater(center[0], center[1] + 20)
+        again = self.renderer.observe(backend="rtx", **camera)
+        self.assertFalse(again["renderer_rebuilt"])
+        colors = self.session.model.shape_color.numpy()
+        colors[-1] = (0.1, 0.1, 0.9)
+        self.session.model.shape_color.assign(colors)
+        recolored = self.renderer.observe(backend="rtx", **camera)
+        self.assertTrue(recolored["renderer_rebuilt"])
+        center = _decode_png(recolored).astype(int)[20:28, 28:36].mean(axis=(0, 1))
+        self.assertGreater(center[2], center[0] + 20)
 
     def test_multi_view_grid_and_reference_comparison(self):
         """Tile several views in one image and compare a render against a reference photo."""

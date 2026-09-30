@@ -352,10 +352,11 @@ class ObservationRenderer:
                     raise ValueError("pick pixels must be [x, y] pairs")
                 _integer("pick x", pixel[0], 0, width - 1)
                 _integer("pick y", pixel[1], 0, height - 1)
-        aggregate_pixels = model.world_count * width * height if backend == "sensor" else width * height
+        # The sensor renders only the observed world, so the budget no longer scales with the world count.
+        aggregate_pixels = width * height
         if aggregate_pixels > self.MAX_PIXELS:
             raise ValueError(
-                f"Observation needs {aggregate_pixels} aggregate pixels (worlds x cameras x width x height); "
+                f"Observation needs {aggregate_pixels} pixels (width x height); "
                 f"limit is {self.MAX_PIXELS}. Reduce resolution."
             )
         frame = self._scene_frame(world_id) if pose is None and eye is None else None
@@ -738,10 +739,10 @@ class ObservationRenderer:
         if key != self._buffer_key:
             self._outputs = {}
             self._rays = self._sensor.utils.compute_camera_rays_pinhole(width, height, camera_fovs=math.radians(fov_y))
-            self._transforms = wp.empty((1, model.world_count), dtype=wp.transform, device=model.device)
+            self._transforms = wp.empty((1, 1), dtype=wp.transform, device=model.device)
             self._buffer_key = key
-        transform = np.broadcast_to(np.asarray(pose, dtype=np.float32), (1, model.world_count, 7)).copy()
-        self._transforms.assign(transform)
+        self._transforms.assign(np.asarray(pose, dtype=np.float32).reshape(1, 1, 7))
+        world_ids = wp.array([world_id], dtype=wp.int32, device=model.device)
         overlay = self._overlay_meshes() if channel == "color" else []
         needed = {channel}
         if contacts or overlay:
@@ -755,7 +756,7 @@ class ObservationRenderer:
         for name in needed:
             if name not in self._outputs:
                 create = getattr(self._sensor.utils, f"create_{name}_image_output")
-                self._outputs[name] = create(width, height)
+                self._outputs[name] = create(width, height, world_count=1)
         model.bvh_refit_shapes(state)
         model.bvh_refit_particles(state)
         config = SensorTiledCamera.RenderConfig(enable_shadows=shadows, enable_textures=textures)
@@ -764,13 +765,14 @@ class ObservationRenderer:
             self._transforms,
             self._rays,
             render_config=config,
+            world_ids=world_ids,
             **{f"{name}_image": output for name, output in self._outputs.items()},
         )
         if overlay:
-            arrays = {name: output[world_id, 0].numpy() for name, output in self._outputs.items()}
+            arrays = {name: output[0, 0].numpy() for name, output in self._outputs.items()}
             self._composite_overlay(arrays, overlay, width, height, fov_y, pose, shadows)
             for name, values in arrays.items():
-                self._outputs[name][world_id, 0].assign(values)
+                self._outputs[name][0, 0].assign(values)
         environment_metadata = {}
         if channel == "color" and (environment or supersample > 1):
             color, environment_metadata = self._finish_color(
@@ -778,7 +780,7 @@ class ObservationRenderer:
             )
         arrays = {}
         for name, output in self._outputs.items():
-            values = output[world_id, 0].numpy()
+            values = output[0, 0].numpy()
             arrays[name] = values[supersample // 2 :: supersample, supersample // 2 :: supersample][
                 :base_height, :base_width
             ]
@@ -816,9 +818,9 @@ class ObservationRenderer:
             _finish_color,
             dim=(height, width),
             inputs=[
-                self._outputs["color"][world_id, 0],
-                self._outputs["shape_index"][world_id, 0] if environment else dummy,
-                self._outputs["depth"][world_id, 0] if environment else dummy_depth,
+                self._outputs["color"][0, 0],
+                self._outputs["shape_index"][0, 0] if environment else dummy,
+                self._outputs["depth"][0, 0] if environment else dummy_depth,
                 self._rays[0],
                 wp.mat33f(*rotation.flatten()),
                 wp.vec3f(*np.asarray(pose[:3], dtype=np.float32)),

@@ -128,15 +128,16 @@ class TestMcpObservation(unittest.TestCase):
         np.testing.assert_allclose(_decode_png(depth)[32, 32], [152, 152, 152], atol=1)
 
     def test_limits_and_unsupported_features(self):
-        """Reject aggregate allocations and unsupported options before rendering."""
+        """Budget pixels per observed world and reject unsupported options before rendering."""
         original_count = self.model.world_count
         self.model.world_count = 100
         try:
-            with self.assertRaisesRegex(ValueError, "aggregate pixels"):
-                self.renderer.observe(width=1024, height=1024)
-            self.assertIsNone(self.renderer._sensor)
+            # Only the observed world is rendered, so many worlds no longer multiply the budget.
+            result = self.renderer.observe(width=64, height=48, antialias=False, view="iso")
+            self.assertEqual(result["aggregate_pixels"], 64 * 48)
         finally:
             self.model.world_count = original_count
+            self.renderer.invalidate()
         for options in (
             {"wireframe": True},
             {"backend": "viewer"},
@@ -185,7 +186,7 @@ class TestMcpObservation(unittest.TestCase):
         self.assertNotEqual(red["picks"][0]["shape_id"], green["picks"][0]["shape_id"])
         self.assertIsNotNone(red["picks"][1]["shape_id"])
         self.assertEqual(red["picks"][1]["shape_id"], green["picks"][1]["shape_id"])
-        self.assertEqual(green["aggregate_pixels"], 2 * 65 * 65)
+        self.assertEqual(green["aggregate_pixels"], 65 * 65)
 
     def test_cpu_texture_toggle(self):
         """Render a real CPU mesh texture and disable it through the same sensor."""
@@ -261,11 +262,16 @@ class TestMcpObservation(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "byte_limit")
         self.renderer.MAX_RECORD_BYTES = 1024 * 1024
         self.renderer.record(action="start", **self.camera)
-        self.session.model.world_count = 10000
+        render = self.renderer._render_sensor
+
+        def failing_render(*args, **kwargs):
+            raise RuntimeError("capture failed")
+
+        self.renderer._render_sensor = failing_render
         try:
             self.renderer.after_step()
         finally:
-            self.session.model.world_count = 1
+            self.renderer._render_sensor = render
         result = self.renderer.record(action="status")
         self.assertFalse(result["active"])
         self.assertIn("capture_error", result["stop_reason"])

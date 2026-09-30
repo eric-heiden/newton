@@ -295,42 +295,50 @@ class Utils:
             stacklevel=3,
         )
 
-    def create_color_image_output(self, width: int, height: int, camera_count: int = 1) -> wp.array4d[wp.uint32]:
+    def create_color_image_output(
+        self, width: int, height: int, camera_count: int = 1, world_count: int | None = None
+    ) -> wp.array4d[wp.uint32]:
         """Create a color output array for :meth:`~newton.sensors.SensorTiledCamera.update`.
 
         Args:
             width: Image width [px].
             height: Image height [px].
             camera_count: Number of cameras.
+            world_count: Number of rendered worlds; defaults to the model world count. Pass
+                ``len(world_ids)`` when rendering a subset of worlds.
 
         Returns:
             Array of shape ``(world_count, camera_count, height, width)``, dtype ``uint32``.
         """
         return wp.zeros(
-            (self.__render_context.world_count, camera_count, height, width),
+            (self.__render_context.world_count if world_count is None else world_count, camera_count, height, width),
             dtype=wp.uint32,
             device=self.__render_context.device,
         )
 
-    def create_depth_image_output(self, width: int, height: int, camera_count: int = 1) -> wp.array4d[wp.float32]:
+    def create_depth_image_output(
+        self, width: int, height: int, camera_count: int = 1, world_count: int | None = None
+    ) -> wp.array4d[wp.float32]:
         """Create a depth output array for :meth:`~newton.sensors.SensorTiledCamera.update`.
 
         Args:
             width: Image width [px].
             height: Image height [px].
             camera_count: Number of cameras.
+            world_count: Number of rendered worlds; defaults to the model world count. Pass
+                ``len(world_ids)`` when rendering a subset of worlds.
 
         Returns:
             Array of shape ``(world_count, camera_count, height, width)``, dtype ``float32``.
         """
         return wp.zeros(
-            (self.__render_context.world_count, camera_count, height, width),
+            (self.__render_context.world_count if world_count is None else world_count, camera_count, height, width),
             dtype=wp.float32,
             device=self.__render_context.device,
         )
 
     def create_forward_depth_image_output(
-        self, width: int, height: int, camera_count: int = 1
+        self, width: int, height: int, camera_count: int = 1, world_count: int | None = None
     ) -> wp.array4d[wp.float32]:
         """Create a forward-depth output array for :meth:`~newton.sensors.SensorTiledCamera.update`.
 
@@ -338,76 +346,94 @@ class Utils:
             width: Image width [px].
             height: Image height [px].
             camera_count: Number of cameras.
+            world_count: Number of rendered worlds; defaults to the model world count. Pass
+                ``len(world_ids)`` when rendering a subset of worlds.
 
         Returns:
             Array of shape ``(world_count, camera_count, height, width)``, dtype ``float32``.
         """
-        return self.create_depth_image_output(width, height, camera_count)
+        return self.create_depth_image_output(width, height, camera_count, world_count)
 
-    def create_shape_index_image_output(self, width: int, height: int, camera_count: int = 1) -> wp.array4d[wp.uint32]:
+    def create_shape_index_image_output(
+        self, width: int, height: int, camera_count: int = 1, world_count: int | None = None
+    ) -> wp.array4d[wp.uint32]:
         """Create a shape-index output array for :meth:`~newton.sensors.SensorTiledCamera.update`.
 
         Args:
             width: Image width [px].
             height: Image height [px].
             camera_count: Number of cameras.
+            world_count: Number of rendered worlds; defaults to the model world count. Pass
+                ``len(world_ids)`` when rendering a subset of worlds.
 
         Returns:
             Array of shape ``(world_count, camera_count, height, width)``, dtype ``uint32``.
         """
         return wp.zeros(
-            (self.__render_context.world_count, camera_count, height, width),
+            (self.__render_context.world_count if world_count is None else world_count, camera_count, height, width),
             dtype=wp.uint32,
             device=self.__render_context.device,
         )
 
-    def create_normal_image_output(self, width: int, height: int, camera_count: int = 1) -> wp.array4d[wp.vec3f]:
+    def create_normal_image_output(
+        self, width: int, height: int, camera_count: int = 1, world_count: int | None = None
+    ) -> wp.array4d[wp.vec3f]:
         """Create a normal output array for :meth:`~newton.sensors.SensorTiledCamera.update`.
 
         Args:
             width: Image width [px].
             height: Image height [px].
             camera_count: Number of cameras.
+            world_count: Number of rendered worlds; defaults to the model world count. Pass
+                ``len(world_ids)`` when rendering a subset of worlds.
 
         Returns:
             Array of shape ``(world_count, camera_count, height, width)``, dtype ``vec3f``.
         """
         return wp.zeros(
-            (self.__render_context.world_count, camera_count, height, width),
+            (self.__render_context.world_count if world_count is None else world_count, camera_count, height, width),
             dtype=wp.vec3f,
             device=self.__render_context.device,
         )
 
-    def create_albedo_image_output(self, width: int, height: int, camera_count: int = 1) -> wp.array4d[wp.uint32]:
+    def create_albedo_image_output(
+        self, width: int, height: int, camera_count: int = 1, world_count: int | None = None
+    ) -> wp.array4d[wp.uint32]:
         """Create an albedo output array for :meth:`~newton.sensors.SensorTiledCamera.update`.
 
         Args:
             width: Image width [px].
             height: Image height [px].
             camera_count: Number of cameras.
+            world_count: Number of rendered worlds; defaults to the model world count. Pass
+                ``len(world_ids)`` when rendering a subset of worlds.
 
         Returns:
             Array of shape ``(world_count, camera_count, height, width)``, dtype ``uint32``.
         """
         return wp.zeros(
-            (self.__render_context.world_count, camera_count, height, width),
+            (self.__render_context.world_count if world_count is None else world_count, camera_count, height, width),
             dtype=wp.uint32,
             device=self.__render_context.device,
         )
 
-    def create_hdr_color_image_output(self, width: int, height: int, camera_count: int = 1) -> wp.array4d[wp.vec3f]:
+    def create_hdr_color_image_output(
+        self, width: int, height: int, camera_count: int = 1, world_count: int | None = None
+    ) -> wp.array4d[wp.vec3f]:
         """Create a linear HDR color output array for :meth:`~SensorTiledCamera.update`.
 
         Args:
             width: Image width [px].
             height: Image height [px].
             camera_count: Number of cameras.
+            world_count: Number of rendered worlds; defaults to the model world count. Pass
+                ``len(world_ids)`` when rendering a subset of worlds.
 
         Returns:
             Array of shape ``(world_count, camera_count, height, width)``, dtype ``vec3f``.
         """
         return wp.zeros(
-            (self.__render_context.world_count, camera_count, height, width),
+            (self.__render_context.world_count if world_count is None else world_count, camera_count, height, width),
             dtype=wp.vec3f,
             device=self.__render_context.device,
         )

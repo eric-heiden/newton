@@ -87,6 +87,7 @@ def create_kernel(
     def render_megakernel(
         # Model and Config
         world_count: wp.int32,
+        world_ids: wp.array[wp.int32],
         camera_count: wp.int32,
         light_count: wp.int32,
         img_width: wp.int32,
@@ -159,11 +160,16 @@ def create_kernel(
         if px >= img_width or py >= img_height:
             return
 
+        # Outputs and camera transforms are indexed by the rendered-world slot; scene
+        # queries use the model world that slot shows.
+        render_slot = world_index
+        world_index = world_ids[render_slot]
+
         pixels_per_camera = img_width * img_height
         pixels_per_world = camera_count * pixels_per_camera
-        out_index = world_index * pixels_per_world + camera_index * pixels_per_camera + py * img_width + px
+        out_index = render_slot * pixels_per_world + camera_index * pixels_per_camera + py * img_width + px
 
-        camera_transform = camera_transforms[camera_index, world_index]
+        camera_transform = camera_transforms[camera_index, render_slot]
         ray_origin_world = wp.transform_point(camera_transform, camera_rays[camera_index, py, px, 0])
         ray_dir_world = wp.transform_vector(camera_transform, camera_rays[camera_index, py, px, 1])
         camera_forward = wp.vec3f(0.0)

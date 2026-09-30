@@ -189,12 +189,15 @@ class SensorTiledCamera:
         clear_data: ClearData | None = None,
         render_config: RenderConfig | None = None,
         kernel_block_dim: int = 64,
+        world_ids: wp.array[wp.int32] | None = None,
     ):
-        """Render output images for all worlds and cameras.
+        """Render output images for all worlds (or the selected ``world_ids``) and cameras.
 
         Each output array has shape ``(world_count, camera_count, height, width)`` where element
         ``[world_id, camera_id, y, x]`` corresponds to the ray in ``camera_rays[camera_id, y, x]``. Each output
-        channel is optional -- pass None to skip that channel's rendering entirely.
+        channel is optional -- pass None to skip that channel's rendering entirely. When ``world_ids`` is given,
+        the leading dimension of the outputs and the second dimension of ``camera_transforms`` are
+        ``len(world_ids)`` instead of ``world_count``, and slot ``i`` renders model world ``world_ids[i]``.
 
         Shape and particle BVHs on :attr:`model` are built for the initial
         state by :meth:`~newton.ModelBuilder.finalize`. Before later frames
@@ -227,6 +230,8 @@ class SensorTiledCamera:
                 :attr:`default_render_config`.
             kernel_block_dim: Thread block dimension forwarded to ``wp.launch``
                 for the render megakernel.
+            world_ids: Indices of the model worlds to render, in output order. ``None`` renders every
+                world. Rendering a subset costs only the selected worlds' pixels.
         """
 
         with wp.ScopedTimer(
@@ -249,6 +254,7 @@ class SensorTiledCamera:
                 clear_data=clear_data if clear_data is not None else self.default_clear_data,
                 config=render_config if render_config is not None else self.default_render_config,
                 kernel_block_dim=kernel_block_dim,
+                world_ids=world_ids,
             )
 
     @property

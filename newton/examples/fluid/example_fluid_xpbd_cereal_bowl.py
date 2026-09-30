@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import tempfile
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +28,7 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.fluid.utils import parse_particle_count, resolve_particle_spacing
+from newton.examples.fluid.utils import parse_particle_count, resolve_particle_spacing, step_simulation
 
 # Cache cooked SDFs on disk so repeated runs skip the (slow) voxelization.
 _SDF_CACHE_DIR = Path(tempfile.gettempdir()) / "newton_cereal_bowl_sdf"
@@ -196,9 +195,8 @@ class Example:
             height=args.bowl_height,
             thickness=args.bowl_thickness,
         )
-        # Build an SDF on the bowl so the ~100k milk particles collide with it
-        # through one cheap SDF sample each, instead of a per-triangle mesh query
-        # against every particle (which makes the soft-contact count explode).
+        # Provision the bowl SDF for rigid-shape contacts. Fluid particles use
+        # the mesh BVH through the standard particle contact pipeline.
         bowl_mesh.build_sdf(
             max_resolution=args.sdf_resolution,
             narrow_band_range=(-0.03, 0.03),
@@ -212,7 +210,7 @@ class Example:
             color=(0.92, 0.93, 0.96),
         )
 
-        # The torus SDF handles milk contact; analytic capsules provide robust
+        # The torus mesh handles milk contact; analytic capsules provide robust
         # rigid contact while preserving each ring's hole.
         self.cereal_bodies = self._add_cereal(builder, args, spacing)
 
@@ -292,8 +290,7 @@ class Example:
         # inside the CUDA graph capture below.
         self.solver.reorder_particles(self.state_0)
 
-        # Replay the substep loop from a CUDA graph (eliminates per-substep launch
-        # overhead, which dominates this uncaptured mesh+SDF scene).
+        # Replay the substep loop from a CUDA graph to reduce launch overhead.
         self.graph = None
         self.use_cuda_graph = wp.get_device(self.model.device).is_cuda
 
@@ -308,12 +305,8 @@ class Example:
         torus_mesh = create_torus_mesh(
             args.cereal_major_radius, args.cereal_minor_radius, segments_major=12, segments_minor=8
         )
-        torus_mesh.build_sdf(
-            target_voxel_size=0.5 * spacing,
-            narrow_band_range=(-2.0 * spacing, 2.0 * spacing),
-            margin=2.0 * spacing,
-            cache_dir=_SDF_CACHE_DIR,
-        )
+        # These meshes only collide with particles, whose contacts use the
+        # triangle BVH. Cooking texture SDFs here would consume unused memory.
         collision_segments = max(args.cereal_collision_segments, 3)
         rng = np.random.default_rng(7)
         # golden-tan palette with slight per-piece variation
@@ -456,22 +449,7 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        if self.use_cuda_graph:
-            if self.graph is None:
-                try:
-                    with wp.ScopedCapture() as capture:
-                        self.simulate()
-                    self.graph = capture.graph
-                    wp.capture_launch(self.graph)
-                except Exception as exc:
-                    warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
-                    self.use_cuda_graph = False
-                    self.graph = None
-                    self.simulate()
-            else:
-                wp.capture_launch(self.graph)
-        else:
-            self.simulate()
+        step_simulation(self)
         self.sim_time += self.frame_dt
 
     def test_final(self):
@@ -618,7 +596,7 @@ class Example:
         parser.add_argument("--cereal-major-radius", type=float, default=0.016)
         parser.add_argument("--cereal-minor-radius", type=float, default=0.007)
         parser.add_argument("--cereal-collision-segments", type=int, default=8)
-        # Light like puffed cereal; the torus SDF displaces its actual milk volume.
+        # Light like puffed cereal; the torus mesh displaces its actual milk volume.
         parser.add_argument("--cereal-density", type=float, default=150.0)
         parser.add_argument(
             "--particle-count",

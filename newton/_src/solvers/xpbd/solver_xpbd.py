@@ -9,6 +9,7 @@ import warp as wp
 from ...core.types import override
 from ...geometry import ParticleFlags
 from ...sim import Contacts, Control, Model, ModelFlags, State
+from ...sim.joint_mimic import has_supported_joint_mimics
 from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
 from . import kernels, restitution_kernels
@@ -46,6 +47,7 @@ from .kernels import (
     gather_vec3,
     solve_body_contact_positions,
     solve_body_joints,
+    solve_joint_mimics,
     solve_particle_particle_contacts,
     solve_particle_shape_contacts,
     # solve_simple_body_joints,
@@ -126,11 +128,21 @@ class SolverXPBD(SolverBase, CouplingInterface):
         - :attr:`~newton.Model.joint_armature`, :attr:`~newton.Model.joint_friction`,
           :attr:`~newton.Model.joint_effort_limit`, :attr:`~newton.Model.joint_velocity_limit`,
           and :attr:`~newton.Model.joint_target_mode` are not supported.
-        - Equality and mimic constraints are not supported.
+        - Joint-owned mimic relationships are supported for PRISMATIC, REVOLUTE, and D6 joints.
+          Equality constraints and the deprecated sparse mimic constraints are not supported.
 
         See :ref:`Joint feature support` for the full comparison across solvers.
 
     Fluids:
+        .. experimental::
+
+            Fluid simulation (all ``fluid_*`` parameters),
+            particle reordering, fluid render outputs, and diffuse particles
+            (``max_diffuse_particles`` and all ``diffuse_*`` parameters) may
+            change without the normal deprecation period. Neighbor caps and
+            bounded corrections trade conservation and accuracy for stability.
+            Fluid simulation does not support gradient tracking.
+
         Particles flagged with :attr:`newton.ParticleFlags.FLUID` are simulated
         as a position-based fluid (Macklin & Müller, "Position Based Fluids",
         2013): instead of pairwise contact constraints, fluid particle pairs
@@ -147,7 +159,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         spawns Flex-style diffuse particles from a trapped-air/wave-crest
         potential over the fluid surface. The results in
         :attr:`diffuse_positions` and :attr:`diffuse_velocities` can be passed
-        to ``Viewer.log_fluid_diffuse()``.
+        to :meth:`newton.viewer.ViewerBase.log_fluid_diffuse`.
 
         .. code-block:: python
 
@@ -178,6 +190,8 @@ class SolverXPBD(SolverBase, CouplingInterface):
 
     @fluid_cohesion.setter
     def fluid_cohesion(self, value: float) -> None:
+        if not math.isfinite(value):
+            raise ValueError("fluid_cohesion must be finite")
         self._fluid_cohesion = min(max(float(value), 0.0), 1.0)
         if hasattr(self, "_fluid_rest_distance_eff"):
             self._fluid_cohesion_step = 0.02 * self._fluid_rest_distance_eff * self._fluid_cohesion
@@ -223,19 +237,31 @@ class SolverXPBD(SolverBase, CouplingInterface):
         """Initialize the XPBD solver.
 
         Args:
-            model: Model to simulate.
-            iterations: Number of XPBD constraint iterations per step.
-            soft_body_relaxation: Relaxation factor for soft body (FEM) constraints.
-            soft_contact_relaxation: Relaxation factor for particle contact constraints.
-            joint_linear_relaxation: Relaxation factor for linear joint corrections.
-            joint_angular_relaxation: Relaxation factor for angular joint corrections.
-            joint_linear_compliance: Compliance of linear joint constraints [m/N].
-            joint_angular_compliance: Compliance of angular joint constraints [rad/(N·m)].
-            rigid_contact_relaxation: Relaxation factor for rigid contact constraints.
-            rigid_contact_con_weighting: Whether to divide rigid contact corrections by the
-                number of active contacts per body.
-            angular_damping: Angular damping coefficient applied during body integration.
-            enable_restitution: Whether to apply restitution at contacts.
+            model: Simulation model to integrate.
+            iterations: Number of constraint-solver iterations per time step. Defaults to 2.
+            soft_body_relaxation: Relaxation factor applied to tetrahedral constraint corrections
+                [dimensionless]. Defaults to 0.9.
+            soft_contact_relaxation: Relaxation factor applied to particle-particle and particle-shape contact
+                corrections [dimensionless]. Defaults to 0.9.
+            joint_linear_relaxation: Relaxation factor applied to linear joint constraint corrections
+                [dimensionless]. Defaults to 0.7.
+            joint_angular_relaxation: Relaxation factor applied to angular joint constraint corrections
+                [dimensionless]. Defaults to 0.4.
+            joint_linear_compliance: Compliance shared by linear joint constraints [m/N]. Defaults to 0.0.
+            joint_angular_compliance: Compliance shared by angular joint constraints [rad/(N·m)]. Defaults to 0.0.
+            rigid_contact_relaxation: Relaxation factor applied to rigid contact constraint corrections
+                [dimensionless]. Defaults to 0.8.
+            rigid_contact_restitution_iterations: Number of outer iterations of the rigid-body restitution
+                velocity solve. Each outer iteration solves every contact manifold (body pair) independently
+                with a fixed number of inner Gauss-Seidel sweeps, then couples manifolds by averaging the
+                resulting velocity changes per body, so values above 1 primarily matter when a body
+                participates in several manifolds (or when a large manifold leaves its inner sweeps
+                under-converged). Defaults to 2.
+            rigid_contact_con_weighting: Whether to divide each rigid body's contact correction by its number of
+                active contacts. Defaults to ``True``.
+            angular_damping: Rigid-body angular velocity damping coefficient [1/s]. Defaults to 0.0.
+            enable_restitution: Whether to apply restitution to rigid and particle-shape contacts after the
+                positional solve. Defaults to ``False``.
             fluid_rest_distance: Rest spacing between fluid particles [m]. If ``None``,
                 twice the maximum particle radius is used (touching spheres). Particles
                 spawned on a grid with this spacing are exactly at rest density.
@@ -272,7 +298,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 ``0`` (default) to disable the diffuse particle layer. When enabled,
                 foam state is written to :attr:`diffuse_positions` and
                 :attr:`diffuse_velocities`, which can be passed to
-                ``Viewer.log_fluid_diffuse()``.
+                :meth:`newton.viewer.ViewerBase.log_fluid_diffuse`.
             diffuse_threshold: Trapped-air/wave-crest potential needed to emit a
                 diffuse particle. The potential favors surface particles whose
                 neighborhood is rapidly compressing or cresting.
@@ -381,6 +407,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self._update_fluid_settings()
         self._ensure_diffuse_storage()
         self._ensure_particle_grid_ready()
+        self._has_joint_mimics = has_supported_joint_mimics(model, "SolverXPBD")
 
         self._init_kinematic_state()
 
@@ -410,7 +437,10 @@ class SolverXPBD(SolverBase, CouplingInterface):
         """Refresh cached body data after model properties change.
 
         Effective inverse masses and inertia tensors are refreshed for body-property changes. The cached restitution
-        state is refreshed for shape-property changes. Other flags are ignored.
+        state is refreshed for shape-property changes. ``MODEL_PROPERTIES``
+        refreshes fluid settings after particle flags, masses, or fluid
+        parameters change; call it outside CUDA graph capture. Other flags
+        are ignored.
 
         Args:
             flags: Bitmask of :class:`~newton.ModelFlags` or custom ``int`` bits indicating which model properties
@@ -422,9 +452,15 @@ class SolverXPBD(SolverBase, CouplingInterface):
             self._refresh_kinematic_state()
         if self.enable_restitution and flags & ModelFlags.SHAPE_PROPERTIES:
             self._refresh_rigid_restitution_enabled()
-        if flags & ModelFlags.PARTICLE_PROPERTIES:
+        if flags & ModelFlags.MODEL_PROPERTIES:
             self._update_fluid_settings()
             self._ensure_particle_grid_ready()
+            if not self._has_fluid:
+                self.render_positions = None
+                self.render_anisotropy = None
+                self.render_anisotropy_secondary = None
+                self.render_anisotropy_tertiary = None
+                self.clear_diffuse_particles()
 
     def _refresh_rigid_restitution_enabled(self) -> None:
         restitution = self.model.shape_material_restitution
@@ -451,6 +487,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         model = self.model
         self._has_fluid = False
         self._all_fluid = False
+        self._fluid_particle_count = 0
         if model.particle_count == 0 or model.particle_flags is None:
             return
 
@@ -459,6 +496,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         fluid_mask = active_mask & ((flags & int(ParticleFlags.FLUID)) != 0)
         if not fluid_mask.any():
             return
+        self._fluid_particle_count = int(fluid_mask.sum())
         # whether every active particle is fluid: lets the solver skip the
         # particle-particle contact kernel entirely (fluid-fluid pairs are
         # handled by the density constraint, so that kernel would be pure waste)
@@ -467,14 +505,14 @@ class SolverXPBD(SolverBase, CouplingInterface):
         rest_distance = self.fluid_rest_distance
         if rest_distance is None:
             rest_distance = 2.0 * model.particle_max_radius
-        if rest_distance <= 0.0:
-            raise ValueError("fluid_rest_distance must be positive (or particle radii must be nonzero)")
+        if not math.isfinite(rest_distance) or rest_distance <= 0.0:
+            raise ValueError("fluid_rest_distance must be finite and positive (or particle radii must be nonzero)")
 
         h = self.fluid_smoothing_length
         if h is None:
             h = 1.8 * rest_distance
-        if h <= rest_distance:
-            raise ValueError("fluid_smoothing_length must be larger than fluid_rest_distance")
+        if not math.isfinite(h) or h <= rest_distance:
+            raise ValueError("fluid_smoothing_length must be finite and larger than fluid_rest_distance")
 
         fluid_masses = model.particle_mass.numpy()[fluid_mask]
         mean_mass = float(fluid_masses.mean())
@@ -495,8 +533,8 @@ class SolverXPBD(SolverBase, CouplingInterface):
                         r_sq = float(ix * ix + iy * iy + iz * iz) * rest_distance * rest_distance
                         lattice_sum += _poly6(r_sq, h)
             rest_density = mean_mass * lattice_sum
-        if rest_density <= 0.0:
-            raise ValueError("fluid_rest_density must be positive")
+        if not math.isfinite(rest_density) or rest_density <= 0.0:
+            raise ValueError("fluid_rest_density must be finite and positive")
 
         # scale-invariant CFM regularizer: a small fraction of the constraint-
         # gradient denominator of a particle in the bulk of the rest lattice
@@ -554,12 +592,25 @@ class SolverXPBD(SolverBase, CouplingInterface):
 
         Args:
             state: State whose ``particle_q`` defines the sort order; its
-                ``particle_q`` and ``particle_qd`` are permuted in place along
+                ``particle_q``, ``particle_qd``, and ``particle_f`` are permuted in place along
                 with the model's per-particle arrays.
         """
         model = self.model
         n = model.particle_count
         if not self._all_fluid or not self._has_fluid or model.world_count > 1 or n <= 1:
+            return
+        if model.spring_count or model.edge_count or model.tri_count or model.tet_count or model.particle_color_groups:
+            return
+        # Custom data may contain particle indices as well as particle values;
+        # leave these models alone until remapping their metadata is supported.
+        if any(
+            name not in Model._CORE_ATTRIBUTE_SPECS
+            and (
+                spec.frequency == Model.AttributeFrequency.PARTICLE
+                or spec.references == Model.AttributeFrequency.PARTICLE
+            )
+            for name, spec in model._iter_attribute_specs()
+        ):
             return
 
         dev = model.device
@@ -592,6 +643,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         for owner, name in (
             (state, "particle_q"),
             (state, "particle_qd"),
+            (state, "particle_f"),
             (model, "particle_q"),
             (model, "particle_qd"),
             (model, "particle_colors"),
@@ -637,7 +689,11 @@ class SolverXPBD(SolverBase, CouplingInterface):
     def _ensure_particle_grid_ready(self) -> None:
         """Reserve and initialize grouped-grid metadata outside graph capture."""
         model = self.model
-        if model.particle_count <= 1 or model.particle_grid is None:
+        # ModelBuilder omits the contact grid for a lone particle, but fluid
+        # rendering and diffuse emission still need to query that particle.
+        if self._has_fluid and model.particle_grid is None:
+            model.particle_grid = wp.HashGrid(1, 1, 1, device=model.device)
+        if model.particle_count == 0 or model.particle_grid is None:
             return
         with wp.ScopedDevice(model.device):
             model.particle_grid.reserve(model.particle_count)
@@ -662,7 +718,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         individual spheres. Results are written to :attr:`render_positions`,
         :attr:`render_anisotropy`, :attr:`render_anisotropy_secondary`, and
         :attr:`render_anisotropy_tertiary`, which can be passed to
-        ``Viewer.log_fluid()``.
+        :meth:`newton.viewer.ViewerBase.log_fluid`.
 
         Args:
             state: State whose ``particle_q``/``particle_qd`` are used.
@@ -680,7 +736,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
 
         n = model.particle_count
         render_count = n if max_particles <= 0 else min(int(max_particles), n)
-        if smoothing <= 0.0 and anisotropy_scale <= 0.0:
+        if smoothing <= 0.0 and anisotropy_scale <= 0.0 and self._fluid_particle_count == n:
             if render_count == n:
                 self.render_positions = state.particle_q
             else:
@@ -803,7 +859,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         if self.diffuse_frame_seed is not None:
             self.diffuse_frame_seed.zero_()
 
-    def _step_diffuse_particles(self, state_out: State, dt: float) -> None:
+    def _step_diffuse_particles(self, state_out: State, dt: float, *, grid_is_current: bool = False) -> None:
         """Advance, spawn, and collide the diffuse foam/spray layer.
 
         Runs over the final particle state of a step. Spawning reuses the
@@ -819,7 +875,8 @@ class SolverXPBD(SolverBase, CouplingInterface):
         bounds_lower = wp.vec3(-1.0e9, -1.0e9, -1.0e9)
         bounds_upper = wp.vec3(1.0e9, 1.0e9, 1.0e9)
 
-        self._build_particle_grid(state_out.particle_q, h)
+        if not grid_is_current:
+            self._build_particle_grid(state_out.particle_q, h)
 
         wp.launch(
             kernel=update_fluid_diffuse_particles,
@@ -951,6 +1008,60 @@ class SolverXPBD(SolverBase, CouplingInterface):
             device=model.device,
         )
 
+    def _solve_particle_shape_contacts(
+        self,
+        particle_q,
+        particle_qd,
+        body_q,
+        body_qd,
+        contacts: Contacts,
+        dt: float,
+        particle_deltas,
+        body_deltas,
+        *,
+        required_particle_flags: int = 0,
+        static_contacts_only: bool = False,
+        apply_body_reaction: bool = True,
+        relaxation: float | None = None,
+    ) -> None:
+        """Project particle contacts with optional fluid and static-shape filters."""
+        model = self.model
+        wp.launch(
+            kernel=solve_particle_shape_contacts,
+            dim=contacts.soft_contact_max,
+            inputs=[
+                particle_q,
+                particle_qd,
+                model.particle_inv_mass,
+                model.particle_radius,
+                model.particle_flags,
+                wp.int32(required_particle_flags),
+                wp.int32(static_contacts_only),
+                wp.int32(apply_body_reaction),
+                body_q,
+                body_qd,
+                model.body_com,
+                self.body_inv_mass_effective,
+                self.body_inv_inertia_effective,
+                model.body_flags,
+                model.shape_body,
+                model.shape_material_mu,
+                model.soft_contact_mu,
+                model.particle_adhesion,
+                contacts.soft_contact_count,
+                contacts.soft_contact_particle,
+                contacts.soft_contact_shape,
+                contacts.soft_contact_body_pos,
+                contacts.soft_contact_body_vel,
+                contacts.soft_contact_normal,
+                contacts.soft_contact_max,
+                dt,
+                self.soft_contact_relaxation if relaxation is None else relaxation,
+            ],
+            outputs=[particle_deltas, body_deltas],
+            device=model.device,
+        )
+
     def _apply_particle_deltas(
         self,
         model: Model,
@@ -1076,6 +1187,8 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self._ensure_restitution_module_options()
         self._apply_module_options()
         requires_grad = state_in.requires_grad
+        if self._has_fluid and requires_grad:
+            raise NotImplementedError("XPBD fluid simulation does not support gradient tracking")
         self._particle_delta_counter = 0
         self._body_delta_counter = 0
 
@@ -1166,7 +1279,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                     self.particle_qd_init = wp.clone(state_out.particle_qd)
 
                 # Build/update the particle hash grid for particle-particle contact queries
-                if model.particle_count > 1 and model.particle_grid is not None:
+                if model.particle_count and model.particle_grid is not None:
                     # Search radius must cover the maximum interaction distance used by the contact query
                     search_radius = model.particle_max_radius * 2.0 + model.particle_cohesion
                     if self._has_fluid:
@@ -1262,6 +1375,10 @@ class SolverXPBD(SolverBase, CouplingInterface):
                             body_deltas.zero_()
 
                     if model.particle_count:
+                        if i > 0 and self._has_fluid and model.particle_grid is not None:
+                            # Pressure and shape projection can move particles
+                            # across cells; the next solve needs their new bins.
+                            self._build_particle_grid(particle_q, search_radius)
                         if requires_grad and i > 0:
                             particle_deltas = wp.zeros_like(particle_deltas)
                         else:
@@ -1270,41 +1387,15 @@ class SolverXPBD(SolverBase, CouplingInterface):
                         # particle-rigid body contacts (besides ground plane)
                         if model.shape_count and contacts is not None:
                             contacts._assert_particle_only_soft_contacts("SolverXPBD")
-                            wp.launch(
-                                kernel=solve_particle_shape_contacts,
-                                dim=contacts.soft_contact_max,
-                                inputs=[
-                                    particle_q,
-                                    particle_qd,
-                                    model.particle_inv_mass,
-                                    model.particle_radius,
-                                    model.particle_flags,
-                                    wp.int32(0),
-                                    wp.int32(0),
-                                    wp.int32(1),
-                                    body_q,
-                                    body_qd,
-                                    model.body_com,
-                                    self.body_inv_mass_effective,
-                                    self.body_inv_inertia_effective,
-                                    model.body_flags,
-                                    model.shape_body,
-                                    model.shape_material_mu,
-                                    model.soft_contact_mu,
-                                    model.particle_adhesion,
-                                    contacts.soft_contact_count,
-                                    contacts.soft_contact_particle,
-                                    contacts.soft_contact_shape,
-                                    contacts.soft_contact_body_pos,
-                                    contacts.soft_contact_body_vel,
-                                    contacts.soft_contact_normal,
-                                    contacts.soft_contact_max,
-                                    dt,
-                                    self.soft_contact_relaxation,
-                                ],
-                                # outputs
-                                outputs=[particle_deltas, body_deltas],
-                                device=model.device,
+                            self._solve_particle_shape_contacts(
+                                particle_q,
+                                particle_qd,
+                                body_q,
+                                body_qd,
+                                contacts,
+                                dt,
+                                particle_deltas,
+                                body_deltas,
                             )
 
                         # Particle-particle contacts. Skipped entirely when every
@@ -1336,7 +1427,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                             )
 
                         # position-based fluid density constraints
-                        if self._has_fluid and model.particle_count > 1 and model.particle_grid is not None:
+                        if self._has_fluid and model.particle_grid is not None:
                             wp.launch(
                                 kernel=compute_fluid_lambdas,
                                 dim=model.particle_count,
@@ -1449,88 +1540,45 @@ class SolverXPBD(SolverBase, CouplingInterface):
                         # otherwise pressure-induced impulses lose momentum.
                         if self._has_fluid and model.shape_count and contacts is not None:
                             particle_deltas.zero_()
-                            wp.launch(
-                                kernel=solve_particle_shape_contacts,
-                                dim=contacts.soft_contact_max,
-                                inputs=[
-                                    particle_q,
-                                    particle_qd,
-                                    model.particle_inv_mass,
-                                    model.particle_radius,
-                                    model.particle_flags,
-                                    wp.int32(ParticleFlags.FLUID),
-                                    wp.int32(0),
-                                    wp.int32(1),
-                                    body_q,
-                                    body_qd,
-                                    model.body_com,
-                                    self.body_inv_mass_effective,
-                                    self.body_inv_inertia_effective,
-                                    model.body_flags,
-                                    model.shape_body,
-                                    model.shape_material_mu,
-                                    model.soft_contact_mu,
-                                    model.particle_adhesion,
-                                    contacts.soft_contact_count,
-                                    contacts.soft_contact_particle,
-                                    contacts.soft_contact_shape,
-                                    contacts.soft_contact_body_pos,
-                                    contacts.soft_contact_body_vel,
-                                    contacts.soft_contact_normal,
-                                    contacts.soft_contact_max,
-                                    dt,
-                                    1.0,
-                                ],
-                                outputs=[particle_deltas, body_deltas],
-                                device=model.device,
+                            self._solve_particle_shape_contacts(
+                                particle_q,
+                                particle_qd,
+                                body_q,
+                                body_qd,
+                                contacts,
+                                dt,
+                                particle_deltas,
+                                body_deltas,
+                                required_particle_flags=ParticleFlags.FLUID,
+                                relaxation=1.0,
                             )
                             particle_q, particle_qd = self._apply_particle_deltas(
                                 model, state_in, state_out, particle_deltas, dt
                             )
 
-                            # A dynamic object can squeeze fluid against a fixed
-                            # boundary. Resolve fixed contacts once more so an
-                            # opposing dynamic contact cannot average away the
-                            # container constraint.
-                            particle_deltas.zero_()
-                            wp.launch(
-                                kernel=solve_particle_shape_contacts,
-                                dim=contacts.soft_contact_max,
-                                inputs=[
+                            if model.body_count:
+                                # A dynamic object can squeeze fluid against a fixed
+                                # boundary. Resolve fixed contacts once more so an
+                                # opposing dynamic contact cannot average away the
+                                # container constraint.
+                                particle_deltas.zero_()
+                                self._solve_particle_shape_contacts(
                                     particle_q,
                                     particle_qd,
-                                    model.particle_inv_mass,
-                                    model.particle_radius,
-                                    model.particle_flags,
-                                    wp.int32(ParticleFlags.FLUID),
-                                    wp.int32(1),
-                                    wp.int32(0),
                                     body_q,
                                     body_qd,
-                                    model.body_com,
-                                    self.body_inv_mass_effective,
-                                    self.body_inv_inertia_effective,
-                                    model.body_flags,
-                                    model.shape_body,
-                                    model.shape_material_mu,
-                                    model.soft_contact_mu,
-                                    model.particle_adhesion,
-                                    contacts.soft_contact_count,
-                                    contacts.soft_contact_particle,
-                                    contacts.soft_contact_shape,
-                                    contacts.soft_contact_body_pos,
-                                    contacts.soft_contact_body_vel,
-                                    contacts.soft_contact_normal,
-                                    contacts.soft_contact_max,
+                                    contacts,
                                     dt,
-                                    1.0,
-                                ],
-                                outputs=[particle_deltas, body_deltas],
-                                device=model.device,
-                            )
-                            particle_q, particle_qd = self._apply_particle_deltas(
-                                model, state_in, state_out, particle_deltas, dt
-                            )
+                                    particle_deltas,
+                                    body_deltas,
+                                    required_particle_flags=ParticleFlags.FLUID,
+                                    relaxation=1.0,
+                                    static_contacts_only=True,
+                                    apply_body_reaction=False,
+                                )
+                                particle_q, particle_qd = self._apply_particle_deltas(
+                                    model, state_in, state_out, particle_deltas, dt
+                                )
 
                     # Apply fluid/soft-body reaction as its own weighted
                     # manifold. Mixing these corrections with rigid contacts
@@ -1585,6 +1633,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                 contacts.rigid_contact_count,
                                 contacts.rigid_contact_point0,
                                 contacts.rigid_contact_point1,
+                                contacts.rigid_contact_surface_velocity,
                                 contacts.rigid_contact_offset0,
                                 contacts.rigid_contact_offset1,
                                 contacts.rigid_contact_normal,
@@ -1676,15 +1725,46 @@ class SolverXPBD(SolverBase, CouplingInterface):
                             device=model.device,
                         )
 
+                        if self._has_joint_mimics:
+                            wp.launch(
+                                kernel=solve_joint_mimics,
+                                dim=model.joint_count,
+                                inputs=[
+                                    body_q,
+                                    model.body_com,
+                                    self.body_inv_mass_effective,
+                                    self.body_inv_inertia_effective,
+                                    model.joint_type,
+                                    model.joint_enabled,
+                                    model.joint_parent,
+                                    model.joint_child,
+                                    model.joint_X_p,
+                                    model.joint_X_c,
+                                    model.joint_qd_start,
+                                    model.joint_dof_dim,
+                                    model.joint_axis,
+                                    model.joint_mimic_joint,
+                                    model.joint_mimic_coeffs,
+                                    self.joint_angular_relaxation,
+                                    self.joint_linear_relaxation,
+                                    dt,
+                                ],
+                                outputs=[body_deltas, joint_impulse],
+                                device=model.device,
+                            )
+
                         body_q, body_qd = self._apply_body_deltas(model, state_in, state_out, body_deltas, dt)
 
             # post-projection fluid velocity pass: viscosity and vorticity confinement
+            fluid_grid_current = False
             if (
                 model.particle_count
                 and self._has_fluid
                 and model.particle_grid is not None
                 and (self.fluid_viscosity > 0.0 or self.fluid_vorticity_confinement > 0.0)
             ):
+                self._build_particle_grid(particle_q, search_radius)
+                fluid_grid_current = True
                 if self.fluid_vorticity_confinement > 0.0:
                     wp.launch(
                         kernel=compute_fluid_vorticity,
@@ -1966,7 +2046,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 and not requires_grad
             ):
                 self._ensure_diffuse_storage()
-                self._step_diffuse_particles(state_out, dt)
+                self._step_diffuse_particles(state_out, dt, grid_is_current=fluid_grid_current)
 
     @override
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:

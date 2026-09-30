@@ -18,14 +18,12 @@
 
 from __future__ import annotations
 
-import warnings
-
 import numpy as np
 import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.fluid.utils import parse_particle_count, resolve_particle_grid
+from newton.examples.fluid.utils import parse_particle_count, resolve_particle_grid, step_simulation
 
 _REFERENCE_SPACING = 0.0205
 _FLUID_SIZE = (34 * _REFERENCE_SPACING, 49 * _REFERENCE_SPACING, 59 * _REFERENCE_SPACING)
@@ -144,22 +142,7 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        if self.use_cuda_graph:
-            if self.graph is None:
-                try:
-                    with wp.ScopedCapture() as capture:
-                        self.simulate()
-                    self.graph = capture.graph
-                    wp.capture_launch(self.graph)
-                except Exception as exc:
-                    warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
-                    self.use_cuda_graph = False
-                    self.graph = None
-                    self.simulate()
-            else:
-                wp.capture_launch(self.graph)
-        else:
-            self.simulate()
+        step_simulation(self)
         self.sim_time += self.frame_dt
 
     def test_final(self):
@@ -218,7 +201,7 @@ class Example:
             self.viewer.log_fluid_diffuse(
                 "/model/fluid/diffuse",
                 self.solver.diffuse_positions,
-                self.solver.diffuse_velocities,
+                velocities=self.solver.diffuse_velocities,
                 radius=0.006,
                 color=(0.9, 0.95, 1.0, 1.1),
                 motion_blur_scale=3.0,

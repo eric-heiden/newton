@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import tempfile
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -25,10 +24,12 @@ import warp as wp
 import newton
 import newton.examples
 from newton.examples.fluid.utils import (
+    build_cup_mesh,
     cylinder_particle_count,
     cylinder_particle_positions,
     parse_particle_count,
     resolve_particle_spacing,
+    step_simulation,
 )
 
 # Share the same cooked SDF cache as the single-cup example.
@@ -54,11 +55,15 @@ def _compact_world_positions(
     src: wp.array[wp.vec3],
     mask: wp.array[wp.int32],
     offsets: wp.array[wp.int32],
-    world_offset: wp.vec3,
+    world_offsets: wp.array[wp.vec3],
+    world: int,
     dst: wp.array[wp.vec3],
 ):
     i = wp.tid()
     if mask[i] == wp.int32(1):
+        world_offset = wp.vec3(0.0)
+        if world_offsets:
+            world_offset = world_offsets[world]
         dst[offsets[i]] = src[i] + world_offset
 
 
@@ -128,7 +133,7 @@ class Example:
         builder.default_particle_radius = radius
         builder.default_shape_cfg.mu = 0.2
 
-        cup_mesh = self._build_cup_mesh(self.inner_radius, wall_thickness, self.cup_height)
+        cup_mesh = build_cup_mesh(self.inner_radius, wall_thickness, self.cup_height)
         cup_mesh.build_sdf(
             max_resolution=args.sdf_resolution,
             narrow_band_range=(-0.03, 0.03),
@@ -137,6 +142,7 @@ class Example:
         )
 
         self.cup_bodies: list[int] = []
+        self._world_particle_counts = []
         cup_colors = (
             (0.65, 0.84, 0.94),
             (0.95, 0.63, 0.42),
@@ -155,7 +161,9 @@ class Example:
                 color=cup_colors[world],
                 opacity=args.cup_opacity,
             )
+            particle_start = builder.particle_count
             self._fill_water(builder, args, wall_thickness)
+            self._world_particle_counts.append(builder.particle_count - particle_start)
             builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.6))
             builder.end_world()
 
@@ -207,42 +215,6 @@ class Example:
         self.use_cuda_graph = wp.get_device(self.model.device).is_cuda
         self._graph_key = None
 
-    @staticmethod
-    def _build_cup_mesh(inner_radius, wall_thickness, height, segments=48):
-        """Closed solid of revolution: a cylindrical cup with an open cavity."""
-        ri = inner_radius
-        ro = inner_radius + wall_thickness
-        t = wall_thickness
-        profile = [(ro, 0.0), (ro, height), (ri, height), (ri, t)]
-        vertices = []
-        for i in range(segments):
-            angle = 2.0 * np.pi * i / segments
-            c, sn = np.cos(angle), np.sin(angle)
-            for r, z in profile:
-                vertices.append((r * c, r * sn, z))
-        bottom_center = len(vertices)
-        vertices.append((0.0, 0.0, 0.0))
-        cavity_center = len(vertices)
-        vertices.append((0.0, 0.0, t))
-
-        rows = len(profile)
-        indices = []
-        for i in range(segments):
-            j = (i + 1) % segments
-            for k in range(rows - 1):
-                a = i * rows + k
-                b = i * rows + k + 1
-                c0 = j * rows + k
-                d = j * rows + k + 1
-                indices += [a, c0, b, b, c0, d]
-            indices += [i * rows + 0, bottom_center, j * rows + 0]
-            indices += [i * rows + rows - 1, j * rows + rows - 1, cavity_center]
-
-        return newton.Mesh(
-            np.asarray(vertices, dtype=np.float32),
-            np.asarray(indices, dtype=np.int32),
-        )
-
     def _fill_water(self, builder, args, wall_thickness):
         spacing = self.particle_spacing
         radius = 0.5 * spacing
@@ -283,24 +255,7 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        if self.use_cuda_graph:
-            key = self._graph_key_tuple()
-            if self.graph is None or key != self._graph_key:
-                try:
-                    with wp.ScopedCapture() as capture:
-                        self.simulate()
-                    self.graph = capture.graph
-                    self._graph_key = key
-                    wp.capture_launch(self.graph)
-                except Exception as exc:
-                    warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
-                    self.use_cuda_graph = False
-                    self.graph = None
-                    self.simulate()
-            else:
-                wp.capture_launch(self.graph)
-        else:
-            self.simulate()
+        step_simulation(self, self._graph_key_tuple())
         self.sim_time += self.frame_dt
 
     def gui(self, ui):
@@ -382,15 +337,6 @@ class Example:
                 cache[name] = wp.empty(count, dtype=dtype, device=self.model.device)
         return cache
 
-    def _visual_world_offset(self, world: int) -> wp.vec3:
-        if self.viewer.world_offsets is None:
-            return wp.vec3(0.0)
-        offsets = self.viewer.world_offsets.numpy()
-        if world < 0 or world >= len(offsets):
-            return wp.vec3(0.0)
-        offset = offsets[world]
-        return wp.vec3(float(offset[0]), float(offset[1]), float(offset[2]))
-
     def _compact_world_render_particles(self, world: int) -> tuple[dict[str, wp.array], int] | tuple[None, int]:
         n = self.model.particle_count
         wp.launch(
@@ -400,12 +346,12 @@ class Example:
             device=self.model.device,
         )
         wp.utils.array_scan(self._render_world_mask, self._render_world_offsets, inclusive=False)
-        count = int(self._render_world_offsets[-1:].numpy()[0]) + int(self._render_world_mask[-1:].numpy()[0])
+        # Spatial sorting changes particle order, but never world membership.
+        count = self._world_particle_counts[world]
         if count == 0:
             return None, 0
 
         cache = self._ensure_world_render_cache(world, count)
-        visual_offset = self._visual_world_offset(world)
         wp.launch(
             _compact_world_positions,
             dim=n,
@@ -413,7 +359,8 @@ class Example:
                 self.solver.render_positions,
                 self._render_world_mask,
                 self._render_world_offsets,
-                visual_offset,
+                self.viewer.world_offsets,
+                world,
                 cache["positions"],
             ],
             device=self.model.device,

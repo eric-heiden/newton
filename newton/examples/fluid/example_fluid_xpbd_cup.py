@@ -8,9 +8,8 @@
 # fluid, that you grab and swing around with the mouse. It is the minimal
 # "fluid in a moving container" scene -- the common robotics case of a
 # gripper carrying a cup -- stripped of the arm/IK so it is easy to profile
-# and tune. The cup carries a texture SDF, so the water collides with it via
-# one cheap SDF sample per particle, and the whole substep loop is captured
-# in a CUDA graph for high frame rates.
+# and tune. Water contacts query the cup's mesh BVH, and the whole substep
+# loop is captured in a CUDA graph for high frame rates.
 #
 # Command: python -m newton.examples fluid_xpbd_cup
 #
@@ -19,7 +18,6 @@
 from __future__ import annotations
 
 import tempfile
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -28,10 +26,12 @@ import warp as wp
 import newton
 import newton.examples
 from newton.examples.fluid.utils import (
+    build_cup_mesh,
     cylinder_particle_count,
     cylinder_particle_positions,
     parse_particle_count,
     resolve_particle_spacing,
+    step_simulation,
 )
 
 # Cache the cooked cup SDF on disk so repeated runs skip the voxelization.
@@ -83,9 +83,9 @@ class Example:
             xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
             label="cup",
         )
-        cup_mesh = self._build_cup_mesh(self.inner_radius, wall_thickness, self.cup_height)
-        # An SDF on the cup lets the water collide with it via one cheap sample
-        # per particle instead of a per-triangle mesh query.
+        cup_mesh = build_cup_mesh(self.inner_radius, wall_thickness, self.cup_height)
+        # Provision a texture SDF for rigid contacts involving the cup mesh.
+        # Fluid-particle contacts use the mesh BVH.
         cup_mesh.build_sdf(
             max_resolution=args.sdf_resolution,
             narrow_band_range=(-0.03, 0.03),
@@ -169,42 +169,6 @@ class Example:
         self.use_cuda_graph = wp.get_device(self.model.device).is_cuda
         self._graph_key = None
 
-    @staticmethod
-    def _build_cup_mesh(inner_radius, wall_thickness, height, segments=48):
-        """Closed solid of revolution: a cylindrical cup with an open cavity."""
-        ri = inner_radius
-        ro = inner_radius + wall_thickness
-        t = wall_thickness
-        profile = [(ro, 0.0), (ro, height), (ri, height), (ri, t)]
-        vertices = []
-        for i in range(segments):
-            angle = 2.0 * np.pi * i / segments
-            c, sn = np.cos(angle), np.sin(angle)
-            for r, z in profile:
-                vertices.append((r * c, r * sn, z))
-        bottom_center = len(vertices)
-        vertices.append((0.0, 0.0, 0.0))
-        cavity_center = len(vertices)
-        vertices.append((0.0, 0.0, t))
-
-        rows = len(profile)
-        indices = []
-        for i in range(segments):
-            j = (i + 1) % segments
-            for k in range(rows - 1):
-                a = i * rows + k
-                b = i * rows + k + 1
-                c0 = j * rows + k
-                d = j * rows + k + 1
-                indices += [a, c0, b, b, c0, d]
-            indices += [i * rows + 0, bottom_center, j * rows + 0]
-            indices += [i * rows + rows - 1, j * rows + rows - 1, cavity_center]
-
-        return newton.Mesh(
-            np.asarray(vertices, dtype=np.float32),
-            np.asarray(indices, dtype=np.int32),
-        )
-
     def _fill_water(self, builder, args, wall_thickness):
         """Fill the cup cavity with a column of fluid at rest spacing.
 
@@ -253,24 +217,7 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        if self.use_cuda_graph:
-            key = self._graph_key_tuple()
-            if self.graph is None or key != self._graph_key:
-                try:
-                    with wp.ScopedCapture() as capture:
-                        self.simulate()
-                    self.graph = capture.graph
-                    self._graph_key = key
-                    wp.capture_launch(self.graph)
-                except Exception as exc:
-                    warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
-                    self.use_cuda_graph = False
-                    self.graph = None
-                    self.simulate()
-            else:
-                wp.capture_launch(self.graph)
-        else:
-            self.simulate()
+        step_simulation(self, self._graph_key_tuple())
         self.sim_time += self.frame_dt
 
     def gui(self, ui):

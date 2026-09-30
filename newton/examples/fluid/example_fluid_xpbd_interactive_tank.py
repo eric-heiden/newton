@@ -17,8 +17,6 @@
 
 from __future__ import annotations
 
-import warnings
-
 import numpy as np
 import warp as wp
 
@@ -29,6 +27,7 @@ from newton.examples.fluid.utils import (
     ignore_shapes_for_picking,
     parse_particle_count,
     resolve_particle_grid,
+    step_simulation,
 )
 
 _REFERENCE_SPACING = 0.02
@@ -118,7 +117,7 @@ class Example:
             x = (column - 1) * 0.34
             y = -0.16 + row * 0.32
             half = args.box_half_extent * (0.85 + 0.12 * (i % 3))
-            q = wp.quat_from_axis_angle(wp.vec3(0.2, 0.8, 0.1), 0.2 * float(i))
+            q = wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.2, 0.8, 0.1)), 0.2 * float(i))
             density = float(fractions[i % len(fractions)]) * args.rest_density
             body = builder.add_body(
                 xform=wp.transform(wp.vec3(x, y, water_top + 0.25 + 0.05 * float(i)), q),
@@ -223,24 +222,7 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        if self.use_cuda_graph:
-            key = self._graph_key_tuple()
-            if self.graph is None or key != self._graph_key:
-                try:
-                    with wp.ScopedCapture() as capture:
-                        self.simulate()
-                    self.graph = capture.graph
-                    self._graph_key = key
-                    wp.capture_launch(self.graph)
-                except Exception as exc:
-                    warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
-                    self.use_cuda_graph = False
-                    self.graph = None
-                    self.simulate()
-            else:
-                wp.capture_launch(self.graph)
-        else:
-            self.simulate()
+        step_simulation(self, self._graph_key_tuple())
         self.sim_time += self.frame_dt
 
     def gui(self, ui):
@@ -334,7 +316,7 @@ class Example:
             self.viewer.log_fluid_diffuse(
                 "/model/fluid/diffuse",
                 self.solver.diffuse_positions,
-                self.solver.diffuse_velocities,
+                velocities=self.solver.diffuse_velocities,
                 radius=self.foam_radius,
                 color=(0.9, 0.95, 1.0, self.foam_opacity),
                 motion_blur_scale=self.foam_stretch,

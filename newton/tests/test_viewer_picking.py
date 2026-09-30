@@ -200,6 +200,15 @@ class TestPickingSetup(unittest.TestCase):
         self.assertTrue(picking.is_picking())
         self.assertEqual(picking.pick_body.numpy()[0], body)
 
+    def test_pick_mask_preserves_truthy_values(self):
+        """Treat fractional nonzero mask values as pickable shapes."""
+        model, _, body = _make_static_wall_dynamic_back_model(device="cpu")
+        picking = Picking(model)
+        picking.set_pickable_shapes([0.0, 0.5])
+        picking.pick(model.state(), wp.vec3(0.0, 0.0, -3.0), wp.vec3(0.0, 0.0, 1.0))
+        self.assertTrue(picking.is_picking())
+        self.assertEqual(picking.pick_body.numpy()[0], body)
+
     def test_pick_empty_model_no_crash(self):
         """pick() with a model that has no shapes returns without error."""
         model = _make_model_no_shapes(device="cpu")

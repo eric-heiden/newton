@@ -34,7 +34,7 @@ def _reserve_diffuse_slot_kernel(
 
 
 def _build_fluid_grid(device, dims=(6, 6, 6), spacing=SPACING, gravity=0.0, ground=False, z0=0.0, fluid=True):
-    builder = newton.ModelBuilder(up_axis="Z", gravity=gravity)
+    builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, gravity))
     builder.add_particle_grid(
         pos=wp.vec3(0.0, 0.0, z0),
         rot=wp.quat_identity(),
@@ -56,7 +56,7 @@ def _build_fluid_grid(device, dims=(6, 6, 6), spacing=SPACING, gravity=0.0, grou
 
 
 def _build_overlapping_world_fluid_grids(device, dims=(4, 4, 4)):
-    builder = newton.ModelBuilder(up_axis="Z", gravity=0.0)
+    builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, 0.0))
     builder.default_particle_radius = RADIUS
     for _ in range(2):
         builder.begin_world()
@@ -83,11 +83,12 @@ def _simulate(model, steps, ground=False, iterations=3, dt=1.0 / 240.0, **solver
     solver = newton.solvers.SolverXPBD(model, iterations=iterations, fluid_rest_distance=SPACING, **solver_kwargs)
     state_0 = model.state()
     state_1 = model.state()
-    contacts = model.contacts() if ground else None
+    collision_pipeline = newton.CollisionPipeline(model) if ground else None
+    contacts = collision_pipeline.contacts() if collision_pipeline is not None else None
     for _ in range(steps):
         state_0.clear_forces()
         if ground:
-            model.collide(state_0, contacts)
+            collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, None, contacts, dt)
         state_0, state_1 = state_1, state_0
     return state_0, solver
@@ -207,12 +208,13 @@ def test_fluid_density_corrections_do_not_cancel_shape_contacts(test, device):
         fluid_cohesion=0.0,
     )
     state_0, state_1 = model.state(), model.state()
-    contacts = model.contacts()
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
 
     minimum_height = float("inf")
     for _ in range(5):
         state_0.clear_forces()
-        model.collide(state_0, contacts)
+        collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, None, contacts, dt)
         state_0, state_1 = state_1, state_0
         minimum_height = min(minimum_height, float(state_0.particle_q.numpy()[:, 2].min()))
@@ -227,7 +229,7 @@ def test_fluid_density_corrections_do_not_cancel_shape_contacts(test, device):
 def test_fluid_pressure_reprojection_conserves_momentum(test, device):
     """A rigid body must receive the reaction from a post-pressure contact correction."""
     particle_mass = 0.125
-    builder = newton.ModelBuilder(up_axis="Z", gravity=0.0)
+    builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, 0.0))
     builder.default_particle_radius = RADIUS
     builder.add_particles(
         pos=[wp.vec3(0.0), wp.vec3(-0.01, 0.0, 0.0)],
@@ -248,8 +250,9 @@ def test_fluid_pressure_reprojection_conserves_momentum(test, device):
     model.particle_max_velocity = 100.0
 
     state_0, state_1 = model.state(), model.state()
-    contacts = model.contacts()
-    model.collide(state_0, contacts)
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
+    collision_pipeline.collide(state_0, contacts)
     solver = newton.solvers.SolverXPBD(
         model,
         iterations=1,
@@ -293,7 +296,7 @@ def test_fluid_pair_coheres_without_oscillation(test, device):
     Near-isolated particles have a saturated density deficit; constraint-based
     attraction diverges for them, so this guards the bounded cohesion term.
     """
-    builder = newton.ModelBuilder(up_axis="Z", gravity=0.0)
+    builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, 0.0))
     builder.add_particles(
         pos=[wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.5 * SPACING, 0.0, 0.0)],
         vel=[wp.vec3(0.0)] * 2,
@@ -322,7 +325,7 @@ def test_fluid_pairs_skip_contact_constraints(test, device):
     """
 
     def run(fluid):
-        builder = newton.ModelBuilder(up_axis="Z", gravity=0.0)
+        builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, 0.0))
         flags = FLUID_FLAGS if fluid else newton.ParticleFlags.ACTIVE
         # closer than 2*radius: a contact constraint would push them apart
         builder.add_particles(
@@ -368,6 +371,7 @@ def test_fluid_render_particles(test, device):
 
 
 def test_fluid_render_particle_limit_and_fast_path(test, device):
+    """Limit render output while preserving the unsmoothed fast path."""
     model = _build_fluid_grid(device, dims=(4, 4, 4))
     state = model.state()
     solver = newton.solvers.SolverXPBD(model, fluid_rest_distance=SPACING)
@@ -402,7 +406,8 @@ def test_fluid_diffuse_particles_spawn_and_expire(test, device):
 
     state_0 = model.state()
     state_1 = model.state()
-    contacts = model.contacts()
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
     dt = 1.0 / 240.0
 
     def alive_count():
@@ -411,7 +416,7 @@ def test_fluid_diffuse_particles_spawn_and_expire(test, device):
     # drop and splash: foam must spawn around the impact
     for _ in range(120):
         state_0.clear_forces()
-        model.collide(state_0, contacts)
+        collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, None, contacts, dt)
         state_0, state_1 = state_1, state_0
     spawned = int(solver.diffuse_spawn_counter.numpy()[0])
@@ -427,7 +432,7 @@ def test_fluid_diffuse_particles_spawn_and_expire(test, device):
     # once the fluid settles, spawning stops and the foam expires
     for _ in range(360):
         state_0.clear_forces()
-        model.collide(state_0, contacts)
+        collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, None, contacts, dt)
         state_0, state_1 = state_1, state_0
     test.assertLess(alive_count(), alive_after_splash, "diffuse particles did not expire")
@@ -477,11 +482,11 @@ def _watertight_box_mesh(hx, hy, hz):
 
 
 def test_fluid_sdf_mesh_contains_particles(test, device):
-    """A mesh with a texture SDF should contain fluid via the SDF soft-contact path.
+    """Preserve a particle-only mesh's SDF and contain fluid on its surface.
 
-    Exercises ``create_soft_contacts_sdf`` (CUDA-only): fluid dropped onto a
-    static SDF box slab must rest on top instead of tunneling through, and the
-    slab must be flagged as carrying an SDF.
+    Check SDF provisioning separately from particle containment: the current
+    per-particle contact path uses mesh queries, while full-surface soft-body
+    contacts consume the provisioned texture SDF.
     """
     if not wp.get_device(device).is_cuda:
         test.skipTest("texture SDFs require CUDA")
@@ -490,7 +495,7 @@ def test_fluid_sdf_mesh_contains_particles(test, device):
     mesh = _watertight_box_mesh(0.5, 0.5, 0.5 * slab_top)
     mesh.build_sdf(max_resolution=64, narrow_band_range=(-0.1, 0.1), margin=0.05)
 
-    builder = newton.ModelBuilder(up_axis="Z", gravity=-9.81)
+    builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, -9.81))
     builder.default_particle_radius = RADIUS
     slab = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5 * slab_top), wp.quat_identity()))
     builder.add_shape_mesh(
@@ -523,11 +528,12 @@ def test_fluid_sdf_mesh_contains_particles(test, device):
 
     solver = newton.solvers.SolverXPBD(model, iterations=3, fluid_rest_distance=SPACING)
     state_0, state_1 = model.state(), model.state()
-    contacts = model.contacts()
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
     dt = 1.0 / 120.0
     for _ in range(120):
         state_0.clear_forces()
-        model.collide(state_0, contacts)
+        collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, None, contacts, dt)
         state_0, state_1 = state_1, state_0
 
@@ -594,7 +600,7 @@ def test_fluid_coincident_particles_separate(test, device):
     constraint is inactive) and have an undefined pair direction, so only the
     un-averaged minimum-separation repulsion can pull them apart.
     """
-    builder = newton.ModelBuilder(up_axis="Z", gravity=0.0)
+    builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, 0.0))
     builder.default_particle_radius = RADIUS
     builder.add_particle_grid(
         pos=wp.vec3(0.0, 0.0, 0.5),
@@ -757,9 +763,10 @@ def test_fluid_reorder_is_pure_relabel(test, device):
     test.assertTrue(bool(np.any(np.abs(before - after).max(axis=1) > 0.0)))
     # a step after reorder must still integrate to a finite state
     state_1 = model.state()
-    contacts = model.contacts()
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
     state.clear_forces()
-    model.collide(state, contacts)
+    collision_pipeline.collide(state, contacts)
     solver.step(state, state_1, None, contacts, 1.0 / 240.0)
     test.assertTrue(np.isfinite(state_1.particle_q.numpy()).all())
 
@@ -778,7 +785,7 @@ def test_fluid_reorder_noop_when_not_all_fluid(test, device):
 def test_fluid_reorder_noop_for_multiworld_model(test, device):
     """Reordering must preserve indices referenced by the collision pipeline's
     precomputed per-world particle-shape candidate pairs."""
-    builder = newton.ModelBuilder(up_axis="Z", gravity=0.0)
+    builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, 0.0))
     for world in range(2):
         builder.begin_world(label=f"world_{world}")
         builder.add_particle(
@@ -800,7 +807,8 @@ def test_fluid_reorder_noop_for_multiworld_model(test, device):
 
 
 def test_fluid_render_particles_ignore_non_fluid_neighbors(test, device):
-    builder = newton.ModelBuilder(up_axis="Z", gravity=0.0)
+    """Exclude non-fluid particles from fluid render neighborhoods."""
+    builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, 0.0))
     builder.default_particle_radius = RADIUS
     builder.add_particle(
         pos=(0.0, 0.0, 0.0),
@@ -829,7 +837,8 @@ def test_fluid_render_particles_ignore_non_fluid_neighbors(test, device):
 
 
 def test_inactive_fluid_flags_do_not_enable_solver(test, device):
-    builder = newton.ModelBuilder(up_axis="Z", gravity=0.0)
+    """Ignore fluid flags on inactive particles when enabling the solver."""
+    builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, 0.0))
     builder.default_particle_radius = RADIUS
     builder.add_particle(
         pos=(0.0, 0.0, 0.0),
@@ -853,6 +862,7 @@ def test_inactive_fluid_flags_do_not_enable_solver(test, device):
 
 
 def test_fluid_cohesion_assignment_updates_derived_coefficient(test, device):
+    """Refresh the derived cohesion coefficient after assignment."""
     model = _build_fluid_grid(device, dims=(2, 2, 2))
     solver = newton.solvers.SolverXPBD(model, fluid_rest_distance=SPACING, fluid_cohesion=1.0)
 
@@ -863,6 +873,7 @@ def test_fluid_cohesion_assignment_updates_derived_coefficient(test, device):
 
 
 def test_fluid_render_particles_reuse_simulation_hash_grid(test, device):
+    """Reuse the simulation hash grid for fluid rendering."""
     model = _build_fluid_grid(device, dims=(3, 3, 3))
     solver = newton.solvers.SolverXPBD(model, fluid_rest_distance=SPACING)
     grid_id = model.particle_grid.id
@@ -879,14 +890,15 @@ def test_fluid_render_update_does_not_interfere_with_capture(test, device):
         model = _build_fluid_grid(device, dims=(4, 4, 4), gravity=-9.81, ground=True, z0=0.2)
         solver = newton.solvers.SolverXPBD(model, iterations=2, fluid_rest_distance=SPACING)
         state_0, state_1 = model.state(), model.state()
-        contacts = model.contacts()
+        collision_pipeline = newton.CollisionPipeline(model)
+        contacts = collision_pipeline.contacts()
 
         with wp.ScopedCapture(device=device) as capture:
             # Two steps return the persistent state to the same pair of buffers,
             # so each graph launch advances from the previous launch's output.
             for _ in range(2):
                 state_0.clear_forces()
-                model.collide(state_0, contacts)
+                collision_pipeline.collide(state_0, contacts)
                 solver.step(state_0, state_1, None, contacts, 1.0 / 240.0)
                 state_0, state_1 = state_1, state_0
 
@@ -902,6 +914,7 @@ def test_fluid_render_update_does_not_interfere_with_capture(test, device):
 
 
 def test_diffuse_emission_ignores_non_fluid_particles(test, device):
+    """Exclude non-fluid particles from diffuse emission."""
     q = wp.array([(-0.5 * SPACING, 0.0, 0.0), (0.5 * SPACING, 0.0, 0.0)], dtype=wp.vec3, device=device)
     qd = wp.array([(-1.0, 0.0, 0.0), (1.0, 0.0, 0.0)], dtype=wp.vec3, device=device)
     flags = wp.array([int(newton.ParticleFlags.ACTIVE)] * 2, dtype=wp.int32, device=device)
@@ -953,6 +966,7 @@ def test_diffuse_emission_ignores_non_fluid_particles(test, device):
 
 
 def test_diffuse_slot_reservation_does_not_overwrite_live_particle(test, device):
+    """Preserve live diffuse particles when the slot pool is full."""
     slot_states = wp.ones(1, dtype=wp.int32, device=device)
     result = wp.zeros(1, dtype=wp.int32, device=device)
 
@@ -961,8 +975,23 @@ def test_diffuse_slot_reservation_does_not_overwrite_live_particle(test, device)
     test.assertEqual(int(result.numpy()[0]), -1)
 
 
+def test_diffuse_slot_reservation_handles_wrapped_counter(test, device):
+    """Reserve valid slots after the signed emission counter wraps around."""
+    # A padded view keeps even a negative-index regression inside the backing
+    # allocation so the test can report the failure without illegal memory access.
+    backing = wp.zeros(6, dtype=wp.int32, device=device)
+    slot_states = backing[3:]
+    result = wp.zeros(1, dtype=wp.int32, device=device)
+    wp.launch(_reserve_diffuse_slot_kernel, dim=1, inputs=[-1, slot_states], outputs=[result], device=device)
+    slot = int(result.numpy()[0])
+    test.assertGreaterEqual(slot, 0)
+    test.assertLess(slot, 3)
+    np.testing.assert_array_equal(backing.numpy()[:3], 0)
+
+
 def test_diffuse_shape_friction_scales_with_timestep(test, device):
-    builder = newton.ModelBuilder(up_axis="Z", gravity=0.0)
+    """Scale diffuse shape friction with the integration time step."""
+    builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, 0.0))
     builder.default_particle_radius = RADIUS
     builder.add_particle(
         pos=(0.0, 0.0, 1.0),
@@ -1002,6 +1031,7 @@ def test_diffuse_shape_friction_scales_with_timestep(test, device):
 
 
 def test_fluid_hash_grid_is_capture_ready(test, device):
+    """Initialize grouped fluid hash grids before CUDA capture."""
     model = _build_overlapping_world_fluid_grids(device, dims=(3, 3, 3))
     solver = newton.solvers.SolverXPBD(model, fluid_rest_distance=SPACING)
     state = model.state()
@@ -1042,6 +1072,7 @@ for _name in (
     "test_fluid_render_particles_reuse_simulation_hash_grid",
     "test_diffuse_emission_ignores_non_fluid_particles",
     "test_diffuse_slot_reservation_does_not_overwrite_live_particle",
+    "test_diffuse_slot_reservation_handles_wrapped_counter",
     "test_diffuse_shape_friction_scales_with_timestep",
     "test_fluid_max_neighbors_truncates_density",
     "test_fluid_coincident_particles_separate",

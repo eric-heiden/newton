@@ -219,10 +219,10 @@ class TestViewerGLNumFramesValidation(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(TypeError):
                 ViewerGL(enable_cuda_interop=value)  # type: ignore[arg-type]
 
-    def test_cuda_interop_defaults_to_dynamic_meshes(self):
-        """Enable CUDA interop for dynamic meshes by default."""
+    def test_cuda_interop_defaults_to_dynamic_meshes_and_fluids(self):
+        """Enable CUDA interop for dynamic meshes and fluids by default."""
         parameter = inspect.signature(ViewerGL).parameters["enable_cuda_interop"]
-        self.assertEqual(parameter.default, ViewerGL.CudaInterop.DYNAMIC_MESH)
+        self.assertEqual(parameter.default, ViewerGL.CudaInterop.DYNAMIC_MESH | ViewerGL.CudaInterop.FLUID)
 
     def test_cuda_interop_flags_are_composable(self):
         """Compose independent CUDA interop categories with bitwise flags."""
@@ -236,7 +236,8 @@ class TestViewerGLNumFramesValidation(unittest.TestCase):
             | ViewerGL.CudaInterop.STATIC_MESH
             | ViewerGL.CudaInterop.POINTS
             | ViewerGL.CudaInterop.INSTANCES
-            | ViewerGL.CudaInterop.LINES,
+            | ViewerGL.CudaInterop.LINES
+            | ViewerGL.CudaInterop.FLUID,
         )
 
     def test_rejects_unknown_cuda_interop_flags(self):

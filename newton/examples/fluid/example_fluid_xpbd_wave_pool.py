@@ -16,14 +16,17 @@
 
 from __future__ import annotations
 
-import warnings
-
 import numpy as np
 import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.fluid.utils import ignore_shapes_for_picking, parse_particle_count, resolve_particle_grid
+from newton.examples.fluid.utils import (
+    ignore_shapes_for_picking,
+    parse_particle_count,
+    resolve_particle_grid,
+    step_simulation,
+)
 
 ParticleFlags = newton.ParticleFlags
 
@@ -299,24 +302,7 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        if self.use_cuda_graph:
-            key = self._graph_key_tuple()
-            if self.graph is None or key != self._graph_key:
-                try:
-                    with wp.ScopedCapture() as capture:
-                        self.simulate()
-                    self.graph = capture.graph
-                    self._graph_key = key
-                    wp.capture_launch(self.graph)
-                except Exception as exc:
-                    warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
-                    self.use_cuda_graph = False
-                    self.graph = None
-                    self.simulate()
-            else:
-                wp.capture_launch(self.graph)
-        else:
-            self.simulate()
+        step_simulation(self, self._graph_key_tuple())
         self.sim_time += self.frame_dt
 
     def gui(self, ui):
@@ -402,7 +388,7 @@ class Example:
             self.viewer.log_fluid_diffuse(
                 "/model/fluid/diffuse",
                 self.solver.diffuse_positions,
-                self.solver.diffuse_velocities,
+                velocities=self.solver.diffuse_velocities,
                 radius=0.006,
                 color=(0.9, 0.95, 1.0, 1.1),
                 motion_blur_scale=3.0,
@@ -448,7 +434,7 @@ class Example:
                 axis = wp.vec3(0.0, 1.0, 0.0) if i % 4 == 0 else wp.vec3(1.0, 0.0, 0.0)
                 q = wp.quat_from_axis_angle(axis, 0.5 * np.pi)
             else:
-                q = wp.quat_from_axis_angle(wp.vec3(0.3, 0.7, 0.2), float(rng.uniform(0.0, 0.5)))
+                q = wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 0.7, 0.2)), float(rng.uniform(0.0, 0.5)))
             body = builder.add_body(xform=wp.transform(wp.vec3(x, y, z), q), label=f"float_{i}")
             if kind == "sphere":
                 builder.add_shape_sphere(body, radius=size, cfg=cfg, color=color)

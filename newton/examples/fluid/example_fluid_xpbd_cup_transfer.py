@@ -11,7 +11,6 @@ speed: crank it up and the water's inertia makes it slosh over the rim."""
 from __future__ import annotations
 
 import tempfile
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -19,11 +18,11 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.fluid.utils import parse_particle_count, resolve_particle_grid
+import newton.ik as ik
+from newton.examples.fluid.utils import build_cup_mesh, parse_particle_count, resolve_particle_grid, step_simulation
 
 _REFERENCE_SPACING = 0.0016
 _REFERENCE_FILL_HEIGHT = 57 * _REFERENCE_SPACING
-import newton.ik as ik
 
 # Cache the cooked cup SDF on disk so repeated runs skip the voxelization.
 _SDF_CACHE_DIR = Path(tempfile.gettempdir()) / "newton_cup_transfer_sdf"
@@ -127,9 +126,9 @@ class Example:
             xform=wp.transform(wp.vec3(self.spot_a[0], self.spot_a[1], 0.0), wp.quat_identity()),
             label="cup",
         )
-        cup_mesh = self._build_cup_mesh(self.cup_inner_radius, wall_thickness, self.cup_height)
-        # Build an SDF on the cup so the ~100k water particles collide with it via
-        # one cheap SDF sample each instead of a per-triangle mesh query.
+        cup_mesh = build_cup_mesh(self.cup_inner_radius, wall_thickness, self.cup_height, segments=40)
+        # Cook the cup SDF for rigid mesh contacts. Fluid particles use the
+        # triangle-mesh contact path.
         cup_mesh.build_sdf(
             max_resolution=args.sdf_resolution,
             narrow_band_range=(-0.03, 0.03),
@@ -280,42 +279,6 @@ class Example:
             self._apply_water_velocity_cap()
             self.graph = None
 
-    @staticmethod
-    def _build_cup_mesh(inner_radius, wall_thickness, height, segments=40):
-        """Closed solid of revolution: cylindrical cup with an open cavity."""
-        ri = inner_radius
-        ro = inner_radius + wall_thickness
-        t = wall_thickness
-        profile = [(ro, 0.0), (ro, height), (ri, height), (ri, t)]
-        vertices = []
-        for i in range(segments):
-            angle = 2.0 * np.pi * i / segments
-            c, sn = np.cos(angle), np.sin(angle)
-            for r, z in profile:
-                vertices.append((r * c, r * sn, z))
-        bottom_center = len(vertices)
-        vertices.append((0.0, 0.0, 0.0))
-        cavity_center = len(vertices)
-        vertices.append((0.0, 0.0, t))
-
-        rows = len(profile)
-        indices = []
-        for i in range(segments):
-            j = (i + 1) % segments
-            for k in range(rows - 1):
-                a = i * rows + k
-                b = i * rows + k + 1
-                c0 = j * rows + k
-                d = j * rows + k + 1
-                indices += [a, c0, b, b, c0, d]
-            indices += [i * rows + 0, bottom_center, j * rows + 0]
-            indices += [i * rows + rows - 1, j * rows + rows - 1, cavity_center]
-
-        return newton.Mesh(
-            np.asarray(vertices, dtype=np.float32),
-            np.asarray(indices, dtype=np.int32),
-        )
-
     def _setup_ik(self):
         self.ee_index = 11  # fr3 hand link
         ik_state = self.ik_model.state()
@@ -346,6 +309,11 @@ class Example:
             lambda_initial=0.1,
             jacobian_mode=ik.IKJacobianType.ANALYTIC,
         )
+        self.ik_graph = None
+        if self.model.device.is_cuda:
+            with wp.ScopedCapture(device=self.model.device) as capture:
+                self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=12)
+            self.ik_graph = capture.graph
 
     # ------------------------------------------------------------------
     def _phase_targets(self, name):
@@ -405,15 +373,15 @@ class Example:
         gripper = g_start * (1.0 - smooth_t) + g_end * smooth_t
 
         # IK toward the interpolated waypoint
-        self.pos_obj.set_target_positions(wp.array([wp.vec3(*[float(v) for v in ee_target])], dtype=wp.vec3))
-        self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=12)
+        self.pos_obj.set_target_position(0, wp.vec3(*[float(v) for v in ee_target]))
+        if self.ik_graph is None:
+            self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=12)
+        else:
+            wp.capture_launch(self.ik_graph)
 
         # apply the IK solution kinematically: arm joints + cosmetic fingers
-        joint_q = self.model.joint_q.numpy()
-        ik_q = self.joint_q_ik.numpy()[0]
-        joint_q[: self.arm_dofs] = ik_q[: self.arm_dofs]
-        joint_q[self.arm_dofs : self.robot_coords] = gripper
-        self.model.joint_q.assign(joint_q)
+        wp.copy(self.model.joint_q, self.joint_q_ik, count=self.arm_dofs)
+        self.model.joint_q[self.arm_dofs : self.robot_coords].fill_(gripper)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
 
@@ -479,22 +447,7 @@ class Example:
     def step(self):
         t = self._advance_robot()
 
-        if self.use_cuda_graph:
-            if self.graph is None:
-                try:
-                    with wp.ScopedCapture() as capture:
-                        self.simulate()
-                    self.graph = capture.graph
-                    wp.capture_launch(self.graph)
-                except Exception as exc:
-                    warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
-                    self.use_cuda_graph = False
-                    self.graph = None
-                    self.simulate()
-            else:
-                wp.capture_launch(self.graph)
-        else:
-            self.simulate()
+        step_simulation(self)
 
         if t >= 1.0:
             self.phase_index = (self.phase_index + 1) % len(self.PHASES)
@@ -542,7 +495,7 @@ class Example:
             self.viewer.log_fluid_diffuse(
                 "/model/fluid/diffuse",
                 self.solver.diffuse_positions,
-                self.solver.diffuse_velocities,
+                velocities=self.solver.diffuse_velocities,
                 radius=0.0033,
                 color=(0.9, 0.95, 1.0, 1.1),
                 motion_blur_scale=3.0,
@@ -578,25 +531,38 @@ class Example:
 
     def test_final(self):
         q = self.state_0.particle_q.numpy()
-        if not np.all(np.isfinite(q)):
-            raise ValueError("XPBD fluid particles contain non-finite positions")
-        if not np.all(np.isfinite(self.state_0.body_q.numpy())):
-            raise ValueError("Bodies contain non-finite transforms")
-        # at default speed the water should still be carried with the cup
+        qd = self.state_0.particle_qd.numpy()
+        body_q = self.state_0.body_q.numpy()
+        body_qd = self.state_0.body_qd.numpy()
+        if not np.all(np.isfinite(q)) or not np.all(np.isfinite(qd)):
+            raise ValueError("XPBD fluid particles contain non-finite state")
+        if not np.all(np.isfinite(body_q)) or not np.all(np.isfinite(body_qd)):
+            raise ValueError("Bodies contain non-finite state")
         active = (self.model.particle_flags.numpy() & int(newton.ParticleFlags.ACTIVE)) != 0
-        heights = q[active][:, 2]
+        water = q[active]
         radius = float(self.model.particle_max_radius)
-        if heights.min() < radius - 1.0e-5:
+        if len(water) == 0:
+            raise ValueError("No active water remains in the scene")
+        if water[:, 2].min() < radius - 1.0e-5:
             raise ValueError("water tunneled below the floor")
-        if heights.max() < 0.005:
-            raise ValueError("All water ended on the floor; the cup carry failed")
+        if self.speed <= 1.0:
+            # The cup remains upright. Measure retention relative to its actual
+            # pose so spilled water resting on the robot cannot satisfy the test.
+            local = water - body_q[self.cup_body, :3]
+            inside = (
+                (np.linalg.norm(local[:, :2], axis=1) < self.cup_inner_radius + radius)
+                & (local[:, 2] >= self.wall_thickness - radius - 1.0e-4)
+                & (local[:, 2] <= self.cup_height + radius)
+            )
+            if np.count_nonzero(inside) < 0.95 * len(water):
+                raise ValueError("More than five percent of the water left the carried cup")
 
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--fps", type=float, default=60.0)
         # ~100k water particles. A smaller pressure timestep suppresses the
-        # particle-scale Jacobi mode and also keeps the moving SDF wall
+        # particle-scale Jacobi mode and also keeps the moving cup wall
         # collision-tight. Four iterations at eight substeps retain the same 32
         # density iterations per rendered frame as the former 4 x 8 setup.
         parser.add_argument("--substeps", type=int, default=8)

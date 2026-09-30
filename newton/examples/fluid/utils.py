@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import warnings
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
@@ -38,11 +39,15 @@ def parse_particle_count(value: str) -> int:
 
 
 def grid_dimensions(size: Sequence[float], spacing: float, minimum: Sequence[int] = (1, 1, 1)) -> tuple[int, int, int]:
-    """Return integer dimensions for a uniform grid contained in ``size``."""
-    if spacing <= 0.0:
+    """Return grid dimensions with the requested per-axis minimum counts."""
+    if not np.isfinite(spacing) or spacing <= 0.0:
         raise ValueError("particle spacing must be positive")
     if len(size) != 3 or len(minimum) != 3:
         raise ValueError("size and minimum must have three components")
+    if any(not np.isfinite(extent) or extent <= 0.0 for extent in size):
+        raise ValueError("grid size must contain positive finite extents")
+    if any(int(lower) != lower or lower < 1 for lower in minimum):
+        raise ValueError("minimum grid dimensions must be positive integers")
     return tuple(
         max(int(np.floor(float(extent) / spacing + 1.0e-9)), int(lower))
         for extent, lower in zip(size, minimum, strict=True)
@@ -59,7 +64,7 @@ def resolve_particle_spacing(
     """Find the spacing whose realizable particle count is nearest a target."""
     if target_count < 1:
         raise ValueError("target particle count must be positive")
-    if reference_spacing <= 0.0:
+    if not np.isfinite(reference_spacing) or reference_spacing <= 0.0:
         raise ValueError("reference spacing must be positive")
 
     reference_count = max(int(count_particles(reference_spacing)), 1)
@@ -69,17 +74,27 @@ def resolve_particle_spacing(
     lower_count = max(int(count_particles(lower)), 0)
     upper_count = lower_count
 
-    while lower_count < target_count:
+    for _ in range(64):
+        if lower_count >= target_count:
+            break
         upper = lower
         upper_count = lower_count
         lower *= 0.5
         lower_count = max(int(count_particles(lower)), 0)
 
-    while upper_count > target_count:
+    else:
+        raise ValueError("particle count cannot reach the target at smaller spacing")
+
+    for _ in range(64):
+        if upper_count <= target_count:
+            break
         lower = upper
         lower_count = upper_count
         upper *= 2.0
         upper_count = max(int(count_particles(upper)), 0)
+
+    else:
+        raise ValueError("particle count cannot reach the target at larger spacing")
 
     best_spacing = lower
     best_count = lower_count
@@ -111,7 +126,11 @@ def resolve_particle_grid(
     reference_spacing: float,
     minimum: Sequence[int] = (1, 1, 1),
 ) -> ParticleGridConfig:
-    """Resolve a fixed-volume Cartesian grid from a target particle count."""
+    """Resolve a Cartesian grid, allowing the minimum grid to exceed the target."""
+    if target_count < 1:
+        raise ValueError("target particle count must be positive")
+    grid_dimensions(size, reference_spacing, minimum)
+    target_count = max(target_count, int(np.prod(minimum)))
 
     def count_particles(spacing: float) -> int:
         return int(np.prod(grid_dimensions(size, spacing, minimum), dtype=np.int64))
@@ -144,6 +163,8 @@ def cylinder_particle_positions(
     particle_radius = 0.5 * spacing
     radial_limit = inner_radius - particle_radius
     lower = floor_height + particle_radius
+    if radial_limit <= 0.0 or fill_height < lower:
+        return np.empty((0, 3), dtype=np.float64)
     dimension_xy = max(int(2.0 * radial_limit / spacing) + 1, 1)
     dimension_z = max(int((fill_height - lower) / spacing) + 1, 1)
     axis_xy = -radial_limit + spacing * np.arange(dimension_xy)
@@ -222,3 +243,73 @@ def ignore_shapes_for_picking(viewer, shape_count: int, shape_indices: Iterable[
     mask = np.ones(int(shape_count), dtype=np.int32)
     mask[indices] = 0
     picking.set_pickable_shapes(mask)
+
+
+def step_simulation(example, graph_key=None) -> None:
+    """Advance one fluid frame, preserving state buffers across graph replays."""
+
+    def simulate():
+        initial_state = example.state_0
+        example.simulate()
+        # Graph replays keep the pointers recorded during capture. An odd
+        # substep count needs a copy back to the original input buffer.
+        if example.state_0 is not initial_state:
+            initial_state.assign(example.state_0)
+            example.state_0, example.state_1 = example.state_1, example.state_0
+
+    if not example.use_cuda_graph:
+        simulate()
+        return
+    if example.graph is None or graph_key != getattr(example, "_graph_key", None):
+        states = example.state_0, example.state_1
+        try:
+            with wp.ScopedCapture(device=example.model.device) as capture:
+                simulate()
+            example.graph = capture.graph
+            example._graph_key = graph_key
+        except Exception as exc:
+            # Capture records kernels without running them, but Python state
+            # swaps happen immediately and must be undone before fallback.
+            example.state_0, example.state_1 = states
+            example.graph = None
+            example.use_cuda_graph = False
+            warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
+            simulate()
+            return
+    wp.capture_launch(example.graph)
+
+
+def build_cup_mesh(inner_radius: float, wall_thickness: float, height: float, *, segments: int = 48) -> newton.Mesh:
+    """Closed solid of revolution: a cylindrical cup with an open cavity."""
+    ri = inner_radius
+    ro = inner_radius + wall_thickness
+    t = wall_thickness
+    profile = [(ro, 0.0), (ro, height), (ri, height), (ri, t)]
+    vertices = []
+    for i in range(segments):
+        angle = 2.0 * np.pi * i / segments
+        c, sn = np.cos(angle), np.sin(angle)
+        for r, z in profile:
+            vertices.append((r * c, r * sn, z))
+    bottom_center = len(vertices)
+    vertices.append((0.0, 0.0, 0.0))
+    cavity_center = len(vertices)
+    vertices.append((0.0, 0.0, t))
+
+    rows = len(profile)
+    indices = []
+    for i in range(segments):
+        j = (i + 1) % segments
+        for k in range(rows - 1):
+            a = i * rows + k
+            b = i * rows + k + 1
+            c0 = j * rows + k
+            d = j * rows + k + 1
+            indices += [a, c0, b, b, c0, d]
+        indices += [i * rows + 0, bottom_center, j * rows + 0]
+        indices += [i * rows + rows - 1, j * rows + rows - 1, cavity_center]
+
+    return newton.Mesh(
+        np.asarray(vertices, dtype=np.float32),
+        np.asarray(indices, dtype=np.int32),
+    )

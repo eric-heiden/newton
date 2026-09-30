@@ -175,7 +175,7 @@ class Picking:
             self.shape_pickable = wp.array([], dtype=wp.int32, device=device)
             return
 
-        mask_np = np.asarray(mask, dtype=np.int32)
+        mask_np = np.asarray(mask, dtype=bool).astype(np.int32)
         if self.model is not None and mask_np.shape != (self.model.shape_count,):
             raise ValueError(f"Picking mask must have shape ({self.model.shape_count},), got {mask_np.shape}.")
         if mask_np.ndim != 1:
@@ -276,7 +276,7 @@ class Picking:
             world_offsets = wp.array([], dtype=wp.vec3, device=self.model.device)
 
         wp.launch(
-            kernel=raycast.raycast_pick_kernel,
+            kernel=raycast.raycast_kernel,
             dim=num_geoms,
             inputs=[
                 state.body_q,
@@ -285,7 +285,6 @@ class Picking:
                 self.model.shape_type,
                 self.model.shape_scale,
                 self.model.shape_source_ptr,
-                self.shape_pickable,
                 p,
                 d,
                 self.lock,
@@ -297,11 +296,10 @@ class Picking:
                 shape_world,
                 world_offsets,
                 self.visible_worlds_mask,
+                self.shape_pickable,
             ],
             device=self.model.device,
         )
-        wp.synchronize()
-
         dist = self.min_dist.numpy()[0]
         index = self.min_index.numpy()[0]
         body_index = self.min_body_index.numpy()[0]

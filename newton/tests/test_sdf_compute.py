@@ -911,6 +911,19 @@ class TestMeshSDFCollisionFlag(unittest.TestCase):
 class TestSDFPublicApi(unittest.TestCase):
     """Test public API shape for SDF creators."""
 
+    @unittest.skipUnless(_cuda_available, "Requires CUDA device")
+    def test_particle_only_box_generates_requested_sdf(self):
+        """Build the requested SDF when a box only collides with particles."""
+        builder = newton.ModelBuilder()
+        cfg = newton.ModelBuilder.ShapeConfig(
+            has_shape_collision=False, has_particle_collision=True, sdf_max_resolution=32
+        )
+        builder.add_shape_box(body=-1, hx=0.5, hy=0.4, hz=0.3, cfg=cfg)
+        model = builder.finalize(device="cuda:0")
+        sdf_index = int(model._shape_sdf_index.numpy()[0])
+        self.assertGreaterEqual(sdf_index, 0)
+        self.assertGreater(model._texture_sdf_data.shape[0], sdf_index)
+
     def test_top_level_sdf_exported(self):
         """Top-level package should expose SDF as newton.SDF."""
         self.assertTrue(hasattr(newton, "SDF"))

@@ -29,6 +29,11 @@ class ParticleFlags(IntEnum):
     other fluid particles instead of pairwise contact constraints in solvers
     that support fluids (see :class:`newton.solvers.SolverXPBD`). Interactions
     with non-fluid particles and shapes are still handled as regular contacts.
+
+    .. experimental::
+
+        This flag and the position-based fluid behavior in
+        :class:`newton.solvers.SolverXPBD` may change without prior notice.
     """
 
 
@@ -68,6 +73,9 @@ class MeshProperties(IntFlag):
 
     WATERTIGHT = 1 << 0
     """The source mesh is closed (every edge shared by exactly two triangles)."""
+
+    SURFACE_VELOCITY = 1 << 1
+    """The source mesh provides per-vertex surface velocities to rigid contacts."""
 
 
 __all__ = [

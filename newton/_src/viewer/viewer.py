@@ -842,13 +842,13 @@ class ViewerBase(ABC):
             raise ValueError("camera_speed must be finite and nonnegative")
         self._camera_speed = value
 
-    def set_camera(self, pos: wp.vec3, pitch: float, yaw: float):
+    def set_camera(self, pos: wp.vec3, pitch: float | None = None, yaw: float | None = None):
         """Set the camera position and orientation.
 
         Args:
-            pos: The position of the camera.
-            pitch: The pitch of the camera.
-            yaw: The yaw of the camera.
+            pos: The position of the camera [m].
+            pitch: The pitch of the camera [deg]. If None, the current pitch is kept.
+            yaw: The yaw of the camera [deg]. If None, the current yaw is kept.
         """
         return
 
@@ -1961,6 +1961,7 @@ class ViewerBase(ABC):
 
         The GL viewer renders these with a dedicated arrow shader that draws
         a screen-space quad line body plus a triangular arrowhead per segment.
+        The RTX viewer renders cylinder shafts with cone heads in world space.
         Other backends fall back to :meth:`log_lines`.
 
         Args:
@@ -1968,9 +1969,9 @@ class ViewerBase(ABC):
             starts: Optional arrow start points as a Warp vec3 array.
             ends: Optional arrow end points (arrowhead tip) as a Warp vec3 array.
             colors: Per-arrow colors as a Warp array, or a single RGB triplet.
-            width: Reserved for future use (world-space line width).
-                Currently ignored; arrow size is set in screen-space pixels
-                via the renderer (e.g. ``RendererGL.arrow_scale``).
+            width: Shaft radius [m] in the RTX viewer. Ignored by the GL viewer,
+                where arrow size is set in screen-space pixels via
+                ``RendererGL.arrow_scale``.
             hidden: Whether the arrow batch should be hidden.
         """
         self.log_lines(self._qualify(name), starts, ends, colors, width=width, hidden=hidden)
@@ -2267,7 +2268,8 @@ class ViewerBase(ABC):
     def _hash_geometry(
         self, geo_type: int, geo_scale, thickness: float, is_solid: bool, geo_src=None, mirror: bool = False
     ) -> int:
-        geometry_hash = hash((int(geo_type), geo_src, *geo_scale, float(thickness), bool(is_solid), bool(mirror)))
+        source_hash = geo_src._get_render_hash() if isinstance(geo_src, newton.Mesh) else geo_src
+        geometry_hash = hash((int(geo_type), source_hash, *geo_scale, float(thickness), bool(is_solid), bool(mirror)))
         if isinstance(geo_src, newton.Mesh) and geo_src.texture is not None:
             geometry_hash = hash((geometry_hash, geo_src.texture_transform))
         return geometry_hash
@@ -3313,10 +3315,11 @@ class ViewerBase(ABC):
     def log_fluid(
         self,
         name: str,
-        points,
-        radii=None,
+        points: wp.array[wp.vec3] | np.ndarray | None,
+        *,
+        radii: wp.array[float] | np.ndarray | float | None = None,
         radius_scale: float = 1.0,
-        color=(0.113, 0.425, 0.55, 0.8),
+        color: tuple[float, float, float, float] = (0.113, 0.425, 0.55, 0.8),
         absorption: tuple[float, float, float] | None = None,
         ior: float = 1.0,
         reflectance: float = 0.1,
@@ -3324,12 +3327,19 @@ class ViewerBase(ABC):
         specular_power: float = 400.0,
         blur_radius_world: float | None = None,
         shadow_opacity: float = 0.5,
-        anisotropy=None,
-        anisotropy_secondary=None,
-        anisotropy_tertiary=None,
+        anisotropy: wp.array[wp.vec4] | np.ndarray | None = None,
+        anisotropy_secondary: wp.array[wp.vec4] | np.ndarray | None = None,
+        anisotropy_tertiary: wp.array[wp.vec4] | np.ndarray | None = None,
         hidden: bool = False,
     ):
         """Log particle samples as a fluid surface.
+
+        .. experimental::
+
+            ``log_fluid`` and its material parameters may change without
+            deprecation. Screen-space reconstruction is available only in
+            :class:`ViewerGL`; overlapping materials are composited in
+            logging order and do not model light transport between liquids.
 
         Viewer backends without a screen-space fluid renderer fall back to
         rendering the samples as plain points. :class:`ViewerGL` overrides this
@@ -3349,6 +3359,7 @@ class ViewerBase(ABC):
             name: Unique path/name for the fluid batch.
             points: Particle positions [m], shape [particle_count, 3].
             radii: Particle radii [m] (array, scalar, or ``None``).
+            radius_scale: Multiplier applied to the particle radii.
             color: Fluid albedo (rgb) and transmittance (a). Transmittance 1
                 renders a clear liquid where the refracted scene shows
                 through; 0 renders an opaque scattering body such as milk.
@@ -3372,15 +3383,25 @@ class ViewerBase(ABC):
             anisotropy_tertiary: Tertiary ellipsoid axis and scale.
             hidden: Whether the fluid batch should be hidden.
         """
-        self.log_points(name=name, points=points, radii=radii, hidden=hidden)
+        if isinstance(points, np.ndarray):
+            points = wp.array(points, dtype=wp.vec3, device=self.device)
+        if points is not None and radius_scale != 1.0:
+            if radii is None:
+                radii = 0.1 * radius_scale
+            elif isinstance(radii, wp.array):
+                radii = radii.numpy() * radius_scale
+            else:
+                radii = np.asarray(radii) * radius_scale
+        self.log_points(name=name, points=points, radii=radii, colors=color[:3], hidden=hidden)
 
     def log_fluid_diffuse(
         self,
         name: str,
-        positions,
-        velocities=None,
+        positions: wp.array[wp.vec4] | np.ndarray | None,
+        *,
+        velocities: wp.array[wp.vec4] | np.ndarray | None = None,
         radius: float = 0.02,
-        color=(0.9, 0.95, 1.0, 0.8),
+        color: tuple[float, float, float, float] = (0.9, 0.95, 1.0, 0.8),
         motion_blur_scale: float = 1.0,
         diffusion: float = 1.0,
         lifetime: float = 2.0,
@@ -3388,6 +3409,11 @@ class ViewerBase(ABC):
         hidden: bool = False,
     ):
         """Log diffuse spray/foam particles (no-op for non-fluid backends).
+
+        .. experimental::
+
+            ``log_fluid_diffuse`` and its material parameters may change
+            without deprecation. Only :class:`ViewerGL` renders these samples.
 
         Args:
             name: Unique path/name for the diffuse batch.
@@ -3407,7 +3433,7 @@ class ViewerBase(ABC):
 
     def _log_particles(self, state: newton.State):
         if self.model.particle_count:
-            if not self.show_particles and not self.show_fluid:
+            if (not self.show_particles and not self.show_fluid) or self._layer_force_hidden():
                 self.log_fluid(name="/model/fluid", points=None, hidden=True)
                 self.log_points(name="/model/particles", points=None, hidden=True)
                 return
@@ -3431,6 +3457,7 @@ class ViewerBase(ABC):
                 if active_count == 0:
                     # None is a no-op in some backends, so use an empty array to hide stale geometry.
                     empty_points = wp.empty(0, dtype=wp.vec3, device=self.device)
+                    self.log_fluid(name="/model/fluid", points=None, hidden=True)
                     self.log_points(name=self._qualify("/model/particles"), points=empty_points, hidden=True)
                     return
                 if active_count < n:
@@ -3444,11 +3471,6 @@ class ViewerBase(ABC):
 
             points = self._apply_layer_transform_to_points(points)
 
-            if self.model_changed:
-                colors = wp.full(shape=len(points), value=wp.vec3(0.7, 0.6, 0.4), device=self.device)
-            else:
-                colors = None
-
             if self.show_fluid:
                 self.log_fluid(
                     name="/model/fluid",
@@ -3460,6 +3482,11 @@ class ViewerBase(ABC):
                 )
                 self.log_points(name="/model/particles", points=None, hidden=True)
                 return
+
+            if self.model_changed:
+                colors = wp.full(shape=len(points), value=wp.vec3(0.7, 0.6, 0.4), device=self.device)
+            else:
+                colors = None
 
             self.log_fluid(name="/model/fluid", points=None, hidden=True)
             self.log_points(

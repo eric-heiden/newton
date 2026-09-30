@@ -105,6 +105,7 @@ class TestViewerParticleFlags(unittest.TestCase):
         self.assertEqual(len(viewer.logged_points), 2)
 
     def test_hidden_particles_skip_particle_data(self):
+        """Skip particle uploads when neither point nor fluid rendering is visible."""
         active = int(newton.ParticleFlags.ACTIVE)
         model = self._build_model([active, active])
         state = model.state()

@@ -195,7 +195,9 @@ def _reserve_diffuse_slot(request: int, diffuse_slot_state: wp.array[wp.int32]) 
     slot = int(-1)
     offset = int(0)
     while offset < scan_count:
-        candidate = (request + offset) % capacity
+        # The long-lived signed spawn counter can wrap; unsigned arithmetic
+        # keeps the modulo in bounds even after that happens.
+        candidate = int((wp.uint32(request) + wp.uint32(offset)) % wp.uint32(capacity))
         old_state = wp.atomic_cas(diffuse_slot_state, candidate, 0, 1)
         if old_state == 0:
             slot = candidate
@@ -627,17 +629,19 @@ def solve_fluid_deltas(
             r = min_sep
 
         grad = spiky_kernel_gradient(r_vec, r, h)
-        delta += (lambda_i + fluid_lambda[j]) * (particle_mass[j] * inv_rest_density) * grad * w_i
+        # Each constraint contributes its own neighbor mass to the gradient.
+        # Using m_j for both terms injects momentum when masses differ.
+        delta += (lambda_i * particle_mass[j] + fluid_lambda[j] * particle_mass[i]) * inv_rest_density * grad * w_i
 
         if cohesion_step > 0.0:
             # bounded position bias toward (or away from) the neighbor
             cohesion += (-cohesion_step * cohesion_kernel(r, h) / r) * r_vec
 
         # short-range repulsion: push the pair apart to the minimum distance,
-        # split evenly (equal fluid masses). Only fires when over-compressed, so
+        # split by inverse mass. Only fires when over-compressed, so
         # the rest lattice (nearest neighbor at ~rest_distance) is untouched.
         if r < min_dist:
-            separation += (0.5 * (min_dist - r) / r) * r_vec
+            separation += (w_i / (w_i + particle_invmass[j]) * (min_dist - r) / r) * r_vec
 
         # Bound the worst-case loop in over-compressed clumps (see
         # compute_fluid_lambdas); must use the same cap so the averaging below
@@ -669,7 +673,8 @@ def solve_fluid_deltas(
     if sep_len > max_delta:
         separation *= max_delta / sep_len
 
-    wp.atomic_add(deltas, i, delta * relaxation + cohesion + separation)
+    # Hash-grid point IDs are a permutation, so each thread owns this output.
+    deltas[i] = deltas[i] + delta * relaxation + cohesion + separation
 
 
 @wp.kernel

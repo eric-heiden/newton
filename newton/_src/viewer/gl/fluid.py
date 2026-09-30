@@ -1,5 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0 AND LicenseRef-NVIDIA-Flex
+#
+# Original NVIDIA Flex shader portions are covered by the license and notice
+# in newton/licenses/nvidia-flex-{LICENSE,NOTICE}.txt. Newton changes are
+# licensed under Apache-2.0.
 
 """Screen-space fluid renderer for ViewerGL, ported from the NVIDIA Flex demo.
 
@@ -962,8 +966,9 @@ class FluidBatch:
         "thickness_gain",
     )
 
-    def __init__(self, gl, capacity: int):
+    def __init__(self, gl, capacity: int, *, enable_cuda_interop: bool = True):
         self._gl = gl
+        self._enable_cuda_interop = enable_cuda_interop
         self.capacity = max(int(capacity), 1)
         self.count = 0
         self.hidden = False
@@ -1000,7 +1005,7 @@ class FluidBatch:
         self._dummy_radii = None
         self._dummy_anisotropy = None
         self._cuda_vbo = None
-        self._interop_failed = False
+        self._interop_failed = not enable_cuda_interop
 
     def destroy(self):
         gl = self._gl
@@ -1020,7 +1025,7 @@ class FluidBatch:
         material = {attr: getattr(self, attr) for attr in self._MATERIAL_ATTRS}
         hidden = self.hidden
         self.destroy()
-        self.__init__(self._gl, max(count, self.capacity * 2))
+        self.__init__(self._gl, max(count, self.capacity * 2), enable_cuda_interop=self._enable_cuda_interop)
         for attr, value in material.items():
             setattr(self, attr, value)
         self.hidden = hidden
@@ -1073,10 +1078,14 @@ class FluidBatch:
                 uniform_radius = 0.1 if radii is None else float(radii)
                 use_radii = 0
             else:
-                radii_array = radii
+                radii_array = radii if isinstance(radii, wp.array) else wp.array(radii, dtype=float, device=device)
                 uniform_radius = 0.0
                 use_radii = 1
             if use_aniso:
+                anisotropy, anisotropy_secondary, anisotropy_tertiary = (
+                    value if isinstance(value, wp.array) else wp.array(value, dtype=wp.vec4, device=device)
+                    for value in anisotropy_arrays
+                )
                 dummy4 = anisotropy
             else:
                 if self._dummy_anisotropy is None or self._dummy_anisotropy.device != device:
@@ -1145,9 +1154,10 @@ class FluidBatch:
             data[:, :3] = host_points
             data[:, 3] = r
             if use_aniso:
-                q1 = anisotropy.numpy().astype(np.float32, copy=False)
-                q2 = anisotropy_secondary.numpy().astype(np.float32, copy=False)
-                q3 = anisotropy_tertiary.numpy().astype(np.float32, copy=False)
+                q1, q2, q3 = (
+                    np.asarray(value.numpy() if isinstance(value, wp.array) else value, dtype=np.float32)
+                    for value in anisotropy_arrays
+                )
                 inactive = q1[:, 3] <= 0.0
                 data[inactive, 3] = 0.0
                 data[:, 4:7] = q1[:, :3]
@@ -1181,8 +1191,9 @@ class FluidBatch:
 class DiffuseBatch:
     """GPU vertex data for diffuse spray/foam particles."""
 
-    def __init__(self, gl, capacity: int):
+    def __init__(self, gl, capacity: int, *, enable_cuda_interop: bool = True):
         self._gl = gl
+        self._enable_cuda_interop = enable_cuda_interop
         self.capacity = max(int(capacity), 1)
         self.count = 0
         self.hidden = False
@@ -1202,7 +1213,7 @@ class DiffuseBatch:
         self._cuda_position_vbo = None
         self._cuda_velocity_vbo = None
         self._cuda_device = None
-        self._interop_failed = False
+        self._interop_failed = not enable_cuda_interop
         self._live_mask = None
         self._live_offsets = None
         self._live_count = None
@@ -1247,7 +1258,7 @@ class DiffuseBatch:
         material = (self.radius, self.color, self.motion_blur_scale, self.diffusion, self.lifetime, self.surface_bias)
         hidden = self.hidden
         self.destroy()
-        self.__init__(self._gl, max(count, self.capacity * 2))
+        self.__init__(self._gl, max(count, self.capacity * 2), enable_cuda_interop=self._enable_cuda_interop)
         self.radius, self.color, self.motion_blur_scale, self.diffusion, self.lifetime, self.surface_bias = material
         self.hidden = hidden
 
@@ -1294,7 +1305,6 @@ class DiffuseBatch:
         self._host_velocities = np.ascontiguousarray(host_velocities[live])
         count = int(self._host_positions.shape[0])
         self.count = count
-        self._upload()
 
     def _ensure_cuda_scratch(self, device):
         if self._live_mask is not None and self._cuda_device == device:
@@ -1403,6 +1413,7 @@ class DiffuseBatch:
                 return
             self._update_host(positions, velocities)
         if self.count <= 1:
+            self._upload()
             return
         rot = view_std[:3, :3]
         trans = view_std[:3, 3]

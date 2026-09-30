@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import tempfile
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +25,12 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.fluid.utils import ignore_shapes_for_picking, parse_particle_count, resolve_particle_grid
+from newton.examples.fluid.utils import (
+    ignore_shapes_for_picking,
+    parse_particle_count,
+    resolve_particle_grid,
+    step_simulation,
+)
 
 _REFERENCE_SPACING = 0.014
 _FLUID_SIZE = (1.90, 0.50, 0.25)
@@ -46,6 +50,8 @@ def drive_archimedes_screw(
     base_rot: wp.quat,
     speed: float,
     ramp_duration: float,
+    wheel_coord: int,
+    joint_q: wp.array[float],
     body_q_0: wp.array[wp.transform],
     body_qd_0: wp.array[wp.spatial_vector],
     body_q_1: wp.array[wp.transform],
@@ -58,6 +64,8 @@ def drive_archimedes_screw(
     angle = motion[1] + angular_speed * dt
     motion[0] = t
     motion[1] = angle
+    # A rotating wheel passes through zero repeatedly; retain its excursion.
+    motion[2] = wp.max(motion[2], wp.abs(joint_q[wheel_coord]))
 
     local_rotation = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), angle)
     rotation = wp.mul(base_rot, local_rotation)
@@ -280,6 +288,7 @@ class Example:
         non_pickable_shapes.append(self._add_delivery_pipe(builder, args, screw_angle))
 
         self.wheel_body, self.wheel_joint = self._add_passive_wheel(builder, args)
+        self.wheel_coord = int(builder.joint_q_start[self.wheel_joint])
         # The revolute joint remains unactuated; right-drag picking is an explicit
         # external force that lets the user brake or accelerate the wheel.
         self.wheel_shapes = tuple(i for i, body in enumerate(builder.shape_body) if body == self.wheel_body)
@@ -311,7 +320,7 @@ class Example:
         self.state_1 = self.model.state()
         self.collision_pipeline = newton.CollisionPipeline(self.model)
         self.contacts = self.collision_pipeline.contacts()
-        self.screw_motion = wp.zeros(2, dtype=float, device=self.model.device)
+        self.screw_motion = wp.zeros(3, dtype=float, device=self.model.device)
 
         self.fluid_color = tuple(args.fluid_color)
         self.particle_render_colors = wp.full(
@@ -640,6 +649,8 @@ class Example:
                     self.screw_base_rot,
                     self.screw_speed,
                     1.2,
+                    self.wheel_coord,
+                    self.model.joint_q,
                     self.state_0.body_q,
                     self.state_0.body_qd,
                     self.state_1.body_q,
@@ -658,24 +669,7 @@ class Example:
             newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
     def step(self):
-        if self.use_cuda_graph:
-            key = self._graph_key_tuple()
-            if self.graph is None or key != self._graph_key:
-                try:
-                    with wp.ScopedCapture() as capture:
-                        self.simulate()
-                    self.graph = capture.graph
-                    self._graph_key = key
-                    wp.capture_launch(self.graph)
-                except Exception as exc:
-                    warnings.warn(f"CUDA graph capture failed; running uncaptured: {exc}", stacklevel=2)
-                    self.use_cuda_graph = False
-                    self.graph = None
-                    self.simulate()
-            else:
-                wp.capture_launch(self.graph)
-        else:
-            self.simulate()
+        step_simulation(self, self._graph_key_tuple())
         self.sim_time += self.frame_dt
 
     def gui(self, ui):
@@ -712,8 +706,8 @@ class Example:
                 raise ValueError("Paddle wheel shapes must remain available for right-drag picking")
         if self.sim_time > 2.5 and float(q[:, 2].max()) < 0.45:
             raise ValueError("Archimedes screw failed to lift water into the round delivery pipe")
-        wheel_coord = int(self.model.joint_q_start.numpy()[self.wheel_joint])
-        if self.sim_time > 3.5 and abs(float(self.model.joint_q.numpy()[wheel_coord])) < 0.05:
+        wheel_excursion = float(self.screw_motion.numpy()[2])
+        if self.sim_time > 3.5 and wheel_excursion < 0.05:
             raise ValueError("Passive paddle wheel did not rotate under water force")
         wheel_position_error = np.linalg.norm(body_q[self.wheel_body, :3] - np.array(_WHEEL_CENTER))
         wheel_axis_error = np.hypot(body_q[self.wheel_body, 3], body_q[self.wheel_body, 5])

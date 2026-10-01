@@ -66,8 +66,8 @@ def cache_env(directory: Path) -> dict[str, str]:
         env[var] = str(directory / name)
     env["__GL_SHADER_DISK_CACHE"] = "1"
     env["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"] = "1"
-    # XDG_CACHE_HOME moves uv's cache too; keep the shared one (uv run --no-sync only reads it).
-    env["UV_CACHE_DIR"] = str(HOME / ".cache/uv")
+    # uv locks its cache even for `uv run --no-sync`, and the shared one is read-only inside the sandbox.
+    env["UV_CACHE_DIR"] = str(directory / "uv")
     env["XDG_CONFIG_HOME"] = str(directory / "config")
     env["MPLCONFIGDIR"] = str(directory / "config" / "matplotlib")
     (directory / "config" / "matplotlib").mkdir(parents=True, exist_ok=True)

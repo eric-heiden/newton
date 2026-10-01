@@ -124,6 +124,9 @@ def solve_particle_shape_contacts(
     particle_invmass: wp.array[float],
     particle_radius: wp.array[float],
     particle_flags: wp.array[wp.int32],
+    required_particle_flags: wp.int32,
+    static_contacts_only: wp.int32,
+    apply_body_reaction: wp.int32,
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
@@ -159,6 +162,10 @@ def solve_particle_shape_contacts(
 
     particle_flag = particle_flags[particle_index]
     if (particle_flag & ParticleFlags.ACTIVE) == 0:
+        return
+    if required_particle_flags != 0 and (particle_flag & required_particle_flags) != required_particle_flags:
+        return
+    if static_contacts_only != 0 and body_index >= 0 and body_m_inv[body_index] > 0.0:
         return
     if (particle_flag & ParticleFlags.PROXY) != 0:
         if body_index < 0:
@@ -232,7 +239,7 @@ def solve_particle_shape_contacts(
 
     wp.atomic_add(delta, particle_index, w1 * delta_total)
 
-    if body_index >= 0:
+    if body_index >= 0 and apply_body_reaction != 0:
         # apply_body_deltas() treats body_delta as a velocity-like correction:
         # it multiplies by inverse mass/inertia and dt to update the body pose.
         # delta_total is a positional contact correction, matching the particle
@@ -250,6 +257,7 @@ def solve_particle_particle_contacts(
     particle_invmass: wp.array[float],
     particle_radius: wp.array[float],
     particle_flags: wp.array[wp.int32],
+    particle_world: wp.array[wp.int32],
     k_mu: float,
     k_cohesion: float,
     max_radius: float,
@@ -274,15 +282,20 @@ def solve_particle_particle_contacts(
     v = particle_v[i]
     radius = particle_radius[i]
     w1 = particle_invmass[i]
+    i_fluid = particle_flags[i] & ParticleFlags.FLUID
+    world_id = particle_world[i]
 
     # particle contact
-    query = wp.hash_grid_query(grid, x, radius + max_radius + k_cohesion)
+    query = wp.hash_grid_query(grid, x, radius + max_radius + k_cohesion, world_id)
     index = int(0)
 
     delta = wp.vec3(0.0)
 
     while wp.hash_grid_query_next(query, index):
         neighbor_flag = particle_flags[index]
+        if i_fluid != 0 and (neighbor_flag & ParticleFlags.FLUID) != 0:
+            # Fluid-fluid interactions are handled by the density constraint.
+            continue
         if (
             (neighbor_flag & ParticleFlags.ACTIVE) != 0
             and (is_proxy == 0 or ((neighbor_flag & ParticleFlags.PROXY) == 0 and particle_invmass[index] > 0.0))
@@ -861,6 +874,11 @@ def apply_particle_deltas(
     if v_new_mag > v_max:
         v_new *= v_max / v_new_mag
         x_new = x0 + v_new * dt
+
+    # Prevent a non-finite correction from contaminating the neighbor grid.
+    if not (wp.isfinite(x_new[0]) and wp.isfinite(x_new[1]) and wp.isfinite(x_new[2])):
+        x_new = x0
+        v_new = wp.vec3(0.0)
 
     x_out[tid] = x_new
     v_out[tid] = v_new
@@ -2900,3 +2918,167 @@ def convert_joint_impulse_to_parent_f(
     f = wp.spatial_top(impulse) * inv_dt
     tau = wp.spatial_bottom(impulse) * inv_dt
     wp.atomic_add(body_parent_f, id_c, wp.spatial_vector(f, tau))
+
+
+# ---------------------------------------------------------------------------
+# Fluid particle spatial reordering (neighbor-read locality)
+
+
+@wp.func
+def part1by2(n: wp.uint32) -> wp.uint32:
+    """Spread ten bits so three coordinates can be interleaved."""
+    n = n & wp.uint32(0x3FF)
+    # Use the signed spelling of this bit pattern so Warp's generated C++ does
+    # not warn while converting the literal to a 32-bit value.
+    n = (n | (n << wp.uint32(16))) & wp.uint32(-16776961)
+    n = (n | (n << wp.uint32(8))) & wp.uint32(0x0300F00F)
+    n = (n | (n << wp.uint32(4))) & wp.uint32(0x030C30C3)
+    n = (n | (n << wp.uint32(2))) & wp.uint32(0x09249249)
+    return n
+
+
+@wp.kernel
+def compute_particle_bounds_min(
+    particle_q: wp.array[wp.vec3],
+    bounds_min: wp.array[wp.float32],
+):
+    tid = wp.tid()
+    p = particle_q[tid]
+    wp.atomic_min(bounds_min, 0, p[0])
+    wp.atomic_min(bounds_min, 1, p[1])
+    wp.atomic_min(bounds_min, 2, p[2])
+
+
+@wp.kernel
+def compute_morton_keys(
+    particle_q: wp.array[wp.vec3],
+    bounds_min: wp.array[wp.float32],
+    inv_cell: float,
+    keys: wp.array[wp.int32],
+    indices: wp.array[wp.int32],
+):
+    tid = wp.tid()
+    p = particle_q[tid]
+    ix = wp.clamp(int((p[0] - bounds_min[0]) * inv_cell), 0, 1023)
+    iy = wp.clamp(int((p[1] - bounds_min[1]) * inv_cell), 0, 1023)
+    iz = wp.clamp(int((p[2] - bounds_min[2]) * inv_cell), 0, 1023)
+    code = (
+        part1by2(wp.uint32(ix)) | (part1by2(wp.uint32(iy)) << wp.uint32(1)) | (part1by2(wp.uint32(iz)) << wp.uint32(2))
+    )
+    keys[tid] = wp.int32(code)
+    indices[tid] = tid
+
+
+@wp.kernel
+def gather_vec3(src: wp.array[wp.vec3], perm: wp.array[wp.int32], dst: wp.array[wp.vec3]):
+    tid = wp.tid()
+    dst[tid] = src[perm[tid]]
+
+
+@wp.kernel
+def gather_float(src: wp.array[wp.float32], perm: wp.array[wp.int32], dst: wp.array[wp.float32]):
+    tid = wp.tid()
+    dst[tid] = src[perm[tid]]
+
+
+@wp.kernel
+def gather_int32(src: wp.array[wp.int32], perm: wp.array[wp.int32], dst: wp.array[wp.int32]):
+    tid = wp.tid()
+    dst[tid] = src[perm[tid]]
+
+
+@wp.kernel
+def gather_uint32(src: wp.array[wp.uint32], perm: wp.array[wp.int32], dst: wp.array[wp.uint32]):
+    tid = wp.tid()
+    dst[tid] = src[perm[tid]]
+
+
+@wp.kernel
+def clamp_body_motion(
+    body_q_prev: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_inv_mass: wp.array[float],
+    max_linear: float,
+    max_angular: float,
+    dt: float,
+    # in/out
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Bound a dynamic body's integrated motion before constraint solving.
+
+    The ordinary integration result is preserved unless a velocity component
+    is non-finite or exceeds its configured limit. In that case, the pose is
+    rebuilt from the previous center-of-mass transform and bounded velocity so
+    a single force spike cannot move a body through a thin collider before the
+    final velocity clamp runs.
+    """
+    tid = wp.tid()
+    if body_inv_mass[tid] == 0.0:
+        return
+
+    qd = body_qd[tid]
+    lin = wp.spatial_top(qd)
+    ang = wp.spatial_bottom(qd)
+    rebuild_pose = False
+
+    if not (wp.isfinite(lin[0]) and wp.isfinite(lin[1]) and wp.isfinite(lin[2])):
+        lin = wp.vec3(0.0)
+        rebuild_pose = True
+    if not (wp.isfinite(ang[0]) and wp.isfinite(ang[1]) and wp.isfinite(ang[2])):
+        ang = wp.vec3(0.0)
+        rebuild_pose = True
+
+    if max_linear > 0.0:
+        speed = wp.length(lin)
+        if speed > max_linear:
+            lin *= max_linear / speed
+            rebuild_pose = True
+    if max_angular > 0.0:
+        speed = wp.length(ang)
+        if speed > max_angular:
+            ang *= max_angular / speed
+            rebuild_pose = True
+
+    if rebuild_pose:
+        q_prev = body_q_prev[tid]
+        com = body_com[tid]
+        p_prev = wp.transform_get_translation(q_prev)
+        r_prev = wp.transform_get_rotation(q_prev)
+        x_com_prev = p_prev + wp.quat_rotate(r_prev, com)
+        r = wp.normalize(r_prev + wp.quat(ang, 0.0) * r_prev * 0.5 * dt)
+        x_com = x_com_prev + lin * dt
+        body_q[tid] = wp.transform(x_com - wp.quat_rotate(r, com), r)
+        body_qd[tid] = wp.spatial_vector(lin, ang)
+
+
+@wp.kernel
+def clamp_body_velocities(
+    body_inv_mass: wp.array[float],
+    max_linear: float,
+    max_angular: float,
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Clamp dynamic-body velocity and clear non-finite components."""
+    tid = wp.tid()
+    if body_inv_mass[tid] == 0.0:
+        return
+    qd = body_qd[tid]
+    lin = wp.spatial_top(qd)
+    ang = wp.spatial_bottom(qd)
+
+    if not (wp.isfinite(lin[0]) and wp.isfinite(lin[1]) and wp.isfinite(lin[2])):
+        lin = wp.vec3(0.0)
+    if not (wp.isfinite(ang[0]) and wp.isfinite(ang[1]) and wp.isfinite(ang[2])):
+        ang = wp.vec3(0.0)
+
+    if max_linear > 0.0:
+        speed = wp.length(lin)
+        if speed > max_linear:
+            lin *= max_linear / speed
+    if max_angular > 0.0:
+        speed = wp.length(ang)
+        if speed > max_angular:
+            ang *= max_angular / speed
+
+    body_qd[tid] = wp.spatial_vector(lin, ang)

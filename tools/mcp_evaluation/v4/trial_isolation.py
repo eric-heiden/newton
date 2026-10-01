@@ -72,6 +72,27 @@ def cache_env(directory: Path) -> dict[str, str]:
     return env
 
 
+def cli_homes(trial_root: Path) -> dict[str, str]:
+    """Per-trial CLI state with the operator's credentials but none of its history.
+
+    Codex gets its own CODEX_HOME holding only auth.json and config.toml (the operator's thread history and
+    log databases name study results), and Claude a copy of ~/.claude.json without per-project entries;
+    ``sandbox`` binds that copy over the original and hides the rest of both CLIs' operator state.
+    """
+    codex = trial_root / "codex-home"
+    codex.mkdir(parents=True, exist_ok=True)
+    for name in ("auth.json", "config.toml"):
+        if (HOME / ".codex" / name).exists():
+            shutil.copy2(HOME / ".codex" / name, codex / name)
+    claude = HOME / ".claude.json"
+    if claude.exists():
+        state = json.loads(claude.read_text())
+        for key in ("projects", "skillUsage", "pluginUsage", "githubRepoPaths"):
+            state.pop(key, None)
+        (trial_root / "claude.json").write_text(json.dumps(state))
+    return {"CODEX_HOME": str(codex)}
+
+
 def trial_env(root: Path, caches: Path, trial_id: str, extra: dict[str, str] | None = None) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith(DROP_PREFIXES)}
     env["PYTHONPATH"] = str(root)
@@ -186,7 +207,10 @@ def sandbox(
         HOME / ".horde-var-tmp",
         HOME / ".claude/projects",
         HOME / ".claude/sessions",
-        HOME / ".codex/sessions",
+        HOME / ".claude/session-env",
+        HOME / ".claude/shell-snapshots",
+        HOME / ".claude/backups",
+        HOME / ".codex",
         SEEDS,
         private,
         *extra_hidden,
@@ -212,6 +236,8 @@ def sandbox(
         if Path(path).exists():
             args += ["--ro-bind", str(path), str(path)]
     args += ["--bind", str(run_dir), str(run_dir)]
+    if (run_dir / "claude.json").exists():
+        args += ["--bind", str(run_dir / "claude.json"), str(HOME / ".claude.json")]
     args += ["--bind", str(run_dir / "tmp"), "/tmp", "--bind", str(run_dir / "var-tmp"), "/var/tmp"]
     args += ["--bind", str(run_dir / "shm"), "/dev/shm"]
     return [*args, *command]

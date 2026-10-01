@@ -313,7 +313,7 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
     workspace = Path(spec["workspace"])
     sandbox_root = workspace.parent
     (sandbox_root / ".mcp").mkdir()
-    env = ti.trial_env(ROOT, sandbox_root / "caches", trial_id)
+    env = ti.trial_env(ROOT, sandbox_root / "caches", trial_id, ti.cli_homes(sandbox_root) if SANDBOX else None)
     env["MCP_TOOL_TIMEOUT"] = "300000"
     env["MAX_MCP_OUTPUT_TOKENS"] = "60000"
     env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = str(BG_WAIT_CEILING_MS)

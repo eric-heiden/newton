@@ -1,0 +1,1 @@
+Group liquid examples under `examples/fluid` and provide XPBD and MPM options for the shared dam-break scene. Use `fluid_viscous` and `fluid_water_surface` for the MPM liquid demonstrations; the previous `mpm_viscous` and `mpm_water_dam_break` commands remain available.

@@ -508,6 +508,89 @@ If you run the examples from a source checkout with uv, use
     </td>
   </tr>
   <tr>
+    <td colspan="3"><h3>Fluid Examples</h3></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_dam_break.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_dam_break.jpg" alt="Fluid Dam Break (XPBD / MPM)">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_tank.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_tank.jpg" alt="Fluid Tank">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_wave_pool.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_wave_pool.jpg" alt="Fluid Wave Pool">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_dam_break</code><br>
+      <code>python -m newton.examples fluid_dam_break --solver mpm</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_tank</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_wave_pool</code>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_archimedes_screw.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_archimedes_screw.jpg" alt="Fluid Archimedes Screw">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_cup.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_cup.jpg" alt="Fluid Cup">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_cup_transfer.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_cup_transfer.jpg" alt="Batched Fluid Cup Transfer">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_archimedes_screw</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_cup</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_cup_transfer</code><br>
+      <code>python -m newton.examples fluid_cup_transfer --world-count 16</code>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_viscous.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_viscous.jpg" alt="Viscous Fluid (MPM)">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/fluid/example_fluid_water_surface.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fluid_water_surface.jpg" alt="Water Surface (MPM)">
+      </a>
+    </td>
+    <td align="center" width="33%"></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_viscous</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fluid_water_surface</code>
+    </td>
+    <td align="center" width="33%"></td>
+  </tr>
+  <tr>
     <td colspan="3"><h3>MPM Examples</h3></td>
   </tr>
   <tr>
@@ -551,9 +634,6 @@ If you run the examples from a source checkout with uv, use
       </a>
     </td>
     <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mpm/example_mpm_viscous.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mpm_viscous.jpg" alt="MPM Viscous">
-      </a>
     </td>
   </tr>
   <tr>
@@ -564,7 +644,6 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples mpm_multi_material</code>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples mpm_viscous</code>
     </td>
   </tr>
   <tr>
@@ -579,9 +658,6 @@ If you run the examples from a source checkout with uv, use
       </a>
     </td>
     <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mpm/example_mpm_water_dam_break.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mpm_water_dam_break.jpg" alt="MPM Water Dam Break">
-      </a>
     </td>
   </tr>
   <tr>
@@ -592,7 +668,6 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples mpm_snow_ball</code>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples mpm_water_dam_break</code>
     </td>
   </tr>
   <tr>

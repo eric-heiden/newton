@@ -1212,6 +1212,46 @@ add_example_test(
 )
 
 
+class TestFluidExamples(NewtonTestCase):
+    pass
+
+
+for fluid_scene in ("tank", "wave_pool", "archimedes_screw", "cup"):
+    add_example_test(
+        TestFluidExamples,
+        name=f"fluid.example_fluid_{fluid_scene}",
+        devices=cuda_test_devices,
+        test_options={"num-frames": 300},
+        use_viewer=True,
+    )
+
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_dam_break",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 300, "world-count": 4},
+    use_viewer=True,
+    test_suffix="xpbd",
+)
+
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_dam_break",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 300, "world-count": 2, "particle-count": 1000, "solver": "mpm"},
+    use_viewer=True,
+    test_suffix="mpm",
+)
+
+add_example_test(
+    TestFluidExamples,
+    name="fluid.example_fluid_cup_transfer",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 840, "world-count": 2, "auto-reset": False},
+    use_viewer=True,
+)
+
+
 class TestMPMExamples(unittest.TestCase):
     pass
 
@@ -1250,8 +1290,8 @@ add_example_test(
 )
 
 add_example_test(
-    TestMPMExamples,
-    name="mpm.example_mpm_water_dam_break",
+    TestFluidExamples,
+    name="fluid.example_fluid_water_surface",
     devices=cuda_test_devices,
     test_options={
         "num-frames": 10,
@@ -1289,8 +1329,8 @@ add_example_test(
 )
 
 add_example_test(
-    TestMPMExamples,
-    name="mpm.example_mpm_viscous",
+    TestFluidExamples,
+    name="fluid.example_fluid_viscous",
     devices=cuda_test_devices,
     test_options={"num-frames": 30, "voxel-size": 0.01},
     use_viewer=True,

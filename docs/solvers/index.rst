@@ -41,12 +41,14 @@ method details. For symptom-driven diagnosis and parameter tuning, start with
 Choosing a Solver
 -----------------
 
-MuJoCo and Kamino currently have dedicated backend guides:
+Dedicated backend and workload guides are available:
 
 - :doc:`MuJoCo <mujoco>` — generalized-coordinate rigid-body simulation and
   MuJoCo or MJCF workflows.
 - :doc:`Kamino <kamino>` — constrained rigid mechanisms with kinematic loops
   and hard frictional contacts; experimental.
+- :doc:`Fluids <fluids>` — XPBD particle fluids, MPM examples, and batched
+  environments for learning workflows.
 
 The other solver backends are documented through their linked API references
 and the comparison tables below.

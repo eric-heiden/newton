@@ -1,0 +1,446 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+###########################################################################
+# Example Fluid Wave Pool
+#
+# A kinematic paddle at the deep end of a walled pool drives waves in
+# XPBD position-based fluid that travel down the tank and break on a
+# sloped beach. The paddle is a kinematic rigid body whose transform is
+# animated directly; the fluid interacts with it and the beach through
+# the standard XPBD particle-shape contact pipeline.
+#
+# Command: python -m newton.examples fluid_wave_pool
+#
+###########################################################################
+
+from __future__ import annotations
+
+import numpy as np
+import warp as wp
+
+import newton
+import newton.examples
+from newton.examples.fluid.utils import (
+    FluidParticleRenderer,
+    parse_particle_count,
+    resolve_particle_grid,
+    step_simulation,
+    validate_simulation_args,
+)
+
+ParticleFlags = newton.ParticleFlags
+
+_REFERENCE_SPACING = 0.0211
+_FLUID_SIZE = (123 * _REFERENCE_SPACING, 43 * _REFERENCE_SPACING, 19 * _REFERENCE_SPACING)
+
+
+@wp.kernel
+def deactivate_particles_inside_box(
+    particle_q: wp.array[wp.vec3],
+    particle_flags: wp.array[wp.int32],
+    box_xform: wp.transform,
+    box_half_extents: wp.vec3,
+    clearance: float,
+):
+    tid = wp.tid()
+    local = wp.transform_point(wp.transform_inverse(box_xform), particle_q[tid])
+    half = box_half_extents + wp.vec3(clearance)
+    if wp.abs(local[0]) <= half[0] and wp.abs(local[1]) <= half[1] and wp.abs(local[2]) <= half[2]:
+        particle_flags[tid] = wp.int32(0)
+
+
+@wp.kernel
+def drive_wave_paddle(
+    paddle_time: wp.array[float],
+    dt: float,
+    paddle_body: int,
+    base_pos: wp.vec3,
+    amplitude: float,
+    angular_frequency: float,
+    start_ramp: float,
+    body_q_0: wp.array[wp.transform],
+    body_qd_0: wp.array[wp.spatial_vector],
+    body_q_1: wp.array[wp.transform],
+    body_qd_1: wp.array[wp.spatial_vector],
+):
+    t = paddle_time[0] + dt
+    paddle_time[0] = t
+
+    ramp = wp.min(t * start_ramp, 1.0)
+    offset = amplitude * ramp * wp.sin(angular_frequency * t)
+    velocity = amplitude * ramp * angular_frequency * wp.cos(angular_frequency * t)
+    if ramp < 1.0:
+        velocity += amplitude * start_ramp * wp.sin(angular_frequency * t)
+    xform = wp.transform(base_pos + wp.vec3(offset, 0.0, 0.0), wp.quat_identity())
+    qd = wp.spatial_vector(wp.vec3(velocity, 0.0, 0.0), wp.vec3(0.0))
+    body_q_0[paddle_body] = xform
+    body_qd_0[paddle_body] = qd
+    body_q_1[paddle_body] = xform
+    body_qd_1[paddle_body] = qd
+
+
+class Example:
+    def __init__(self, viewer, args):
+        validate_simulation_args(args, supported_solvers=("xpbd",))
+        self.fps = args.fps
+        self.frame_dt = 1.0 / self.fps
+        self.sim_time = 0.0
+        self.sim_substeps = args.substeps
+        self.sim_dt = self.frame_dt / self.sim_substeps
+        self.viewer = viewer
+
+        particle_grid = resolve_particle_grid(args.particle_count, _FLUID_SIZE, _REFERENCE_SPACING)
+        spacing = particle_grid.spacing
+        radius = 0.5 * spacing
+        self.particle_radius = radius
+        mass = args.rest_density * spacing**3
+        dim_x, dim_y, dim_z = particle_grid.dimensions
+
+        self.pool_half_y = 0.5 * args.pool_width
+        self.pool_back_inner_x = args.paddle_x - 0.30
+        self.paddle_amplitude = args.paddle_amplitude
+        self.paddle_frequency = 2.0 * np.pi / max(args.paddle_period, 1.0e-3)
+
+        builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, args.gravity))
+        builder.default_particle_radius = radius
+        builder.default_shape_cfg.mu = 0.2
+
+        builder.add_particle_grid(
+            pos=wp.vec3(args.emit_lower[0], -0.5 * (dim_y - 1) * spacing, args.emit_lower[1]),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=dim_x,
+            dim_y=dim_y,
+            dim_z=dim_z,
+            cell_x=spacing,
+            cell_y=spacing,
+            cell_z=spacing,
+            mass=mass,
+            jitter=0.05 * spacing,
+            radius_mean=radius,
+            flags=ParticleFlags.ACTIVE | ParticleFlags.FLUID,
+        )
+        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.2))
+
+        # sloped beach the waves run up and break on
+        beach_angle = float(np.deg2rad(args.beach_angle_deg))
+        beach_length = args.beach_length
+        beach_half_thickness = 0.10
+        beach_center = wp.vec3(
+            args.beach_start + 0.5 * beach_length * np.cos(beach_angle),
+            0.0,
+            0.5 * beach_length * np.sin(beach_angle) - beach_half_thickness / np.cos(beach_angle),
+        )
+        beach_q = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), -beach_angle)
+        self.beach_xform = wp.transform(beach_center, beach_q)
+        self.beach_half_extents = wp.vec3(0.5 * beach_length, self.pool_half_y + 0.2, beach_half_thickness)
+        builder.add_shape_box(
+            -1,
+            xform=self.beach_xform,
+            hx=self.beach_half_extents[0],
+            hy=self.beach_half_extents[1],
+            hz=self.beach_half_extents[2],
+            cfg=newton.ModelBuilder.ShapeConfig(mu=0.4),
+            color=(0.83, 0.74, 0.55),
+            label="beach",
+        )
+
+        # side walls and a back wall behind the paddle keep the pool contained;
+        # the walls run past the end of the beach so breaking waves cannot
+        # spill off its sides
+        wall_color = (0.62, 0.72, 0.78)
+        wall_height = 0.55
+        beach_end = args.beach_start + beach_length * float(np.cos(beach_angle))
+        pool_center_x = 0.5 * (args.paddle_x - 0.5 + beach_end + 0.2)
+        pool_half_x = 0.5 * (beach_end + 0.2 - (args.paddle_x - 0.5))
+        wall_shapes = []
+        for sy in (-1.0, 1.0):
+            wall_shapes.append(
+                builder.add_shape_box(
+                    body=-1,
+                    xform=wp.transform(
+                        wp.vec3(pool_center_x, sy * (self.pool_half_y + 0.05), 0.5 * wall_height),
+                        wp.quat_identity(),
+                    ),
+                    hx=pool_half_x,
+                    hy=0.05,
+                    hz=0.5 * wall_height,
+                    color=wall_color,
+                    opacity=args.wall_opacity,
+                )
+            )
+        wall_shapes.append(
+            builder.add_shape_box(
+                body=-1,
+                xform=wp.transform(wp.vec3(args.paddle_x - 0.35, 0.0, 0.5 * wall_height), wp.quat_identity()),
+                hx=0.05,
+                hy=self.pool_half_y + 0.1,
+                hz=0.5 * wall_height,
+                color=wall_color,
+                opacity=args.wall_opacity,
+            )
+        )
+        self.wall_shapes = tuple(wall_shapes)
+
+        # kinematic paddle at the deep end; its transform is animated directly
+        self.paddle_base_pos = wp.vec3(args.paddle_x, 0.0, args.paddle_height)
+        self.paddle_body = builder.add_body(
+            xform=wp.transform(self.paddle_base_pos, wp.quat_identity()),
+            is_kinematic=True,
+            label="wave_paddle",
+        )
+        builder.add_shape_box(
+            self.paddle_body,
+            hx=0.06,
+            hy=self.pool_half_y,
+            hz=args.paddle_height + 0.1,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.1),
+            color=(0.35, 0.38, 0.42),
+        )
+
+        # Small primitives with mixed densities demonstrate two-way fluid coupling:
+        # bodies less dense than water float while denser bodies settle lower.
+        water_top = args.emit_lower[1] + (dim_z - 1) * spacing
+        self.float_bodies, self.light_float_bodies, self.dense_float_bodies = self._add_floats(builder, args, water_top)
+
+        self.model = builder.finalize()
+        self.model.particle_max_velocity = 0.5 * radius / self.sim_dt
+        self.model.soft_contact_mu = 0.1
+
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
+        self.paddle_time = wp.zeros(1, dtype=float, device=self.model.device)
+
+        # remove spawned particles that started inside the beach ramp
+        wp.launch(
+            kernel=deactivate_particles_inside_box,
+            dim=self.model.particle_count,
+            inputs=[
+                self.state_0.particle_q,
+                self.model.particle_flags,
+                self.beach_xform,
+                self.beach_half_extents,
+                radius,
+            ],
+            device=self.model.device,
+        )
+
+        self.solver = newton.solvers.SolverXPBD(
+            self.model,
+            iterations=args.iterations,
+            fluid_rest_distance=spacing,
+            fluid_cohesion=args.cohesion,
+            fluid_viscosity=args.viscosity,
+            fluid_relaxation=args.relaxation,
+            # Cranking the paddle amplitude slams water into momentary clumps at
+            # many times the rest neighbor count (~30-80), and a single such
+            # particle stalls its whole warp -- the cause of the FPS collapse at
+            # high amplitude. Capping above the settled bulk leaves calm water
+            # untouched but bounds those clumps, so the frame rate holds up no
+            # matter how violent the paddle gets.
+            fluid_max_neighbors=args.max_neighbors,
+            # keep a yanked float from diverging if the user grabs and flings it
+            body_max_velocity=12.0,
+            body_max_angular_velocity=40.0,
+        )
+
+        self.viewer.set_model(self.model)
+        self.particle_renderer = FluidParticleRenderer(self.model)
+        self.viewer.picking_enabled = True
+        self.viewer.show_particles = True
+        self.viewer.set_camera(pos=wp.vec3(args.camera_pos), pitch=args.camera_pitch, yaw=args.camera_yaw)
+
+        # CUDA graph capture: the whole substep loop (paddle, collide, picking,
+        # solve) is replayed as a single graph, eliminating per-substep launch
+        # overhead. Recaptured only when a GUI-tunable scalar baked into the
+        # kernels changes.
+        self.graph = None
+        self.use_cuda_graph = wp.get_device(self.model.device).is_cuda
+        self._graph_key = None
+
+    def _graph_key_tuple(self):
+        return (round(self.paddle_amplitude, 6), round(self.solver.fluid_viscosity, 6))
+
+    def simulate(self):
+        self.solver.reorder_particles(self.state_0)
+        for _ in range(self.sim_substeps):
+            self.state_0.clear_forces()
+            wp.launch(
+                kernel=drive_wave_paddle,
+                dim=1,
+                inputs=[
+                    self.paddle_time,
+                    self.sim_dt,
+                    self.paddle_body,
+                    self.paddle_base_pos,
+                    self.paddle_amplitude,
+                    self.paddle_frequency,
+                    0.5,
+                    self.state_0.body_q,
+                    self.state_0.body_qd,
+                    self.state_1.body_q,
+                    self.state_1.body_qd,
+                ],
+                device=self.model.device,
+            )
+            self.collision_pipeline.collide(self.state_0, self.contacts)
+            self.viewer.apply_forces(self.state_0)
+            self.solver.step(self.state_0, self.state_1, None, self.contacts, self.sim_dt)
+            self.state_0, self.state_1 = self.state_1, self.state_0
+
+    def step(self):
+        step_simulation(self, self._graph_key_tuple())
+        self.sim_time += self.frame_dt
+
+    def gui(self, ui):
+        _, self.paddle_amplitude = ui.slider_float("Paddle Amplitude", self.paddle_amplitude, 0.0, 0.4, "%.2f")
+        _, self.solver.fluid_viscosity = ui.slider_float("Viscosity", self.solver.fluid_viscosity, 0.0, 1.0, "%.2f")
+
+    def test_final(self):
+        """Check finite state, containment, and the scene's intended motion."""
+        active = (self.model.particle_flags.numpy() & int(ParticleFlags.ACTIVE)) != 0
+        q = self.state_0.particle_q.numpy()[active]
+        qd = self.state_0.particle_qd.numpy()[active]
+        if not np.all(np.isfinite(q)) or not np.all(np.isfinite(qd)):
+            raise ValueError("XPBD fluid particles contain non-finite state")
+        tolerance = 1.0e-5
+        if q[:, 2].min() < self.particle_radius - tolerance:
+            raise ValueError("Fluid penetrated the pool floor")
+        if np.abs(q[:, 1]).max() > self.pool_half_y - self.particle_radius + tolerance:
+            raise ValueError("Fluid escaped the pool side walls")
+        if q[:, 0].min() < self.pool_back_inner_x + self.particle_radius - tolerance:
+            raise ValueError("Fluid escaped through the pool back wall")
+        mean_speed = float(np.linalg.norm(qd, axis=1).mean())
+        if mean_speed < 1.0e-3:
+            raise ValueError("Wave pool fluid is static; the paddle generated no waves")
+
+        if self.float_bodies:
+            float_q = self.state_0.body_q.numpy()[self.float_bodies]
+            if not np.all(np.isfinite(float_q)):
+                raise ValueError("Floating primitives contain non-finite transforms")
+            if np.abs(float_q[:, 1]).max() > self.pool_half_y + 0.3:
+                raise ValueError("A floating primitive escaped the pool side walls")
+            # Rigid primitives may float or sink, but should remain in the pool.
+            if float_q[:, 2].min() < 0.0:
+                raise ValueError("A rigid primitive sank through the pool floor")
+        if self.light_float_bodies and self.dense_float_bodies and self.sim_time > 0.5:
+            body_q = self.state_0.body_q.numpy()
+            light_height = body_q[list(self.light_float_bodies), 2].max()
+            dense_height = body_q[list(self.dense_float_bodies), 2].max()
+            if light_height <= dense_height:
+                raise ValueError("Fluid density did not separate floating and sinking primitives")
+
+    def render(self):
+        self.viewer.begin_frame(self.sim_time)
+        self.particle_renderer.log_state(self.viewer, self.state_0)
+        self.viewer.end_frame()
+
+    @staticmethod
+    def _add_floats(builder, args, water_top):
+        """Drop a few small primitives with mixed buoyancy on the waves.
+
+        Densities are fractions of the fluid rest density. Values below one
+        float; values above one are intentionally denser so only some bodies
+        sit at the surface.
+        """
+        rng = np.random.default_rng(5)
+        size = args.float_size
+        # (primitive kind, density as a fraction of water, RGB color)
+        specs = (
+            ("sphere", 0.18, (0.16, 0.78, 0.42)),
+            ("box", 1.20, (0.95, 0.20, 0.25)),
+            ("capsule", 0.28, (0.92, 0.96, 0.98)),
+            ("sphere", 1.35, (0.22, 0.54, 1.0)),
+            ("box", 0.42, (0.00, 0.72, 0.66)),
+            ("capsule", 1.10, (0.82, 0.32, 0.78)),
+        )
+        bodies = []
+        light_bodies = []
+        dense_bodies = []
+        n = max(int(args.float_count), 0)
+        for i in range(n):
+            kind, fraction, color = specs[i % len(specs)]
+            # scatter along the deep-to-mid pool (clear of the paddle and beach),
+            # alternating across the width so the waves rock each one differently
+            x = -1.6 + 1.6 * (float(i) / float(max(n - 1, 1)))
+            y = (0.22 if i % 2 == 0 else -0.22) + float(rng.uniform(-0.05, 0.05))
+            z = water_top + 0.12 + 0.05 * float(i)
+            cfg = newton.ModelBuilder.ShapeConfig(density=fraction * args.rest_density, mu=0.3)
+            if kind == "capsule":
+                # the capsule's length is along local +Z; lay it on its side so
+                # it floats like a log instead of bobbing end-up
+                axis = wp.vec3(0.0, 1.0, 0.0) if i % 4 == 0 else wp.vec3(1.0, 0.0, 0.0)
+                q = wp.quat_from_axis_angle(axis, 0.5 * np.pi)
+            else:
+                q = wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 0.7, 0.2)), float(rng.uniform(0.0, 0.5)))
+            body = builder.add_body(xform=wp.transform(wp.vec3(x, y, z), q), label=f"float_{i}")
+            if kind == "sphere":
+                builder.add_shape_sphere(body, radius=size, cfg=cfg, color=color)
+            elif kind == "box":
+                builder.add_shape_box(body, hx=size, hy=size, hz=0.7 * size, cfg=cfg, color=color)
+            else:
+                builder.add_shape_capsule(body, radius=0.65 * size, half_height=size, cfg=cfg, color=color)
+            bodies.append(body)
+            if fraction < 1.0:
+                light_bodies.append(body)
+            else:
+                dense_bodies.append(body)
+        return bodies, light_bodies, dense_bodies
+
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        parser.add_argument(
+            "--solver", choices=["xpbd"], default="xpbd", help="This scene requires XPBD two-way rigid-body coupling."
+        )
+        parser.add_argument("--fps", type=float, default=60.0)
+        # The pressure timestep, not just the iteration count, controls the
+        # high-frequency Jacobi mode. Four substeps and two iterations balance
+        # wave propagation with the interactive workload.
+        parser.add_argument("--substeps", type=int, default=4)
+        parser.add_argument("--iterations", type=int, default=2)
+
+        parser.add_argument(
+            "--particle-count",
+            type=parse_particle_count,
+            default=10_000,
+            help="Target fluid particle count; spacing and grid dimensions are derived automatically.",
+        )
+        parser.add_argument("--emit-lower", type=float, nargs=2, default=(-2.05, 0.025))
+        parser.add_argument("--rest-density", type=float, default=1000.0)
+        parser.add_argument("--gravity", type=float, default=-9.81)
+
+        parser.add_argument("--pool-width", type=float, default=0.95)
+        parser.add_argument("--wall-opacity", type=float, default=0.3)
+        parser.add_argument("--beach-angle-deg", type=float, default=8.0)
+        parser.add_argument("--beach-length", type=float, default=2.4)
+        parser.add_argument("--beach-start", type=float, default=0.35)
+        parser.add_argument("--paddle-x", type=float, default=-2.20)
+        parser.add_argument("--paddle-height", type=float, default=0.30)
+        parser.add_argument("--paddle-amplitude", type=float, default=0.16)
+        parser.add_argument("--paddle-period", type=float, default=1.5)
+
+        parser.add_argument("--cohesion", type=float, default=0.6)
+        parser.add_argument("--viscosity", type=float, default=0.03)
+        parser.add_argument("--relaxation", type=float, default=0.5)
+        # Cap fluid neighbors above the settled bulk (~80) so high-amplitude
+        # clumps can't stall a warp; 0 disables the cap.
+        parser.add_argument("--max-neighbors", type=int, default=128)
+
+        # small primitives (spheres/boxes/capsules) with mixed buoyancy
+        parser.add_argument("--float-count", type=int, default=6)
+        parser.add_argument("--float-size", type=float, default=0.08)
+
+        parser.add_argument("--camera-pos", type=float, nargs=3, default=(0.9, -2.4, 1.5))
+        parser.add_argument("--camera-pitch", type=float, default=-26.0)
+        parser.add_argument("--camera-yaw", type=float, default=112.0)
+        return parser
+
+
+if __name__ == "__main__":
+    parser = Example.create_parser()
+    viewer, args = newton.examples.init(parser)
+    newton.examples.run(Example(viewer, args), args)

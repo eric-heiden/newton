@@ -48,6 +48,7 @@ Newton Physics
    :caption: Solvers
 
    Overview <solvers/index>
+   Fluids <solvers/fluids>
    MuJoCo <solvers/mujoco>
    Kamino <solvers/kamino>
 

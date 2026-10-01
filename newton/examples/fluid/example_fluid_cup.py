@@ -1,0 +1,296 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+###########################################################################
+# Example Fluid Cup
+#
+# A single rigid cup sitting on the ground, filled with XPBD position-based
+# fluid, that you grab and swing around with the mouse. It is the minimal
+# "fluid in a moving container" scene -- the common robotics case of a
+# gripper carrying a cup -- stripped of the arm/IK so it is easy to profile
+# and tune. Water contacts query the cup's mesh BVH, and the whole substep
+# loop is captured in a CUDA graph for high frame rates.
+#
+# Command: python -m newton.examples fluid_cup
+#
+###########################################################################
+
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import warp as wp
+
+import newton
+import newton.examples
+from newton.examples.fluid.utils import (
+    FluidParticleRenderer,
+    build_cup_mesh,
+    cylinder_particle_count,
+    cylinder_particle_positions,
+    parse_particle_count,
+    resolve_particle_spacing,
+    step_simulation,
+    validate_simulation_args,
+)
+
+# Cache the cooked cup SDF on disk so repeated runs skip the voxelization.
+_SDF_CACHE_DIR = Path(tempfile.gettempdir()) / "newton_cup_sdf"
+_REFERENCE_SPACING = 0.0024
+
+
+def _points_to_body_frame(points, body_xform):
+    delta = points - body_xform[:3]
+    inverse_quat_vector = np.broadcast_to(-body_xform[3:6], delta.shape)
+    cross = 2.0 * np.cross(inverse_quat_vector, delta)
+    return delta + body_xform[6] * cross + np.cross(inverse_quat_vector, cross)
+
+
+class Example:
+    def __init__(self, viewer, args):
+        validate_simulation_args(args, supported_solvers=("xpbd",))
+        self.fps = args.fps
+        self.frame_dt = 1.0 / self.fps
+        self.sim_time = 0.0
+        self.sim_substeps = args.substeps
+        self.sim_dt = self.frame_dt / self.sim_substeps
+        self.viewer = viewer
+
+        spacing, _ = resolve_particle_spacing(
+            args.particle_count,
+            _REFERENCE_SPACING,
+            lambda candidate: cylinder_particle_count(
+                candidate,
+                args.cup_inner_radius,
+                args.wall_thickness,
+                args.fill_height,
+            ),
+        )
+        radius = 0.5 * spacing
+        self.particle_spacing = spacing
+        self.particle_radius = radius
+        self.inner_radius = args.cup_inner_radius
+        self.cup_height = args.cup_height
+        self.fill_height = args.fill_height
+        wall_thickness = args.wall_thickness
+        self.wall_thickness = wall_thickness
+
+        builder = newton.ModelBuilder(up_axis="Z", gravity=(0.0, 0.0, args.gravity))
+        builder.default_particle_radius = radius
+        builder.default_shape_cfg.mu = 0.2
+
+        # dynamic ceramic cup resting on the ground; grab it with the mouse
+        self.cup_body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+            label="cup",
+        )
+        cup_mesh = build_cup_mesh(self.inner_radius, wall_thickness, self.cup_height)
+        # Provision a texture SDF for rigid contacts involving the cup mesh.
+        # Fluid-particle contacts use the mesh BVH.
+        cup_mesh.build_sdf(
+            max_resolution=args.sdf_resolution,
+            narrow_band_range=(-0.03, 0.03),
+            margin=0.02,
+            cache_dir=_SDF_CACHE_DIR,
+        )
+        builder.add_shape_mesh(
+            self.cup_body,
+            mesh=cup_mesh,
+            cfg=newton.ModelBuilder.ShapeConfig(density=args.cup_density, mu=0.4),
+            color=(0.8, 0.85, 0.92),
+            opacity=args.cup_opacity,
+        )
+
+        self._fill_water(builder, args, wall_thickness)
+
+        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.6))
+
+        self.model = builder.finalize()
+        # The water leaks when the cup is moved because the default CFL cap
+        # (half a particle radius per substep) is far slower than the cup: the
+        # water can't keep up, so the moving wall leaves it behind and it ends
+        # up outside the cup. Cap it instead just under the wall-crossing speed
+        # -- fast enough to ride along with the cup, slow enough that it cannot
+        # cross the thin wall in one substep -- and clamp the cup just under
+        # that so it can never outrun the water (see the solver below).
+        wall_cross_speed = 0.5 * wall_thickness / self.sim_dt
+        self._water_max_velocity = 0.85 * wall_cross_speed
+        self._cup_max_velocity = 0.6 * wall_cross_speed
+        self.model.particle_max_velocity = self._water_max_velocity
+        self.model.soft_contact_mu = 0.3
+        self.solver = newton.solvers.SolverXPBD(
+            self.model,
+            iterations=args.iterations,
+            fluid_rest_distance=spacing,
+            fluid_cohesion=args.cohesion,
+            fluid_viscosity=args.viscosity,
+            fluid_relaxation=args.relaxation,
+            # bound the per-warp cost when a swing slams water into the cup wall
+            fluid_max_neighbors=args.max_neighbors,
+            # clamp the cup just under the water's max speed so it can never move
+            # faster than the water can follow (which is what leaks it through
+            # the wall); the angular cap keeps the rim from sweeping too fast
+            body_max_velocity=self._cup_max_velocity,
+            body_max_angular_velocity=10.0,
+        )
+
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
+
+        self.viewer.set_model(self.model)
+        self.particle_renderer = FluidParticleRenderer(self.model)
+        self.viewer.picking_enabled = True
+        self._apply_picking_params(args.pick_stiffness, args.pick_damping)
+        self.viewer.show_particles = True
+        self.viewer.set_camera(pos=wp.vec3(args.camera_pos), pitch=args.camera_pitch, yaw=args.camera_yaw)
+
+        # Replay the whole substep loop (collide, picking, solve) from a CUDA
+        # graph; recaptured only when a GUI-tunable solver scalar changes. Prime
+        # the reorder scratch first -- it allocates on first use, which cannot
+        # happen inside the capture.
+        self.solver.reorder_particles(self.state_0)
+        self.graph = None
+        self.use_cuda_graph = wp.get_device(self.model.device).is_cuda
+        self._graph_key = None
+
+    def _fill_water(self, builder, args, wall_thickness):
+        """Fill the cup cavity with a column of fluid at rest spacing.
+
+        Filling the full inner radius (not a narrower inset block) and starting
+        at the rest spacing avoids the column collapsing into a dense slug at the
+        bottom -- the water sits at rest density across the whole cross-section.
+        """
+        spacing = self.particle_spacing
+        radius = 0.5 * spacing
+        pts = cylinder_particle_positions(spacing, self.inner_radius, wall_thickness, args.fill_height)
+        rng = np.random.default_rng(0)
+        pts += rng.uniform(-0.05 * spacing, 0.05 * spacing, size=pts.shape)
+
+        mass = args.rest_density * spacing**3
+        builder.add_particles(
+            pos=pts.tolist(),
+            vel=[(0.0, 0.0, 0.0)] * len(pts),
+            mass=[mass] * len(pts),
+            radius=[radius] * len(pts),
+            flags=[int(newton.ParticleFlags.ACTIVE | newton.ParticleFlags.FLUID)] * len(pts),
+        )
+
+    def _apply_picking_params(self, stiffness, damping):
+        picking = getattr(self.viewer, "picking", None)
+        if picking is None:
+            return
+        picking.pick_stiffness = float(stiffness)
+        picking.pick_damping = float(damping)
+        state = picking.pick_state.numpy()
+        state[0]["pick_stiffness"] = float(stiffness)
+        state[0]["pick_damping"] = float(damping)
+        picking.pick_state.assign(state)
+
+    def _graph_key_tuple(self):
+        return (round(self.solver.fluid_viscosity, 6), round(self.solver.fluid_cohesion, 6))
+
+    def simulate(self):
+        # spatial re-sort once per frame so the density solve's neighbor reads
+        # stay cache-coherent after a swing churns the water
+        self.solver.reorder_particles(self.state_0)
+        for _ in range(self.sim_substeps):
+            self.state_0.clear_forces()
+            self.collision_pipeline.collide(self.state_0, self.contacts)
+            self.viewer.apply_forces(self.state_0)
+            self.solver.step(self.state_0, self.state_1, None, self.contacts, self.sim_dt)
+            self.state_0, self.state_1 = self.state_1, self.state_0
+
+    def step(self):
+        step_simulation(self, self._graph_key_tuple())
+        self.sim_time += self.frame_dt
+
+    def gui(self, ui):
+        _, self.solver.fluid_viscosity = ui.slider_float("Viscosity", self.solver.fluid_viscosity, 0.0, 1.0, "%.2f")
+        changed, cohesion = ui.slider_float("Cohesion", self.solver.fluid_cohesion, 0.0, 1.0, "%.2f")
+        if changed:
+            self.solver.fluid_cohesion = cohesion
+
+    def test_final(self):
+        """Check finite state, containment, and the scene's intended motion."""
+        q = self.state_0.particle_q.numpy()
+        qd = self.state_0.particle_qd.numpy()
+        body_q = self.state_0.body_q.numpy()
+        if not np.all(np.isfinite(q)) or not np.all(np.isfinite(qd)) or not np.all(np.isfinite(body_q)):
+            raise ValueError("XPBD fluid or cup state contains non-finite values")
+        tolerance = 1.0e-4
+        if q[:, 2].min() < self.particle_radius - tolerance:
+            raise ValueError("water tunneled below the floor")
+        local_q = _points_to_body_frame(q, body_q[self.cup_body])
+        if local_q[:, 2].min() < self.wall_thickness - self.particle_radius - tolerance:
+            raise ValueError("water tunneled through the cup bottom")
+        radial = np.linalg.norm(local_q[:, :2], axis=1)
+        below_rim = local_q[:, 2] <= self.cup_height + self.particle_radius
+        outer_radius = self.inner_radius + self.wall_thickness + self.particle_radius
+        if np.any(radial[below_rim] > outer_radius + tolerance):
+            raise ValueError("water tunneled through the cup wall")
+        # and it should fill a reasonable fraction of the cup cross-section,
+        # rather than collapsing into a narrow slug at the bottom
+        rmax = float(radial.max())
+        if rmax < 0.5 * self.inner_radius:
+            raise ValueError("water collapsed to a narrow column instead of filling the cup")
+        minimum_fill_top = self.wall_thickness + 0.7 * (self.fill_height - self.wall_thickness)
+        if float(local_q[:, 2].max()) < minimum_fill_top:
+            raise ValueError("water over-compressed instead of retaining its fill height")
+
+    def render(self):
+        self.viewer.begin_frame(self.sim_time)
+        self.particle_renderer.log_state(self.viewer, self.state_0)
+        self.viewer.end_frame()
+
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        parser.add_argument(
+            "--solver", choices=["xpbd"], default="xpbd", help="This scene requires XPBD two-way rigid-body coupling."
+        )
+        parser.add_argument("--fps", type=float, default=60.0)
+        # Fine particles need a smaller pressure timestep than rigid-body-only
+        # scenes. Eight substeps keep the density projection below its Jacobi
+        # stability limit without relying on artificial viscosity.
+        parser.add_argument("--substeps", type=int, default=8)
+        parser.add_argument("--iterations", type=int, default=4)
+        parser.add_argument("--max-neighbors", type=int, default=128)
+        parser.add_argument("--gravity", type=float, default=-9.81)
+
+        parser.add_argument("--cup-inner-radius", type=float, default=0.06)
+        parser.add_argument("--cup-height", type=float, default=0.11)
+        parser.add_argument("--wall-thickness", type=float, default=0.008)
+        parser.add_argument("--cup-density", type=float, default=2000.0)
+        parser.add_argument("--cup-opacity", type=float, default=0.35)
+        parser.add_argument("--sdf-resolution", type=int, default=96, help="Cup SDF grid resolution.")
+
+        parser.add_argument(
+            "--particle-count",
+            type=parse_particle_count,
+            default=8_000,
+            help="Target fluid particle count; spacing, radius, mass, and fill grid are derived automatically.",
+        )
+        parser.add_argument("--fill-height", type=float, default=0.085)
+        parser.add_argument("--rest-density", type=float, default=1000.0)
+        parser.add_argument("--cohesion", type=float, default=0.4)
+        parser.add_argument("--viscosity", type=float, default=0.0)
+        # Weighted Jacobi relaxation suppresses the particle-scale pressure mode;
+        # four iterations at this weight retain volume without buzzing.
+        parser.add_argument("--relaxation", type=float, default=0.6)
+        parser.add_argument("--pick-stiffness", type=float, default=400.0)
+        parser.add_argument("--pick-damping", type=float, default=40.0)
+
+        parser.add_argument("--camera-pos", type=float, nargs=3, default=(0.32, -0.32, 0.22))
+        parser.add_argument("--camera-pitch", type=float, default=-22.0)
+        parser.add_argument("--camera-yaw", type=float, default=135.0)
+        return parser
+
+
+if __name__ == "__main__":
+    parser = Example.create_parser()
+    viewer, args = newton.examples.init(parser)
+    newton.examples.run(Example(viewer, args), args)

@@ -1,0 +1,1 @@
+Extend the MCP `filmstrip` to compare a rollout with recorded video: references may be image paths, an `(N, H, W, 3)` array, or a directory; `stride` subsamples long recordings, `comparison` selects mismatch, edge, or blend panels, `mask` restricts the metrics, and results include per-frame PSNR, SSIM, and edge NCC with their mean. Large grids are downscaled instead of rejected.

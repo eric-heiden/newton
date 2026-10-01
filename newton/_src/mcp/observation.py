@@ -24,7 +24,9 @@ from newton.sensors import SensorTiledCamera
 from .imaging import compare as _compare_images
 from .imaging import comparison_panel as _comparison_panel
 from .imaging import encode_png as _png
+from .imaging import image_metrics as _image_metrics
 from .imaging import load_image, tile
+from .imaging import to_rgb as _rgb
 
 
 def _integer(name: str, value: int, minimum: int, maximum: int) -> int:
@@ -180,6 +182,41 @@ def _inverse_brown_conrady_rays(width: int, height: int, intrinsics: dict) -> np
     rays = np.zeros((1, height, width, 2, 3), dtype=np.float32)
     rays[0, :, :, 1] = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
     return rays
+
+
+def _reference_rows(references, views: int) -> list[list]:
+    """Normalize filmstrip references to one list of images (paths or arrays) per view."""
+    if isinstance(references, (str, Path)) and Path(references).is_dir():
+        files = sorted(
+            p for p in Path(references).iterdir() if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+        )
+        if not files:
+            raise ValueError(f"No images in {references}")
+        return [[str(f) for f in files]]
+    if isinstance(references, np.ndarray):
+        if references.ndim != 4:
+            raise ValueError("Reference arrays must have shape (N, H, W, 3)")
+        return [list(references)]
+    if not isinstance(references, list) or not references:
+        raise ValueError("references must be a list, an (N, H, W, 3) array, or a directory")
+    if views == 1 and not (
+        isinstance(references[0], list) or (isinstance(references[0], np.ndarray) and references[0].ndim == 4)
+    ):
+        return [list(references)]
+    return [_reference_rows(row, 1)[0] if not isinstance(row, list) else row for row in references]
+
+
+def _mask(value, shape) -> np.ndarray:
+    """Boolean pixel mask from an array or image path (nonzero pixels selected)."""
+    array = load_image(value).max(axis=-1) if isinstance(value, (str, Path)) else np.asarray(value)
+    if array.shape[:2] != tuple(shape):
+        raise ValueError(f"mask shape {array.shape[:2]} differs from the frame {tuple(shape)}")
+    return array.astype(bool)
+
+
+def _shrink(image: np.ndarray, factor: int) -> np.ndarray:
+    h, w = (image.shape[0] // factor) * factor, (image.shape[1] // factor) * factor
+    return image[:h, :w].reshape(h // factor, factor, w // factor, factor, -1).mean(axis=(1, 3)).astype(np.uint8)
 
 
 def _checker_cell(scene_radius: float) -> float:
@@ -720,16 +757,30 @@ class ObservationRenderer:
         restore: str | None = None,
         views=None,
         references=None,
+        stride: int | None = None,
+        mask=None,
+        comparison: str = "mismatch",
         **options,
     ) -> dict:
         """Advance the simulation and return one labeled grid of frames over time.
 
         Columns are capture times; rows are views. ``times`` are absolute
         simulation times [s] at or after the current time (after the optional
-        ``reset``/``restore``). Alternatively capture ``count`` frames every
-        ``every_steps`` steps, starting with the current state. ``references``
-        holds reference image paths per view row, one per time, adding
-        reference and mismatch rows beneath each simulated row.
+        ``reset``/``restore``); the simulation steps to each one, so frames show
+        the simulated state. Alternatively capture ``count`` frames every
+        ``every_steps`` steps, starting with the current state.
+
+        ``references`` adds a reference row and a comparison row beneath each
+        simulated row, with per-frame metrics (PSNR, SSIM, edge NCC; within
+        ``mask`` if given) and their mean. For one view it may be a list of image
+        paths or arrays, an ``(N, H, W, 3)`` array, or a directory of images
+        (sorted by name), one per time; for several views, one such list per view.
+        Simulated frames are rendered at the reference size, so pass the real
+        camera's ``pose`` and ``intrinsics`` to compare with recorded video.
+        ``stride`` keeps every ``stride``-th time (and reference), e.g. to check a
+        long recording a few frames at a time. ``comparison`` selects the third
+        row: ``mismatch``, ``edges`` (for real photos), or ``blend``. ``mask`` is
+        a boolean ``(H, W)`` array or image path, or one per time.
         """
         self._check_thread()
         session = self.session
@@ -739,10 +790,26 @@ class ObservationRenderer:
             session.dispatch("reset")
         elif restore is not None:
             session.dispatch("restore", {"name": restore})
+        if comparison not in ("mismatch", "edges", "blend"):
+            raise ValueError("comparison must be 'mismatch', 'edges', or 'blend'")
+        if references is not None:
+            references = _reference_rows(references, 1 if views is None else len(views))
+        per_frame_mask = isinstance(mask, list) and bool(mask) and not isinstance(mask[0], bool)
         if times is not None:
-            if not isinstance(times, list) or not 1 <= len(times) <= 32:
-                raise ValueError("times must list 1 to 32 simulation times [s]")
-            targets = sorted(float(t) for t in times)
+            times = [float(t) for t in np.asarray(times, dtype=float).reshape(-1)]
+            if stride is not None:
+                stride = _integer("stride", stride, 1, 100_000)
+                times = times[::stride]
+                references = None if references is None else [row[::stride] for row in references]
+                mask = mask[::stride] if per_frame_mask else mask
+            if not 1 <= len(times) <= 32:
+                raise ValueError("times must list 1 to 32 simulation times [s] (use stride to subsample)")
+            if references is not None and any(len(row) != len(times) for row in references):
+                raise ValueError("references need one image per time (after stride)")
+            order = np.argsort(times, kind="stable")
+            targets = [times[i] for i in order]
+            references = None if references is None else [[row[i] for i in order] for row in references]
+            mask = [mask[i] for i in order] if per_frame_mask else mask
             if targets[0] < session.time - 1.0e-9:
                 raise ValueError(f"times must not precede the current time {session.time}; pass reset=true")
         else:
@@ -763,11 +830,8 @@ class ObservationRenderer:
         )
         options.setdefault("width", 320)
         options.setdefault("height", 240)
-        if references is not None:
-            if len(view_specs) == 1 and references and isinstance(references[0], str):
-                references = [references]
-            if len(references) != len(view_specs):
-                raise ValueError("references must hold one list of image paths per view")
+        if references is not None and len(references) != len(view_specs):
+            raise ValueError("references must hold one list of images per view")
         columns, captured_times, statistics = [], [], []
         steps = 0
         for index in range(len(targets) if targets is not None else count):
@@ -788,7 +852,7 @@ class ObservationRenderer:
                 camera.pop("label", None)
                 reference = None if references is None else references[row][index]
                 if reference is not None:
-                    reference_rgb = load_image(reference)
+                    reference_rgb = load_image(reference) if isinstance(reference, (str, Path)) else _rgb(reference)
                     camera["height"], camera["width"] = reference_rgb.shape[:2]
                 rgb, _ = self._single(**camera)
                 column.append((rgb, None if reference is None else reference_rgb))
@@ -802,13 +866,27 @@ class ObservationRenderer:
             if references is not None:
                 grid.append([column[row][1] for column in columns])
                 labels.append([f"reference t={t:.3f}" for t in captured_times])
-                panels = []
-                for column, t in zip(columns, captured_times, strict=True):
-                    panel, stats = _compare_images(column[row][0], column[row][1])
-                    panels.append(panel)
-                    statistics.append({"view": name, "time": round(t, 6), **stats})
+                panels, row_stats = [], []
+                for index, (column, t) in enumerate(zip(columns, captured_times, strict=True)):
+                    simulated, reference_rgb = column[row]
+                    _, stats = _compare_images(simulated, reference_rgb)
+                    frame_mask = mask[index] if per_frame_mask else mask
+                    weights = None if frame_mask is None else _mask(frame_mask, simulated.shape[:2])
+                    stats.update(_image_metrics(simulated, reference_rgb, weights))
+                    panels.append(_comparison_panel(simulated, reference_rgb, comparison))
+                    row_stats.append({"view": name, "time": round(t, 6), **stats})
+                statistics.extend(row_stats)
                 grid.append(panels)
-                labels.append([f"mismatch {100 * s['mismatch_fraction']:.1f}%" for s in statistics[-len(panels) :]])
+                labels.append([f"{comparison} ssim {s['ssim']:.2f} ncc {s['edge_ncc']:.2f}" for s in row_stats])
+        # Shrink thumbnails (box filter) until the grid fits the pixel budget; metrics stay full size.
+        scale = 1
+        while (
+            sum(im.shape[0] for im in (r[0] for r in grid)) * sum(im.shape[1] for im in grid[0])
+            > self.MAX_PIXELS * scale * scale
+        ):
+            scale += 1
+        if scale > 1:
+            grid = [[_shrink(im, scale) for im in r] for r in grid]
         image = tile(grid, labels)
         if image.shape[0] * image.shape[1] > self.MAX_PIXELS:
             raise ValueError("Filmstrip exceeds the pixel budget; reduce width/height, times, or views")
@@ -823,6 +901,10 @@ class ObservationRenderer:
         }
         if statistics:
             result["mismatch"] = statistics
+            keys = ("psnr_db", "ssim", "edge_ncc", "mismatch_fraction")
+            result["metrics_mean"] = {k: round(float(np.mean([s[k] for s in statistics])), 4) for k in keys}
+        if scale > 1:
+            result["thumbnail_scale"] = 1.0 / scale
         return result
 
     def _render_sensor(

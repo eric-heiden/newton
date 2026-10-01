@@ -513,6 +513,43 @@ class TestMcpObservation(unittest.TestCase):
         )
         self.assertEqual([row["mismatch_fraction"] for row in compared["mismatch"]], [0.0, 0.0, 0.0])
         self.assertEqual(_decode_png(compared).shape[0], 3 * 32 + 2 * 4)
+        # Recorded video: an (N, H, W, 3) array with extra frames that stride skips, a mask, and edge panels.
+        frames = np.stack(
+            [_decode_png({"image_base64": base64.b64encode(Path(p).read_bytes()).decode()}) for p in paths]
+        )
+        padded = np.stack([frames[0], frames[0], frames[1], frames[1], frames[2], frames[2]])
+        mask = np.ones(frames.shape[1:3], dtype=bool)
+        mask[:, :8] = False
+        video = session.dispatch(
+            "filmstrip",
+            {
+                "times": [0.0, 0.05, 0.1, 0.2, 0.3, 0.35],
+                "reset": True,
+                "references": padded,
+                "stride": 2,
+                "mask": mask,
+                "comparison": "edges",
+                **camera,
+            },
+        )
+        self.assertEqual(video["times"], [0.0, 0.1, 0.3])
+        self.assertEqual([row["mismatch_fraction"] for row in video["mismatch"]], [0.0, 0.0, 0.0])
+        self.assertGreater(video["metrics_mean"]["ssim"], 0.99)
+        directory = Path(self.directory.name) / "frames"
+        directory.mkdir()
+        for index, path in enumerate(paths):
+            (directory / f"{index:03d}.png").write_bytes(Path(path).read_bytes())
+        # Unsorted times keep their references.
+        shuffled = session.dispatch(
+            "filmstrip",
+            {"times": [0.3, 0.0, 0.1], "reset": True, "references": [paths[2], paths[0], paths[1]], **camera},
+        )
+        self.assertEqual(shuffled["times"], [0.0, 0.1, 0.3])
+        self.assertEqual([row["mismatch_fraction"] for row in shuffled["mismatch"]], [0.0, 0.0, 0.0])
+        from_directory = session.dispatch(
+            "filmstrip", {"times": [0.0, 0.1, 0.3], "reset": True, "references": str(directory), **camera}
+        )
+        self.assertEqual([row["mismatch_fraction"] for row in from_directory["mismatch"]], [0.0, 0.0, 0.0])
         counted = session.dispatch("filmstrip", {"count": 2, "every_steps": 5, "reset": True, "view": "front"})
         self.assertEqual(counted["times"], [0.0, 0.05])
         with self.assertRaisesRegex(ValueError, "precede"):

@@ -141,6 +141,9 @@ def rollout(
         solver.step(state_0, state_1, control, None, SIM_DT)
         state_0.assign(state_1)
         wp.launch(_record_step, dim=worlds * coords, inputs=[state_0.joint_q, counter], outputs=[history])
+        # Advance the step counter in its own launch: incrementing it inside _record_step races with the
+        # threads of that launch that have not read it yet.
+        wp.launch(_advance_counter, dim=1, inputs=[counter])
 
     if model.device.is_cuda:
         with wp.ScopedCapture() as capture:
@@ -163,10 +166,12 @@ def _load_command(schedule: wp.array2d[wp.float32], counter: wp.array[wp.int32],
 @wp.kernel
 def _record_step(q: wp.array[wp.float32], counter: wp.array[wp.int32], history: wp.array2d[wp.float32]):
     i = wp.tid()
-    k = counter[0]
-    history[k + 1, i] = q[i]
-    if i == 0:
-        counter[0] = k + 1
+    history[counter[0] + 1, i] = q[i]
+
+
+@wp.kernel
+def _advance_counter(counter: wp.array[wp.int32]):
+    counter[0] = counter[0] + 1
 
 
 def window_errors(segments: list[tuple[np.ndarray, float]], times: np.ndarray, q: np.ndarray) -> np.ndarray:

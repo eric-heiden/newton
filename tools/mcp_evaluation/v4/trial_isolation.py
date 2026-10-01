@@ -192,6 +192,7 @@ def sandbox(
     *,
     extra_ro: list[Path] = (),
     extra_hidden: list[Path] = (),
+    masked: list[Path] = (),
 ) -> list[str]:
     """Run ``command`` with only ``run_dir`` writable among the study's paths.
 
@@ -235,6 +236,10 @@ def sandbox(
         if history.is_file():
             args += ["--ro-bind", str(empty), str(history)]
     args += ["--ro-bind", str(root), str(root)]
+    # Parts of the read-only tree that stay hidden (e.g. verifiers and data generators from agents).
+    for path in masked:
+        if Path(path).is_dir():
+            args += ["--tmpfs", str(path)]
     # The venv's base interpreter, the CLIs, and installed tools must not change between trials.
     shared = (HOME / "opt", HOME / ".local/share/uv/python", HOME / ".local/bin", HOME / ".cache/uv")
     for path in (*shared, *extra_ro):

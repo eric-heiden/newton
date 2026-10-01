@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -46,6 +47,9 @@ DP_DATA = Path(os.environ.get("NEWTON_DP_DATA", "/home/horde/artifacts/newton-li
 ABC_DATA = Path(os.environ.get("NEWTON_ABC_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_twin_task"))
 ARM_DATA = Path(os.environ.get("NEWTON_ARM_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_arm_task"))
 LOOK_DATA = Path(os.environ.get("NEWTON_LOOK_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_look_task"))
+REPLAY_DATA = Path(
+    os.environ.get("NEWTON_REPLAY_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_replay_task")
+)
 # Blender for the look task and the MCP's blender backend (inherited by hosts, agents, and verifiers).
 os.environ.setdefault("NEWTON_BLENDER", "/home/horde/opt/blender-5.2.2-linux-x64/blender")
 PRIVATE = Path(os.environ.get("NEWTON_VISUAL_PRIVATE", Path.home() / ".newton-visual-private"))
@@ -176,6 +180,31 @@ Constraints (checked): keep one arm per world with the kinematics of yam_arm.xml
 Goal: write look.py so that the renders match the recording. Verification runs only look.py, in a fresh Blender worker on the same twin, renders 5 held-out frames of the same window (between the given ones), and compares them with the recorded frames: the mean color difference over shape regions (look_common.region_color_error, sRGB 0-255) must be at most {region_color_error}, and the color PSNR (twin_render.score) at least {color_psnr_db} dB. The starter scores about 46 and 17.6 dB.
 Constraints (checked): appearance only. Materials, lights, world, and color management may change; adding or reshaping mesh objects, loading images, and compositing are not allowed. The geometry files, look_common.py, and twin_render.py are fixed (the verifier uses its own copies). Keep render_look.py working.""",
         },
+        "abc_replay": {
+            "files": {
+                **{name: HERE / "abc_replay" / name for name in ("fruit_replay.py", "replay_common.py", "FORMAT.md")},
+                **{
+                    name: REPLAY_DATA / name
+                    for name in ("station", "episodes", "scenes", "gt", "frames", "camera.json", "video_reference.npz")
+                },
+                "arm_logs": ARM_DATA / "logs",
+            },
+            "script": "fruit_replay.py",
+            "host_args": [],
+            "run_args": "[--seconds <S>] [--episode sib_1] [--num-worlds 8 --jitter]",
+            "verifier": "tools/mcp_evaluation/v4/abc_replay/verify.py",
+            "seconds": 3600,
+            "private": ["abc_replay"],
+            # One frame of the starter (its main ignores --num-frames and would replay the whole episode).
+            "warmup": [
+                ["fruit_replay.py", "--viewer", "null", "--seconds", "0.034"],
+                ["-m", "tools.mcp_evaluation.v4.trial_isolation", "warm", "fruit_replay.py"],
+            ],
+            "goal": """fruit_replay.py replays a real robot episode from the ABC-130k dataset (https://abc.bot) in Newton. At a bimanual station (two 6-DoF YAM arms with parallel grippers, filmed from above and from both wrists), a teleoperator picks up three fake fruits one after another, a pear and an orange with the left arm and a dark fruit with the right, and puts them into a wedge-shaped tray. episodes/main.npz holds the measured joint positions, velocities, and torques, the gripper openings, and the logged joint and gripper commands (about 30 Hz); scenes/main.json the station layout (arm bases, tray sector, and per fruit its size, start pose, grasping arm, and the video frames of the real grasp events); frames/main/ the recorded top and wrist videos and video_reference.npz the fruit positions tracked in them. episodes/, scenes/, gt/, and frames/ also hold four 10 fps episodes of the same station and fruits (sib_1 to sib_4), and arm_logs/ 64 recorded YAM arm logs (32 episodes of various tasks, both arms; measured joints, velocities, torques, and commands) for calibrating the arms. FORMAT.md describes the files, their clocks, and the fixed helpers in replay_common.py (Replay, score, check, rendering through the real cameras, contact_summary, StationFK). Each scene is one Newton world from build_model(scenes), driven open loop by the logged commands as joint position targets (replay_common.Replay) and stepped with make_solver(model) and make_pipeline(model). Problem: the starter keeps the ABC simulator's defaults, and none of the fruits is held: the grasps slip, so nothing is carried to the tray.
+
+Goal: make the replay physically reproduce the whole episode: every fruit grasped, lifted, carried, and released into the tray the way the real robot did it. Verification imports build_model, make_solver, make_pipeline, and PARAMS and runs its own replay of the full timelines (its own copy of replay_common: Replay, score, and jitter_scene) in fresh processes, on the main episode in 8 copies (2 nominal, 6 with the fruit starts jittered by up to 4 mm and the pear heading by 5 degrees) and on unseen episodes of the same station and fruits in 4 copies each. Main episode, per fruit: held through the carry in at least {held} of 8 copies and resting in the tray at the end in at least {placed}; medians over the copies: lifted fraction at least {lifted}, carry-track error at most {track_cm} cm, lift-off error at most {liftoff} state samples, release error between {release_low} and +{release_high} s, movement before the grasp at most {moved_cm} cm, finger-gap error while holding at most {gap_mm} mm, and final position error at most {final_cm} cm; whole-episode joint RMSE at most {arm_rad} rad per arm. Unseen episodes: at least {heldout_pct}% of their fruit copies held and placed (fruits whose real grasp the recorded data cannot reproduce are excluded), and joint RMSE at most {heldout_arm_rad} rad per arm (mean over episodes). Two negative controls replay the main episode with the gripper commands forced open and with arm and fruit friction set to 0.02: no fruit may rise more than {control_cm} cm. Verification runs twice (a third time if they disagree) and the majority decides. The starter holds no fruit in any copy and scores about 0.040 rad joint RMSE.
+Constraints (checked): keep the station's arm kinematics, finger collision geometry (within 0.5 mm), arm bases (within 3 mm of the scene's), table plane, gravity, and the command input; add no shapes, actuators, equality constraints, tendons, or contact pairs to the robot. Each fruit is one free, dynamic body labelled pear, orange, or dark_fruit, starting at the scene's start (within 2 mm, resting on the table, pear long axis within 5 degrees of the scene's heading), with 20 to 150 g, principal inertias between 0.8x a solid and 1.2x a hollow ellipsoid of its extents, at most 8 collision shapes spanning the size ranges in the scene, collisions with the fingers, table, tray, and the other fruits, and no joint drives, springs, damping, gravity compensation, or applied forces. Tunable: arm joint gains, armature, friction, damping, effort limits (at most 28 N m on joints 1-3 and 10 N m on joints 4-6), and gravity compensation (0 to 1) per link; gripper position gain (100 to 3000 N/m) and squeeze force (5 to 60 N); PARAMS["command_delay"] (0 to 0.2 s) and PARAMS["dt"] (0.25 to 2 ms); the solver (a Newton solver class, not a subclass) and its settings; newton.CollisionPipeline settings or MuJoCo's own contacts; materials (friction at most 1.5, torsional at most 0.02 m, rolling at most 0.005 m, restitution at most 0.8, margin at most 2 mm, contact gap at most 0.1 m, no adhesion; robot shapes may keep their MJCF values); fruit shapes, masses, and inertias within the bounds above; and the tray model (at most 40 shapes, static or on one dynamic body labelled tray of 0.1 to 1 kg, inside the scene's tray sector plus 15 mm and at most 35 mm above the table). The verification batch (about 44 worlds) must replay within about 400 s. replay_common.py is fixed (verification uses its own copy). Verification calls build_model, make_solver, and make_pipeline in a copy of the workspace without frames/, arm_logs/, gt/, and video_reference.npz, and passes only the scenes (geometry, starts, sizes; no episode paths or ids), so keep fitted values in the script or in a file next to it. The submission may not inspect the verifier (stack frames, garbage collector, raw memory, code objects, trace hooks), start processes, or read files outside the workspace while it is built. Use only the data in the workspace: do not download recordings or any other data. Keep the file runnable (`python fruit_replay.py --viewer null` replays the main episode and prints the metrics; `--episode sib_1`, `--num-worlds 8 --jitter`, and `--seconds` select episodes, ensembles, and shorter runs).""",
+        },
     }
     if name == "abc_look":
         from tools.mcp_evaluation.v4.abc_look.verify import THRESHOLDS  # noqa: PLC0415
@@ -197,6 +226,25 @@ Constraints (checked): appearance only. Materials, lights, world, and color mana
         from tools.mcp_evaluation.v4.dp_real.verify import THRESHOLDS  # noqa: PLC0415
 
         tasks[name]["goal"] = tasks[name]["goal"].format(**THRESHOLDS)
+    if name == "abc_replay":
+        from tools.mcp_evaluation.v4.abc_replay.verify import THRESHOLDS as t  # noqa: PLC0415
+
+        tasks[name]["goal"] = tasks[name]["goal"].format(
+            held=t["main_held_min"],
+            placed=t["main_placed_min"],
+            lifted=f"{t['lifted_fraction_min']:g}",
+            track_cm=f"{100 * t['carry_track_err_m_max']:.2f}",
+            liftoff=f"{t['liftoff_err_rows_max']:g}",
+            release_low=f"{t['release_err_s_min']:g}",
+            release_high=f"{t['release_err_s_max']:g}",
+            moved_cm=f"{100 * t['moved_before_grasp_m_max']:g}",
+            gap_mm=f"{t['grip_gap_err_mm_max']:g}",
+            final_cm=f"{100 * t['final_xy_err_m_max']:.1f}",
+            arm_rad=f"{t['arm_rmse_rad_max']:g}",
+            heldout_pct=f"{100 * t['heldout_fruit_rate_min']:.1f}",
+            heldout_arm_rad=f"{t['heldout_arm_rmse_rad_max']:g}",
+            control_cm=f"{100 * t['control_rise_m_max']:g}",
+        )
     task = tasks[name]
     # Commands run once on the starter to build the compile-cache seed both conditions start from.
     task.setdefault(
@@ -225,7 +273,9 @@ Newton source tree (read-only reference, including docs and examples): {ROOT}
 
 Deliverable: the edited {task["script"]} in the workspace, then a brief report. You have {seconds // 60} minutes, starting {START} (check with `date -u`); working efficiently matters. Do not modify files outside the workspace, do not look for other trials or hidden verification data, and do not use subagents.
 """
-    run = f"uv run --no-sync --project {ROOT} python {task['script']} --viewer null --num-frames <N> {' '.join(task['host_args'])}".rstrip()
+    run_args = task.get("run_args", "--num-frames <N>")
+    run = f"uv run --no-sync --project {ROOT} python {task['script']} --viewer null {run_args} {' '.join(task['host_args'])}"
+    run = run.rstrip()
     if condition == "restart":
         return (
             common
@@ -318,13 +368,17 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
     env["MAX_MCP_OUTPUT_TOKENS"] = "60000"
     env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = str(BG_WAIT_CEILING_MS)
 
-    def contained(command: list[str], extra_ro: list[Path] = ()) -> list[str]:
+    def contained(command: list[str], extra_ro: list[Path] = (), harness: bool = False) -> list[str]:
         # The host runs the agent's code too, so it shares the agent's filesystem view, including /tmp.
         if not SANDBOX:
             return command
         # Hide the run directory's parent too (other trials' records), wherever the iteration directory lives.
         hidden = [TRIALS, run_dir.parent]
-        return ti.sandbox(command, sandbox_root, ROOT, PRIVATE, extra_ro=list(extra_ro), extra_hidden=hidden)
+        # The study's harness (verifiers, data generators) is only for the verifier itself.
+        masked = [] if harness else [ROOT / "tools" / "mcp_evaluation"]
+        return ti.sandbox(
+            command, sandbox_root, ROOT, PRIVATE, extra_ro=list(extra_ro), extra_hidden=hidden, masked=masked
+        )
 
     host, sampler, agent = None, None, None
     # Mount namespaces of the trial's sandboxes: cleanup also finds detached jobs that cleared their env.
@@ -475,6 +529,8 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
         "trial_cpu_seconds": max((s["trial_cpu_s"] or 0.0 for s in samples), default=None),
         "max_live_trials": max((s["live_trials"] for s in samples), default=None),
         "private_reference": _mentions_private(workspace),
+        "introspection": _introspection(workspace),
+        "downloads": _downloads(run_dir / "agent.jsonl"),
         **activity,
         "verification": verification,
         "success": bool(verification.get("success")) and not timed_out,
@@ -496,13 +552,68 @@ def _mentions_private(workspace: Path) -> bool:
     return False
 
 
+# Frame, garbage-collector, and memory introspection: a submission could use it to forge its verification.
+INTROSPECTION = re.compile(
+    r"_getframe|_current_frames|currentframe|f_back|f_locals|tb_frame|gi_frame|get_referrers|get_objects"
+    r"|\bctypes\b|addaudithook|settrace|setprofile|os\._exit|/proc/self|\bnonce\b"
+)
+# Fetching data from the network (the held-out episodes are public).
+DOWNLOAD = re.compile(
+    r"huggingface\.co|hf_hub|snapshot_download|hf_hub_download|datasets\.load_dataset|abc\.bot|voxel51"
+    r"|\b(?:curl|wget)\b[^\n]*https?://|urllib\.request|requests\.get|git clone",
+    re.IGNORECASE,
+)
+
+
+def _introspection(workspace: Path) -> list[str]:
+    """Introspection names in the workspace's Python sources, for review."""
+    hits = []
+    for path in sorted(workspace.rglob("*.py")):
+        if path.name == "replay_common.py" or "__pycache__" in path.parts:
+            continue
+        for match in INTROSPECTION.finditer(path.read_text(errors="replace")):
+            hits.append(f"{path.relative_to(workspace)}: {match.group(0)}")
+    return hits[:20]
+
+
+def _downloads(transcript: Path) -> list[str]:
+    """Agent commands and code that fetch data from the network, for review."""
+    if not transcript.exists():
+        return []
+    hits = []
+    for line in transcript.read_text(errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        # Only what the agent wrote (tool calls and messages), not file contents it read.
+        text = json.dumps(_agent_inputs(event))
+        hits += [match.group(0) for match in DOWNLOAD.finditer(text)]
+    return sorted(set(hits))[:20]
+
+
+def _agent_inputs(event: dict) -> list:
+    """Tool inputs and commands the agent issued in one transcript event (Claude Code or Codex)."""
+    out = []
+    message = event.get("message") if isinstance(event.get("message"), dict) else None
+    if event.get("type") == "assistant" and message:
+        out += [
+            c.get("input") for c in message.get("content") or [] if isinstance(c, dict) and c.get("type") == "tool_use"
+        ]
+    item = event.get("item") if isinstance(event.get("item"), dict) else None
+    if item and item.get("type") in ("command_execution", "mcp_tool_call", "file_change"):
+        out.append({key: item.get(key) for key in ("command", "arguments", "changes")})
+    return out
+
+
 def verify(workspace: Path, run_dir: Path, task: dict, env: dict, contained=None) -> dict:
     """Run the task's verifier on the submission, sandboxed with only this task's hidden data readable."""
     sandbox_root = workspace.parent
     output = sandbox_root / "verification.json"
     command = [str(PYTHON), str(ROOT / task["verifier"]), str(workspace / task["script"]), "--output", str(output)]
     if contained is not None:
-        command = contained(command, extra_ro=[PRIVATE / name for name in task["private"] if (PRIVATE / name).exists()])
+        private = [PRIVATE / name for name in task["private"] if (PRIVATE / name).exists()]
+        command = contained(command, extra_ro=private, harness=True)
     process = subprocess.Popen(
         command,
         cwd=workspace,
@@ -555,6 +666,7 @@ def main() -> None:
             "abc_twin",
             "abc_arm",
             "abc_look",
+            "abc_replay",
         ),
     )
     parser.add_argument("--condition", choices=("mcp", "restart"))

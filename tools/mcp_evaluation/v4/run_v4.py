@@ -42,6 +42,9 @@ CUBE_DATA = Path(os.environ.get("NEWTON_CUBE_DATA", "/home/horde/artifacts/newto
 DP_DATA = Path(os.environ.get("NEWTON_DP_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/dp_real_task"))
 ABC_DATA = Path(os.environ.get("NEWTON_ABC_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_twin_task"))
 ARM_DATA = Path(os.environ.get("NEWTON_ARM_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_arm_task"))
+LOOK_DATA = Path(os.environ.get("NEWTON_LOOK_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_look_task"))
+# Blender for the look task and the MCP's blender backend (inherited by hosts, agents, and verifiers).
+os.environ.setdefault("NEWTON_BLENDER", "/home/horde/opt/blender-5.2.2-linux-x64/blender")
 
 
 def _task(name: str) -> dict:
@@ -139,7 +142,32 @@ Constraints (checked): keep one world and the station's arm kinematics (link 1 t
 Goal: calibrate the arm model so it predicts the real arm. Verification imports build_model(num_worlds), make_solver(model), and PARAMS["command_delay"], and runs its own multiple-shooting evaluation (1 s windows every 0.5 s, 2 ms steps, the logged commands applied as joint position targets after the command delay) on 16 held-out logs of 8 other episodes. The mean joint-angle RMSE must be at most {heldout_rad} rad. The starter scores about {starter_rad} rad.
 Constraints (checked): keep one arm per world with the kinematics of yam_arm.xml (joint frames, axes, and types), gravity, nonnegative masses, and valid inertias; the command delay must be between 0 and 0.2 s. Controller gains, effort limits, armature, friction, damping, masses and inertias, gravity compensation, solver settings, and other Newton modeling features inside build_model/make_solver may change. Keep the file runnable (`python arm_replay.py --viewer null`).""",
         },
+        "abc_look": {
+            "files": {
+                **{
+                    name: HERE / "abc_look" / name
+                    for name in ("station_look.py", "look.py", "render_look.py", "look_common.py")
+                },
+                "twin_render.py": HERE / "abc_twin/twin_render.py",
+                **{
+                    name: LOOK_DATA / name
+                    for name in ("scene.json", "camera.json", "joint_log.npz", "frames", "station")
+                },
+            },
+            "script": "station_look.py",
+            "host_args": [],
+            "verifier": "tools/mcp_evaluation/v4/abc_look/verify.py",
+            "seconds": 2700,
+            "goal": """station_look.py is a fixed digital twin of a real robot station from the ABC-130k dataset (https://abc.bot): two YAM arms in a white enclosure with plates, dishes, and an orange bin on the table, seen by the station's top camera (a RealSense D405). The geometry is fitted already: scene.json holds the camera pose and the objects, joint_log.npz the robot's measured joint positions for 43 frames, frames/ six recorded top-camera frames (640x480), and camera.json the calibrated intrinsics. The twin is rendered in Blender EEVEE (look_common.LookRenderer), and its appearance comes from look.py, bpy code that runs once in Blender after the scene is built. render_look.py renders frames with the current look.py in a fresh Blender process and scores them. Problem: look.py is empty, so every object on the table is neutral gray, and materials, lights, and exposure are Blender defaults.
+
+Goal: write look.py so that the renders match the recording. Verification runs only look.py, in a fresh Blender worker on the same twin, renders 5 held-out frames of the same window (between the given ones), and compares them with the recorded frames: the mean color difference over shape regions (look_common.region_color_error, sRGB 0-255) must be at most {region_color_error}, and the color PSNR (twin_render.score) at least {color_psnr_db} dB. The starter scores about 46 and 17.6 dB.
+Constraints (checked): appearance only. Materials, lights, world, and color management may change; adding or reshaping mesh objects, loading images, and compositing are not allowed. The geometry files, look_common.py, and twin_render.py are fixed (the verifier uses its own copies). Keep render_look.py working.""",
+        },
     }
+    if name == "abc_look":
+        from tools.mcp_evaluation.v4.abc_look.verify import THRESHOLDS  # noqa: PLC0415
+
+        tasks[name]["goal"] = tasks[name]["goal"].format(**THRESHOLDS)
     if name == "abc_arm":
         from tools.mcp_evaluation.v4.abc_arm.verify import STARTER_RAD, THRESHOLDS  # noqa: PLC0415
 
@@ -379,7 +407,17 @@ def main() -> None:
     parser.add_argument(
         "--task",
         required=True,
-        choices=("grasp_drift", "g1_track", "dp_real", "cube_toss", "sdf_grind", "g1_hard", "abc_twin", "abc_arm"),
+        choices=(
+            "grasp_drift",
+            "g1_track",
+            "dp_real",
+            "cube_toss",
+            "sdf_grind",
+            "g1_hard",
+            "abc_twin",
+            "abc_arm",
+            "abc_look",
+        ),
     )
     parser.add_argument("--condition", required=True, choices=("mcp", "restart"))
     parser.add_argument("--model", required=True, choices=sorted(MODELS))

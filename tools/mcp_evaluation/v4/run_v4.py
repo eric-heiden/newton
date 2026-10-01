@@ -322,7 +322,9 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
         # The host runs the agent's code too, so it shares the agent's filesystem view, including /tmp.
         if not SANDBOX:
             return command
-        return ti.sandbox(command, sandbox_root, ROOT, PRIVATE, extra_ro=list(extra_ro), extra_hidden=[TRIALS])
+        # Hide the run directory's parent too (other trials' records), wherever the iteration directory lives.
+        hidden = [TRIALS, run_dir.parent]
+        return ti.sandbox(command, sandbox_root, ROOT, PRIVATE, extra_ro=list(extra_ro), extra_hidden=hidden)
 
     host, sampler, agent = None, None, None
     # Mount namespaces of the trial's sandboxes: cleanup also finds detached jobs that cleared their env.

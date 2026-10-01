@@ -1,0 +1,1 @@
+Add the `contacts_between(a, b=None)` MCP workspace helper: contact count, the solver's normal and friction force, slip speed at the contact points, and penetration between two shape sets, selected by label, index, or body. `rollout(record=...)` probes that return dictionaries now record one series per key.

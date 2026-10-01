@@ -844,6 +844,7 @@ class SimulationSession:
         "render",
         "compare_images",
         "blender",
+        "contacts_between",
     )
     _EXPRESSION_RESULT = "__newton_expression_result__"
 
@@ -867,6 +868,7 @@ class SimulationSession:
                     "render",
                     "compare_images",
                     "blender",
+                    "contacts_between",
                 )
             }
         )
@@ -882,6 +884,7 @@ class SimulationSession:
             render=self.render,
             compare_images=self.compare_images,
             blender=self.blender,
+            contacts_between=self.contacts_between,
             np=np,
             wp=wp,
             newton=newton,
@@ -1426,7 +1429,8 @@ class SimulationSession:
             seconds: Simulated duration [s], rounded to whole steps.
             record: Series to sample, as ``name: callable`` (taking no arguments or
                 the session) or a Python expression evaluated in the workspace
-                (``"state.body_q.numpy()[3, 2]"``).
+                (``"state.body_q.numpy()[3, 2]"``). A probe that returns a dictionary
+                records one series per numeric key, named ``name.key``.
             every: Sample every ``every`` steps (the final step is always sampled).
             start: ``True`` resets to the initial state, a string restores that
                 checkpoint, ``False`` continues from the current state.
@@ -1470,7 +1474,10 @@ class SimulationSession:
             times.append(self.time)
             for name, probe in probes.items():
                 value = probe(self)
-                series[name].append(value.numpy() if isinstance(value, wp.array) else np.asarray(value))
+                if isinstance(value, dict):
+                    series[name].append(value)
+                else:
+                    series[name].append(value.numpy() if isinstance(value, wp.array) else np.asarray(value))
 
         sample()
         for index in range(frames):
@@ -1482,7 +1489,16 @@ class SimulationSession:
             if done:
                 stopped = f"until at t={self.time:.4g} s"
                 break
-        result = {"t": np.asarray(times), **{name: np.stack(values) for name, values in series.items()}}
+        result = {"t": np.asarray(times)}
+        for name, values in series.items():
+            if values and isinstance(values[0], dict):
+                # Dictionary probes become one series per numeric key, e.g. "grip.normal_force".
+                for key in values[0]:
+                    column = [v.get(key) for v in values]
+                    if all(isinstance(x, (int, float, np.number)) or x is None for x in column):
+                        result[f"{name}.{key}"] = np.asarray([np.nan if x is None else x for x in column], dtype=float)
+            else:
+                result[name] = np.stack(values)
         result.update(frames=index + 1, stopped=stopped)
         if plot:
             self._plot_series(result, plot if isinstance(plot, list) else list(series))
@@ -1604,6 +1620,20 @@ class SimulationSession:
             else:
                 result["panel_image"] = image
         return result
+
+    def contacts_between(self, a, b=None, *, detail: bool = False) -> dict:
+        """Contact count, solver normal and friction force, slip speed, and penetration between two shape sets.
+
+        ``a`` and ``b`` select shapes by label substring (last path component of the shape's or its
+        body's label), shape index, ``{"shape": ...}``, ``{"body": ...}``, or a list of these; ``b=None``
+        means everything else. Returns flat scalars, so it can be recorded over time with
+        ``rollout(record={"grip": lambda: contacts_between("finger", "apple")})`` (series ``grip.count``,
+        ``grip.normal_force``, ...). ``detail=True`` adds per-body-pair counts and forces (``by_body``).
+        """
+        from .diagnostics import contacts_between  # noqa: PLC0415
+
+        self._assert_owner()
+        return contacts_between(self, a, b, detail=detail)
 
     def solver_contacts(self, limit: int = 20) -> dict:
         """Active solver contacts grouped by shape pair, with the effective solver parameters."""

@@ -298,6 +298,45 @@ class TestMcpHelpers(unittest.TestCase):
         self.assertEqual(call(client)["frame"], 0)
 
 
+@unittest.skipUnless(wp.is_cuda_available(), "SolverMuJoCo contact forces need CUDA")
+class TestMcpContactsBetween(unittest.TestCase):
+    def _session(self, use_mujoco_contacts: bool):
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()), label="box")
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0))
+        model = builder.finalize(device="cuda:0")
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        session = SimulationSession(
+            model,
+            newton.solvers.SolverMuJoCo(model, use_mujoco_contacts=use_mujoco_contacts),
+            dt=0.005,
+            allow_execute=True,
+            artifact_directory=directory.name,
+        )
+        self.addCleanup(session.close)
+        return session, float(model.body_mass.numpy()[0])
+
+    def test_resting_box_carries_its_weight_and_sliding_box_slips(self):
+        """Report the supporting force of a resting box and the slip of a sliding one, as rollout series."""
+        for use_mujoco_contacts in (True, False):
+            session, mass = self._session(use_mujoco_contacts)
+            resting = session.rollout(seconds=0.5, record={"box": lambda s=session: s.contacts_between("box")})
+            self.assertAlmostEqual(resting["box.normal_force"][-1], 9.81 * mass, delta=0.02 * 9.81 * mass)
+            self.assertGreater(resting["box.touching"][-1], 0)
+            self.assertLess(resting["box.slip_max"][-1], 1.0e-3)
+            joint_qd = session.state.joint_qd.numpy()
+            joint_qd[0] = 1.0
+            session.state.joint_qd.assign(joint_qd)
+            session.rollout(frames=1)
+            sliding = session.contacts_between({"body": "box"}, "ground", detail=True)
+            self.assertGreater(sliding["slip_max"], 0.3)
+            self.assertIn("box | world", sliding["by_body"])
+            with self.assertRaises(ValueError):
+                session.contacts_between("no_such_shape")
+
+
 class TestMcpLeanProfile(unittest.TestCase):
     def test_lean_profile_lists_execute_and_rebuild(self):
         """Advertise two tools and short instructions that point to Python-side observation."""

@@ -1172,6 +1172,17 @@ class RendererGL:
         try:
             import pyglet
 
+            # Render offscreen through EGL when headless on Linux: a hidden GLX window needs a running
+            # X server, and under Xvfb it silently falls back to CPU rendering without MSAA or CUDA
+            # interop. The option only takes effect before pyglet's GL and window modules load.
+            if (
+                headless
+                and sys.platform.startswith("linux")
+                and "pyglet.window" not in sys.modules
+                and "pyglet.gl" not in sys.modules
+            ):
+                pyglet.options["headless"] = True
+
             # disable error checking for performance
             pyglet.options["debug_gl"] = False
 

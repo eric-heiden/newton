@@ -326,6 +326,7 @@ class ObservationRenderer:
         self._recording = None
         self._last_recording = {"active": False, "frame_count": 0}
         self._rtx = self._rtx_model = self._rtx_colors = self._rtx_world = None
+        self._blender = self._blender_signature = None
 
     def _check_thread(self):
         if threading.get_ident() != self._owner_thread:
@@ -388,8 +389,8 @@ class ObservationRenderer:
         width = _integer("width", width, 1, 2048)
         height = _integer("height", height, 1, 2048)
         world_id = _integer("world_id", world_id, 0, model.world_count - 1)
-        if backend not in ("sensor", "viewer", "rtx"):
-            raise ValueError("backend must be 'sensor', 'viewer', or 'rtx'")
+        if backend not in ("sensor", "viewer", "rtx", "blender", "blender_cycles"):
+            raise ValueError("backend must be 'sensor', 'viewer', 'rtx', 'blender', or 'blender_cycles'")
         samples = _integer("samples", samples, 1, 256)
         if channel not in self.CHANNELS:
             raise ValueError(f"channel must be one of {self.CHANNELS}")
@@ -409,8 +410,12 @@ class ObservationRenderer:
             raise ValueError("fov_y must be finite and in [1, 175] degrees")
         intrinsics = _intrinsics(intrinsics, width, height)
         if intrinsics is not None:
-            if backend != "sensor":
-                raise ValueError("intrinsics require the sensor backend")
+            if backend.startswith("blender") and (
+                set(intrinsics) & set(_DISTORTION) or "distortion_model" in intrinsics
+            ):
+                raise ValueError("The blender backend takes pinhole intrinsics without distortion")
+            if backend not in ("sensor", "blender", "blender_cycles"):
+                raise ValueError("intrinsics require the sensor or blender backend")
             # Framing and overlays use the equivalent vertical field of view.
             fov_y = math.degrees(2.0 * math.atan(0.5 * intrinsics["image_height"] / intrinsics["fy"]))
         if contact_depth not in ("visible", "always"):
@@ -485,6 +490,18 @@ class ObservationRenderer:
             if pick is not None:
                 metadata["picks"] = self._pick(arrays["shape_index"], pick)
             depth = arrays.get("forward_depth")
+        elif backend.startswith("blender"):
+            if channel != "color" or raw or pick is not None or wireframe or contacts:
+                raise ValueError("The blender backend renders color only; channels, picking, contacts need sensor")
+            started = time.perf_counter()
+            engine = "CYCLES" if backend == "blender_cycles" else "EEVEE"
+            rgb, blender_metadata = self._render_blender(
+                width, height, fov_y, camera_pose, world_id, samples, intrinsics, engine
+            )
+            metadata.update(blender_metadata)
+            metadata["render_seconds"] = round(time.perf_counter() - started, 3)
+            depth = None
+            arrays = {}
         elif backend == "rtx":
             if channel != "color" or raw or pick is not None or wireframe:
                 raise ValueError("The rtx backend renders color only; raw channels, picking and wireframe need sensor")
@@ -991,6 +1008,59 @@ class ObservationRenderer:
             "renderer_rebuilt": rebuilt,
         }
 
+    def blender_worker(self, world_id: int = 0):
+        """The Blender render worker for the current model, started on first use.
+
+        The worker is rebuilt when the model, its visible shapes, or shape colors change.
+        """
+        from .blender_bridge import BlenderRenderer, find_blender  # noqa: PLC0415
+
+        model = self.session.model
+        signature = (
+            id(model),
+            world_id,
+            hash(model.shape_flags.numpy().tobytes()),
+            hash(model.shape_color.numpy().tobytes()) if model.shape_color is not None else None,
+        )
+        if self._blender is not None and self._blender_signature == signature:
+            return self._blender, False
+        self._close_blender()
+        blender = find_blender()
+        if blender is None:
+            raise ValueError("backend='blender' needs Blender; set NEWTON_BLENDER or put blender on PATH")
+        directory = Path(self.session.artifact_directory) / "blender" if self.session.artifact_directory else None
+        self._blender = BlenderRenderer(model, blender=blender, world_id=world_id, workdir=directory)
+        self._blender_signature = signature
+        return self._blender, True
+
+    def _render_blender(self, width, height, fov_y, pose, world_id, samples, intrinsics, engine):
+        worker, rebuilt = self.blender_worker(world_id)
+        rgb, timing = worker.render(
+            self.session.state,
+            pose=pose,
+            fov_y=fov_y,
+            width=width,
+            height=height,
+            samples=samples,
+            engine=engine,
+            intrinsics=intrinsics,
+        )
+        return np.ascontiguousarray(rgb[..., :3], dtype=np.uint8), {
+            "renderer": f"Blender {engine.title()}",
+            "samples": samples,
+            "renderer_rebuilt": rebuilt,
+            "blender_render_seconds": timing.get("render_s"),
+            **({"startup_seconds": round(worker.startup_s, 2)} if rebuilt else {}),
+        }
+
+    def _close_blender(self):
+        worker, self._blender = getattr(self, "_blender", None), None
+        if worker is not None:
+            try:
+                worker.close()
+            except Exception:
+                pass
+
     def _close_rtx(self):
         viewer, self._rtx = getattr(self, "_rtx", None), None
         if viewer is not None:
@@ -1265,3 +1335,4 @@ class ObservationRenderer:
             self._finish_recording("session_closed")
         self.invalidate()
         self._close_rtx()
+        self._close_blender()

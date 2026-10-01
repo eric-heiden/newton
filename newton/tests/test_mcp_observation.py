@@ -20,6 +20,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.mcp.blender_bridge import find_blender as _blender_path
 from newton._src.mcp.observation import ObservationRenderer, _inverse_brown_conrady_rays
 from newton.mcp import SimulationSession
 from newton.solvers import SolverXPBD
@@ -417,6 +418,23 @@ class TestMcpObservation(unittest.TestCase):
         np.testing.assert_allclose(rays[0, 0, 0, 1], expected / np.linalg.norm(expected), atol=1e-6)
         with self.assertRaises(ValueError):
             self.renderer.observe(intrinsics={**realsense, "k4": 0.1}, **self.camera)
+
+    @unittest.skipUnless(_blender_path() is not None, "requires Blender (NEWTON_BLENDER or blender on PATH)")
+    def test_blender_backend_matches_sensor_camera(self):
+        """Blender renders line up with sensor renders for fov and calibrated cameras, and accept bpy edits."""
+        session = SimulationSession(self.model, self.model.state(), artifact_directory=Path(self.directory.name))
+        self.addCleanup(session.close)
+        camera = {"eye": [2.0, -1.6, 1.2], "target": [0, 0, 0], "width": 96, "height": 72, "environment": False}
+
+        def red_center(image):
+            ys, xs = np.nonzero((image[..., 0] > 120) & (image[..., 1] < 90) & (image[..., 2] < 90))
+            return np.array([xs.mean(), ys.mean()])
+
+        for options in ({}, {"intrinsics": {"fx": 80.0, "fy": 80.0, "cx": 40.0, "cy": 30.0}}):
+            sensor = session.render(backend="sensor", **camera, **options)
+            blender = session.render(backend="blender", samples=4, **camera, **options)
+            np.testing.assert_allclose(red_center(blender), red_center(sensor), atol=1.0)
+        self.assertEqual(session.blender("result = len(shape_objects)"), "1")
 
     @unittest.skipUnless(
         importlib.util.find_spec("ovrtx") is not None and wp.is_cuda_available(), "requires ovrtx and CUDA"

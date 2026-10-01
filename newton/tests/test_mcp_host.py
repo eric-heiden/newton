@@ -341,6 +341,7 @@ class TestMcpLeanProfile(unittest.TestCase):
                 result = server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})["result"]
             self.assertEqual("backend='rtx'" in result["instructions"], installed)
             self.assertNotIn("<<RTX>>", result["instructions"])
+            self.assertNotIn("<<BLENDER>>", result["instructions"])
 
 
 if __name__ == "__main__":

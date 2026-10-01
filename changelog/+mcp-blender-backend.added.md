@@ -1,0 +1,1 @@
+Add an optional Blender render worker to the MCP: `observe(backend='blender')` (EEVEE) or `'blender_cycles'` renders the observed world with the same camera, including calibrated intrinsics, and the `blender(code)` workspace helper edits materials, lights, and exposure in that worker. Blender is found through `NEWTON_BLENDER` or `PATH`.

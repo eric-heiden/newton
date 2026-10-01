@@ -41,6 +41,7 @@ WORKERS = int(os.environ.get("NEWTON_MCP_WORKERS", "2"))
 CUBE_DATA = Path(os.environ.get("NEWTON_CUBE_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/cube_toss_task"))
 DP_DATA = Path(os.environ.get("NEWTON_DP_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/dp_real_task"))
 ABC_DATA = Path(os.environ.get("NEWTON_ABC_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_twin_task"))
+ARM_DATA = Path(os.environ.get("NEWTON_ARM_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_arm_task"))
 
 
 def _task(name: str) -> dict:
@@ -125,7 +126,24 @@ Constraints (checked): keep the workpiece shape, wheel size, tool path (_grinder
 Goal: make the twin reproduce the recording. Verification imports build_model, CAMERA_POSITION, CAMERA_ROTATION, and LOOK, renders 5 held-out frames of the same window (between the given ones) with the robot posed from the log, and scores them against the recorded frames with twin_render.score: the mean edge_ncc must be at least {edge_ncc}, ssim at least {ssim}, and color_psnr_db at least {color_psnr_db}. The starter scores about 0.37, 0.53, and 14.0 dB.
 Constraints (checked): keep one world and the station's arm kinematics (link 1 to link 6 of each arm), and add at most 60 shapes. twin_render.py is fixed (the verifier uses its own copy), and build_model runs without the recorded frames. The camera pose, arm base placement, enclosure and table, objects (static shapes; any Newton geometry), shape colors, and LOOK may change. Keep the file runnable (`python station_twin.py --viewer null`).""",
         },
+        "abc_arm": {
+            "files": {
+                "arm_replay.py": HERE / "abc_arm/arm_replay.py",
+                **{name: ARM_DATA / name for name in ("yam_arm.xml", "meshes", "logs")},
+            },
+            "script": "arm_replay.py",
+            "host_args": [],
+            "verifier": "tools/mcp_evaluation/v4/abc_arm/verify.py",
+            "goal": """arm_replay.py models a real robot arm from the ABC-130k dataset (https://abc.bot): the 6-DoF YAM arm of a bimanual teleoperation station, whose joints track position commands streamed from a leader arm at about 30 Hz. logs/ holds 64 recorded arm logs (32 episodes, both arms; about 87 minutes per arm) with measured joint positions, velocities, and motor torques, the commanded joint positions, and the gripper opening. Each log is cut into 1 s windows; each window is one Newton world that starts from the measured state and is driven open loop by the logged commands through the arm's joint position targets (rollout/window_errors). Problem: the model uses the nominal gains, armature, and friction of the ABC simulation model, and its predicted joint angles drift from the recordings.
+
+Goal: calibrate the arm model so it predicts the real arm. Verification imports build_model(num_worlds), make_solver(model), and PARAMS["command_delay"], and runs its own multiple-shooting evaluation (1 s windows every 0.5 s, 2 ms steps, the logged commands applied as joint position targets after the command delay) on 16 held-out logs of 8 other episodes. The mean joint-angle RMSE must be at most {heldout_rad} rad. The starter scores about {starter_rad} rad.
+Constraints (checked): keep one arm per world with the kinematics of yam_arm.xml (joint frames, axes, and types), gravity, nonnegative masses, and valid inertias; the command delay must be between 0 and 0.2 s. Controller gains, effort limits, armature, friction, damping, masses and inertias, gravity compensation, solver settings, and other Newton modeling features inside build_model/make_solver may change. Keep the file runnable (`python arm_replay.py --viewer null`).""",
+        },
     }
+    if name == "abc_arm":
+        from tools.mcp_evaluation.v4.abc_arm.verify import STARTER_RAD, THRESHOLDS  # noqa: PLC0415
+
+        tasks[name]["goal"] = tasks[name]["goal"].format(starter_rad=STARTER_RAD, **THRESHOLDS)
     if name == "abc_twin":
         from tools.mcp_evaluation.v4.abc_twin.verify import THRESHOLDS  # noqa: PLC0415
 
@@ -361,7 +379,7 @@ def main() -> None:
     parser.add_argument(
         "--task",
         required=True,
-        choices=("grasp_drift", "g1_track", "dp_real", "cube_toss", "sdf_grind", "g1_hard", "abc_twin"),
+        choices=("grasp_drift", "g1_track", "dp_real", "cube_toss", "sdf_grind", "g1_hard", "abc_twin", "abc_arm"),
     )
     parser.add_argument("--condition", required=True, choices=("mcp", "restart"))
     parser.add_argument("--model", required=True, choices=sorted(MODELS))

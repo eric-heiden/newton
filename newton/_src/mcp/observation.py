@@ -23,9 +23,9 @@ from newton.sensors import SensorTiledCamera
 
 from .imaging import compare as _compare_images
 from .imaging import comparison_panel as _comparison_panel
+from .imaging import draw_label, load_image, tile
 from .imaging import encode_png as _png
 from .imaging import image_metrics as _image_metrics
-from .imaging import load_image, tile
 from .imaging import to_rgb as _rgb
 
 
@@ -182,6 +182,166 @@ def _inverse_brown_conrady_rays(width: int, height: int, intrinsics: dict) -> np
     rays = np.zeros((1, height, width, 2, 3), dtype=np.float32)
     rays[0, :, :, 1] = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
     return rays
+
+
+def _distort_opencv(x: np.ndarray, y: np.ndarray, k: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Apply OpenCV's rational, tangential, and thin-prism distortion to normalized coordinates (y down)."""
+
+    def radial(s):
+        return (1.0 + k["k1"] * s + k["k2"] * s * s + k["k3"] * s**3) / (
+            1.0 + k["k4"] * s + k["k5"] * s * s + k["k6"] * s**3
+        )
+
+    r2 = x * x + y * y
+    xd = x * radial(r2) + 2.0 * k["p1"] * x * y + k["p2"] * (r2 + 2.0 * x * x) + k["s1"] * r2 + k["s2"] * r2 * r2
+    yd = y * radial(r2) + k["p1"] * (r2 + 2.0 * y * y) + 2.0 * k["p2"] * x * y + k["s3"] * r2 + k["s4"] * r2 * r2
+    # Past the radius where r * radial(r^2) stops growing, the polynomial folds points from outside
+    # the calibrated field of view back into the image.
+    radii = np.sqrt(np.nan_to_num(r2, nan=0.0))[:, None] * np.linspace(0.0, 1.0, 65)[None, :]
+    monotonic = (np.diff(radii * radial(radii * radii), axis=1) > 0.0).all(axis=1) | (r2 == 0.0)
+    return np.where(monotonic, xd, np.nan), np.where(monotonic, yd, np.nan)
+
+
+def _distort_inverse_brown_conrady(x: np.ndarray, y: np.ndarray, k: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Distorted coordinates that the inverse Brown-Conrady map of :func:`_inverse_brown_conrady_rays` sends to (x, y)."""
+
+    def undistort(xd, yd):
+        r2 = xd * xd + yd * yd
+        radial = 1.0 + k["k1"] * r2 + k["k2"] * r2 * r2 + k["k3"] * r2**3
+        return (
+            xd * radial + 2.0 * k["p1"] * xd * yd + k["p2"] * (r2 + 2.0 * xd * xd),
+            yd * radial + 2.0 * k["p2"] * xd * yd + k["p1"] * (r2 + 2.0 * yd * yd),
+            radial,
+        )
+
+    xd, yd = x.copy(), y.copy()
+    for _ in range(100):
+        ux, uy, radial = undistort(xd, yd)
+        xd, yd = xd + (x - ux) / radial, yd + (y - uy) / radial
+    ux, uy, _ = undistort(xd, yd)
+    converged = np.hypot(ux - x, uy - y) <= 1.0e-9 * np.maximum(1.0, np.hypot(x, y))
+    return np.where(converged, xd, np.nan), np.where(converged, yd, np.nan)
+
+
+def _project(points, pose, width: int, height: int, fov_y: float, intrinsics: dict | None):
+    """Image coordinates [px] and forward depth [m] of world points seen by an observation camera.
+
+    Coordinates match the renderer's rays: x right, y down, and pixel ``i`` spans ``[i, i + 1)``.
+    Points behind the camera or outside a distortion model's valid range are NaN.
+    """
+    pose = np.asarray(pose, dtype=np.float64)
+    rotation = np.asarray(wp.quat_to_matrix(wp.quat(*pose[3:7])), dtype=np.float64).reshape(3, 3)
+    local = (np.asarray(points, dtype=np.float64).reshape(-1, 3) - pose[:3]) @ rotation
+    depth = -local[:, 2]
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        ahead = depth > 1.0e-9
+        x = np.where(ahead, local[:, 0] / np.where(ahead, depth, 1.0), np.nan)
+        y = np.where(ahead, -local[:, 1] / np.where(ahead, depth, 1.0), np.nan)
+        if intrinsics is None:
+            focal = height / (2.0 * math.tan(math.radians(fov_y) / 2.0))
+            u, v = 0.5 * width + focal * x, 0.5 * height + focal * y
+        else:
+            k = {name: intrinsics.get(name, 0.0) for name in _DISTORTION}
+            if intrinsics.get("distortion_model") == "inverse_brown_conrady":
+                x, y = _distort_inverse_brown_conrady(x, y, k)
+            else:
+                x, y = _distort_opencv(x, y, k)
+            u = (intrinsics["fx"] * x + intrinsics["cx"]) * width / intrinsics["image_width"]
+            v = (intrinsics["fy"] * y + intrinsics["cy"]) * height / intrinsics["image_height"]
+    return np.stack([u, v], axis=-1), depth
+
+
+def _body_index(model, selector, world_id: int) -> int:
+    """Index of the body selected by label or index within ``world_id`` (or among global bodies).
+
+    Labels match exactly, then by their last path component, then as a substring; worlds
+    replicated from one builder share labels, so the observed world disambiguates them.
+    """
+    if isinstance(selector, bool) or not isinstance(selector, (str, int, np.integer)):
+        raise ValueError("Bodies are selected by label or index")
+    if not model.body_count:
+        raise ValueError("The model has no bodies")
+    worlds = model.body_world.numpy() if model.body_world is not None else np.full(model.body_count, -1)
+    if not isinstance(selector, str):
+        index = _integer("body index", selector, 0, model.body_count - 1)
+        if worlds[index] not in (world_id, -1):
+            raise ValueError(f"Body {index} belongs to world {worlds[index]}, not world_id {world_id}")
+        return index
+    labels = [str(label) for label in (model.body_label or [])]
+    candidates = [i for i in range(min(len(labels), model.body_count)) if worlds[i] in (world_id, -1)]
+    for matches in (
+        lambda label: label == selector,
+        lambda label: label.rsplit("/", 1)[-1] == selector,
+        lambda label: selector in label,
+    ):
+        found = [i for i in candidates if matches(labels[i])]
+        if len(found) == 1:
+            return found[0]
+        if found:
+            names = ", ".join(labels[i] for i in found[:8])
+            raise ValueError(f"Body {selector!r} matches {len(found)} bodies in world {world_id}: {names}")
+    raise ValueError(f"No body labeled {selector!r} in world {world_id}")
+
+
+_MARKER_COLORS = (
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 0),
+    (0, 255, 0),
+    (255, 128, 0),
+    (80, 140, 255),
+    (255, 255, 255),
+    (255, 40, 40),
+)
+
+
+def _draw_markers(image: np.ndarray, markers: list, scale: int = 1) -> np.ndarray:
+    """Copy of ``image`` with a labeled ring per projected point; ``scale`` divides the pixel coordinates."""
+    image = image.copy()
+    height, width = image.shape[:2]
+    radius = max(4.0, min(width, height) / 40.0)
+    text_scale = 2 if min(width, height) >= 480 else 1
+    for index, (name, pixels, single) in enumerate(markers):
+        color = _MARKER_COLORS[index % len(_MARKER_COLORS)]
+        for point, (u, v) in enumerate(pixels / scale):
+            if not (np.isfinite(u) and np.isfinite(v)) or not (0 <= u < width and 0 <= v < height):
+                continue
+            x0, x1 = max(int(u - radius - 3), 0), min(int(u + radius + 3), width)
+            y0, y1 = max(int(v - radius - 3), 0), min(int(v + radius + 3), height)
+            ys, xs = np.mgrid[y0:y1, x0:x1]
+            distance = np.abs(np.hypot(xs + 0.5 - u, ys + 0.5 - v) - radius)
+            region = image[y0:y1, x0:x1]
+            region[distance <= 2.0] = 0
+            region[distance <= 1.0] = color
+            image[int(v), int(u)] = color
+            text = name if single else f"{name}[{point}]"
+            text_width = (len(text) * 6 + 2) * text_scale
+            left = u + radius + 3 if u + radius + 3 + text_width <= width else u - radius - 3 - text_width
+            top = min(max(v - 4.5 * text_scale, 0), height - 9 * text_scale)
+            draw_label(image, text, int(left), int(top), text_scale, color)
+    return image
+
+
+def _marker_report(markers: list) -> dict:
+    """Pixel coordinates [x, y] per overlay name (a list for point arrays), None where a point is not projectable."""
+    report = {}
+    for name, pixels, single in markers:
+        coordinates = [
+            [round(float(u), 1), round(float(v), 1)] if np.isfinite([u, v]).all() else None for u, v in pixels
+        ]
+        report[name] = coordinates[0] if single else coordinates
+    return report
+
+
+def _view_name(spec: dict, index: int) -> str:
+    """Caption for a camera specification: its label, preset, mounting body, or list position."""
+    if isinstance(spec.get("label"), str):
+        return spec["label"]
+    if spec.get("view"):
+        return spec["view"]
+    if spec.get("camera_body") is not None:
+        return str(spec["camera_body"])
+    return "auto" if spec.get("eye") is None and spec.get("pose") is None else f"view {index}"
 
 
 def _reference_rows(references, views: int) -> list[list]:
@@ -403,6 +563,8 @@ class ObservationRenderer:
         environment: bool = True,
         intrinsics: dict | None = None,
         samples: int = 16,
+        camera_body: str | int | None = None,
+        camera_offset=None,
     ) -> dict:
         """Return a PNG and bounded metadata for the current simulation state.
 
@@ -422,12 +584,38 @@ class ObservationRenderer:
         Color images are supersampled (``antialias``) when the pixel budget
         allows, and ``environment`` adds a sky gradient behind the scene and a
         checker of known cell size on ground planes for scale and motion cues.
+        ``camera_body`` (a body label or index, matched within ``world_id``)
+        mounts the camera on that body, e.g. a wrist camera: ``camera_offset``
+        is the camera pose in the body frame (position [m] and xyzw quaternion,
+        default identity), and the body's pose at render time places it. A ROS
+        optical frame (+Z forward, +Y down) needs ``camera_offset=[0, 0, 0, 1, 0, 0, 0]``.
         """
         self._check_thread()
         model = self.session.model
         width = _integer("width", width, 1, 2048)
         height = _integer("height", height, 1, 2048)
         world_id = _integer("world_id", world_id, 0, model.world_count - 1)
+        mount = None
+        if camera_body is not None:
+            if any(value is not None for value in (eye, target, up, pose, view)):
+                raise ValueError("camera_body places the camera; give camera_offset instead of eye/target/up/pose/view")
+            body = _body_index(model, camera_body, world_id)
+            if self.session.state.body_q is None:
+                raise ValueError("camera_body needs body transforms in the state")
+            offset = _vector("camera_offset", (0, 0, 0, 0, 0, 0, 1) if camera_offset is None else camera_offset, 7)
+            if np.linalg.norm(offset[3:]) < 1.0e-12:
+                raise ValueError("camera_offset quaternion must be nonzero")
+            offset = np.concatenate([offset[:3], offset[3:] / np.linalg.norm(offset[3:])])
+            body_pose = self.session.state.body_q.numpy()[body]
+            pose = list(wp.transform_multiply(wp.transform(*body_pose), wp.transform(*offset)))
+            labels = getattr(model, "body_label", None) or []
+            mount = {
+                "body": body,
+                **({"label": str(labels[body])[:256]} if body < len(labels) else {}),
+                "offset": [round(float(v), 6) for v in offset],
+            }
+        elif camera_offset is not None:
+            raise ValueError("camera_offset requires camera_body")
         if backend not in ("sensor", "viewer", "rtx", "blender", "blender_cycles"):
             raise ValueError("backend must be 'sensor', 'viewer', 'rtx', 'blender', or 'blender_cycles'")
         samples = _integer("samples", samples, 1, 256)
@@ -494,6 +682,7 @@ class ObservationRenderer:
                 "pose": camera_pose,
                 "fov_y": float(fov_y),
                 **({"intrinsics": intrinsics} if intrinsics is not None else {}),
+                **({"mount": mount} if mount is not None else {}),
                 "convention": "xyzw, -Z forward, +Y up, top-left",
                 "coordinates": "simulation world coordinates [m]",
             },
@@ -564,7 +753,7 @@ class ObservationRenderer:
             depth = None
             arrays = {}
         if contacts:
-            metadata["contacts"] = self._overlay_contacts(rgb, eye, rotation, fov_y, world_id, contact_depth, depth)
+            metadata["contacts"] = self._overlay_contacts(rgb, metadata["camera"], world_id, contact_depth, depth)
         if raw:
             directory = Path(self.session.artifact_directory)
             directory.mkdir(parents=True, exist_ok=True)
@@ -590,6 +779,15 @@ class ObservationRenderer:
         pixel statistics and PSNR, SSIM, and edge NCC. ``comparison="edges"``
         (simulated edges magenta, reference edges green, overlap white) or
         ``"blend"`` suits real photos better than pixel mismatch. Width/height default to the reference size.
+
+        ``overlay`` maps names to simulated world points [m] to mark, each a
+        Python expression (needs ``allow_execute``) or callable returning a
+        point or an ``(N, 3)`` array, ``{"body": label or index, "point": [x, y, z]}``
+        (a point in the body frame, default its origin, resolved in ``world_id``),
+        or fixed coordinates. The points are projected through the same camera,
+        including ``intrinsics`` and distortion, and drawn as labeled rings on
+        the simulated and reference images after the comparison metrics are
+        computed; ``overlay`` in the result holds their pixel coordinates.
         """
         self._check_thread()
         if views is None:
@@ -643,6 +841,7 @@ class ObservationRenderer:
             spec = dict(view_spec)
             name = spec.pop("label", None)
             name = name if isinstance(name, str) else None
+            overlay = spec.pop("overlay", None)
             reference_rgb = None
             if reference is not None:
                 if not isinstance(reference, str):
@@ -654,11 +853,8 @@ class ObservationRenderer:
             total_pixels += rgb.shape[0] * rgb.shape[1] * (1 if reference_rgb is None else 3)
             if total_pixels > self.MAX_PIXELS:
                 raise ValueError(f"Combined image exceeds {self.MAX_PIXELS} pixels; reduce width/height or views")
-            name = (
-                name
-                or spec.get("view")
-                or ("auto" if spec.get("eye") is None and spec.get("pose") is None else f"view {index}")
-            )
+            name = name or _view_name(spec, index)
+            markers = self._overlay_markers(overlay, metadata) if overlay is not None else None
             row, row_labels = [rgb], [f"{name} t={self.session.time:.3f}" if label else ""]
             if reference_rgb is not None:
                 stats = _compare_images(rgb, reference_rgb)[1]
@@ -671,6 +867,10 @@ class ObservationRenderer:
                 row += [reference_rgb, panel]
                 row_labels += ["reference", caption] if label else ["", ""]
                 metadata["reference"] = {"path": reference, **stats}
+            if markers is not None:
+                # Markers go on after the metrics so they never affect the scores.
+                row[: min(len(row), 2)] = [_draw_markers(image, markers) for image in row[:2]]
+                metadata["overlay"] = _marker_report(markers)
             rows.append(row)
             labels.append(row_labels)
             views.append(metadata)
@@ -681,6 +881,76 @@ class ObservationRenderer:
             "views": views,
         }
         return rows, labels, summary
+
+    MAX_OVERLAY_POINTS = 256
+
+    def _check_overlay(self, overlay) -> None:
+        """Validate the overlay mapping before any stepping."""
+        if not isinstance(overlay, dict) or not 1 <= len(overlay) <= 16:
+            raise ValueError("overlay must map 1 to 16 names to points")
+        for name, source in overlay.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("overlay names must be nonempty strings")
+            # Expressions are Python, so they follow the same permission as execute.
+            if isinstance(source, str) and not getattr(self.session, "allow_execute", False):
+                raise ValueError("overlay expressions need allow_execute; give {'body': ...} or coordinates instead")
+
+    def _overlay_points(self, overlay, world_id: int) -> list:
+        """Evaluate overlay sources on the current state as ``(name, world points [m] (N, 3), single)``."""
+        self._check_overlay(overlay)
+        session = self.session
+        body_q = None
+        result = []
+        for name, source in overlay.items():
+            if isinstance(source, dict):
+                if "body" not in source or set(source) - {"body", "point"}:
+                    raise ValueError(
+                        "overlay bodies are {'body': label or index, 'point': [x, y, z] in the body frame}"
+                    )
+                if body_q is None:
+                    if session.state.body_q is None:
+                        raise ValueError("overlay bodies need body transforms in the state")
+                    body_q = session.state.body_q.numpy()
+                body = _body_index(session.model, source["body"], world_id)
+                local = _vector("overlay point", source.get("point", (0.0, 0.0, 0.0)), 3)
+                value = wp.transform_point(wp.transform(*body_q[body]), wp.vec3(*local))
+            elif isinstance(source, str):
+                scope = getattr(session, "_eval_scope", None)
+                scope = (
+                    scope()
+                    if callable(scope)
+                    else {"session": session, "model": session.model, "state": session.state, "np": np, "wp": wp}
+                )
+                value = eval(compile(source, f"<overlay:{name}>", "eval"), scope)
+            elif callable(source):
+                from .session import _session_callable  # noqa: PLC0415
+
+                value = _session_callable(source)(session)
+            else:
+                value = source
+            try:
+                points = np.asarray(value.numpy() if isinstance(value, wp.array) else value, dtype=np.float64)
+            except (TypeError, ValueError):
+                points = np.zeros(0)
+            if points.ndim not in (1, 2) or points.shape[-1] != 3:
+                raise ValueError(f"overlay {name!r} must give a world point [x, y, z] [m] or an (N, 3) array of points")
+            result.append((name, points.reshape(-1, 3), points.ndim == 1))
+        if sum(len(points) for _, points, _ in result) > self.MAX_OVERLAY_POINTS:
+            raise ValueError(f"overlay is limited to {self.MAX_OVERLAY_POINTS} points")
+        return result
+
+    def _overlay_markers(self, overlay, metadata: dict) -> list:
+        """Project overlay points through the camera of an observation; returns ``(name, pixels, single)``."""
+        camera = metadata["camera"]
+        width, height = metadata["width"], metadata["height"]
+        return [
+            (
+                name,
+                _project(points, camera["pose"], width, height, camera["fov_y"], camera.get("intrinsics"))[0],
+                single,
+            )
+            for name, points, single in self._overlay_points(overlay, metadata["world_id"])
+        ]
 
     def _scene_frame(self, world_id: int) -> tuple[np.ndarray, float, np.ndarray]:
         """Center, bounding radius [m], and extent points of non-plane shapes and particles in one world."""
@@ -762,6 +1032,7 @@ class ObservationRenderer:
         stride: int | None = None,
         mask=None,
         comparison: str = "mismatch",
+        overlay: dict | None = None,
         **options,
     ) -> dict:
         """Advance the simulation and return one labeled grid of frames over time.
@@ -783,6 +1054,12 @@ class ObservationRenderer:
         long recording a few frames at a time. ``comparison`` selects the third
         row: ``mismatch``, ``edges`` (for real photos), or ``blend``. ``mask`` is
         a boolean ``(H, W)`` array or image path, or one per time.
+
+        Cameras on a ``camera_body`` follow that body to each capture time.
+        ``overlay`` marks simulated points on the simulated and reference
+        frames (see :meth:`observe`), evaluated at each capture time and
+        projected through each view's camera; ``overlay`` in the result lists
+        their pixel coordinates per time and view.
         """
         self._check_thread()
         session = self.session
@@ -794,6 +1071,8 @@ class ObservationRenderer:
             session.dispatch("restore", {"name": restore})
         if comparison not in ("mismatch", "edges", "blend"):
             raise ValueError("comparison must be 'mismatch', 'edges', or 'blend'")
+        if overlay is not None:
+            self._check_overlay(overlay)
         if references is not None:
             references = _reference_rows(references, 1 if views is None else len(views))
         per_frame_mask = isinstance(mask, list) and bool(mask) and not isinstance(mask[0], bool)
@@ -818,23 +1097,25 @@ class ObservationRenderer:
             count = _integer("count", 6 if count is None else count, 1, 32)
             every_steps = _integer("every_steps", 10 if every_steps is None else every_steps, 1, 100_000)
             targets = None
+        placement = ("eye", "target", "up", "pose", "view", "camera_body", "camera_offset")
         view_specs = (
             views
             if views is not None
-            else [dict(options) if any(k in options for k in ("eye", "pose")) else options.get("view", "iso")]
+            else [
+                dict(options)
+                if any(k in options for k in ("eye", "pose", "camera_body", "camera_offset"))
+                else options.get("view", "iso")
+            ]
         )
         if not isinstance(view_specs, list) or not 1 <= len(view_specs) <= 4:
             raise ValueError("views must list 1 to 4 presets or camera dictionaries")
-        options = (
-            {k: v for k, v in options.items() if k not in ("eye", "target", "up", "pose", "view")}
-            if views is None
-            else options
-        )
+        options = {k: v for k, v in options.items() if k not in placement} if views is None else options
+        names = [_view_name(spec, row) if isinstance(spec, dict) else str(spec) for row, spec in enumerate(view_specs)]
         options.setdefault("width", 320)
         options.setdefault("height", 240)
         if references is not None and len(references) != len(view_specs):
             raise ValueError("references must hold one list of images per view")
-        columns, captured_times, statistics = [], [], []
+        columns, captured_times, statistics, overlay_rows = [], [], [], []
         steps = 0
         for index in range(len(targets) if targets is not None else count):
             if targets is not None:
@@ -852,25 +1133,32 @@ class ObservationRenderer:
                 else:
                     camera.update(spec)
                 camera.pop("label", None)
+                view_overlay = camera.pop("overlay", overlay)
                 reference = None if references is None else references[row][index]
                 if reference is not None:
                     reference_rgb = load_image(reference) if isinstance(reference, (str, Path)) else _rgb(reference)
                     camera["height"], camera["width"] = reference_rgb.shape[:2]
-                rgb, _ = self._single(**camera)
-                column.append((rgb, None if reference is None else reference_rgb))
+                rgb, info = self._single(**camera)
+                markers = None if view_overlay is None else self._overlay_markers(view_overlay, info)
+                if markers is not None:
+                    overlay_rows.append(
+                        {"view": names[row], "time": round(float(session.time), 6), "pixels": _marker_report(markers)}
+                    )
+                column.append((rgb, None if reference is None else reference_rgb, markers))
             columns.append(column)
             captured_times.append(float(session.time))
-        grid, labels = [], []
-        for row, spec in enumerate(view_specs):
-            name = spec if isinstance(spec, str) else spec.get("label", f"view {row}")
+        grid, labels, grid_markers = [], [], []
+        for row, name in enumerate(names):
             grid.append([column[row][0] for column in columns])
             labels.append([f"{name} t={t:.3f}" for t in captured_times])
+            grid_markers.append([column[row][2] for column in columns])
             if references is not None:
                 grid.append([column[row][1] for column in columns])
                 labels.append([f"reference t={t:.3f}" for t in captured_times])
+                grid_markers.append([column[row][2] for column in columns])
                 panels, row_stats = [], []
                 for index, (column, t) in enumerate(zip(columns, captured_times, strict=True)):
-                    simulated, reference_rgb = column[row]
+                    simulated, reference_rgb, _ = column[row]
                     _, stats = _compare_images(simulated, reference_rgb)
                     frame_mask = mask[index] if per_frame_mask else mask
                     weights = None if frame_mask is None else _mask(frame_mask, simulated.shape[:2])
@@ -880,6 +1168,7 @@ class ObservationRenderer:
                 statistics.extend(row_stats)
                 grid.append(panels)
                 labels.append([f"{comparison} ssim {s['ssim']:.2f} ncc {s['edge_ncc']:.2f}" for s in row_stats])
+                grid_markers.append([None] * len(columns))
         # Shrink thumbnails (box filter) until the grid fits the pixel budget; metrics stay full size.
         scale = 1
         while (
@@ -889,6 +1178,14 @@ class ObservationRenderer:
             scale += 1
         if scale > 1:
             grid = [[_shrink(im, scale) for im in r] for r in grid]
+        # Markers go on after the metrics and the downscale, so they stay crisp and never affect scores.
+        grid = [
+            [
+                image if markers is None else _draw_markers(image, markers, scale)
+                for image, markers in zip(r, m, strict=True)
+            ]
+            for r, m in zip(grid, grid_markers, strict=True)
+        ]
         image = tile(grid, labels)
         if image.shape[0] * image.shape[1] > self.MAX_PIXELS:
             raise ValueError("Filmstrip exceeds the pixel budget; reduce width/height, times, or views")
@@ -901,6 +1198,8 @@ class ObservationRenderer:
             "image_base64": base64.b64encode(_png(image)).decode("ascii"),
             "mime_type": "image/png",
         }
+        if overlay_rows:
+            result["overlay"] = overlay_rows
         if statistics:
             result["mismatch"] = statistics
             keys = ("psnr_db", "ssim", "edge_ncc", "mismatch_fraction")
@@ -1262,19 +1561,18 @@ class ObservationRenderer:
             rows.append(row)
         return rows
 
-    def _overlay_contacts(self, rgb, eye, rotation, fov_y, world_id, policy, depth):
+    def _overlay_contacts(self, rgb, camera, world_id, policy, depth):
         data = self.session.contact_data(refresh=False, limit=256, world=world_id, include_global=True)
         height, width = rgb.shape[:2]
-        focal = height / (2 * math.tan(math.radians(fov_y) / 2))
+        points = [(np.asarray(row["surface0"]) + np.asarray(row["surface1"])) * 0.5 for row in data["rows"]]
+        pixels, distances = _project(
+            np.reshape(points, (-1, 3)), camera["pose"], width, height, camera["fov_y"], camera.get("intrinsics")
+        )
         drawn = 0
-        for row in data["rows"]:
-            point = (np.asarray(row["surface0"]) + np.asarray(row["surface1"])) * 0.5
-            camera = (point - eye) @ rotation
-            distance = -camera[2]
-            if not np.isfinite(camera).all() or distance <= 0:
+        for (u, v), distance in zip(pixels, distances, strict=True):
+            if not (np.isfinite(u) and np.isfinite(v)):
                 continue
-            x = int(math.floor(width / 2 + focal * camera[0] / distance))
-            y = int(math.floor(height / 2 - focal * camera[1] / distance))
+            x, y = int(math.floor(u)), int(math.floor(v))
             if not 0 <= x < width or not 0 <= y < height:
                 continue
             if policy == "visible":
@@ -1387,7 +1685,9 @@ class ObservationRenderer:
     @staticmethod
     def _write_manifest(recording):
         path = Path(recording["directory"]) / "manifest.json"
-        path.write_text(json.dumps(recording, indent=2), encoding="utf-8")
+        # Options may hold arrays or overlay callables, which have no JSON form.
+        text = json.dumps(recording, indent=2, default=lambda v: v.tolist() if isinstance(v, np.ndarray) else repr(v))
+        path.write_text(text, encoding="utf-8")
 
     def _finish_recording(self, reason="stopped"):
         recording = self._recording

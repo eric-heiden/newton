@@ -1548,8 +1548,9 @@ class SimulationSession:
         """Render the current state to an RGB array without PNG encoding (trusted execution helper).
 
         Accepts the camera and rendering options of ``observe`` (``view``, ``eye``/``target``,
-        ``pose``, ``fov_y`` or ``intrinsics``, ``width``/``height``, ``world_id``, ``backend``,
-        ``channel``, ``environment``, ...), which makes it the fast path for fitting loops.
+        ``pose`` or ``camera_body``/``camera_offset``, ``fov_y`` or ``intrinsics``, ``width``/``height``,
+        ``world_id``, ``backend``, ``channel``, ``environment``, ...), which makes it the fast path for
+        fitting loops.
 
         Args:
             metadata: Also return the observation metadata (camera pose, settings).

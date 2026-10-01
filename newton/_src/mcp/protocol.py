@@ -73,6 +73,23 @@ _OBSERVE = {
         "maxItems": 7,
         "description": "Position xyz [m] and quaternion xyzw, camera-local -Z forward/+Y up.",
     },
+    "camera_body": {
+        "type": ["string", "integer"],
+        "description": "Mount the camera on this body (label or index, matched in world_id) so it moves with the "
+        "body, e.g. a wrist camera; replaces eye/target/pose/view.",
+    },
+    "camera_offset": {
+        "type": "array",
+        "items": {"type": "number"},
+        "minItems": 7,
+        "maxItems": 7,
+        "description": "Camera pose in the camera_body frame: position [m] and quaternion xyzw (default identity).",
+    },
+    "intrinsics": {
+        "type": "object",
+        "description": "Calibrated camera instead of fov_y: fx, fy, cx, cy [px], optional image_width/image_height, "
+        "OpenCV distortion k1-k6, p1, p2, s1-s4, or distortion_model='inverse_brown_conrady' with k1-k3, p1, p2.",
+    },
     "world_id": {"type": "integer", "minimum": 0, "default": 0},
     "width": {"type": "integer", "minimum": 1, "maximum": 2048, "default": 640},
     "height": {"type": "integer", "minimum": 1, "maximum": 2048, "default": 480},
@@ -97,6 +114,14 @@ _OBSERVE = {
     },
 }
 _LABEL = {"type": ["boolean", "string"], "description": "Caption tiles (default on for grids)."}
+_OVERLAY = {
+    "type": "object",
+    "maxProperties": 16,
+    "additionalProperties": {"oneOf": [{"type": "object"}, {"type": "array"}, {"type": "string"}]},
+    "description": "Mark simulated points on the simulated and reference images: name -> {'body': label or index, "
+    "'point': [x, y, z] in the body frame}, world coordinates [m] (a point or a list of points), or a Python "
+    "expression (needs execute). Returns their pixel coordinates.",
+}
 
 
 def _tool(name: str, description: str, properties: dict | None = None, required: tuple = (), *, read_only=False):
@@ -205,10 +230,12 @@ TOOLS = [
         "Render the current state as an inline PNG. Omit the camera to auto-frame the scene (view preset, default iso). "
         "views=[...] renders several cameras into one labeled grid. reference='photo.png' (or a list aligned with views) "
         "renders with the same size and returns simulated | reference | mismatch panels plus pixel statistics. "
+        "camera_body mounts the camera on a body; overlay marks projected simulated points. "
         "Sensor backend needs no GL; optional raw depth/IDs and pixel picking preserve numeric values.",
         {
             **_OBSERVE,
             "views": _VIEWS,
+            "overlay": _OVERLAY,
             "reference": {
                 "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": ["string", "null"]}}],
                 "description": "Reference image path(s) taken with the same camera.",
@@ -221,6 +248,7 @@ TOOLS = [
         "Advance the simulation and return ONE labeled image grid (columns = times, rows = views): the fastest way to "
         "see a motion. Give absolute times [s] (use reset=true to start from t=0, or restore='checkpoint'), or count "
         "frames every_steps apart. references=[[paths per time] per view] adds reference and mismatch rows. "
+        "A camera_body camera follows its body to every time; overlay marks simulated points on every frame. "
         "Default tiles 320x240; state stays at the last time.",
         {
             "times": {"type": "array", "items": {"type": "number"}, "minItems": 1, "maxItems": 32},
@@ -230,10 +258,26 @@ TOOLS = [
             "restore": {"type": "string"},
             "views": {**_VIEWS, "maxItems": 4},
             "references": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+            "overlay": _OVERLAY,
             **{
                 k: v
                 for k, v in _OBSERVE.items()
-                if k in ("view", "eye", "target", "up", "fov_y", "width", "height", "world_id", "channel", "shadows")
+                if k
+                in (
+                    "view",
+                    "eye",
+                    "target",
+                    "up",
+                    "fov_y",
+                    "width",
+                    "height",
+                    "world_id",
+                    "channel",
+                    "shadows",
+                    "camera_body",
+                    "camera_offset",
+                    "intrinsics",
+                )
             },
         },
     ),
@@ -285,7 +329,7 @@ TOOLS = [
 _INSTRUCTIONS = """Live Newton simulation running in another process; its Python state persists between calls.
 Efficient workflow:
 - newton_observe() returns an inline image; omit the camera to auto-frame (view='iso'|'front'|'left'|'right'|'top'). views=[...] gives a multi-view grid in one image. reference='photo.png' renders at the photo's size with the same camera and adds reference and mismatch panels plus pixel statistics.
-- newton_filmstrip(times=[...], reset=true) runs forward and returns one labeled grid of frames; references=[[...]] compares each frame with reference images.
+- newton_filmstrip(times=[...], reset=true) runs forward and returns one labeled grid of frames; references=[[...]] compares each frame with reference images. camera_body='label' (optional camera_offset pose in the body frame) mounts a camera on a body, e.g. a wrist camera, and overlay={'name': {'body': 'label'}} marks simulated points on the simulated and reference frames.
 - newton_execute runs Python in the app: batch several parameter candidates in one call, compute numeric comparisons, and call show(image_or_figure, label) to see custom plots or composites inline. Prefer one larger call over many small ones.
 - session.dispatch('checkpoint', {'name': ...}) / ('restore', ...) branches from a saved state instead of re-simulating.
 - Built-in helpers (no import needed; newton, np, wp are preloaded): rollout(frames or seconds=..., record={'name': 'expr' or fn}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the solver's effective parameters (MuJoCo solref/solimp/friction after priority and mixing) next to the authored materials; health() flags NaNs, runaway velocities, deep penetration, and solver buffer overflow.
@@ -322,7 +366,7 @@ newton_execute runs Python in it (preloaded: session, model, state, control, sol
 - render(**observe_options) returns an RGB numpy image directly (fast path for fitting loops); compare_images(sim, ref, mask=None, panel='edges'|'blend'|'mismatch') returns PSNR, SSIM and edge NCC (geometric alignment) and shows a comparison panel.
 - rollout(frames or seconds=..., record={'name': 'expr' or fn}, start=True|'checkpoint', until='expr', plot=True) steps and returns NumPy series.
 - solver_contacts(): active contacts per shape pair with the parameters the solver integrates and which material decided them. contacts_between(a, b=None): contact count, solver normal/friction force, slip speed, and penetration between two shape sets (label substrings), recordable over time in rollout(record=...). health(): NaNs, runaway velocities, penetration, full solver buffers.
-- Images: show(session.dispatch('observe', {'view': 'iso'})) or show(session.dispatch('filmstrip', {'times': [0.5, 1.0], 'reset': True})); show() also takes arrays and matplotlib figures. filmstrip compares a rollout with recorded video when given references (image paths, an (N,H,W,3) array, or a directory; one per time), with stride=k, comparison='edges'|'blend', and an optional mask; it returns per-frame PSNR/SSIM/edge NCC and their mean. observe options: views=[...], width/height, eye/target or pose, fov_y or intrinsics={'fx','fy','cx','cy', distortion..., 'distortion_model': 'opencv'|'inverse_brown_conrady' (RealSense)} for calibrated cameras, world_id, reference='photo.png'<<RTX>>
+- Images: show(session.dispatch('observe', {'view': 'iso'})) or show(session.dispatch('filmstrip', {'times': [0.5, 1.0], 'reset': True})); show() also takes arrays and matplotlib figures. filmstrip compares a rollout with recorded video when given references (image paths, an (N,H,W,3) array, or a directory; one per time), with stride=k, comparison='edges'|'blend', and an optional mask; it returns per-frame PSNR/SSIM/edge NCC and their mean. observe options: views=[...], width/height, eye/target or pose, fov_y or intrinsics={'fx','fy','cx','cy', distortion..., 'distortion_model': 'opencv'|'inverse_brown_conrady' (RealSense)} for calibrated cameras, world_id, reference='photo.png', camera_body='label' with optional camera_offset=[x, y, z, qx, qy, qz, qw] in the body frame for a camera that moves with a body (e.g. a wrist camera), overlay={'name': 'expr', fn, or {'body': label, 'point': [x, y, z]}} to mark projected simulated points on simulated and reference frames and return their pixels<<RTX>>
 - session.dispatch('checkpoint' | 'restore' | 'reset' | 'describe', {...}) manage and inspect the scene.<<BLENDER>>
 newton_rebuild reloads the application (for hosted scripts: re-imports the edited file) in the same process."""
 

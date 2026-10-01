@@ -193,10 +193,13 @@ def to_rgb(image: Any) -> np.ndarray:
     return np.ascontiguousarray(array, dtype=np.uint8)
 
 
-def draw_label(rgb: np.ndarray, text: str, x: int = 3, y: int = 3, scale: int | None = None) -> None:
-    """Draw white-on-black ASCII text in place; unsupported characters render as '?'."""
+def draw_label(
+    rgb: np.ndarray, text: str, x: int = 3, y: int = 3, scale: int | None = None, color=(255, 255, 255)
+) -> None:
+    """Draw ASCII text in ``color`` on a black box in place; unsupported characters render as '?'."""
     height, width = rgb.shape[:2]
     scale = scale or (2 if min(width, height) >= 320 else 1)
+    x, y = max(int(x), 0), max(int(y), 0)
     text = text.upper()[: max(1, (width - x) // (6 * scale))]
     box_w, box_h = len(text) * 6 * scale + 2 * scale, 9 * scale
     rgb[y : y + box_h, x : x + box_w] = 0
@@ -205,7 +208,7 @@ def draw_label(rgb: np.ndarray, text: str, x: int = 3, y: int = 3, scale: int | 
         ink = np.kron(glyph, np.ones((scale, scale), dtype=bool))
         top, left = y + scale, x + scale + i * 6 * scale
         region = rgb[top : top + ink.shape[0], left : left + ink.shape[1]]
-        region[ink[: region.shape[0], : region.shape[1]]] = 255
+        region[ink[: region.shape[0], : region.shape[1]]] = color
 
 
 def tile(images: list[list[np.ndarray | None]], labels: list[list[str]] | None = None, gap: int = 4) -> np.ndarray:

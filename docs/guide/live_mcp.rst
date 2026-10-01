@@ -209,6 +209,19 @@ frames ``every_steps`` apart. ``references`` adds reference and mismatch rows
 per view, one reference image per time. Stepping uses the normal step path,
 so application callbacks and recordings behave as in ``step``.
 
+``camera_body`` mounts the camera on a body, given by label or index; labels
+that replicated worlds share resolve within ``world_id``. ``camera_offset``
+is the camera pose in the body frame (``[x, y, z, qx, qy, qz, qw]``, default
+identity), and ``observe``, ``filmstrip``, and ``record`` read the body pose at
+every capture, so a wrist camera with calibrated ``intrinsics`` can be
+compared frame by frame with recorded wrist video. ``overlay`` maps names to
+simulated world points in meters: ``{"body": ..., "point": [x, y, z]}`` (a
+point in the body frame), fixed coordinates, or, with trusted execution, a
+Python expression or callable returning a point or an ``(N, 3)`` array.
+``observe`` and ``filmstrip`` project the points through the same camera,
+including distortion, draw labeled rings on the simulated and reference images
+after the comparison metrics are computed, and return their pixel coordinates.
+
 Persistent Python workspace
 ---------------------------
 

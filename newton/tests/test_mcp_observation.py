@@ -21,9 +21,14 @@ import warp as wp
 
 import newton
 from newton._src.mcp.blender_bridge import find_blender as _blender_path
-from newton._src.mcp.observation import ObservationRenderer, _inverse_brown_conrady_rays
+from newton._src.mcp.observation import ObservationRenderer, _inverse_brown_conrady_rays, _project
+from newton._src.mcp.protocol import TOOLS
 from newton.mcp import SimulationSession
 from newton.solvers import SolverXPBD
+
+# Rotates a camera's local -Z (its viewing direction) onto world +Y, keeping +Z up.
+_LOOK_ALONG_Y = [float(v) for v in wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5 * math.pi)]
+_MAGENTA = (255, 0, 255)
 
 
 def _decode_png(result):
@@ -42,6 +47,22 @@ def _decode_png(result):
     if np.any(rows[:, 0]):
         raise ValueError("Unexpected PNG filter")
     return rows[:, 1:].reshape(height, width, 3)
+
+
+def _assert_nearly_equal_images(test, a, b, max_pixels=2):
+    """Allow a couple of silhouette pixels to flip under float32 rounding of equivalent camera poses."""
+    test.assertEqual(a.shape, b.shape)
+    test.assertLessEqual(int(np.any(a != b, axis=-1).sum()), max_pixels)
+
+
+def _hit_centroid(image):
+    """Mean pixel-center coordinates [x, y] of the non-black pixels of a shape_index image."""
+    ys, xs = np.nonzero(np.asarray(image).any(axis=-1))
+    return np.array([xs.mean() + 0.5, ys.mean() + 0.5])
+
+
+def _has_color(image, color):
+    return bool(np.all(np.asarray(image) == color, axis=-1).any())
 
 
 class TestMcpObservation(unittest.TestCase):
@@ -289,6 +310,18 @@ class TestMcpObservation(unittest.TestCase):
         self.assertEqual(visible["contacts"]["drawn"], 0)
         self.assertGreater(always["contacts"]["drawn"], 0)
         self.assertFalse(np.array_equal(_decode_png(visible), _decode_png(always)))
+
+    def test_contact_markers_follow_calibrated_intrinsics(self):
+        """Contact markers use the calibrated principal point, like the rendered image."""
+        top = {"surface0": [0.0, 0.0, 0.5], "surface1": [0.0, 0.0, 0.5]}
+        self.session.contact_data = lambda **kwargs: {"rows": [top], "source": "test"}
+        focal = 32.5 / math.tan(math.radians(30.0))
+        shifted = {"fx": focal, "fy": focal, "cx": 22.5, "cy": 32.5}
+        result = self.renderer.observe(contacts=True, contact_depth="always", intrinsics=shifted, **self.camera)
+        self.assertEqual(result["contacts"]["drawn"], 1)
+        ys, xs = np.nonzero(np.all(_decode_png(result) == (255, 32, 224), axis=-1))
+        # The point lies on the optical axis, so its marker is centered on the principal point's pixel.
+        np.testing.assert_allclose([xs.mean(), ys.mean()], [22.0, 32.0], atol=0.01)
 
     def test_recording_byte_budget_and_capture_error(self):
         """Stop at the byte budget and contain recording failures during physics."""
@@ -575,6 +608,227 @@ class TestMcpObservation(unittest.TestCase):
         self.assertEqual(counted["times"], [0.0, 0.05])
         with self.assertRaisesRegex(ValueError, "precede"):
             session.dispatch("filmstrip", {"times": [0.0]})
+
+    def test_projection_matches_camera_rays(self):
+        """Overlay projection inverts the renderer's rays for pinhole, OpenCV, and inverse Brown-Conrady cameras."""
+        camera = {"width": 40, "height": 30, "eye": [1.0, -2.5, 0.8], "target": [0.1, 0.0, 0.2]}
+        calibration = {"fx": 30.0, "fy": 32.0, "cx": 22.0, "cy": 13.0}
+        opencv = {**calibration, "k1": -0.12, "k2": 0.03, "p1": 0.002, "p2": -0.003, "k4": 0.01, "s1": 0.001}
+        realsense = {**calibration, "distortion_model": "inverse_brown_conrady", "k1": 0.1, "k2": -0.02, "p1": 0.002}
+        ys, xs = np.mgrid[0:30, 0:40]
+        centers = np.stack([xs.ravel() + 0.5, ys.ravel() + 0.5], axis=-1)
+        for options in ({}, {"intrinsics": opencv}, {"intrinsics": realsense}):
+            with self.subTest(options=options):
+                metadata = self.renderer.observe(channel="depth", **camera, **options)
+                directions = self.renderer._rays.numpy().reshape(30, 40, 2, 3)[:, :, 1].reshape(-1, 3)
+                pose = np.asarray(metadata["camera"]["pose"], dtype=np.float64)
+                rotation = np.asarray(wp.quat_to_matrix(wp.quat(*pose[3:])), dtype=np.float64).reshape(3, 3)
+                points = pose[:3] + 2.0 * directions.astype(np.float64) @ rotation.T
+                pixels, depth = _project(
+                    points, pose, 40, 30, metadata["camera"]["fov_y"], metadata["camera"].get("intrinsics")
+                )
+                np.testing.assert_allclose(pixels, centers, atol=1.0e-3)
+                self.assertTrue(np.all(depth > 0.0))
+        # Points behind the camera, or past the radius where the distortion polynomial folds back, have no pixel.
+        folding = {
+            "fx": 30.0,
+            "fy": 30.0,
+            "cx": 20.0,
+            "cy": 15.0,
+            "image_width": 40.0,
+            "image_height": 30.0,
+            "k1": -0.3,
+        }
+        pixels, _ = _project(
+            [[0.1, 0.0, -1.0], [2.0, 0.0, -1.0], [0.0, 0.0, 1.0]], [0, 0, 0, 0, 0, 0, 1], 40, 30, 60.0, folding
+        )
+        self.assertTrue(np.isfinite(pixels[0]).all())
+        self.assertTrue(np.isnan(pixels[1:]).all())
+
+    def test_camera_body_follows_its_body(self):
+        """A camera mounted on a body renders like the equivalent fixed pose and moves with the body."""
+        builder = newton.ModelBuilder()
+        target = builder.add_body(xform=wp.transform_identity(), label="scene/target")
+        builder.add_shape_sphere(target, radius=0.5)
+        builder.add_body(xform=wp.transform(wp.vec3(0.0, -3.0, 0.0), wp.quat(*_LOOK_ALONG_Y)), label="scene/mount")
+        model = builder.finalize(device="cpu")
+        self.session.model, self.session.state = model, model.state()
+        camera = {"width": 48, "height": 32, "channel": "shape_index"}
+
+        def fixed(position):
+            return _decode_png(self.renderer.observe(pose=[*position, *_LOOK_ALONG_Y], **camera))
+
+        mounted = self.renderer.observe(camera_body="mount", **camera)
+        _assert_nearly_equal_images(self, _decode_png(mounted), fixed([0.0, -3.0, 0.0]))
+        self.assertEqual(mounted["camera"]["mount"]["body"], 1)
+        self.assertEqual(mounted["camera"]["mount"]["label"], "scene/mount")
+        np.testing.assert_allclose(_hit_centroid(_decode_png(mounted)), [24.0, 16.0], atol=0.5)
+        # camera_offset is a pose in the body frame, whose x axis is world x here.
+        offset = self.renderer.observe(camera_body="scene/mount", camera_offset=[0.5, 0, 0, 0, 0, 0, 1], **camera)
+        _assert_nearly_equal_images(self, _decode_png(offset), fixed([0.5, -3.0, 0.0]))
+        transforms = self.session.state.body_q.numpy()
+        transforms[1, :3] = [0.0, -2.0, 0.4]
+        self.session.state.body_q.assign(transforms)
+        moved = self.renderer.observe(camera_body=1, **camera)
+        np.testing.assert_allclose(moved["camera"]["pose"][:3], [0.0, -2.0, 0.4], atol=1.0e-6)
+        _assert_nearly_equal_images(self, _decode_png(moved), fixed([0.0, -2.0, 0.4]))
+        for bad in (
+            {"camera_body": "mount", "eye": [0.0, 0.0, 3.0]},
+            {"camera_body": "mount", "view": "top"},
+            {"camera_offset": [0, 0, 0, 0, 0, 0, 1]},
+            {"camera_body": "missing"},
+            {"camera_body": 7},
+            {"camera_body": "mount", "camera_offset": [0, 0, 0, 0, 0, 0, 0]},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.renderer.observe(**camera, **bad)
+
+    def test_body_labels_resolve_in_the_observed_world(self):
+        """Replicated worlds share labels: world_id picks the camera body and overlay bodies, ambiguity fails."""
+        robot = newton.ModelBuilder()
+        link = robot.add_body(xform=wp.transform_identity(), label="arm/link")
+        robot.add_shape_sphere(link, radius=0.3)
+        robot.add_body(xform=wp.transform(wp.vec3(0.0, -3.0, 0.0), wp.quat(*_LOOK_ALONG_Y)), label="arm/link_camera")
+        builder = newton.ModelBuilder()
+        builder.replicate(robot, 2, spacing=(1.0, 0.0, 0.0))
+        model = builder.finalize(device="cpu")
+        self.session.model, self.session.state = model, model.state()
+        camera = {"width": 48, "height": 32, "channel": "shape_index"}
+        mounted = [self.renderer.observe(camera_body="link_camera", world_id=w, **camera) for w in (0, 1)]
+        self.assertEqual([m["camera"]["mount"]["body"] for m in mounted], [1, 3])
+        # Each world's camera sees its own link centered (shape ids, and so the colors, differ per world).
+        for result in mounted:
+            np.testing.assert_allclose(_hit_centroid(_decode_png(result)), [24.0, 16.0], atol=0.5)
+        self.assertEqual(
+            self.renderer.observe(camera_body="arm/link", world_id=1, **camera)["camera"]["mount"]["body"], 2
+        )
+        # Replication centers the worlds at x = -0.5 and 0.5, so a camera on the y axis sees them on either side.
+        fixed = {"eye": [0.0, -4.0, 0.0], "target": [0.0, 0.0, 0.0], **camera}
+        for world in (0, 1):
+            plain = _decode_png(self.renderer.observe(world_id=world, **fixed))
+            marked = self.renderer.observe(world_id=world, overlay={"link": {"body": "link"}}, **fixed)
+            np.testing.assert_allclose(marked["overlay"]["link"], _hit_centroid(plain), atol=1.0)
+            self.assertEqual(marked["overlay"]["link"][0] > 24.0, world == 1)
+        with self.assertRaisesRegex(ValueError, "matches 2 bodies"):
+            self.renderer.observe(camera_body="lin", **camera)
+        with self.assertRaisesRegex(ValueError, "belongs to world 0"):
+            self.renderer.observe(camera_body=1, world_id=1, **camera)
+
+    def test_observe_overlay_marks_simulated_and_reference_images(self):
+        """Overlay markers appear on both panels, report pixel coordinates, and leave the metrics unchanged."""
+        plain = self.renderer.observe(**self.camera)
+        self.assertFalse(_has_color(_decode_png(plain), _MAGENTA))
+        reference = Path(self.directory.name) / "reference.png"
+        reference.write_bytes(base64.b64decode(plain["image_base64"]))
+        camera = {k: v for k, v in self.camera.items() if k not in ("width", "height")}
+        overlay = {"center": [0.0, 0.0, 0.0], "rim": {"body": 0, "point": [0.5, 0.0, 0.0]}}
+        marked = self.renderer.observe(reference=str(reference), overlay=overlay, **camera)
+        self.assertEqual(marked["reference"]["mismatch_fraction"], 0.0)
+        self.assertEqual(marked["overlay"]["center"], [32.5, 32.5])
+        focal = 32.5 / math.tan(math.radians(30.0))
+        np.testing.assert_allclose(marked["overlay"]["rim"], [32.5 + focal * 0.5 / 3.0, 32.5], atol=0.06)
+        image = _decode_png(marked)
+        self.assertTrue(_has_color(image[:, :65], _MAGENTA))
+        self.assertTrue(_has_color(image[:, 69:134], _MAGENTA))
+        with self.assertRaisesRegex(ValueError, "allow_execute"):
+            self.renderer.observe(overlay={"center": "np.zeros(3)"}, **self.camera)
+        with self.assertRaisesRegex(ValueError, "world point"):
+            self.renderer.observe(overlay={"bad": [1.0, 2.0]}, **self.camera)
+
+    def test_filmstrip_mounted_camera_and_overlay(self):
+        """A mounted camera follows a falling body to every capture time; overlays mark it in every frame."""
+        builder = newton.ModelBuilder()
+        ball = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 2.0), wp.quat_identity()), label="ball")
+        builder.add_shape_sphere(ball, radius=0.2)
+        model = builder.finalize(device="cpu")
+        session = SimulationSession(model, SolverXPBD(model), dt=0.01, artifact_directory=self.directory.name)
+        self.addCleanup(session.close)
+        realsense = {"fx": 40.0, "fy": 40.0, "cx": 20.0, "cy": 14.0, "distortion_model": "inverse_brown_conrady"}
+        chase = {"camera_body": "ball", "camera_offset": [0.0, -3.0, 0.0, *_LOOK_ALONG_Y], "intrinsics": realsense}
+        fixed = {"eye": [0.0, -6.0, 1.2], "target": [0.0, 0.0, 1.2], "fov_y": 30.0}
+        size = {"width": 48, "height": 32}
+        times = [0.0, 0.3, 0.6]
+        strip = session.dispatch(
+            "filmstrip",
+            {
+                "times": times,
+                "reset": True,
+                "views": [{"label": "chase", **chase}, {"label": "fixed", **fixed}],
+                "overlay": {"ball": {"body": "ball"}},
+                **size,
+            },
+        )
+        rows = {
+            view: [r["pixels"]["ball"] for r in strip["overlay"] if r["view"] == view] for view in ("chase", "fixed")
+        }
+        self.assertEqual([r["time"] for r in strip["overlay"]], [0.0, 0.0, 0.3, 0.3, 0.6, 0.6])
+        # The mounted camera keeps the ball on its optical axis while it falls; the fixed camera sees it drop.
+        np.testing.assert_allclose(rows["chase"], [[20.0, 14.0]] * 3, atol=0.05)
+        self.assertGreater(rows["fixed"][2][1], rows["fixed"][0][1] + 10.0)
+        for spec, pixel in ((chase, rows["chase"][-1]), (fixed, rows["fixed"][-1])):
+            rendered = session.render(channel="shape_index", **spec, **size)
+            np.testing.assert_allclose(_hit_centroid(rendered), pixel, atol=1.0)
+        # Against references, markers go on both rows after scoring, so identical frames still match exactly.
+        frames = []
+        session.dispatch("reset")
+        for t in times:
+            while session.time < t - 0.005:
+                session.dispatch("step", {"count": 1})
+            frames.append(session.render(**chase, **size))
+        self.assertFalse(any(_has_color(frame, _MAGENTA) for frame in frames))
+        compared = session.dispatch(
+            "filmstrip",
+            {
+                "times": times,
+                "reset": True,
+                "references": frames,
+                "overlay": {"ball": {"body": "ball"}},
+                **chase,
+                **size,
+            },
+        )
+        self.assertEqual([row["mismatch_fraction"] for row in compared["mismatch"]], [0.0, 0.0, 0.0])
+        grid = _decode_png(compared)
+        for column in range(3):
+            left = column * (48 + 4)
+            self.assertTrue(_has_color(grid[0:32, left : left + 48], _MAGENTA))
+            self.assertTrue(_has_color(grid[36:68, left : left + 48], _MAGENTA))
+        # Expressions and callables are evaluated at every capture time; expressions need allow_execute.
+        expression = {"top": "state.body_q.numpy()[0, :3] + np.array([0.0, 0.0, 0.2])"}
+        with self.assertRaisesRegex(ValueError, "allow_execute"):
+            session.dispatch("filmstrip", {"times": [0.0], "reset": True, "overlay": expression, **fixed, **size})
+        session.allow_execute = True
+        evaluated = session.dispatch(
+            "filmstrip",
+            {"times": times, "reset": True, "overlay": {**expression, "fn": lambda: [0.0, 0.0, 1.2]}, **fixed, **size},
+        )
+        tops = [row["pixels"]["top"] for row in evaluated["overlay"]]
+        self.assertGreater(tops[2][1], tops[0][1] + 10.0)
+        self.assertEqual([row["pixels"]["fn"] for row in evaluated["overlay"]], [[24.0, 16.0]] * 3)
+        with self.assertRaisesRegex(ValueError, "camera_offset requires camera_body"):
+            session.dispatch(
+                "filmstrip", {"times": [0.0], "reset": True, "camera_offset": [0, 0, 0, 0, 0, 0, 1], **size}
+            )
+        # Recordings follow the mounted camera as well; the manifest keeps overlay callables as text.
+        session.dispatch("reset")
+        options = {**chase, **size, "overlay": {"ball": {"body": "ball"}, "fn": lambda: [0.0, 0.0, 1.2]}}
+        status = session.dispatch("record", {"action": "start", "every_steps": 30, **options})
+        session.dispatch("step", {"count": 60})
+        session.dispatch("record", {"action": "stop"})
+        manifest = json.loads((Path(status["directory"]) / "manifest.json").read_text())
+        self.assertEqual(len(manifest["frames"]), 3)
+        for frame in manifest["frames"]:
+            self.assertEqual(frame["camera"]["mount"]["label"], "ball")
+            np.testing.assert_allclose(frame["overlay"]["ball"], [20.0, 14.0], atol=0.05)
+
+    def test_tool_schemas_expose_mounted_cameras_and_overlays(self):
+        """The structured observe, filmstrip, and record tools accept camera_body, camera_offset, and intrinsics."""
+        schemas = {tool["name"]: tool["inputSchema"]["properties"] for tool in TOOLS}
+        for name in ("newton_observe", "newton_filmstrip", "newton_record"):
+            for key in ("camera_body", "camera_offset", "intrinsics"):
+                self.assertIn(key, schemas[name], f"{name} lacks {key}")
+        self.assertIn("overlay", schemas["newton_observe"])
+        self.assertIn("overlay", schemas["newton_filmstrip"])
 
 
 if __name__ == "__main__":

@@ -582,7 +582,12 @@ class RenderContext:
 
                         data = MeshData()
                         if shape.uvs is not None:
-                            data.uvs = wp.array(shape.uvs, dtype=wp.vec2f, device=self.device)
+                            uvs = np.asarray(shape.uvs, dtype=np.float32)
+                            transform = np.asarray(shape.texture_transform, dtype=np.float32)
+                            if not np.array_equal(transform, np.eye(2, 3, dtype=np.float32)):
+                                # Mesh.texture_transform maps authored UVs (tiling, offset, rotation).
+                                uvs = uvs @ transform[:, :2].T + transform[:, 2]
+                            data.uvs = wp.array(uvs, dtype=wp.vec2f, device=self.device)
                         if shape.normals is not None:
                             data.normals = wp.array(shape.normals, dtype=wp.vec3f, device=self.device)
                         self.__mesh_data.append(data)

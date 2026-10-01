@@ -168,7 +168,10 @@ def _agent_command(spec: dict, workspace: Path, mcp: dict | None) -> list[str]:
             "project",
             "--strict-mcp-config",
             "--disallowedTools",
-            "Task,Agent,WebSearch,WebFetch",
+            # No subagents or web, and none of the tools that reach other sessions, run workflows,
+            # or schedule work outside the trial (the operator machine runs other Claude sessions).
+            "Task,Agent,WebSearch,WebFetch,ListAgents,SendMessage,Workflow,Skill,CronCreate,CronDelete,CronList,"
+            "ScheduleWakeup,PushNotification,EnterWorktree,ExitWorktree,DesignSync,ReportFindings,RemoteTrigger",
         ]
         config = {"mcpServers": {}}
         if mcp is not None:
@@ -433,19 +436,30 @@ def run_trial(workspace: Path, prepared: dict, *, mcp_root: Path | None = None) 
 
 
 def mcp_available(path: Path, spec: dict) -> bool:
-    """Whether the agent session exposed the newton MCP tools (Codex occasionally omits them)."""
-    text = path.read_text(errors="replace")
+    """Whether the agent session exposed the newton MCP tools (Codex occasionally omits them).
+
+    A newton tool call proves availability. Otherwise the session counts as unavailable only if the
+    agent itself replied with the UNAVAILABLE token; the token also appears in TASK.md, so command
+    output (e.g. ``cat TASK.md``) must not count.
+    """
+    events = []
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
     if spec["cli"] == "claude":
-        for line in text.splitlines()[:5]:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for event in events[:5]:
             if event.get("subtype") == "init":
                 return any(
                     s.get("name") == "newton" and s.get("status") == "connected" for s in event.get("mcp_servers", [])
                 )
-    return '"mcp_tool_call"' in text and UNAVAILABLE not in text
+        return False
+    items = [event.get("item") or {} for event in events if event.get("type", "").startswith("item.")]
+    if any(item.get("type") == "mcp_tool_call" and item.get("server", "newton") == "newton" for item in items):
+        return True
+    said = " ".join(item.get("text") or "" for item in items if item.get("type") == "agent_message")
+    return UNAVAILABLE not in said
 
 
 def candidate_summary(path: Path, started: float) -> dict:

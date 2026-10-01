@@ -15,12 +15,15 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
+from tools.mcp_evaluation.v4 import trial_isolation as ti
 from tools.mcp_evaluation.visual.run_visual import (
     MODELS,
     UNAVAILABLE,
@@ -45,6 +48,16 @@ ARM_DATA = Path(os.environ.get("NEWTON_ARM_DATA", "/home/horde/artifacts/newton-
 LOOK_DATA = Path(os.environ.get("NEWTON_LOOK_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_look_task"))
 # Blender for the look task and the MCP's blender backend (inherited by hosts, agents, and verifiers).
 os.environ.setdefault("NEWTON_BLENDER", "/home/horde/opt/blender-5.2.2-linux-x64/blender")
+PRIVATE = Path(os.environ.get("NEWTON_VISUAL_PRIVATE", Path.home() / ".newton-visual-private"))
+# Agent workspaces get opaque names under a neutral root; the labeled run directory keeps the harness
+# records (spec, command, transcript, host log, verification), which agents must not see.
+TRIALS = Path(os.environ.get("NEWTON_TRIAL_ROOT", Path.home() / "trials"))
+SANDBOX = os.environ.get("NEWTON_TRIAL_SANDBOX", "1") == "1"
+START = "__START_UTC__"
+# Claude -p waits this long for background shell jobs after the agent's last turn; set explicitly so it does
+# not depend on the launcher's environment (v4 trials inherited 30 min from the operator session).
+BG_WAIT_CEILING_MS = 1_800_000
+"""Placeholder for the budget start time, filled in when the agent launches."""
 
 
 def _task(name: str) -> dict:
@@ -184,7 +197,21 @@ Constraints (checked): appearance only. Materials, lights, world, and color mana
         from tools.mcp_evaluation.v4.dp_real.verify import THRESHOLDS  # noqa: PLC0415
 
         tasks[name]["goal"] = tasks[name]["goal"].format(**THRESHOLDS)
-    return tasks[name]
+    task = tasks[name]
+    # Commands run once on the starter to build the compile-cache seed both conditions start from.
+    task.setdefault(
+        "warmup",
+        [
+            [task["script"], "--viewer", "null", "--num-frames", "1", *task["host_args"]],
+            # Warp caches kernels per module name: also warm the MCP host's and an importer's names.
+            ["-m", "tools.mcp_evaluation.v4.trial_isolation", "warm", task["script"], *task["host_args"]],
+        ],
+    )
+    task.setdefault("private", [name])
+    if name == "abc_look":
+        task["warmup"].append(["render_look.py", "--frames", "0"])  # EEVEE shaders (GL cache: 23 s cold)
+        task["private"] = ["abc_look", "abc_twin"]
+    return task
 
 
 def prompt_for(name: str, condition: str, workspace: Path, seconds: int, guide: str | None) -> str:
@@ -196,7 +223,7 @@ Newton source tree (read-only reference, including docs and examples): {ROOT}
 
 {task["goal"]}
 
-Deliverable: the edited {task["script"]} in the workspace, then a brief report. You have {seconds // 60} minutes, starting {time.strftime("%H:%M:%S UTC", time.gmtime())} (check with `date -u`); working efficiently matters. Do not modify files outside the workspace, do not look for other trials or hidden verification data, and do not use subagents.
+Deliverable: the edited {task["script"]} in the workspace, then a brief report. You have {seconds // 60} minutes, starting {START} (check with `date -u`); working efficiently matters. Do not modify files outside the workspace, do not look for other trials or hidden verification data, and do not use subagents.
 """
     run = f"uv run --no-sync --project {ROOT} python {task['script']} --viewer null --num-frames <N> {' '.join(task['host_args'])}".rstrip()
     if condition == "restart":
@@ -218,22 +245,29 @@ If no newton tools are available to you, reply only with {UNAVAILABLE} and stop.
     )
 
 
-def prepare(workspace: Path, name: str, condition: str, model: str, seconds: int | None, phase: str) -> dict:
+def prepare(run_dir: Path, name: str, condition: str, model: str, seconds: int | None, phase: str) -> dict:
+    """Lay out one trial: harness records in ``run_dir``, the agent's files under an opaque name."""
     if condition not in ("mcp", "restart"):
         raise ValueError("condition must be mcp or restart")
     task = _task(name)
     seconds = seconds or task.get("seconds", 1800)
-    workspace.mkdir(parents=True, exist_ok=False)
-    for target, source in task["files"].items():
-        if Path(source).is_dir():
-            shutil.copytree(source, workspace / target)
-        else:
-            shutil.copyfile(source, workspace / target)
+    run_dir.mkdir(parents=True, exist_ok=False)
+    trial_id = uuid.uuid4().hex[:12]
+    sandbox_root = TRIALS / trial_id
+    workspace = sandbox_root / "work"
+    try:
+        ti.copy_files(task["files"], workspace)
+        # Both conditions start from the same compile caches: the starter's, built once per task and commit.
+        seed = ti.seed_caches(name, task["files"], task["warmup"], PYTHON, ROOT)
+        shutil.copytree(seed, sandbox_root / "caches")
+    except BaseException:
+        shutil.rmtree(sandbox_root, ignore_errors=True)
+        raise
+    (run_dir / "workspace").symlink_to(workspace)
     guide = None
     if condition == "mcp":
         guide = _host_guide(workspace, task)
     prompt = prompt_for(name, condition, workspace, seconds, guide)
-    (workspace / "TASK.md").write_text(prompt)
     spec = {
         "task": name,
         "condition": condition,
@@ -241,14 +275,24 @@ def prepare(workspace: Path, name: str, condition: str, model: str, seconds: int
         **MODELS[model],
         "phase": phase,
         "budget_seconds": seconds,
+        "trial_id": trial_id,
+        "workspace": str(workspace),
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "starter_sha256": {
             target: digest(workspace / target) for target in task["files"] if (workspace / target).is_file()
         },
+        "cache_seed": str(seed),
+        "mcp_workers": WORKERS if condition == "mcp" else None,
+        "mcp_profile": PROFILE if condition == "mcp" else None,
+        "sandbox": SANDBOX,
         "harness_version": os.environ.get("NEWTON_HARNESS_VERSION", "unversioned"),
+        "claude_bg_wait_ceiling_ms": BG_WAIT_CEILING_MS,
     }
-    (workspace / "spec.json").write_text(json.dumps(spec, indent=2) + "\n")
-    return {"spec": spec, "prompt": prompt}
+    info = ti.provenance(ROOT, PYTHON)
+    (run_dir / "harness.diff").write_text(info.pop("diff"))
+    spec.update(info)
+    (run_dir / "spec.json").write_text(json.dumps(spec, indent=2) + "\n")
+    return {"spec": spec, "prompt": prompt, "run_dir": run_dir}
 
 
 def _host_guide(workspace: Path, task: dict) -> str:
@@ -262,145 +306,212 @@ def _host_guide(workspace: Path, task: dict) -> str:
     return result.stdout.strip()
 
 
-def run_trial(workspace: Path, prepared: dict) -> dict:
-    spec = prepared["spec"]
+def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> dict:
+    spec, run_dir = prepared["spec"], prepared["run_dir"]
     task = _task(spec["task"])
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    trial_id = spec["trial_id"]
+    workspace = Path(spec["workspace"])
+    sandbox_root = workspace.parent
+    (sandbox_root / ".mcp").mkdir()
+    env = ti.trial_env(ROOT, sandbox_root / "caches", trial_id)
     env["MCP_TOOL_TIMEOUT"] = "300000"
-    # Every trial compiles its own kernels: a shared Warp or CUDA JIT cache would let one condition
-    # inherit the other's (or an earlier trial's) compile work. The live host, the agent's own runs,
-    # and its fresh-process checks all inherit these.
-    env["WARP_CACHE_PATH"] = str(workspace / ".warp-cache")
-    env["CUDA_CACHE_PATH"] = str(workspace / ".cuda-cache")
     env["MAX_MCP_OUTPUT_TOKENS"] = "60000"
-    host, mcp, startup = None, None, 0.0
-    started = time.time()
-    if spec["condition"] == "mcp":
-        connection = workspace / ".connection.json"
-        before = time.perf_counter()
-        log = (workspace / "host.log").open("w")
-        host = subprocess.Popen(
-            [
-                str(PYTHON),
-                "-m",
-                "newton.mcp",
-                "host",
-                task["script"],
-                "--connection-file",
-                str(connection),
-                "--artifacts",
-                str(workspace / "observations"),
-                "--workers",
-                str(WORKERS),
-                "--",
-                *task["host_args"],
-            ],
-            cwd=workspace,
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        ready = connection.with_suffix(".ready")
-        while not ready.exists():
-            if host.poll() is not None or time.perf_counter() - before > 300:
-                _stop(host)
-                raise RuntimeError(f"Host failed to start; see {workspace / 'host.log'}")
+    env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = str(BG_WAIT_CEILING_MS)
+
+    def contained(command: list[str], extra_ro: list[Path] = ()) -> list[str]:
+        # The host runs the agent's code too, so it shares the agent's filesystem view, including /tmp.
+        if not SANDBOX:
+            return command
+        return ti.sandbox(command, sandbox_root, ROOT, PRIVATE, extra_ro=list(extra_ro), extra_hidden=[TRIALS])
+
+    host, sampler, agent = None, None, None
+    # Mount namespaces of the trial's sandboxes: cleanup also finds detached jobs that cleared their env.
+    namespaces: set[str] = set()
+
+    def remember_namespace(process: subprocess.Popen) -> None:
+        if not SANDBOX:
+            return
+        for _ in range(100):
+            namespace = ti.mount_namespace(ti.cli_child(process.pid))
+            if namespace is not None:
+                namespaces.add(namespace)
+                return
+            if process.poll() is not None:
+                return
             time.sleep(0.1)
-        startup = time.perf_counter() - before
-        mcp = {
-            "command": str(PYTHON),
-            # The task prompt already carries the host guide, so the server instructions omit it.
-            "args": [
-                *("-m", "newton.mcp", "--connect", str(connection), "--profile", PROFILE, "--timeout", "300"),
-                "--no-app-guide",
-            ],
-            # Load the Newton tools up front instead of behind a tool-search round trip (Claude Code only).
-            "alwaysLoad": True,
-        }
-    command = _agent_command(spec, workspace, mcp)
-    (workspace / "command.json").write_text(json.dumps(command))
-    agent_start = time.perf_counter()
-    timed_out = False
-    with (
-        (workspace / "agent.jsonl").open("w") as out,
-        (workspace / "agent.times.jsonl").open("w") as times,
-        (workspace / "agent.stderr").open("w") as err,
-    ):
-        agent = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=err,
-            cwd=workspace,
-            env=env,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
 
-        def pump():
-            for number, line in enumerate(agent.stdout):
-                out.write(line)
-                out.flush()
-                times.write(json.dumps({"line": number, "seconds": time.perf_counter() - agent_start}) + "\n")
+    try:
+        mcp, startup = None, 0.0
+        started = time.time()
+        if spec["condition"] == "mcp":
+            connection = sandbox_root / ".mcp/connection.json"
+            before = time.perf_counter()
+            log = (run_dir / "host.log").open("w")
+            host = subprocess.Popen(
+                contained(
+                    [
+                        str(PYTHON),
+                        *("-m", "newton.mcp", "host", task["script"], "--connection-file", str(connection)),
+                        *("--artifacts", str(workspace / "observations"), "--workers", str(WORKERS)),
+                        "--",
+                        *task["host_args"],
+                    ]
+                ),
+                cwd=workspace,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            remember_namespace(host)
+            ready = connection.with_suffix(".ready")
+            while not ready.exists():
+                if host.poll() is not None or time.perf_counter() - before > 600:
+                    raise RuntimeError(f"Host failed to start; see {run_dir / 'host.log'}")
+                time.sleep(0.1)
+            startup = time.perf_counter() - before
+            mcp = {
+                "command": str(PYTHON),
+                # The task prompt already carries the host guide, so the server instructions omit it.
+                "args": [
+                    *("-m", "newton.mcp", "--connect", str(connection), "--profile", PROFILE, "--timeout", "300"),
+                    "--no-app-guide",
+                ],
+                # Load the Newton tools up front instead of behind a tool-search round trip (Claude Code only).
+                "alwaysLoad": True,
+            }
+        command = _agent_command(spec, workspace, mcp)
+        if "--mcp-config" in command:
+            # Inline the MCP config so no harness file (an empty server list in restart) sits in the workspace.
+            index = command.index("--mcp-config") + 1
+            config = Path(command[index])
+            command[index] = config.read_text()
+            config.unlink()
+        command = contained(command)
+        (run_dir / "command.json").write_text(json.dumps(command))
+        # Both conditions launch together once both are ready, so the MCP host's startup never falls into the
+        # restart agent's budget, and the stated start time is the moment the budget clock starts.
+        budget_start = ti.pair_barrier(barrier, spec["condition"], parties) if barrier else time.time()
+        prompt = prepared["prompt"].replace(START, time.strftime("%H:%M:%S UTC", time.gmtime(budget_start)))
+        (workspace / "TASK.md").write_text(prompt)
+        sampler = ti.ResourceSampler(run_dir / "resources.jsonl", trial_id)
+        sampler.start()
+        agent_start = time.perf_counter()
+        timed_out = False
+        with (
+            (run_dir / "agent.jsonl").open("w") as out,
+            (run_dir / "agent.times.jsonl").open("w") as times,
+            (run_dir / "agent.stderr").open("w") as err,
+        ):
+            agent = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=err,
+                cwd=workspace,
+                env=env,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
 
-        reader = threading.Thread(target=pump, daemon=True)
-        reader.start()
-        try:
-            agent.stdin.write(prepared["prompt"])
-            agent.stdin.close()
-            agent.wait(timeout=spec["budget_seconds"])
-        except subprocess.TimeoutExpired:
-            timed_out = True
+            def pump():
+                for number, line in enumerate(agent.stdout):
+                    out.write(line)
+                    out.flush()
+                    times.write(json.dumps({"line": number, "seconds": time.perf_counter() - agent_start}) + "\n")
+
+            reader = threading.Thread(target=pump, daemon=True)
+            reader.start()
+            threading.Thread(target=remember_namespace, args=(agent,), daemon=True).start()
             try:
-                os.killpg(agent.pid, 2)
-                agent.wait(timeout=20)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                pass
-        finally:
-            _stop(agent)
-            reader.join(timeout=10)
-    elapsed = time.perf_counter() - agent_start
-    if host is not None:
-        _stop(host)
-    activity = parse_events(workspace / "agent.jsonl", spec["cli"])
-    activity["mcp_available"] = mcp_available(workspace / "agent.jsonl", spec) if mcp is not None else None
-    verification = verify(workspace, task)
+                agent.stdin.write(prompt)
+                agent.stdin.close()
+                agent.wait(timeout=max(1.0, spec["budget_seconds"] - (time.time() - budget_start)))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                # Interrupt the CLI itself, not bwrap: bwrap would die at once and take the CLI down before it
+                # writes its final usage record.
+                child = ti.cli_child(agent.pid) if SANDBOX else agent.pid
+                try:
+                    os.kill(child or agent.pid, signal.SIGINT)
+                    agent.wait(timeout=20)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass
+            finally:
+                _stop(agent)
+                reader.join(timeout=10)
+        elapsed = time.perf_counter() - agent_start
+    finally:
+        if host is not None:
+            _stop(host)
+        # Shell commands run in their own sessions, so background jobs survive the agent's process group.
+        orphans = ti.kill_tagged(trial_id, namespaces=namespaces)
+        if sampler is not None:
+            sampler.stop()
+        if agent is None:
+            # The trial never launched its agent (host failure, barrier timeout): keep the records, drop the rest.
+            shutil.rmtree(sandbox_root, ignore_errors=True)
+    load_end = os.getloadavg()
+    activity = parse_events(run_dir / "agent.jsonl", spec["cli"])
+    activity["mcp_available"] = mcp_available(run_dir / "agent.jsonl", spec) if mcp is not None else None
+    verification = verify(workspace, run_dir, task, env, contained)
+    samples = [json.loads(line) for line in (run_dir / "resources.jsonl").read_text().splitlines()]
     summary = {
         **spec,
         "started_unix": started,
+        "budget_start_unix": budget_start,
         "application_startup_seconds": startup,
         "agent_seconds": elapsed,
         "total_seconds": elapsed + startup,
         "timed_out": timed_out,
         "agent_exit_code": agent.returncode,
-        "load_average_end": os.getloadavg(),
+        "orphans_killed": len(orphans),
+        "load_average_end": load_end,
+        "load_1min_mean": sum(s["load"][0] for s in samples) / len(samples) if samples else None,
+        "trial_cpu_seconds": max((s["trial_cpu_s"] or 0.0 for s in samples), default=None),
+        "max_live_trials": max((s["live_trials"] for s in samples), default=None),
+        "private_reference": _mentions_private(workspace),
         **activity,
         "verification": verification,
         "success": bool(verification.get("success")) and not timed_out,
     }
-    (workspace / "summary.json").write_text(json.dumps(summary, indent=2, default=float) + "\n")
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=float) + "\n")
+    # Archive the workspace with the records; drop the trial's caches and private temp directories.
+    (run_dir / "workspace").unlink()
+    shutil.move(str(workspace), str(run_dir / "workspace"))
+    shutil.rmtree(sandbox_root, ignore_errors=True)
     return summary
 
 
-def verify(workspace: Path, task: dict) -> dict:
-    output = workspace / "verification.json"
+def _mentions_private(workspace: Path) -> bool:
+    """Whether any workspace source names the hidden verification data."""
+    for path in workspace.rglob("*.py"):
+        text = path.read_text(errors="replace")
+        if "newton-visual-private" in text or "NEWTON_VISUAL_PRIVATE" in text:
+            return True
+    return False
+
+
+def verify(workspace: Path, run_dir: Path, task: dict, env: dict, contained=None) -> dict:
+    """Run the task's verifier on the submission, sandboxed with only this task's hidden data readable."""
+    sandbox_root = workspace.parent
+    output = sandbox_root / "verification.json"
+    command = [str(PYTHON), str(ROOT / task["verifier"]), str(workspace / task["script"]), "--output", str(output)]
+    if contained is not None:
+        command = contained(command, extra_ro=[PRIVATE / name for name in task["private"] if (PRIVATE / name).exists()])
     try:
         result = subprocess.run(
-            [str(PYTHON), str(ROOT / task["verifier"]), str(workspace / task["script"]), "--output", str(output)],
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=1800,
-            check=False,
+            command, cwd=workspace, env=env, capture_output=True, text=True, timeout=1800, check=False
         )
     except subprocess.TimeoutExpired:
         return {"success": False, "error": "verification timed out"}
-    (workspace / "verification.log").write_text(result.stdout + result.stderr)
+    finally:
+        ti.kill_tagged(env["NEWTON_TRIAL_ID"])
+    (run_dir / "verification.log").write_text(result.stdout + result.stderr)
     if result.returncode != 0 or not output.exists():
         return {"success": False, "error": (result.stderr or result.stdout)[-2000:]}
+    shutil.copyfile(output, run_dir / "verification.json")
     data = json.loads(output.read_text())
     return {k: data[k] for k in ("success", "integrity", "failed_checks", "metrics", "normalized_worst")}
 
@@ -424,24 +535,27 @@ def main() -> None:
     )
     parser.add_argument("--condition", required=True, choices=("mcp", "restart"))
     parser.add_argument("--model", required=True, choices=sorted(MODELS))
-    parser.add_argument("--workspace", type=Path, required=True)
+    parser.add_argument("--workspace", type=Path, required=True, help="Run directory for the harness records")
     parser.add_argument("--seconds", type=int, default=None, help="Budget [s]; defaults to the task's (usually 1800)")
     parser.add_argument("--phase", default="loop")
+    parser.add_argument("--barrier", type=Path, help="Shared directory that starts both conditions of a pair together")
+    parser.add_argument("--parties", type=int, default=2)
     parser.add_argument("--run", action="store_true")
     args = parser.parse_args()
-    workspace = args.workspace.resolve()
-    prepared = prepare(workspace, args.task, args.condition, args.model, args.seconds, args.phase)
+    run_dir = args.workspace.resolve()
+    prepared = prepare(run_dir, args.task, args.condition, args.model, args.seconds, args.phase)
     if not args.run:
-        print(f"Prepared {workspace}")
+        print(f"Prepared {run_dir}")
         return
-    summary = run_trial(workspace, prepared)
+    summary = run_trial(prepared, args.barrier, args.parties)
     attempt = 1
     while summary.get("mcp_available") is False and attempt < 3:
-        workspace.rename(workspace.with_name(f"{workspace.name}.infra-failure-{attempt}"))
-        prepared = prepare(workspace, args.task, args.condition, args.model, args.seconds, args.phase)
-        summary = run_trial(workspace, prepared)
+        # The partner already ran, so a retry runs alone; analyses must treat retried pairs separately.
+        run_dir.rename(run_dir.with_name(f"{run_dir.name}.infra-failure-{attempt}"))
+        prepared = prepare(run_dir, args.task, args.condition, args.model, args.seconds, args.phase)
+        summary = run_trial(prepared)
         summary["infrastructure_retries"] = attempt
-        (workspace / "summary.json").write_text(json.dumps(summary, indent=2, default=float) + "\n")
+        (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=float) + "\n")
         attempt += 1
     print(
         json.dumps(

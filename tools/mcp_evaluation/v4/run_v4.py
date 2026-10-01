@@ -501,14 +501,30 @@ def verify(workspace: Path, run_dir: Path, task: dict, env: dict, contained=None
     command = [str(PYTHON), str(ROOT / task["verifier"]), str(workspace / task["script"]), "--output", str(output)]
     if contained is not None:
         command = contained(command, extra_ro=[PRIVATE / name for name in task["private"] if (PRIVATE / name).exists()])
+    process = subprocess.Popen(
+        command,
+        cwd=workspace,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    # The submission runs inside the verifier, so its detached jobs are found by the sandbox's mount namespace.
+    namespace = None
+    for _ in range(100):
+        namespace = ti.mount_namespace(ti.cli_child(process.pid)) if contained is not None else None
+        if namespace is not None or process.poll() is not None or contained is None:
+            break
+        time.sleep(0.1)
     try:
-        result = subprocess.run(
-            command, cwd=workspace, env=env, capture_output=True, text=True, timeout=1800, check=False
-        )
+        stdout, stderr = process.communicate(timeout=1800)
     except subprocess.TimeoutExpired:
+        _stop(process)
         return {"success": False, "error": "verification timed out"}
     finally:
-        ti.kill_tagged(env["NEWTON_TRIAL_ID"])
+        ti.kill_tagged(env["NEWTON_TRIAL_ID"], namespaces={namespace} if namespace else set())
+    result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     (run_dir / "verification.log").write_text(result.stdout + result.stderr)
     if result.returncode != 0 or not output.exists():
         return {"success": False, "error": (result.stderr or result.stdout)[-2000:]}

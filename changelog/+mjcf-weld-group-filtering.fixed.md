@@ -1,0 +1,1 @@
+Filter contacts between bodies joined by fixed joints in MJCF imports the way MuJoCo does (weld bodies, and `filterparent` on weld bodies), so fixed-joint chains such as gripper finger pads no longer collide with their own wrist under the Newton collision pipeline.

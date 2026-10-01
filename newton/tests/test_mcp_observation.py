@@ -20,7 +20,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.mcp.observation import ObservationRenderer
+from newton._src.mcp.observation import ObservationRenderer, _inverse_brown_conrady_rays
 from newton.mcp import SimulationSession
 from newton.solvers import SolverXPBD
 
@@ -400,6 +400,23 @@ class TestMcpObservation(unittest.TestCase):
         self.assertLess(hit.mean(), 32.0 - 5.0)
         with self.assertRaises(ValueError):
             self.renderer.observe(intrinsics={"fx": 1.0}, **self.camera)
+
+    def test_inverse_brown_conrady_distortion(self):
+        """RealSense distortion maps distorted pixels straight to rays and matches the ideal camera at zero."""
+        focal = 32.5 / math.tan(math.radians(30.0))
+        ideal = {"fx": focal, "fy": focal, "cx": 32.5, "cy": 32.5}
+        realsense = {**ideal, "distortion_model": "inverse_brown_conrady", "k1": 0.0}
+        pinhole = self.renderer.observe(channel="depth", raw=True, intrinsics=ideal, **self.camera)
+        zero = self.renderer.observe(channel="depth", raw=True, intrinsics=realsense, **self.camera)
+        with np.load(pinhole["raw_artifact"]) as a, np.load(zero["raw_artifact"]) as b:
+            np.testing.assert_allclose(a["depth"], b["depth"], atol=1e-4)
+        rays = _inverse_brown_conrady_rays(4, 2, {**realsense, "k1": 0.2, "image_width": 4.0, "image_height": 2.0})
+        x, y = (0.5 - 32.5) / focal, (0.5 - 32.5) / focal
+        r2 = x * x + y * y
+        expected = np.array([x * (1 + 0.2 * r2), -y * (1 + 0.2 * r2), -1.0])
+        np.testing.assert_allclose(rays[0, 0, 0, 1], expected / np.linalg.norm(expected), atol=1e-6)
+        with self.assertRaises(ValueError):
+            self.renderer.observe(intrinsics={**realsense, "k4": 0.1}, **self.camera)
 
     @unittest.skipUnless(
         importlib.util.find_spec("ovrtx") is not None and wp.is_cuda_available(), "requires ovrtx and CUDA"

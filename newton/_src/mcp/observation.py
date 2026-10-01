@@ -136,10 +136,15 @@ def _intrinsics(value, width: int, height: int) -> dict | None:
         return None
     if not isinstance(value, dict):
         raise ValueError("intrinsics must be an object with fx, fy, cx, cy")
-    unknown = set(value) - {"fx", "fy", "cx", "cy", "image_width", "image_height", *_DISTORTION}
+    unknown = set(value) - {"fx", "fy", "cx", "cy", "image_width", "image_height", "distortion_model", *_DISTORTION}
     if unknown:
         raise ValueError(f"Unknown intrinsics keys: {sorted(unknown)}")
-    result = {}
+    model = value.get("distortion_model", "opencv")
+    if model not in ("opencv", "inverse_brown_conrady"):
+        raise ValueError("intrinsics distortion_model must be 'opencv' or 'inverse_brown_conrady'")
+    if model == "inverse_brown_conrady" and set(value) & {"k4", "k5", "k6", "s1", "s2", "s3", "s4"}:
+        raise ValueError("inverse_brown_conrady takes k1, k2, k3, p1, p2")
+    result = {} if model == "opencv" else {"distortion_model": model}
     for key in ("fx", "fy", "cx", "cy", "image_width", "image_height", *_DISTORTION):
         if key not in value:
             continue
@@ -155,6 +160,26 @@ def _intrinsics(value, width: int, height: int) -> dict | None:
     result.setdefault("image_width", float(width))
     result.setdefault("image_height", float(height))
     return result
+
+
+def _inverse_brown_conrady_rays(width: int, height: int, intrinsics: dict) -> np.ndarray:
+    """Camera rays for RealSense's inverse Brown-Conrady model, which maps distorted pixels directly to rays.
+
+    Returns ray origins and directions in the sensor's camera frame (x right, y up, looking along -z),
+    shape [1, height, width, 2, 3].
+    """
+    k = {name: intrinsics.get(name, 0.0) for name in ("k1", "k2", "k3", "p1", "p2")}
+    u = (np.arange(width) + 0.5) / width * intrinsics["image_width"]
+    v = (np.arange(height) + 0.5) / height * intrinsics["image_height"]
+    x, y = np.meshgrid((u - intrinsics["cx"]) / intrinsics["fx"], (v - intrinsics["cy"]) / intrinsics["fy"])
+    r2 = x * x + y * y
+    radial = 1.0 + k["k1"] * r2 + k["k2"] * r2 * r2 + k["k3"] * r2 * r2 * r2
+    ux = x * radial + 2.0 * k["p1"] * x * y + k["p2"] * (r2 + 2.0 * x * x)
+    uy = y * radial + 2.0 * k["p2"] * x * y + k["p1"] * (r2 + 2.0 * y * y)
+    directions = np.stack([ux, -uy, -np.ones_like(ux)], axis=-1)
+    rays = np.zeros((1, height, width, 2, 3), dtype=np.float32)
+    rays[0, :, :, 1] = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
+    return rays
 
 
 def _checker_cell(scene_radius: float) -> float:
@@ -352,6 +377,8 @@ class ObservationRenderer:
         ``fx``, ``fy``, ``cx``, ``cy`` [px] for an image of ``image_width`` x
         ``image_height`` (default: the output size, scaled to it otherwise),
         plus optional distortion ``k1``-``k6``, ``p1``, ``p2``, ``s1``-``s4``.
+        ``distortion_model='inverse_brown_conrady'`` (RealSense cameras) reads
+        ``k1``, ``k2``, ``k3``, ``p1``, ``p2`` as a distorted-to-undistorted map.
         Color images are supersampled (``antialias``) when the pixel budget
         allows, and ``environment`` adds a sky gradient behind the scene and a
         checker of known cell size on ground planes for scale and motion cues.
@@ -814,6 +841,10 @@ class ObservationRenderer:
             if intrinsics is None:
                 self._rays = self._sensor.utils.compute_camera_rays_pinhole(
                     width, height, camera_fovs=math.radians(fov_y)
+                )
+            elif intrinsics.get("distortion_model") == "inverse_brown_conrady":
+                self._rays = wp.array(
+                    _inverse_brown_conrady_rays(width, height, intrinsics), dtype=wp.vec3f, device=model.device
                 )
             else:
                 # The helper rescales the calibration to the (supersampled) output size.

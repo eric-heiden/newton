@@ -85,6 +85,7 @@ class RenderContext:
         self.lights_position: wp.array[wp.vec3f] | None = None
         self.lights_orientation: wp.array[wp.vec3f] | None = None
         self.lights_color: wp.array[wp.vec3f] | None = None
+        self.__no_triangle_colors: wp.array[wp.vec3f] | None = None
         """Linear RGB intensity per light; ``None`` means white at unit intensity."""
         self.ambient_sky_color = wp.vec3f(0.2, 0.2, 0.225)
         """Linear RGB ambient radiance from above (surfaces facing the up axis)."""
@@ -392,6 +393,7 @@ class RenderContext:
                     # Triangle Mesh
                     self.triangle_mesh.id if self.triangle_mesh is not None else 0,
                     self.triangle_mesh_group_roots,
+                    self.__triangle_colors(model),
                     # Meshes
                     self.mesh_data,
                     # Gaussians
@@ -420,6 +422,15 @@ class RenderContext:
                 device=self.device,
                 block_dim=kernel_block_dim,
             )
+
+    def __triangle_colors(self, model: Model) -> wp.array[wp.vec3f]:
+        """Per-triangle display colors (sRGB) of the deformable triangle mesh; empty without ``Model.tri_color``."""
+        colors = getattr(model, "tri_color", None)
+        if colors is not None and colors.shape[0] == model.tri_count:
+            return colors
+        if self.__no_triangle_colors is None:
+            self.__no_triangle_colors = wp.zeros(0, dtype=wp.vec3f, device=self.device)
+        return self.__no_triangle_colors
 
     def __light_colors(self) -> wp.array[wp.vec3f] | None:
         count = self.light_count

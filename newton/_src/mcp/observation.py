@@ -292,6 +292,8 @@ class ObservationRenderer:
         self._sensor = None
         self._sensor_model = None
         self._visibility_signature = None
+        self._textured_model = None
+        self._textured = False
         self._buffer_key = None
         self._rays = None
         self._transforms = None
@@ -443,7 +445,7 @@ class ObservationRenderer:
                 world_id,
                 channel,
                 shadows,
-                bool(textures),
+                self._has_textures() if textures is None else textures,
                 contacts,
                 pick,
                 supersample=supersample,
@@ -965,6 +967,15 @@ class ObservationRenderer:
                 viewer.close()
             except Exception:
                 pass
+
+    def _has_textures(self) -> bool:
+        """Whether any shape of the session model carries a texture (textures then render by default)."""
+        model = self.session.model
+        if self._textured_model is not model:
+            sources = getattr(model, "shape_source", None) or []
+            self._textured = any(getattr(source, "texture", None) is not None for source in sources)
+            self._textured_model = model
+        return self._textured
 
     def _overlay_meshes(self) -> list:
         callback = getattr(self.session, "overlay_callback", None)

@@ -214,8 +214,11 @@ class TestMcpObservation(unittest.TestCase):
         self.session.state = self.session.model.state()
         textured = self.renderer.observe(channel="albedo", textures=True, **self.camera)
         plain = self.renderer.observe(channel="albedo", textures=False, **self.camera)
+        default = self.renderer.observe(channel="albedo", **self.camera)
         np.testing.assert_allclose(_decode_png(textured)[32, 32], [0, 255, 0], atol=1)
         np.testing.assert_allclose(_decode_png(plain)[32, 32], [255, 255, 255], atol=1)
+        # Textured models render their textures unless the caller turns them off.
+        np.testing.assert_allclose(_decode_png(default)[32, 32], [0, 255, 0], atol=1)
 
     def test_recording_stride_stop_and_timestamps(self):
         """Write a bounded sequence with reproducible frame times and stop state."""

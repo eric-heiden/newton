@@ -268,6 +268,11 @@ def run_trial(workspace: Path, prepared: dict) -> dict:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env["MCP_TOOL_TIMEOUT"] = "300000"
+    # Every trial compiles its own kernels: a shared Warp or CUDA JIT cache would let one condition
+    # inherit the other's (or an earlier trial's) compile work. The live host, the agent's own runs,
+    # and its fresh-process checks all inherit these.
+    env["WARP_CACHE_PATH"] = str(workspace / ".warp-cache")
+    env["CUDA_CACHE_PATH"] = str(workspace / ".cuda-cache")
     env["MAX_MCP_OUTPUT_TOKENS"] = "60000"
     host, mcp, startup = None, None, 0.0
     started = time.time()
@@ -288,8 +293,6 @@ def run_trial(workspace: Path, prepared: dict) -> dict:
                 str(workspace / "observations"),
                 "--workers",
                 str(WORKERS),
-                "--deadline",
-                str(time.time() + spec["budget_seconds"]),
                 "--",
                 *task["host_args"],
             ],

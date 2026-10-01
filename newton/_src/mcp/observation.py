@@ -281,7 +281,9 @@ def _finish_color(
                         c = horizon + (wp.vec3f(0.22, 0.38, 0.66) - horizon) * wp.sqrt(wp.min(elevation, 1.0))
                     else:
                         c = horizon + (wp.vec3f(0.30, 0.29, 0.28) - horizon) * wp.min(-elevation * 4.0, 1.0)
-                elif int(shape) < plane_flag.shape[0]:
+                elif shape < wp.uint32(plane_flag.shape[0]):
+                    # Unsigned compare: the sentinel ids of particles, cloth, and overlays (0xFFFFFFFx)
+                    # are negative as int and must not index the shape arrays.
                     if plane_flag[int(shape)] != 0:
                         local = wp.transform_point(plane_inverse[int(shape)], eye + direction * depth[py, px])
                         parity = int(wp.floor(local[0] / cell) + wp.floor(local[1] / cell)) % 2

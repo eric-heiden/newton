@@ -58,6 +58,11 @@ class _RecordingViewer:
         super().__init__(*args, **kwargs)
         self.logged_meshes = {}
 
+    def _log_triangles(self, state):
+        # The camera sensor renders the model's own triangle mesh (cloth) directly, with its colors;
+        # recording it as an overlay would rebuild a second scene on every observation.
+        pass
+
     def log_mesh(
         self,
         name,

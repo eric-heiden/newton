@@ -131,6 +131,27 @@ class TestMcpObservation(unittest.TestCase):
         hidden = self.renderer.observe(channel="depth", **self.camera)
         self.assertEqual(hidden["depth_stats"]["valid_count"], 0)
 
+    def test_environment_leaves_cloth_untouched(self):
+        """The ground checker applies to plane shapes only, not to cloth pixels with sentinel shape ids."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        builder.add_cloth_grid(
+            pos=wp.vec3(-1.0, -1.0, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=8,
+            dim_y=8,
+            cell_x=0.25,
+            cell_y=0.25,
+            mass=0.1,
+        )
+        self.session.model = builder.finalize(device="cpu")
+        self.session.state = self.session.model.state()
+        camera = {"eye": [0.0, 0.0, 4.0], "target": [0.0, 0.0, 0.0], "up": [0.0, 1.0, 0.0], "width": 32, "height": 32}
+        plain = _decode_png(self.renderer.observe(environment=False, antialias=False, **camera))
+        dressed = _decode_png(self.renderer.observe(environment=True, antialias=False, **camera))
+        np.testing.assert_array_equal(dressed[12:20, 12:20], plain[12:20, 12:20])
+
     def test_albedo_normal_and_fixed_depth_range(self):
         """Return known albedo, world normals, and explicitly normalized depth."""
         albedo = self.renderer.observe(channel="albedo", **self.camera)

@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+from newton import ShapeFlags
 from newton.sensors import SensorTiledCamera
 
 from .imaging import compare as _compare_images
@@ -290,6 +291,7 @@ class ObservationRenderer:
         self._owner_thread = threading.get_ident()
         self._sensor = None
         self._sensor_model = None
+        self._visibility_signature = None
         self._buffer_key = None
         self._rays = None
         self._transforms = None
@@ -803,6 +805,7 @@ class ObservationRenderer:
             self._sensor = SensorTiledCamera(model, default_render_config=config, load_textures=True)
             self._sensor.utils.create_default_light(enable_shadows=True)
             self._sensor_model = model
+            self._visibility_signature = None
         key = (width, height, fov_y, json.dumps(intrinsics, sort_keys=True))
         if key != self._buffer_key:
             self._outputs = {}
@@ -831,6 +834,15 @@ class ObservationRenderer:
             if name not in self._outputs:
                 create = getattr(self._sensor.utils, f"create_{name}_image_output")
                 self._outputs[name] = create(width, height, world_count=1)
+        # Shapes hidden or made transparent after finalize() only leave the render BVH on a rebuild.
+        visible = model.shape_flags.numpy() & int(ShapeFlags.VISIBLE) != 0
+        if model.shape_opacity is not None:
+            visible &= model.shape_opacity.numpy() > 0.0
+        signature = hash(visible.tobytes())
+        if signature != self._visibility_signature:
+            if self._visibility_signature is not None:
+                model.bvh_build_shapes(state)
+            self._visibility_signature = signature
         model.bvh_refit_shapes(state)
         model.bvh_refit_particles(state)
         config = SensorTiledCamera.RenderConfig(enable_shadows=shadows, enable_textures=textures)

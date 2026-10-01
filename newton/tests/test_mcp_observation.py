@@ -120,6 +120,16 @@ class TestMcpObservation(unittest.TestCase):
         self.assertIs(self.renderer._rays, rays)
         self.assertIs(self.renderer._outputs["depth"], output)
 
+    def test_hiding_shape_after_finalize(self):
+        """Clearing a shape's VISIBLE flag on the finalized model removes it from the next observation."""
+        first = self.renderer.observe(channel="depth", **self.camera)
+        self.assertGreater(first["depth_stats"]["valid_count"], 0)
+        flags = self.model.shape_flags.numpy()
+        flags[0] &= ~int(newton.ShapeFlags.VISIBLE)
+        self.model.shape_flags.assign(flags)
+        hidden = self.renderer.observe(channel="depth", **self.camera)
+        self.assertEqual(hidden["depth_stats"]["valid_count"], 0)
+
     def test_albedo_normal_and_fixed_depth_range(self):
         """Return known albedo, world normals, and explicitly normalized depth."""
         albedo = self.renderer.observe(channel="albedo", **self.camera)

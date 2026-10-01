@@ -390,7 +390,8 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
         command = contained(command)
         (run_dir / "command.json").write_text(json.dumps(command))
         # Both conditions launch together once both are ready, so the MCP host's startup never falls into the
-        # restart agent's budget, and the stated start time is the moment the budget clock starts.
+        # restart agent's budget, and the stated start time is the moment the budget clock starts. The host's
+        # (seeded, a few seconds) startup is outside both budgets; analyses charge it through total_seconds.
         budget_start = ti.pair_barrier(barrier, spec["condition"], parties) if barrier else time.time()
         prompt = prepared["prompt"].replace(START, time.strftime("%H:%M:%S UTC", time.gmtime(budget_start)))
         (workspace / "TASK.md").write_text(prompt)

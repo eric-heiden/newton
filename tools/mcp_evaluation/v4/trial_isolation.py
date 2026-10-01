@@ -68,6 +68,9 @@ def cache_env(directory: Path) -> dict[str, str]:
     env["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"] = "1"
     # XDG_CACHE_HOME moves uv's cache too; keep the shared one (uv run --no-sync only reads it).
     env["UV_CACHE_DIR"] = str(HOME / ".cache/uv")
+    env["XDG_CONFIG_HOME"] = str(directory / "config")
+    env["MPLCONFIGDIR"] = str(directory / "config" / "matplotlib")
+    (directory / "config" / "matplotlib").mkdir(parents=True, exist_ok=True)
     env["UV_NO_SYNC"] = "1"
     return env
 
@@ -197,7 +200,9 @@ def sandbox(
     """
     for name in ("tmp", "var-tmp", "shm"):
         (run_dir / name).mkdir(parents=True, exist_ok=True)
-    args = ["bwrap", "--dev-bind", "/", "/", "--die-with-parent"]
+    # $HOME is read-only (no files a later trial could pick up, no edits to the CLIs or tools it runs);
+    # the trial's own directory, temp directories, and CLI state are mounted writable on top.
+    args = ["bwrap", "--dev-bind", "/", "/", "--die-with-parent", "--ro-bind", str(HOME), str(HOME)]
     # On this pod /tmp and /var/tmp are binds of ~/.horde-tmp and ~/.horde-var-tmp, which `/` exposes again.
     hidden = [
         HOME / "apps",
@@ -238,6 +243,13 @@ def sandbox(
     args += ["--bind", str(run_dir), str(run_dir)]
     if (run_dir / "claude.json").exists():
         args += ["--bind", str(run_dir / "claude.json"), str(HOME / ".claude.json")]
+    # Claude writes caches and session files under ~/.claude: give it a private, writable one.
+    claude_home = run_dir / "claude-home"
+    claude_home.mkdir(exist_ok=True)
+    for name in (".credentials.json", "settings.json", "policy-limits.json", "remote-settings.json"):
+        if (HOME / ".claude" / name).is_file() and not (claude_home / name).exists():
+            shutil.copy2(HOME / ".claude" / name, claude_home / name)
+    args += ["--bind", str(claude_home), str(HOME / ".claude")]
     args += ["--bind", str(run_dir / "tmp"), "/tmp", "--bind", str(run_dir / "var-tmp"), "/var/tmp"]
     args += ["--bind", str(run_dir / "shm"), "/dev/shm"]
     return [*args, *command]

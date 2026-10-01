@@ -25,6 +25,13 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+from .protocol import rtx_available
+
+_RTX_GUIDE = (
+    " backend='rtx' path-traces a photographic image (about 1 s; the first call and calls after shape_color "
+    "edits rebuild the renderer, 5-10 s);"
+)
+
 
 def _load_module(path: Path, generation: int):
     # A fresh module name per load keeps Warp kernels of the old and new script apart.
@@ -251,12 +258,13 @@ class ExampleHost:
                 setattr(self.example, name, value)
 
     def guide(self, workers: int = 0) -> str:
+        rtx = _RTX_GUIDE if rtx_available() else ""
         text = f"""Hosted Newton example: {self.script} (class {self.example_class}, args {self.argv}).
 - `example` is the live Example instance and `module` its script module; one step is one example frame of {getattr(self.example, "frame_dt", "?")} s. Use rollout(...) or session.dispatch('step', {{'count': n}}) rather than example.step() so time, recordings, and bindings stay in sync.
 - Checkpoints (session.dispatch('checkpoint'/'restore', {{'name': ...}})) and reset rewind the physics state, the example's own Warp arrays, and the scalar attributes that step() changes (timers, phase counters). Scalar settings you assign (gains, amplitudes, look-ahead) are kept across reset/restore; model arrays you edit are kept too. Other objects (meshes, SDFs, textures, Python containers) are not rewound; newton_rebuild gives a fresh scene. Branch candidates from one checkpoint instead of re-simulating the approach each time.
 - Live edits: change model arrays and call example.solver.notify_model_changed(newton.ModelFlags....) (arrays are read at run time, so this works with CUDA graphs); assign example attributes (gains, amplitudes) or a new example.solver. After such a cell the host re-records the example's CUDA graphs so captured kernel arguments pick up the change (reported as `note`); call recapture() after in-place changes it cannot see.
 - Helpers (preloaded with newton, np, wp): rollout(frames or seconds=..., record={{'name': 'expr' or fn}}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the parameters the solver actually integrates and which shape's material decided them; health() flags NaNs, runaway velocities, deep penetration, and full solver buffers.
-- Observations (session.dispatch('observe'/'filmstrip', ...), shown with show()) draw the model's visible shapes plus meshes the example logs in its own render() (e.g. extracted surfaces), auto-framed, with a sky and a ground checker of reported cell size (environment=False for plain renders). backend='rtx' path-traces a photographic image (about 1 s; the first call and calls after shape_color edits rebuild the renderer, 5-10 s); intrinsics={{fx, fy, cx, cy, ...}} matches a calibrated real camera. render(**observe_options) returns a numpy image for fitting loops; compare_images(sim, ref, mask=None, panel='edges') scores PSNR, SSIM, and edge NCC against a real frame; observe(reference='frame.png', comparison='edges' or 'blend') shows the comparison panel.
+- Observations (session.dispatch('observe'/'filmstrip', ...), shown with show()) draw the model's visible shapes plus meshes the example logs in its own render() (e.g. extracted surfaces), auto-framed, with a sky and a ground checker of reported cell size (environment=False for plain renders).{rtx} intrinsics={{fx, fy, cx, cy, ...}} matches a calibrated real camera (distortion_model='inverse_brown_conrady' for RealSense). render(**observe_options) returns a numpy image for fitting loops; compare_images(sim, ref, mask=None, panel='edges') scores PSNR, SSIM, and edge NCC against a real frame; observe(reference='frame.png', comparison='edges' or 'blend') shows the comparison panel.
 - When results include `time_left_s`, it is the wall-clock time left in your task budget; plan around it.
 - Python errors in a cell are reported but keep the scene valid; statements before the failing line keep their effects.
 - newton_rebuild(arguments={{"restart": true}}) restarts the whole host process (fresh CUDA context, same script and arguments; Python variables are lost, and the next call waits for the new process). Use it only if the process is broken, e.g. after a CUDA error.

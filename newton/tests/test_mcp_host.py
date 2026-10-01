@@ -325,6 +325,23 @@ class TestMcpLeanProfile(unittest.TestCase):
         listed = protocol.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         self.assertEqual([tool["name"] for tool in listed["result"]["tools"]], ["newton_execute", "newton_rebuild"])
 
+    def test_rtx_backend_is_advertised_only_when_installed(self):
+        """Instructions mention backend='rtx' only if the optional ovrtx renderer can be imported."""
+        from unittest import mock  # noqa: PLC0415
+
+        from newton._src.mcp import protocol as protocol_module  # noqa: PLC0415
+
+        class Client:
+            def request(self, operation, **_):
+                return {}
+
+        for installed in (False, True):
+            with mock.patch.object(protocol_module, "rtx_available", return_value=installed):
+                server = protocol_module._Protocol(Client(), profile="lean", app_guide=False)
+                result = server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})["result"]
+            self.assertEqual("backend='rtx'" in result["instructions"], installed)
+            self.assertNotIn("<<RTX>>", result["instructions"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

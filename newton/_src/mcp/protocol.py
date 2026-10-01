@@ -10,6 +10,7 @@ endpoint. Device operations occur exclusively in the embedding process.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 from typing import ClassVar
@@ -289,12 +290,23 @@ Efficient workflow:
 If a cell raises, the error states whether the scene stayed valid. If invalid, use execute(recovery='inspect') to diagnose and 'acknowledge' after repair, or rebuild."""
 
 
+_RTX_NOTE = (
+    "; backend='rtx' path-traces a photographic image (about 1 s, first call 5-10 s) for judging appearance, "
+    "the default sensor backend takes about 20 ms."
+)
+
+
+def rtx_available() -> bool:
+    """Whether the optional OVRTX renderer behind ``observe(backend='rtx')`` is installed."""
+    return importlib.util.find_spec("ovrtx") is not None
+
+
 _INSTRUCTIONS_LEAN = """Live Newton simulation running in another process; its Python state persists between calls.
 newton_execute runs Python in it (preloaded: session, model, state, control, solver, newton, np, wp, show, rollout, health, solver_contacts, render, compare_images). Batch many evaluations per call and print compact numbers.
 - render(**observe_options) returns an RGB numpy image directly (fast path for fitting loops); compare_images(sim, ref, mask=None, panel='edges'|'blend'|'mismatch') returns PSNR, SSIM and edge NCC (geometric alignment) and shows a comparison panel.
 - rollout(frames or seconds=..., record={'name': 'expr' or fn}, start=True|'checkpoint', until='expr', plot=True) steps and returns NumPy series.
 - solver_contacts(): active contacts per shape pair with the parameters the solver integrates and which material decided them. health(): NaNs, runaway velocities, penetration, full solver buffers.
-- Images: show(session.dispatch('observe', {'view': 'iso'})) or show(session.dispatch('filmstrip', {'times': [0.5, 1.0], 'reset': True})); show() also takes arrays and matplotlib figures. observe options: views=[...], width/height, eye/target or pose, fov_y or intrinsics={'fx','fy','cx','cy', distortion...} for calibrated cameras, world_id, reference='photo.png'; backend='rtx' path-traces a photographic image (about 1 s, first call 5-10 s) for judging appearance, the default sensor backend takes about 20 ms.
+- Images: show(session.dispatch('observe', {'view': 'iso'})) or show(session.dispatch('filmstrip', {'times': [0.5, 1.0], 'reset': True})); show() also takes arrays and matplotlib figures. observe options: views=[...], width/height, eye/target or pose, fov_y or intrinsics={'fx','fy','cx','cy', distortion..., 'distortion_model': 'opencv'|'inverse_brown_conrady' (RealSense)} for calibrated cameras, world_id, reference='photo.png'<<RTX>>
 - session.dispatch('checkpoint' | 'restore' | 'reset' | 'describe', {...}) manage and inspect the scene.
 newton_rebuild reloads the application (for hosted scripts: re-imports the edited file) in the same process.
 Results may include time_left_s: the wall-clock seconds left in your task budget."""
@@ -402,6 +414,7 @@ class _Protocol:
 
     def _instructions(self) -> str:
         text = _INSTRUCTIONS_LEAN if self.profile == "lean" else _INSTRUCTIONS
+        text = text.replace("<<RTX>>", _RTX_NOTE if rtx_available() else ".")
         if not self.app_guide:
             return text
         try:

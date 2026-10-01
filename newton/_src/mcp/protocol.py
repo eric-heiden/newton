@@ -324,8 +324,7 @@ newton_execute runs Python in it (preloaded: session, model, state, control, sol
 - solver_contacts(): active contacts per shape pair with the parameters the solver integrates and which material decided them. health(): NaNs, runaway velocities, penetration, full solver buffers.
 - Images: show(session.dispatch('observe', {'view': 'iso'})) or show(session.dispatch('filmstrip', {'times': [0.5, 1.0], 'reset': True})); show() also takes arrays and matplotlib figures. observe options: views=[...], width/height, eye/target or pose, fov_y or intrinsics={'fx','fy','cx','cy', distortion..., 'distortion_model': 'opencv'|'inverse_brown_conrady' (RealSense)} for calibrated cameras, world_id, reference='photo.png'<<RTX>>
 - session.dispatch('checkpoint' | 'restore' | 'reset' | 'describe', {...}) manage and inspect the scene.<<BLENDER>>
-newton_rebuild reloads the application (for hosted scripts: re-imports the edited file) in the same process.
-Results may include time_left_s: the wall-clock seconds left in your task budget."""
+newton_rebuild reloads the application (for hosted scripts: re-imports the edited file) in the same process."""
 
 
 def _compact(data: dict, *, full: bool = False) -> dict:

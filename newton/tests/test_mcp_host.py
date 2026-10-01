@@ -243,13 +243,6 @@ class TestMcpHelpers(unittest.TestCase):
         self.session.state.body_q.assign(body_q)
         self.assertFalse(self.session.health()["ok"])
 
-    def test_status_reports_time_left_when_a_deadline_is_set(self):
-        """Report the remaining wall-clock budget so agents can pace themselves."""
-        self.assertNotIn("time_left_s", self.session.dispatch("describe", {}))
-        self.session.deadline = time.time() + 100.0
-        left = self.session.dispatch("execute", {"code": "1"})["time_left_s"]
-        self.assertTrue(95 <= left <= 100)
-
     def test_render_and_compare_images(self):
         """Render arrays directly and score them against references with image metrics."""
         camera = {"eye": [1.5, -1.5, 1.0], "target": [0.0, 0.0, 0.3], "width": 64, "height": 48}

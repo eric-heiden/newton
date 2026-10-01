@@ -536,8 +536,13 @@ def verify(workspace: Path, run_dir: Path, task: dict, env: dict, contained=None
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--spec",
+        type=Path,
+        help="JSON file with the other options (keys as below, e.g. task, condition, model, workspace, run); "
+        "keeps them out of the runner's command line, which other processes on this machine can read",
+    )
+    parser.add_argument(
         "--task",
-        required=True,
         choices=(
             "grasp_drift",
             "g1_track",
@@ -550,16 +555,22 @@ def main() -> None:
             "abc_look",
         ),
     )
-    parser.add_argument("--condition", required=True, choices=("mcp", "restart"))
-    parser.add_argument("--model", required=True, choices=sorted(MODELS))
-    parser.add_argument("--workspace", type=Path, required=True, help="Run directory for the harness records")
+    parser.add_argument("--condition", choices=("mcp", "restart"))
+    parser.add_argument("--model", choices=sorted(MODELS))
+    parser.add_argument("--workspace", type=Path, help="Run directory for the harness records")
     parser.add_argument("--seconds", type=int, default=None, help="Budget [s]; defaults to the task's (usually 1800)")
     parser.add_argument("--phase", default="loop")
     parser.add_argument("--barrier", type=Path, help="Shared directory that starts both conditions of a pair together")
     parser.add_argument("--parties", type=int, default=2)
     parser.add_argument("--run", action="store_true")
     args = parser.parse_args()
-    run_dir = args.workspace.resolve()
+    if args.spec is not None:
+        for key, value in json.loads(args.spec.read_text()).items():
+            setattr(args, key, Path(value) if key in ("workspace", "barrier") and value else value)
+    missing = [name for name in ("task", "condition", "model", "workspace") if getattr(args, name) is None]
+    if missing:
+        parser.error(f"missing {', '.join(missing)} (pass them as options or in --spec)")
+    run_dir = Path(args.workspace).resolve()
     prepared = prepare(run_dir, args.task, args.condition, args.model, args.seconds, args.phase)
     if not args.run:
         print(f"Prepared {run_dir}")

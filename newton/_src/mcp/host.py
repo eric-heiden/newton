@@ -93,6 +93,11 @@ class _NoSolver:
         pass
 
 
+def _frame_dt(example) -> str:
+    frame_dt = getattr(example, "frame_dt", None)
+    return f"{frame_dt:g} s" if isinstance(frame_dt, (int, float)) else "example.frame_dt"
+
+
 class ExampleHost:
     """Construct and serve a Newton ``Example`` script.
 
@@ -267,7 +272,7 @@ class ExampleHost:
         if blender_available():
             rtx += " backend='blender' renders with Blender EEVEE (about 1 s; 'blender_cycles' path-traces) and blender(code) edits its materials and lights;"
         text = f"""Hosted Newton example: {self.script} (class {self.example_class}, args {self.argv}).
-- `example` is the live Example instance and `module` its script module; one step is one example frame of {getattr(self.example, "frame_dt", "?")} s. Use rollout(...) or session.dispatch('step', {{'count': n}}) rather than example.step() so time, recordings, and bindings stay in sync.
+- `example` is the live Example instance and `module` its script module; one step is one example frame ({_frame_dt(self.example)}). Use rollout(...) or session.dispatch('step', {{'count': n}}) rather than example.step() so time, recordings, and bindings stay in sync.
 - Checkpoints (session.dispatch('checkpoint'/'restore', {{'name': ...}})) and reset rewind the physics state, the example's own Warp arrays, and the scalar attributes that step() changes (timers, phase counters). Scalar settings you assign (gains, amplitudes, look-ahead) are kept across reset/restore; model arrays you edit are kept too. Other objects (meshes, SDFs, textures, Python containers) are not rewound; newton_rebuild gives a fresh scene. Branch candidates from one checkpoint instead of re-simulating the approach each time.
 - Live edits: change model arrays and call example.solver.notify_model_changed(newton.ModelFlags....) (arrays are read at run time, so this works with CUDA graphs); assign example attributes (gains, amplitudes) or a new example.solver. After such a cell the host re-records the example's CUDA graphs so captured kernel arguments pick up the change (reported as `note`); call recapture() after in-place changes it cannot see.
 - Helpers (preloaded with newton, np, wp): rollout(frames or seconds=..., record={{'name': 'expr' or fn}}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the parameters the solver actually integrates and which shape's material decided them; contacts_between(a, b=None, detail=False) summarizes contacts between two shape sets (count, solver normal and friction force, slip speed, penetration) and works as a rollout(record=...) probe; health() flags NaNs, runaway velocities, deep penetration, and full solver buffers.

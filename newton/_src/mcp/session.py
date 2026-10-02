@@ -795,7 +795,7 @@ class SimulationSession:
 
         Accepts HxW/HxWx3/HxWx4 arrays (uint8, or floats in [0, 1]), Pillow
         images, matplotlib figures, PNG bytes, image file paths, or an
-        ``observe``/``filmstrip`` result. At most eight images of up to four
+        ``observe``/``filmstrip`` result (every page of a paged filmstrip). At most eight images of up to four
         megapixels each are returned per call; MCP clients see them inline.
 
         Args:
@@ -808,6 +808,12 @@ class SimulationSession:
             raise RuntimeError("show() is only available during trusted execution")
         if len(self._shown_images) >= self._MAX_SHOWN_IMAGES:
             raise ValueError(f"At most {self._MAX_SHOWN_IMAGES} images can be shown per execute call")
+        if isinstance(image, dict) and image.get("images"):
+            # A paged filmstrip: every page, the first one labeled.
+            self.show({"image_base64": image["image_base64"]}, label)
+            for page in image["images"]:
+                self.show(page)
+            return
         if isinstance(image, dict) and "image_base64" in image:
             rgb = to_rgb(base64.b64decode(image["image_base64"]))
         else:

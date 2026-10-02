@@ -1,0 +1,1 @@
+Lay out MCP `filmstrip` results in bands and pages sized for how MCP clients display images, instead of one row of frames that clients shrank until frames were illegible; `max_pages` bounds the page count and pages after the first are returned in `images`.

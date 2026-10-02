@@ -245,10 +245,11 @@ TOOLS = [
     ),
     _tool(
         "filmstrip",
-        "Advance the simulation and return ONE labeled image grid (columns = times, rows = views): the fastest way to "
+        "Advance the simulation and return labeled image grids (columns = times, rows = views): the fastest way to "
         "see a motion. Give absolute times [s] (use reset=true to start from t=0, or restore='checkpoint'), or count "
         "frames every_steps apart. references=[[paths per time] per view] adds reference and mismatch rows. "
         "A camera_body camera follows its body to every time; overlay marks simulated points on every frame. "
+        "Times wrap into bands and pages that fit the displayed image size (at most max_pages images). "
         "Default tiles 320x240; state stays at the last time.",
         {
             "times": {"type": "array", "items": {"type": "number"}, "minItems": 1, "maxItems": 32},
@@ -259,6 +260,7 @@ TOOLS = [
             "views": {**_VIEWS, "maxItems": 4},
             "references": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
             "overlay": _OVERLAY,
+            "max_pages": {"type": "integer", "minimum": 1, "maximum": 8, "default": 4},
             **{
                 k: v
                 for k, v in _OBSERVE.items()
@@ -329,7 +331,7 @@ TOOLS = [
 _INSTRUCTIONS = """Live Newton simulation running in another process; its Python state persists between calls.
 Efficient workflow:
 - newton_observe() returns an inline image; omit the camera to auto-frame (view='iso'|'front'|'left'|'right'|'top'). views=[...] gives a multi-view grid in one image. reference='photo.png' renders at the photo's size with the same camera and adds reference and mismatch panels plus pixel statistics.
-- newton_filmstrip(times=[...], reset=true) runs forward and returns one labeled grid of frames; references=[[...]] compares each frame with reference images. camera_body='label' (optional camera_offset pose in the body frame) mounts a camera on a body, e.g. a wrist camera, and overlay={'name': {'body': 'label'}} marks simulated points on the simulated and reference frames.
+- newton_filmstrip(times=[...], reset=true) runs forward and returns labeled grids of frames (paged to fit the displayed size); references=[[...]] compares each frame with reference images. camera_body='label' (optional camera_offset pose in the body frame) mounts a camera on a body, e.g. a wrist camera, and overlay={'name': {'body': 'label'}} marks simulated points on the simulated and reference frames.
 - newton_execute runs Python in the app: batch several parameter candidates in one call, compute numeric comparisons, and call show(image_or_figure, label) to see custom plots or composites inline. Prefer one larger call over many small ones.
 - session.dispatch('checkpoint', {'name': ...}) / ('restore', ...) branches from a saved state instead of re-simulating.
 - Built-in helpers (no import needed; newton, np, wp are preloaded): rollout(frames or seconds=..., record={'name': 'expr' or fn}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the solver's effective parameters (MuJoCo solref/solimp/friction after priority and mixing) next to the authored materials; health() flags NaNs, runaway velocities, deep penetration, and solver buffer overflow.

@@ -609,6 +609,46 @@ class TestMcpObservation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "precede"):
             session.dispatch("filmstrip", {"times": [0.0]})
 
+    def test_filmstrip_pages_fit_the_display_size(self):
+        """Long filmstrips wrap into bands and pages that fit the display size, and show() returns every page."""
+        builder = newton.ModelBuilder()
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 2.0), wp.quat_identity()))
+        builder.add_shape_sphere(body, radius=0.2)
+        model = builder.finalize(device="cpu")
+        session = SimulationSession(
+            model, SolverXPBD(model), dt=0.01, artifact_directory=self.directory.name, allow_execute=True
+        )
+        self.addCleanup(session.close)
+        camera = {"eye": [0.0, -6.0, 1.0], "target": [0.0, 0.0, 1.0]}
+        size = {"width": 96, "height": 64}
+        times = [round(0.02 * k, 2) for k in range(10)]
+        views = [{"label": "a", **camera}, {"label": "b", "eye": [6.0, 0.0, 1.0], "target": [0.0, 0.0, 1.0]}]
+        original = ObservationRenderer.DISPLAY_EDGE
+        ObservationRenderer.DISPLAY_EDGE = 300
+        self.addCleanup(setattr, ObservationRenderer, "DISPLAY_EDGE", original)
+        strip = session.dispatch("filmstrip", {"times": times, "reset": True, "views": views, **size})
+        # Bands of 3 times (100 px columns), 2 bands per page (144 px bands): 10 times on 2 pages, full-size frames.
+        self.assertEqual(strip["pages"], 2)
+        self.assertNotIn("thumbnail_scale", strip)
+        self.assertIn("3 times per band, 2 bands per page", strip["layout"])
+        pages = [_decode_png(strip), *(_decode_png(page) for page in strip["images"])]
+        for page in pages:
+            self.assertLessEqual(max(page.shape[:2]), 300)
+        self.assertEqual(pages[0].shape[:2], (2 * (2 * 64 + 4) + 12, 3 * 96 + 2 * 4))
+        # One page at most: frames shrink instead.
+        single = session.dispatch("filmstrip", {"times": times, "reset": True, "views": views, **size, "max_pages": 1})
+        self.assertNotIn("images", single)
+        self.assertEqual(single["thumbnail_scale"], 0.5)
+        self.assertLessEqual(max(_decode_png(single).shape[:2]), 300)
+        shown = session.dispatch(
+            "execute",
+            {
+                "code": f"show(session.dispatch('filmstrip', {{'times': {times}, 'reset': True, 'views': {views}, "
+                "'width': 96, 'height': 64}), 'strip')"
+            },
+        )
+        self.assertEqual(len(shown["images"]), 2)
+
     def test_projection_matches_camera_rays(self):
         """Overlay projection inverts the renderer's rays for pinhole, OpenCV, and inverse Brown-Conrady cameras."""
         camera = {"width": 40, "height": 30, "eye": [1.0, -2.5, 0.8], "target": [0.1, 0.0, 0.2]}

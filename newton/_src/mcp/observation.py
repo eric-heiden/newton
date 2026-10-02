@@ -374,6 +374,39 @@ def _mask(value, shape) -> np.ndarray:
     return array.astype(bool)
 
 
+def _page_layout(
+    row_heights: list[int], width: int, columns: int, edge: int, max_pages: int, gap: int = 4, band_gap: int = 12
+) -> tuple[int, int, int]:
+    """Shrink factor, columns per band, and bands per page for grid pages that fit ``edge`` x ``edge`` pixels.
+
+    Takes the smallest shrink factor whose layout needs at most ``max_pages`` pages, shrinking frames to no less
+    than 48 px wide.
+    """
+    scale = 1
+    while True:
+        column = -(-width // scale) + gap
+        band = sum(-(-height // scale) for height in row_heights) + gap * (len(row_heights) - 1) + band_gap
+        if column <= edge + gap and band <= edge + band_gap:
+            per_band = min(columns, max(1, (edge + gap) // column))
+            bands = max(1, (edge + band_gap) // band)
+            bands = min(bands, -(-columns // per_band))
+            # Stop before frames get narrower than 48 px, even if that needs more pages.
+            if -(-columns // (per_band * bands)) <= max_pages or -(-width // (scale + 1)) < min(48, width):
+                return scale, per_band, bands
+        scale += 1
+
+
+def _stack_bands(bands: list[np.ndarray], gap: int = 12) -> np.ndarray:
+    """Stack band images vertically on white, left-aligned."""
+    width = max(band.shape[1] for band in bands)
+    page = np.full((sum(band.shape[0] for band in bands) + gap * (len(bands) - 1), width, 3), 255, dtype=np.uint8)
+    top = 0
+    for band in bands:
+        page[top : top + band.shape[0], : band.shape[1]] = band
+        top += band.shape[0] + gap
+    return page
+
+
 def _shrink(image: np.ndarray, factor: int) -> np.ndarray:
     h, w = (image.shape[0] // factor) * factor, (image.shape[1] // factor) * factor
     return image[:h, :w].reshape(h // factor, factor, w // factor, factor, -1).mean(axis=(1, 3)).astype(np.uint8)
@@ -474,6 +507,8 @@ class ObservationRenderer:
 
     CHANNELS = ("color", "albedo", "depth", "forward_depth", "normal", "shape_index")
     MAX_PIXELS = 4_194_304
+    # Clients downscale images to about this long edge (Claude: 1568 px), so filmstrip pages are laid out to fit it.
+    DISPLAY_EDGE = 1568
     MAX_RECORD_BYTES = 256 * 1024 * 1024
 
     class _CaptureCamera:
@@ -1033,9 +1068,10 @@ class ObservationRenderer:
         mask=None,
         comparison: str = "mismatch",
         overlay: dict | None = None,
+        max_pages: int = 4,
         **options,
     ) -> dict:
-        """Advance the simulation and return one labeled grid of frames over time.
+        """Advance the simulation and return labeled grids of frames over time.
 
         Columns are capture times; rows are views. ``times`` are absolute
         simulation times [s] at or after the current time (after the optional
@@ -1054,6 +1090,11 @@ class ObservationRenderer:
         long recording a few frames at a time. ``comparison`` selects the third
         row: ``mismatch``, ``edges`` (for real photos), or ``blend``. ``mask`` is
         a boolean ``(H, W)`` array or image path, or one per time.
+
+        Times wrap into bands (each band repeats the rows for its times) and bands into
+        pages, so every page fits the size clients display images at; frames are
+        shrunk only as far as needed to fit ``max_pages`` pages. The first page is
+        ``image_base64``; further pages are in ``images``.
 
         Cameras on a ``camera_body`` follow that body to each capture time.
         ``overlay`` marks simulated points on the simulated and reference
@@ -1169,13 +1210,15 @@ class ObservationRenderer:
                 grid.append(panels)
                 labels.append([f"{comparison} ssim {s['ssim']:.2f} ncc {s['edge_ncc']:.2f}" for s in row_stats])
                 grid_markers.append([None] * len(columns))
-        # Shrink thumbnails (box filter) until the grid fits the pixel budget; metrics stay full size.
-        scale = 1
-        while (
-            sum(im.shape[0] for im in (r[0] for r in grid)) * sum(im.shape[1] for im in grid[0])
-            > self.MAX_PIXELS * scale * scale
-        ):
-            scale += 1
+        # Shrink thumbnails (box filter) only as far as needed for the pages to fit the display size; metrics stay
+        # full size.
+        scale, per_band, bands = _page_layout(
+            [max(im.shape[0] for im in r) for r in grid],
+            max(im.shape[1] for r in grid for im in r),
+            len(columns),
+            self.DISPLAY_EDGE,
+            max(1, int(max_pages)),
+        )
         if scale > 1:
             grid = [[_shrink(im, scale) for im in r] for r in grid]
         # Markers go on after the metrics and the downscale, so they stay crisp and never affect scores.
@@ -1186,18 +1229,35 @@ class ObservationRenderer:
             ]
             for r, m in zip(grid, grid_markers, strict=True)
         ]
-        image = tile(grid, labels)
-        if image.shape[0] * image.shape[1] > self.MAX_PIXELS:
-            raise ValueError("Filmstrip exceeds the pixel budget; reduce width/height, times, or views")
+        pages = []
+        per_page = per_band * bands
+        for first in range(0, len(columns), per_page):
+            band_images = []
+            for start in range(first, min(first + per_page, len(columns)), per_band):
+                stop = min(start + per_band, len(columns))
+                band_images.append(tile([r[start:stop] for r in grid], [r[start:stop] for r in labels]))
+            page = _stack_bands(band_images)
+            if page.shape[0] * page.shape[1] > self.MAX_PIXELS:
+                raise ValueError("Filmstrip exceeds the pixel budget; reduce width/height, times, or views")
+            pages.append(page)
+        layout = "columns = times; rows = views" + (" (simulated, reference, mismatch)" if references else "")
+        if len(pages) > 1 or per_band < len(columns):
+            layout += f"; {per_band} times per band, {bands} bands per page"
         result = {
             "time": float(session.time),
             "frame": int(session.frame),
             "times": [round(t, 6) for t in captured_times],
             "steps_advanced": steps,
-            "layout": "columns = times; rows = views" + (" (simulated, reference, mismatch)" if references else ""),
-            "image_base64": base64.b64encode(_png(image)).decode("ascii"),
+            "layout": layout,
+            "image_base64": base64.b64encode(_png(pages[0])).decode("ascii"),
             "mime_type": "image/png",
         }
+        if len(pages) > 1:
+            result["pages"] = len(pages)
+            result["images"] = [
+                {"image_base64": base64.b64encode(_png(page)).decode("ascii"), "mime_type": "image/png"}
+                for page in pages[1:]
+            ]
         if overlay_rows:
             result["overlay"] = overlay_rows
         if statistics:

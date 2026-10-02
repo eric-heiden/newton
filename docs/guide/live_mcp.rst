@@ -207,7 +207,10 @@ columns are capture times and whose rows are views. Give absolute ``times``
 (optionally after ``reset=True`` or ``restore=<checkpoint>``) or ``count``
 frames ``every_steps`` apart. ``references`` adds reference and mismatch rows
 per view, one reference image per time. Stepping uses the normal step path,
-so application callbacks and recordings behave as in ``step``.
+so application callbacks and recordings behave as in ``step``. Times wrap into
+bands and pages sized for how MCP clients display images (about 1568 px on the
+long edge); frames shrink only as far as needed to fit ``max_pages`` pages, and
+pages after the first are returned in ``images``.
 
 ``camera_body`` mounts the camera on a body, given by label or index; labels
 that replicated worlds share resolve within ``world_id``. ``camera_offset``

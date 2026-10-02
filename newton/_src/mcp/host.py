@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from .protocol import blender_available, rtx_available
+from .protocol import rtx_available
 
 _RTX_GUIDE = (
     " backend='rtx' path-traces a photographic image (about 1 s; the first call and calls after shape_color "
@@ -269,8 +269,6 @@ class ExampleHost:
 
     def guide(self, workers: int = 0) -> str:
         rtx = _RTX_GUIDE if rtx_available() else ""
-        if blender_available():
-            rtx += " backend='blender' renders with Blender EEVEE (about 1 s; 'blender_cycles' path-traces) and blender(code) edits its materials and lights;"
         text = f"""Hosted Newton example: {self.script} (class {self.example_class}, args {self.argv}).
 - `example` is the live Example instance and `module` its script module; one step is one example frame ({_frame_dt(self.example)}). Use rollout(...) or session.dispatch('step', {{'count': n}}) rather than example.step() so time, recordings, and bindings stay in sync.
 - Checkpoints (session.dispatch('checkpoint'/'restore', {{'name': ...}})) and reset rewind the physics state, the example's own Warp arrays, and the scalar attributes that step() changes (timers, phase counters). Scalar settings you assign (gains, amplitudes, look-ahead) are kept across reset/restore; model arrays you edit are kept too. Other objects (meshes, SDFs, textures, Python containers) are not rewound; newton_rebuild gives a fresh scene. Branch candidates from one checkpoint instead of re-simulating the approach each time.

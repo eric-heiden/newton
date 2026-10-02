@@ -34,6 +34,8 @@ def verify(script: Path) -> dict:
         work = Path(tmp)
         shutil.copy2(HERE / "look_common.py", work / "look_common.py")
         shutil.copy2(HERE.parent / "abc_twin" / "twin_render.py", work / "twin_render.py")
+        for name in ("blender_bridge.py", "blender_server.py"):
+            shutil.copy2(HERE / name, work / name)
         for name in ("scene.json", "camera.json", "joint_log.npz"):
             shutil.copy2(PRIVATE / "abc_look" / name, work / name)
         shutil.copytree(PRIVATE / "abc_twin" / "station", work / "station")

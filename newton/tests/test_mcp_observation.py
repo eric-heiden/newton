@@ -20,16 +20,12 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.mcp.blender_bridge import find_blender as _blender_path
 from newton._src.mcp.imaging import encode_png as _encode_png
 from newton._src.mcp.observation import (
     ObservationRenderer,
     _intrinsics,
     _inverse_brown_conrady_rays,
-    _is_square_pinhole,
-    _pinhole_cover,
     _project,
-    _sample_bilinear,
 )
 from newton._src.mcp.protocol import TOOLS
 from newton.mcp import SimulationSession
@@ -153,22 +149,6 @@ def _red(image):
     """Pixels redder than any gray or black background."""
     image = np.asarray(image, dtype=int)
     return image[..., 0] - np.maximum(image[..., 1], image[..., 2]) > 25
-
-
-# Blender look with flat red shapes on black, so silhouettes threshold at half coverage independent of lighting.
-_FLAT_BLENDER = """
-for obj in shape_objects:
-    for slot in obj.material_slots:
-        slot.material.use_nodes = True
-        tree = slot.material.node_tree
-        tree.nodes.clear()
-        emission = tree.nodes.new("ShaderNodeEmission")
-        emission.inputs["Color"].default_value = (1.0, 0.0, 0.0, 1.0)
-        tree.links.new(emission.outputs[0], tree.nodes.new("ShaderNodeOutputMaterial").inputs[0])
-for node in world.node_tree.nodes:
-    if node.type == "BACKGROUND":
-        node.inputs["Strength"].default_value = 0.0
-"""
 
 
 def _pinhole(intrinsics):
@@ -583,89 +563,6 @@ class TestMcpObservation(unittest.TestCase):
         np.testing.assert_allclose(rays[0, 0, 0, 1], expected / np.linalg.norm(expected), atol=1e-6)
         with self.assertRaises(ValueError):
             self.renderer.observe(intrinsics={**realsense, "k4": 0.1}, **self.camera)
-
-    @unittest.skipUnless(_blender_path() is not None, "requires Blender (NEWTON_BLENDER or blender on PATH)")
-    def test_blender_backend_matches_sensor_camera(self):
-        """Blender renders line up with sensor renders for fov and calibrated cameras, and accept bpy edits."""
-        session = SimulationSession(self.model, self.model.state(), artifact_directory=Path(self.directory.name))
-        self.addCleanup(session.close)
-        camera = {"eye": [2.0, -1.6, 1.2], "target": [0, 0, 0], "width": 96, "height": 72, "environment": False}
-
-        def red_center(image):
-            ys, xs = np.nonzero((image[..., 0] > 120) & (image[..., 1] < 90) & (image[..., 2] < 90))
-            return np.array([xs.mean(), ys.mean()])
-
-        for options in ({}, {"intrinsics": {"fx": 80.0, "fy": 80.0, "cx": 40.0, "cy": 30.0}}):
-            sensor = session.render(backend="sensor", **camera, **options)
-            blender = session.render(backend="blender", samples=4, **camera, **options)
-            np.testing.assert_allclose(red_center(blender), red_center(sensor), atol=1.0)
-        self.assertEqual(session.blender("result = len(shape_objects)"), "1")
-
-    @unittest.skipUnless(_blender_path() is not None, "requires Blender (NEWTON_BLENDER or blender on PATH)")
-    def test_blender_backend_resamples_distorted_cameras(self):
-        """Blender renders of distorted and non-square-pixel cameras line up with the sensor's rays."""
-        model = _corner_spheres()
-        session = SimulationSession(model, model.state(), artifact_directory=Path(self.directory.name))
-        self.addCleanup(session.close)
-        session.blender(_FLAT_BLENDER)
-
-        def centroids(backend, intrinsics):
-            if backend == "sensor":
-                image = session.render(channel="shape_index", intrinsics=intrinsics, **_CORNER_CAMERA)
-                return _corner_centroids(image.any(axis=-1)), {}
-            image, metadata = session.render(
-                backend="blender", samples=4, intrinsics=intrinsics, metadata=True, **_CORNER_CAMERA
-            )
-            return _corner_centroids(image[..., 0] > 127), metadata
-
-        pinhole = _pinhole(_REALSENSE_848)
-        opencv = {**pinhole, "k1": -0.25, "k2": 0.08, "p1": 0.001, "p2": -0.0015}
-        for intrinsics in (_REALSENSE_848, opencv, pinhole):
-            with self.subTest(intrinsics=intrinsics):
-                blender, metadata = centroids("blender", intrinsics)
-                error = blender - centroids("sensor", intrinsics)[0]
-                self.assertLess(np.abs(error).max(), 0.35)
-                self.assertLess(np.abs(error.mean(axis=0)).max(), 0.15)
-                self.assertIn("pinhole render", metadata["lens"])
-        # Without the resampling, Blender's pinhole misses the distorted corners by several pixels.
-        undistorted = centroids("blender", pinhole)[0] - centroids("sensor", _REALSENSE_848)[0]
-        self.assertGreater(np.linalg.norm(undistorted, axis=1)[:4].min(), 3.0)
-        # Undistorted square-pixel cameras render directly.
-        self.assertNotIn("lens", centroids("blender", {**pinhole, "fx": pinhole["fy"]})[1])
-
-    def test_pinhole_cover_resamples_to_distorted_camera(self):
-        """A pinhole render covering a distorted camera's rays, resampled through them, matches that camera."""
-        model = _corner_spheres()
-        self.session.model, self.session.state = model, model.state()
-        pinhole = _pinhole(_REALSENSE_848)
-        opencv = {**pinhole, "k1": -0.25, "k2": 0.08, "p1": 0.001, "p2": -0.0015}
-        for camera in (_REALSENSE_848, opencv, pinhole):
-            with self.subTest(intrinsics=camera):
-                intrinsics = _intrinsics(camera, 848, 480)
-                self.assertFalse(_is_square_pinhole(intrinsics, 848, 480))
-                cover, coordinates = _pinhole_cover(848, 480, intrinsics, "cpu", ObservationRenderer.MAX_PIXELS)
-                self.assertEqual(coordinates.shape, (480, 848, 2))
-                self.assertEqual(cover["fx"], cover["fy"])
-                self.assertAlmostEqual(cover["fx"], intrinsics["fx"])
-                # The sensor stands in for a renderer without lens models.
-                size = {"width": int(cover["image_width"]), "height": int(cover["image_height"])}
-                wide = self.renderer.observe(intrinsics=cover, antialias=False, **{**_CORNER_CAMERA, **size})
-                resampled = _sample_bilinear(_decode_png(wide), coordinates)
-                direct = _decode_png(self.renderer.observe(intrinsics=camera, antialias=False, **_CORNER_CAMERA))
-                # Resampled silhouette edges move centroids by a few tenths of a pixel, but not systematically.
-                error = _corner_centroids(_red(resampled)) - _corner_centroids(_red(direct))
-                self.assertLess(np.abs(error).max(), 0.5)
-                self.assertLess(np.abs(error.mean(axis=0)).max(), 0.25)
-        self.assertTrue(_is_square_pinhole(_intrinsics({**pinhole, "fx": pinhole["fy"]}, 848, 480), 848, 480))
-        # Covering within a smaller budget lowers the pinhole's resolution, down to half; pixels without rays are black.
-        intrinsics = _intrinsics(_REALSENSE_848, 848, 480)
-        cover, _ = _pinhole_cover(848, 480, intrinsics, "cpu", 200_000)
-        self.assertLessEqual(cover["image_width"] * cover["image_height"], 200_000)
-        with self.assertRaisesRegex(ValueError, "too wide"):
-            _pinhole_cover(848, 480, intrinsics, "cpu", 50_000)
-        image = np.full((4, 4, 3), 200, dtype=np.uint8)
-        sampled = _sample_bilinear(image, np.array([[[2.0, 2.0], [np.nan, np.nan]]]))
-        np.testing.assert_array_equal(sampled, [[[200, 200, 200], [0, 0, 0]]])
 
     @unittest.skipUnless(
         importlib.util.find_spec("ovrtx") is not None and wp.is_cuda_available(), "requires ovrtx and CUDA"

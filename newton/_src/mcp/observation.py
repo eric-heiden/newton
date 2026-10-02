@@ -251,92 +251,6 @@ def _project(points, pose, width: int, height: int, fov_y: float, intrinsics: di
     return np.stack([u, v], axis=-1), depth
 
 
-def _camera_directions(width: int, height: int, intrinsics: dict, device) -> np.ndarray:
-    """Camera-frame ray directions [H, W, 3] that the sensor backend traces for calibrated ``intrinsics``.
-
-    Directions use the sensor convention (x right, y up, looking along -z); pixels without a valid ray are zero.
-    """
-    if intrinsics.get("distortion_model") == "inverse_brown_conrady":
-        return _inverse_brown_conrady_rays(width, height, intrinsics)[0, :, :, 1]
-    from ..sensors.warp_raytrace.camera_utils import compute_camera_rays_pinhole_opencv_kernel  # noqa: PLC0415
-
-    rays = wp.zeros((1, height, width, 2), dtype=wp.vec3f, device=device)
-    calibration = [intrinsics[key] for key in ("image_width", "image_height", "fx", "fy", "cx", "cy")]
-    coefficients = [intrinsics.get(key, 0.0) for key in _DISTORTION]
-    wp.launch(
-        compute_camera_rays_pinhole_opencv_kernel,
-        dim=(height, width),
-        inputs=[width, height, *calibration, *coefficients, 0, rays],
-        device=device,
-    )
-    return rays.numpy()[0, :, :, 1]
-
-
-def _is_square_pinhole(intrinsics: dict, width: int, height: int) -> bool:
-    """Whether calibrated intrinsics, scaled to the output size, are an undistorted pinhole with square pixels."""
-    if any(intrinsics.get(key, 0.0) for key in _DISTORTION):
-        return False
-    scale_x, scale_y = width / intrinsics["image_width"], height / intrinsics["image_height"]
-    return math.isclose(intrinsics["fx"], intrinsics["fy"], rel_tol=1.0e-6) and math.isclose(
-        scale_x, scale_y, rel_tol=1.0e-6
-    )
-
-
-def _pinhole_cover(width: int, height: int, intrinsics: dict, device, max_pixels: int) -> tuple[dict, np.ndarray]:
-    """Square-pixel pinhole intrinsics whose image covers every ray of a calibrated camera, and where each ray lands.
-
-    Renderers without lens models draw such a camera by rendering the pinhole and sampling it at the returned
-    continuous pixel coordinates [H, W, 2] (pixel ``i`` spans ``[i, i + 1)``; NaN where the camera has no ray).
-    The pinhole keeps the camera's pixel density at its principal point unless that exceeds ``max_pixels``.
-    """
-    directions = _camera_directions(width, height, intrinsics, device).astype(np.float64)
-    ahead = directions[..., 2] < -1.0e-9
-    if not ahead.any():
-        raise ValueError("intrinsics give no valid camera rays")
-    depth = np.where(ahead, -directions[..., 2], 1.0)
-    x = np.where(ahead, directions[..., 0] / depth, np.nan)
-    y = np.where(ahead, -directions[..., 1] / depth, np.nan)
-    lower = np.array([np.nanmin(x), np.nanmin(y)])
-    extent = np.array([np.nanmax(x), np.nanmax(y)]) - lower
-    focal = native = max(
-        intrinsics["fx"] * width / intrinsics["image_width"], intrinsics["fy"] * height / intrinsics["image_height"]
-    )
-    # One pixel of margin keeps bilinear samples inside the image.
-    size = np.ceil(extent * focal + 2.0).astype(int)
-    while size.prod() > max_pixels:
-        focal *= 0.99 * math.sqrt(max_pixels / float(size.prod()))
-        size = np.ceil(extent * focal + 2.0).astype(int)
-    if focal < 0.5 * native:
-        raise ValueError("The camera's rays span too wide a view to render through a pinhole; use backend='sensor'")
-    cx, cy = (float(value) for value in 1.0 - lower * focal)
-    pinhole = {
-        "fx": focal,
-        "fy": focal,
-        "cx": cx,
-        "cy": cy,
-        "image_width": float(size[0]),
-        "image_height": float(size[1]),
-    }
-    return pinhole, np.stack([x * focal + cx, y * focal + cy], axis=-1)
-
-
-def _sample_bilinear(image: np.ndarray, coordinates: np.ndarray) -> np.ndarray:
-    """Bilinearly sample an RGB image at continuous pixel coordinates [H, W, 2]; NaN coordinates give black."""
-    height, width = image.shape[:2]
-    valid = np.isfinite(coordinates).all(axis=-1)
-    u = np.clip(np.nan_to_num(coordinates[..., 0]) - 0.5, 0.0, width - 1.0)
-    v = np.clip(np.nan_to_num(coordinates[..., 1]) - 0.5, 0.0, height - 1.0)
-    u0, v0 = np.floor(u).astype(int), np.floor(v).astype(int)
-    u1, v1 = np.minimum(u0 + 1, width - 1), np.minimum(v0 + 1, height - 1)
-    du, dv = (u - u0)[..., None], (v - v0)[..., None]
-    pixels = image.astype(np.float32)
-    top = pixels[v0, u0] * (1.0 - du) + pixels[v0, u1] * du
-    bottom = pixels[v1, u0] * (1.0 - du) + pixels[v1, u1] * du
-    result = top * (1.0 - dv) + bottom * dv
-    result[~valid] = 0.0
-    return np.clip(result + 0.5, 0.0, 255.0).astype(np.uint8)
-
-
 def _body_index(model, selector, world_id: int) -> int:
     """Index of the body selected by label or index within ``world_id`` (or among global bodies).
 
@@ -646,8 +560,6 @@ class ObservationRenderer:
         self._recording = None
         self._last_recording = {"active": False, "frame_count": 0}
         self._rtx = self._rtx_model = self._rtx_colors = self._rtx_world = None
-        self._blender = self._blender_signature = None
-        self._pinhole_cover = self._pinhole_cover_key = None
 
     def _check_thread(self):
         if threading.get_ident() != self._owner_thread:
@@ -703,8 +615,6 @@ class ObservationRenderer:
         plus optional distortion ``k1``-``k6``, ``p1``, ``p2``, ``s1``-``s4``.
         ``distortion_model='inverse_brown_conrady'`` (RealSense cameras) reads
         ``k1``, ``k2``, ``k3``, ``p1``, ``p2`` as a distorted-to-undistorted map.
-        The blender backends render distorted or non-square-pixel cameras as a
-        pinhole covering their rays and resample it through those rays.
         Color images are supersampled (``antialias``) when the pixel budget
         allows, and ``environment`` adds a sky gradient behind the scene and a
         checker of known cell size on ground planes for scale and motion cues.
@@ -740,8 +650,8 @@ class ObservationRenderer:
             }
         elif camera_offset is not None:
             raise ValueError("camera_offset requires camera_body")
-        if backend not in ("sensor", "viewer", "rtx", "blender", "blender_cycles"):
-            raise ValueError("backend must be 'sensor', 'viewer', 'rtx', 'blender', or 'blender_cycles'")
+        if backend not in ("sensor", "viewer", "rtx"):
+            raise ValueError("backend must be 'sensor', 'viewer', or 'rtx'")
         samples = _integer("samples", samples, 1, 256)
         if channel not in self.CHANNELS:
             raise ValueError(f"channel must be one of {self.CHANNELS}")
@@ -761,8 +671,8 @@ class ObservationRenderer:
             raise ValueError("fov_y must be finite and in [1, 175] degrees")
         intrinsics = _intrinsics(intrinsics, width, height)
         if intrinsics is not None:
-            if backend not in ("sensor", "blender", "blender_cycles"):
-                raise ValueError("intrinsics require the sensor or blender backend")
+            if backend != "sensor":
+                raise ValueError("intrinsics require the sensor backend")
             # Framing and overlays use the equivalent vertical field of view.
             fov_y = math.degrees(2.0 * math.atan(0.5 * intrinsics["image_height"] / intrinsics["fy"]))
         if contact_depth not in ("visible", "always"):
@@ -838,18 +748,6 @@ class ObservationRenderer:
             if pick is not None:
                 metadata["picks"] = self._pick(arrays["shape_index"], pick)
             depth = arrays.get("forward_depth")
-        elif backend.startswith("blender"):
-            if channel != "color" or raw or pick is not None or wireframe or contacts:
-                raise ValueError("The blender backend renders color only; channels, picking, contacts need sensor")
-            started = time.perf_counter()
-            engine = "CYCLES" if backend == "blender_cycles" else "EEVEE"
-            rgb, blender_metadata = self._render_blender(
-                width, height, fov_y, camera_pose, world_id, samples, intrinsics, engine
-            )
-            metadata.update(blender_metadata)
-            metadata["render_seconds"] = round(time.perf_counter() - started, 3)
-            depth = None
-            arrays = {}
         elif backend == "rtx":
             if channel != "color" or raw or pick is not None or wireframe:
                 raise ValueError("The rtx backend renders color only; raw channels, picking and wireframe need sensor")
@@ -1536,75 +1434,6 @@ class ObservationRenderer:
             "renderer_rebuilt": rebuilt,
         }
 
-    def blender_worker(self, world_id: int = 0):
-        """The Blender render worker for the current model, started on first use.
-
-        The worker is rebuilt when the model, its visible shapes, or shape colors change.
-        """
-        from .blender_bridge import BlenderRenderer, find_blender  # noqa: PLC0415
-
-        model = self.session.model
-        signature = (
-            id(model),
-            world_id,
-            hash(model.shape_flags.numpy().tobytes()),
-            hash(model.shape_color.numpy().tobytes()) if model.shape_color is not None else None,
-        )
-        if self._blender is not None and self._blender_signature == signature:
-            return self._blender, False
-        self._close_blender()
-        blender = find_blender()
-        if blender is None:
-            raise ValueError("backend='blender' needs Blender; set NEWTON_BLENDER or put blender on PATH")
-        directory = Path(self.session.artifact_directory) / "blender" if self.session.artifact_directory else None
-        self._blender = BlenderRenderer(model, blender=blender, world_id=world_id, workdir=directory)
-        self._blender_signature = signature
-        return self._blender, True
-
-    def _render_blender(self, width, height, fov_y, pose, world_id, samples, intrinsics, engine):
-        worker, rebuilt = self.blender_worker(world_id)
-        camera, coordinates = intrinsics, None
-        if intrinsics is not None and not _is_square_pinhole(intrinsics, width, height):
-            # Blender cameras are square-pixel pinholes without lens distortion.
-            key = (width, height, json.dumps(intrinsics, sort_keys=True))
-            if self._pinhole_cover_key != key:
-                self._pinhole_cover = _pinhole_cover(
-                    width, height, intrinsics, self.session.model.device, self.MAX_PIXELS
-                )
-                self._pinhole_cover_key = key
-            camera, coordinates = self._pinhole_cover
-        rgb, timing = worker.render(
-            self.session.state,
-            pose=pose,
-            fov_y=fov_y,
-            width=width if coordinates is None else int(camera["image_width"]),
-            height=height if coordinates is None else int(camera["image_height"]),
-            samples=samples,
-            engine=engine,
-            intrinsics=camera,
-        )
-        rgb = np.ascontiguousarray(rgb[..., :3], dtype=np.uint8)
-        metadata = {
-            "renderer": f"Blender {engine.title()}",
-            "samples": samples,
-            "renderer_rebuilt": rebuilt,
-            "blender_render_seconds": timing.get("render_s"),
-            **({"startup_seconds": round(worker.startup_s, 2)} if rebuilt else {}),
-        }
-        if coordinates is not None:
-            rgb = _sample_bilinear(rgb, coordinates)
-            size = f"{int(camera['image_width'])}x{int(camera['image_height'])}"
-            metadata["lens"] = f"resampled through the calibrated rays from a {size} pinhole render"
-        return rgb, metadata
-
-    def _close_blender(self):
-        worker, self._blender = getattr(self, "_blender", None), None
-        if worker is not None:
-            try:
-                worker.close()
-            except Exception:
-                pass
-
     def _close_rtx(self):
         viewer, self._rtx = getattr(self, "_rtx", None), None
         if viewer is not None:
@@ -1880,4 +1709,3 @@ class ObservationRenderer:
             self._finish_recording("session_closed")
         self.invalidate()
         self._close_rtx()
-        self._close_blender()

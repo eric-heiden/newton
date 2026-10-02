@@ -452,25 +452,6 @@ def warm_solvers(script: str, variants: list[dict]) -> None:
         example.step()
 
 
-def warm_blender(script: str) -> None:
-    """Render the starter once through the MCP's Blender backend, so the GL shader cache Blender's EEVEE compiles
-    lands in the seed. Both conditions start from that seed (their prompts name Blender), and both the MCP backend
-    and agents' own Blender scripts reuse the cache."""
-    import os  # noqa: PLC0415
-
-    from newton.mcp import ExampleHost  # noqa: PLC0415
-
-    if not os.environ.get("NEWTON_BLENDER"):
-        return
-    host = ExampleHost(script, [])
-    host.build()
-    session = host.session(allow_execute=False)
-    try:
-        session.dispatch("observe", {"backend": "blender", "width": 160, "height": 120})
-    finally:
-        session.close()
-
-
 if __name__ == "__main__":
     import sys
 
@@ -478,10 +459,7 @@ if __name__ == "__main__":
         warm(sys.argv[2], sys.argv[3:])
     elif len(sys.argv) == 4 and sys.argv[1] == "warm-solvers":
         warm_solvers(sys.argv[2], json.loads(sys.argv[3]))
-    elif len(sys.argv) == 3 and sys.argv[1] == "warm-blender":
-        warm_blender(sys.argv[2])
     else:
         raise SystemExit(
             "usage: python -m tools.mcp_evaluation.v4.trial_isolation warm SCRIPT [ARGS...] | warm-solvers SCRIPT JSON"
-            " | warm-blender SCRIPT"
         )

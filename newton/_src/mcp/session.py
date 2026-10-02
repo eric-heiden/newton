@@ -849,7 +849,6 @@ class SimulationSession:
         "solver_contacts",
         "render",
         "compare_images",
-        "blender",
         "contacts_between",
     )
     _EXPRESSION_RESULT = "__newton_expression_result__"
@@ -873,7 +872,6 @@ class SimulationSession:
                     "solver_contacts",
                     "render",
                     "compare_images",
-                    "blender",
                     "contacts_between",
                 )
             }
@@ -889,7 +887,6 @@ class SimulationSession:
             solver_contacts=self.solver_contacts,
             render=self.render,
             compare_images=self.compare_images,
-            blender=self.blender,
             contacts_between=self.contacts_between,
             np=np,
             wp=wp,
@@ -1567,30 +1564,6 @@ class SimulationSession:
         self._assert_owner()
         image, info = self._renderer_get()._single(**options)
         return (image, info) if metadata else image
-
-    def blender(self, code: str | None = None, *, save: str | None = None, world_id: int = 0) -> str | None:
-        """Run ``bpy`` look-development code in the Blender render worker (trusted execution helper).
-
-        The worker behind ``observe(backend='blender')`` starts on first use. ``code`` sees
-        ``bpy``, ``scene``, ``shape_objects`` (one object per visible shape, in model order with
-        ``obj["newton_shape"]`` the shape index), ``materials``, ``camera``, ``world``, ``sun``,
-        and ``key`` (an area light); assign ``result`` to return a value. Edits persist until
-        the worker is rebuilt (after model, visibility, or shape-color changes).
-
-        Args:
-            code: Python code to run inside Blender.
-            save: Write the Blender scene to this ``.blend`` path.
-            world_id: World mirrored by the worker.
-
-        Returns:
-            The ``repr`` of ``result`` set by the code, or the saved path.
-        """
-        self._assert_owner()
-        worker, _ = self._renderer_get().blender_worker(world_id)
-        result = worker.exec(code) if code else None
-        if save:
-            result = worker.save_blend(Path(save).resolve())
-        return result
 
     def compare_images(
         self, simulated, reference, *, mask=None, panel: str | None = None, label: str | None = None

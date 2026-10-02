@@ -15,9 +15,9 @@ from pathlib import Path
 import numpy as np
 import twin_render
 import warp as wp
+from blender_bridge import BlenderRenderer, find_blender
 
 import newton
-from newton._src.mcp.blender_bridge import BlenderRenderer, find_blender
 
 HERE = Path(__file__).resolve().parent
 NEUTRAL = (0.6, 0.6, 0.6)

@@ -51,8 +51,6 @@ REPLAY_DATA = Path(
     os.environ.get("NEWTON_REPLAY_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_replay_task")
 )
 BIN_DATA = Path(os.environ.get("NEWTON_BIN_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_bin_task"))
-# Blender for the look task and the MCP's blender backend (inherited by hosts, agents, and verifiers).
-os.environ.setdefault("NEWTON_BLENDER", "/home/horde/opt/blender-5.2.2-linux-x64/blender")
 PRIVATE = Path(os.environ.get("NEWTON_VISUAL_PRIVATE", Path.home() / ".newton-visual-private"))
 # Agent workspaces get opaque names under a neutral root; the labeled run directory keeps the harness
 # records (spec, command, transcript, host log, verification), which agents must not see.
@@ -164,7 +162,14 @@ Constraints (checked): keep one arm per world with the kinematics of yam_arm.xml
             "files": {
                 **{
                     name: HERE / "abc_look" / name
-                    for name in ("station_look.py", "look.py", "render_look.py", "look_common.py")
+                    for name in (
+                        "station_look.py",
+                        "look.py",
+                        "render_look.py",
+                        "look_common.py",
+                        "blender_bridge.py",
+                        "blender_server.py",
+                    )
                 },
                 "twin_render.py": HERE / "abc_twin/twin_render.py",
                 **{
@@ -252,8 +257,6 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
                         ]
                     ),
                 ],
-                # Blender's EEVEE shader cache (both prompts name Blender).
-                ["-m", "tools.mcp_evaluation.v4.trial_isolation", "warm-blender", "screwdriver_replay.py"],
             ],
             "goal": """screwdriver_replay.py replays a real robot episode from the ABC-130k dataset (https://abc.bot) in Newton. At a bimanual station (two 6-DoF YAM arms with parallel grippers, filmed from above and from the wrists), the right arm picks up a screwdriver lying on the table by its handle, carries it over, and puts it into a pink plastic bin. episodes/main.npz holds the measured joint positions, velocities, and torques (including the gripper motor's effort), the gripper openings, and the logged joint and gripper commands (about 30 Hz); scenes/main.json the station layout (arm bases, the bin's pose and size, and the screwdriver: its tapered handle profile, start pose, grasping arm, and the video frames of the real grasp events); frames/main/ the recorded top and right wrist videos; gt/main.npz the screwdriver's carry track (rigidly attached to the hand) and its final pose in the bin from the top video. episodes/, scenes/, gt/, and frames/ also hold four 10 fps episodes of the same station, bin, and screwdriver (sib_1 to sib_4), and arm_logs/ 64 recorded YAM arm logs (32 episodes of various tasks, both arms; measured joints, velocities, torques, and commands) for calibrating the arms. FORMAT.md describes the files, their clocks, and the fixed helpers in replay_common.py (Replay, score, check, rendering through the real cameras, contact_summary, StationFK). Each scene is one Newton world from build_model(scenes), driven open loop by the logged commands as joint position targets (replay_common.Replay) and stepped with make_solver(model) and make_pipeline(model). Problem: the starter keeps the ABC simulator's arm and gripper defaults. The screwdriver ends up in the bin, but during the carry it swings about {starter_rot}° in the fingers (median over copies) and slips about {starter_slip_mm} mm, while the right wrist video shows the real one sitting still in the hand, and the arms track the recording at about {starter_arm_rad} rad joint RMSE. In the friction-{control_mu} control below, the starter's simulation diverges in its first step (MuJoCo Warp's pyramidal friction cone is unstable at such low friction), which counts as held.
 
@@ -262,6 +265,8 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
         },
     }
     if name == "abc_look":
+        # The look task renders with Blender in both conditions (inherited by agents and verifiers).
+        os.environ.setdefault("NEWTON_BLENDER", "/home/horde/opt/blender-5.2.2-linux-x64/blender")
         from tools.mcp_evaluation.v4.abc_look.verify import THRESHOLDS  # noqa: PLC0415
 
         tasks[name]["goal"] = tasks[name]["goal"].format(**THRESHOLDS)
@@ -343,7 +348,7 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
 
 
 def _renderers() -> str:
-    """Renderers available to both conditions (the MCP guide names them too, so the prompt must)."""
+    """Renderers available to both conditions when a task provides Blender (the look task)."""
     blender = os.environ.get("NEWTON_BLENDER")
     if not blender or not Path(blender).exists():
         return ""

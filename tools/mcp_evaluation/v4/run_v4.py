@@ -50,6 +50,7 @@ LOOK_DATA = Path(os.environ.get("NEWTON_LOOK_DATA", "/home/horde/artifacts/newto
 REPLAY_DATA = Path(
     os.environ.get("NEWTON_REPLAY_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_replay_task")
 )
+BIN_DATA = Path(os.environ.get("NEWTON_BIN_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_bin_task"))
 # Blender for the look task and the MCP's blender backend (inherited by hosts, agents, and verifiers).
 os.environ.setdefault("NEWTON_BLENDER", "/home/horde/opt/blender-5.2.2-linux-x64/blender")
 PRIVATE = Path(os.environ.get("NEWTON_VISUAL_PRIVATE", Path.home() / ".newton-visual-private"))
@@ -219,6 +220,46 @@ Constraints (checked): appearance only. Materials, lights, world, and color mana
 Goal: make the replay physically reproduce the whole episode: every fruit grasped, lifted, carried, and released into the tray the way the real robot did it. Verification imports build_model, make_solver, make_pipeline, and PARAMS and runs its own replay of the full timelines (its own copy of replay_common: Replay, score, and jitter_scene) in fresh processes, on the main episode in 8 copies (2 nominal, 6 with the fruit starts jittered by up to 4 mm and the pear heading by 5 degrees) and on unseen episodes of the same station and fruits in 4 copies each. Main episode, per fruit: held through the carry in at least {held} of 8 copies and resting in the tray at the end in at least {placed}; medians over the copies: lifted fraction at least {lifted}, carry-track error at most {track_cm} cm, lift-off error at most {liftoff} state samples, release error between {release_low} and +{release_high} s, movement before the grasp at most {moved_cm} cm, finger-gap error while holding at most {gap_mm} mm, and final position error at most {final_cm} cm; whole-episode joint RMSE at most {arm_rad} rad per arm. Unseen episodes: at least {heldout_pct}% of their fruit copies held and placed (fruits whose real grasp the recorded data cannot reproduce are excluded), and joint RMSE at most {heldout_arm_rad} rad per arm (mean over episodes). Two negative controls replay the main episode with the gripper commands forced open and with arm and fruit friction set to 0.02: no fruit may rise more than {control_cm} cm. Verification runs twice (a third time if they disagree) and the majority decides. The starter holds no fruit in any copy and scores about 0.040 rad joint RMSE.
 Constraints (checked): keep the station's arm kinematics, finger collision geometry (within 0.5 mm), arm bases (within 3 mm of the scene's), table plane, gravity, and the command input; add no shapes, actuators, equality constraints, tendons, or contact pairs to the robot. Each fruit is one free, dynamic body labelled pear, orange, or dark_fruit, starting at the scene's start (within 2 mm, resting on the table, pear long axis within 5 degrees of the scene's heading), with 20 to 150 g, principal inertias between 0.8x a solid and 1.2x a hollow ellipsoid of its extents, at most 8 collision shapes spanning the size ranges in the scene, collisions with the fingers, table, tray, and the other fruits, and no joint drives, springs, damping, gravity compensation, or applied forces. Tunable: arm joint gains, armature, friction, damping, effort limits (at most 28 N m on joints 1-3 and 10 N m on joints 4-6), and gravity compensation (0 to 1) per link; gripper position gain (100 to 3000 N/m) and squeeze force (5 to 60 N); PARAMS["command_delay"] (0 to 0.2 s) and PARAMS["dt"] (0.25 to 2 ms); the solver (a Newton solver class, not a subclass) and its settings; newton.CollisionPipeline settings or MuJoCo's own contacts; materials (friction at most 1.5, torsional at most 0.02 m, rolling at most 0.005 m, restitution at most 0.8, margin at most 2 mm, contact gap at most 0.1 m, no adhesion; robot shapes may keep their MJCF values); fruit shapes, masses, and inertias within the bounds above; and the tray model (at most 40 shapes, static or on one dynamic body labelled tray of 0.1 to 1 kg, inside the scene's tray sector plus 15 mm and at most 35 mm above the table). The verification batch (about 44 worlds) must replay within about 400 s. replay_common.py is fixed (verification uses its own copy). Verification calls build_model, make_solver, and make_pipeline in a copy of the workspace without frames/, arm_logs/, gt/, and video_reference.npz, and passes only the scenes (geometry, starts, sizes; no episode paths or ids), so keep fitted values in the script or in a file next to it. The submission may not inspect the verifier (stack frames, garbage collector, raw memory, code objects, trace hooks), start processes, or read files outside the workspace while it is built. Use only the data in the workspace: do not download recordings or any other data. Keep the file runnable (`python fruit_replay.py --viewer null` replays the main episode and prints the metrics; `--episode sib_1`, `--num-worlds 8 --jitter`, and `--seconds` select episodes, ensembles, and shorter runs).""",
         },
+        "abc_bin": {
+            "files": {
+                **{
+                    name: HERE / "abc_bin" / name for name in ("screwdriver_replay.py", "replay_common.py", "FORMAT.md")
+                },
+                **{name: BIN_DATA / name for name in ("station", "episodes", "scenes", "gt", "frames", "camera.json")},
+                "arm_logs": ARM_DATA / "logs",
+            },
+            "script": "screwdriver_replay.py",
+            "host_args": [],
+            "run_args": "[--seconds <S>] [--episode sib_1] [--num-worlds 8 --jitter]",
+            "verifier": "tools/mcp_evaluation/v4/abc_bin/verify.py",
+            "seconds": 3600,
+            "private": ["abc_bin"],
+            # One frame of the starter (its main ignores --num-frames and would replay the whole episode).
+            "warmup": [
+                ["screwdriver_replay.py", "--viewer", "null", "--seconds", "0.034"],
+                ["-m", "tools.mcp_evaluation.v4.trial_isolation", "warm", "screwdriver_replay.py"],
+                # Solver variants agents try (both conditions get the same seed).
+                [
+                    "-m",
+                    "tools.mcp_evaluation.v4.trial_isolation",
+                    "warm-solvers",
+                    "screwdriver_replay.py",
+                    json.dumps(
+                        [
+                            {"cone": "elliptic"},
+                            {"use_mujoco_contacts": True},
+                            {"use_mujoco_contacts": True, "cone": "elliptic"},
+                        ]
+                    ),
+                ],
+                # Blender's EEVEE shader cache (both prompts name Blender).
+                ["-m", "tools.mcp_evaluation.v4.trial_isolation", "warm-blender", "screwdriver_replay.py"],
+            ],
+            "goal": """screwdriver_replay.py replays a real robot episode from the ABC-130k dataset (https://abc.bot) in Newton. At a bimanual station (two 6-DoF YAM arms with parallel grippers, filmed from above and from the wrists), the right arm picks up a screwdriver lying on the table by its handle, carries it over, and puts it into a pink plastic bin. episodes/main.npz holds the measured joint positions, velocities, and torques (including the gripper motor's effort), the gripper openings, and the logged joint and gripper commands (about 30 Hz); scenes/main.json the station layout (arm bases, the bin's pose and size, and the screwdriver: its tapered handle profile, start pose, grasping arm, and the video frames of the real grasp events); frames/main/ the recorded top and right wrist videos; gt/main.npz the screwdriver's carry track (rigidly attached to the hand) and its final pose in the bin from the top video. episodes/, scenes/, gt/, and frames/ also hold four 10 fps episodes of the same station, bin, and screwdriver (sib_1 to sib_4), and arm_logs/ 64 recorded YAM arm logs (32 episodes of various tasks, both arms; measured joints, velocities, torques, and commands) for calibrating the arms. FORMAT.md describes the files, their clocks, and the fixed helpers in replay_common.py (Replay, score, check, rendering through the real cameras, contact_summary, StationFK). Each scene is one Newton world from build_model(scenes), driven open loop by the logged commands as joint position targets (replay_common.Replay) and stepped with make_solver(model) and make_pipeline(model). Problem: the starter keeps the ABC simulator's arm and gripper defaults. The screwdriver ends up in the bin, but during the carry it swings about {starter_rot}° in the fingers (median over copies) and slips about {starter_slip_mm} mm, while the right wrist video shows the real one sitting still in the hand, and the arms track the recording at about {starter_arm_rad} rad joint RMSE. In the friction-{control_mu} control below, the starter's simulation diverges in its first step (MuJoCo Warp's pyramidal friction cone is unstable at such low friction), which counts as held.
+
+Goal: make the replay physically reproduce the whole episode: the screwdriver grasped, lifted, carried without turning or slipping in the fingers, and placed in the bin the way the real robot did it. Verification imports build_model, make_solver, make_pipeline, and PARAMS and runs its own replay of the full timelines (its own copy of replay_common: Replay, score, and jitter_scene) in fresh processes, on the main episode in 8 copies (2 nominal, 6 with the screwdriver start jittered by up to 4 mm and 5 degrees) and on unseen episodes of the same station, bin, and screwdriver in 4 copies each. Main episode: the screwdriver held through the carry in at least {held} of 8 copies and resting in the bin at the end in at least {placed}; medians over the copies: in-hand rotation during the carry at most {rot}°, slip at most {slip_mm} mm, finger-gap error while holding at most {gap_mm} mm, lift-off error at most {liftoff} state samples, carry-track error at most {track_cm} cm, final tip error at most {final_cm} cm, and movement before the grasp at most {moved_cm} cm; whole-episode joint RMSE at most {arm_rad} rad per arm. Unseen episodes: at least {ho_pct}% of their copies held, placed, and rotated at most {ho_rot}° in the hand (episodes whose real grasp the recorded data cannot reproduce are excluded), and joint RMSE at most {ho_arm_rad} rad per arm (mean over episodes). Two negative controls replay the main episode with the gripper commands forced open (the screwdriver may not rise more than {control_cm} cm) and with the friction of every collision shape set to {control_mu} (the screwdriver may not be held in any copy; a copy whose simulation diverges counts as held). Verification runs twice (a third time if they disagree) and the majority decides.
+Constraints (checked): keep the station's arm kinematics, finger collision geometry (within 0.5 mm), arm bases (within 3 mm of the scene's), table plane, gravity, and the command input; add no shapes, actuators, equality constraints, tendons, or contact pairs to the robot (the finger-mirror equality may be stiffened, not removed). The screwdriver is one free, dynamic body labelled screwdriver with at most 6 collision shapes: 200 to 215 mm long, handle radius within 1.5 mm of the scene's profile at its stations and within 2.5 mm between them, shaft radius 1.5 to 3.5 mm, 40 to 150 g, centre of mass on the axis, within the handle and within 15 mm of the scene's com_local, principal inertias between 0.8x a solid and 1.2x a hollow screwdriver of the scene's shape, starting at the scene's start (within 2 mm and 5 degrees, resting on the table), colliding with the fingers, table, and bin, and with no joint drives, springs, damping, gravity compensation, or applied forces. Tunable: arm joint gains, armature, friction, damping, effort limits (at most 28 N m on joints 1-3 and 10 N m on joints 4-6), and gravity compensation (0 to 1) per link; gripper position gain (100 to 30000 N/m) and pinch force (5 to 80 N per pad; the finger mirror splits the finger actuators' force between the two pads); PARAMS["command_delay"] (0 to 0.2 s) and PARAMS["dt"] (0.25 to 2 ms); the solver (a Newton solver class, not a subclass) and its settings; newton.CollisionPipeline settings or MuJoCo's own contacts; MuJoCo contact and finger-mirror stiffness (solref in standard form with a time constant of at least 2 dt and a damping ratio of 0.5 to 2, refsafe on); materials of every collision shape, finger pads included (friction at most 1.5, torsional at most 0.01 m, rolling at most 0.001 m, restitution at most 0.8, margin at most 2 mm, contact gap at most 0.1 m, no adhesion); and the bin model (at most 12 shapes with walls all around, static or on one dynamic body labelled bin of 0.2 to 0.6 kg, inside the scene's rim outline plus 10 mm, its top within 15 mm of the scene's height). The verification batch (68 worlds) must replay within about 400 s. replay_common.py is fixed (verification uses its own copy). Verification calls build_model, make_solver, and make_pipeline in a copy of the workspace without frames/, arm_logs/, and gt/, and passes only the scenes (geometry, starts, sizes, events; no episode paths, ids, or image measurements), so keep fitted values in the script or in a file next to it. The submission may not inspect the verifier (stack frames, garbage collector, raw memory, code objects, trace hooks), start processes, or read files outside the workspace while it is built. Use only the data in the workspace: do not download recordings or any other data. Keep the file runnable (`python screwdriver_replay.py --viewer null` replays the main episode and prints the metrics; `--episode sib_1`, `--num-worlds 8 --jitter`, and `--seconds` select episodes, ensembles, and shorter runs).""",
+        },
     }
     if name == "abc_look":
         from tools.mcp_evaluation.v4.abc_look.verify import THRESHOLDS  # noqa: PLC0415
@@ -258,6 +299,31 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
             heldout_pct=f"{100 * t['heldout_fruit_rate_min']:.1f}",
             heldout_arm_rad=f"{t['heldout_arm_rmse_rad_max']:g}",
             control_cm=f"{100 * t['control_rise_m_max']:g}",
+        )
+    if name == "abc_bin":
+        from tools.mcp_evaluation.v4.abc_bin import verify as bin_verify  # noqa: PLC0415
+
+        CONTROL_MU, STARTER, t = bin_verify.CONTROL_MU, bin_verify.STARTER, bin_verify.THRESHOLDS
+
+        tasks[name]["goal"] = tasks[name]["goal"].format(
+            starter_rot=f"{STARTER['inhand_rot_deg']:.0f}",
+            starter_slip_mm=f"{STARTER['slip_mm']:.0f}",
+            starter_arm_rad=f"{STARTER['arm_rmse_rad']:.2f}",
+            held=t["main_held_min"],
+            placed=t["main_placed_min"],
+            rot=f"{t['inhand_rot_deg_max']:g}",
+            slip_mm=f"{1000 * t['slip_m_max']:g}",
+            gap_mm=f"{t['grip_gap_err_mm_max']:g}",
+            liftoff=f"{t['liftoff_err_rows_max']:g}",
+            track_cm=f"{100 * t['carry_track_err_m_max']:.2f}",
+            final_cm=f"{100 * t['final_tip_xy_err_m_max']:.1f}",
+            moved_cm=f"{100 * t['moved_before_grasp_m_max']:g}",
+            arm_rad=f"{t['arm_rmse_rad_max']:g}",
+            ho_pct=f"{100 * t['heldout_rate_min']:.1f}",
+            ho_rot=f"{t['heldout_rot_max_deg']:g}",
+            ho_arm_rad=f"{t['heldout_arm_rmse_rad_max']:g}",
+            control_cm=f"{100 * t['control_rise_m_max']:g}",
+            control_mu=f"{CONTROL_MU:g}",
         )
     task = tasks[name]
     # Commands run once on the starter to build the compile-cache seed both conditions start from.
@@ -586,7 +652,7 @@ INTROSPECTION = re.compile(
 # Fetching data from the network (the held-out episodes are public).
 DOWNLOAD = re.compile(
     r"huggingface\.co|hf_hub|snapshot_download|hf_hub_download|datasets\.load_dataset|abc\.bot|voxel51"
-    r"|\b(?:curl|wget)\b[^\n]*https?://|urllib\.request|requests\.get|git clone",
+    r"|\b(?:curl|wget)\b[^\n]*https?://|urllib\.request|requests\.get|git clone|\bhf download|huggingface-cli",
     re.IGNORECASE,
 )
 
@@ -719,6 +785,7 @@ def main() -> None:
             "abc_arm",
             "abc_look",
             "abc_replay",
+            "abc_bin",
         ),
     )
     parser.add_argument("--condition", choices=("mcp", "restart"))

@@ -276,6 +276,17 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
     return task
 
 
+def _renderers() -> str:
+    """Renderers available to both conditions (the MCP guide names them too, so the prompt must)."""
+    blender = os.environ.get("NEWTON_BLENDER")
+    if not blender or not Path(blender).exists():
+        return ""
+    return (
+        "Renderers: newton.sensors.SensorTiledCamera (ray-cast, GPU) and Blender (headless, scriptable with bpy; "
+        f"executable in $NEWTON_BLENDER = {blender}).\n"
+    )
+
+
 def prompt_for(name: str, condition: str, workspace: Path, seconds: int, guide: str | None) -> str:
     task = _task(name)
     common = f"""You are working on a Newton physics simulation task.
@@ -286,7 +297,7 @@ Newton source tree (read-only reference, including docs and examples): {ROOT}
 {task["goal"]}
 
 Deliverable: the edited {task["script"]} in the workspace, then a brief report. You have {seconds // 60} minutes, starting {START} (check with `date -u`); working efficiently matters. Do not modify files outside the workspace, do not look for other trials or hidden verification data, and do not use subagents.
-"""
+{_renderers()}"""
     run_args = task.get("run_args", "--num-frames <N>")
     run = f"uv run --no-sync --project {ROOT} python {task['script']} --viewer null {run_args} {' '.join(task['host_args'])}"
     run = run.rstrip()

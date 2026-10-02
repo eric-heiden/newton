@@ -430,10 +430,36 @@ def warm(script: str, args: list[str]) -> None:
     cls(newton.viewer.ViewerNull(), parsed).step()
 
 
+def warm_solvers(script: str, variants: list[dict]) -> None:
+    """Step the starter with other SolverMuJoCo settings, so their kernels land in the seed too.
+
+    Which solver variants an agent happens to try (MuJoCo's own contacts compile for minutes) should not decide
+    its time; both conditions start from the same seed, so warming them keeps the comparison fair. Solver kernels
+    live in Newton's and MuJoCo Warp's modules, so the starter's module name does not matter here.
+    """
+    import newton  # noqa: PLC0415
+    from newton.mcp import ExampleHost  # noqa: PLC0415
+
+    host = ExampleHost(script, [])
+    host.build()
+    example = host.example
+    for options in variants:
+        example.solver = newton.solvers.SolverMuJoCo(example.model, **options)
+        if options.get("use_mujoco_contacts"):
+            example.collision_pipeline = None
+        if hasattr(example, "capture"):
+            example.capture()
+        example.step()
+
+
 if __name__ == "__main__":
     import sys
 
     if len(sys.argv) >= 3 and sys.argv[1] == "warm":
         warm(sys.argv[2], sys.argv[3:])
+    elif len(sys.argv) == 4 and sys.argv[1] == "warm-solvers":
+        warm_solvers(sys.argv[2], json.loads(sys.argv[3]))
     else:
-        raise SystemExit("usage: python -m tools.mcp_evaluation.v4.trial_isolation warm SCRIPT [ARGS...]")
+        raise SystemExit(
+            "usage: python -m tools.mcp_evaluation.v4.trial_isolation warm SCRIPT [ARGS...] | warm-solvers SCRIPT JSON"
+        )

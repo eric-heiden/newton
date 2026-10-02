@@ -199,6 +199,20 @@ Constraints (checked): appearance only. Materials, lights, world, and color mana
             "warmup": [
                 ["fruit_replay.py", "--viewer", "null", "--seconds", "0.034"],
                 ["-m", "tools.mcp_evaluation.v4.trial_isolation", "warm", "fruit_replay.py"],
+                # Solver variants agents try (both conditions get the same seed).
+                [
+                    "-m",
+                    "tools.mcp_evaluation.v4.trial_isolation",
+                    "warm-solvers",
+                    "fruit_replay.py",
+                    json.dumps(
+                        [
+                            {"cone": "elliptic"},
+                            {"use_mujoco_contacts": True},
+                            {"use_mujoco_contacts": True, "cone": "elliptic"},
+                        ]
+                    ),
+                ],
             ],
             "goal": """fruit_replay.py replays a real robot episode from the ABC-130k dataset (https://abc.bot) in Newton. At a bimanual station (two 6-DoF YAM arms with parallel grippers, filmed from above and from both wrists), a teleoperator picks up three fake fruits one after another, a pear and an orange with the left arm and a dark fruit with the right, and puts them into a wedge-shaped tray. episodes/main.npz holds the measured joint positions, velocities, and torques, the gripper openings, and the logged joint and gripper commands (about 30 Hz); scenes/main.json the station layout (arm bases, tray sector, and per fruit its size, start pose, grasping arm, and the video frames of the real grasp events); frames/main/ the recorded top and wrist videos and video_reference.npz the fruit positions tracked in them. episodes/, scenes/, gt/, and frames/ also hold four 10 fps episodes of the same station and fruits (sib_1 to sib_4), and arm_logs/ 64 recorded YAM arm logs (32 episodes of various tasks, both arms; measured joints, velocities, torques, and commands) for calibrating the arms. FORMAT.md describes the files, their clocks, and the fixed helpers in replay_common.py (Replay, score, check, rendering through the real cameras, contact_summary, StationFK). Each scene is one Newton world from build_model(scenes), driven open loop by the logged commands as joint position targets (replay_common.Replay) and stepped with make_solver(model) and make_pipeline(model). Problem: the starter keeps the ABC simulator's defaults, and none of the fruits is held: the grasps slip, so nothing is carried to the tray.
 
@@ -531,6 +545,7 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
         "private_reference": _mentions_private(workspace),
         "introspection": _introspection(workspace),
         "downloads": _downloads(run_dir / "agent.jsonl"),
+        "api_failure": api_failure(run_dir / "agent.jsonl"),
         **activity,
         "verification": verification,
         "success": bool(verification.get("success")) and not timed_out,
@@ -563,6 +578,32 @@ DOWNLOAD = re.compile(
     r"|\b(?:curl|wget)\b[^\n]*https?://|urllib\.request|requests\.get|git clone",
     re.IGNORECASE,
 )
+
+
+# API-side errors that end an agent's run (not the agent's doing): the trial is retried.
+API_FAILURE = re.compile(
+    r"capacity|overloaded|rate.?limit|too many requests|internal server error|service unavailable|\b(?:429|500|502|503|529)\b",
+    re.IGNORECASE,
+)
+
+
+def api_failure(transcript: Path) -> str | None:
+    """The API error that ended the agent's run (model at capacity, overloaded, rate limited), if any."""
+    if not transcript.exists():
+        return None
+    for line in reversed(transcript.read_text(errors="replace").splitlines()[-20:]):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "turn.failed":  # Codex
+            message = str((event.get("error") or {}).get("message"))
+        elif event.get("type") == "result" and event.get("is_error"):  # Claude Code
+            message = str(event.get("result"))
+        else:
+            continue
+        return message[:300] if API_FAILURE.search(message) else None
+    return None
 
 
 def _introspection(workspace: Path) -> list[str]:
@@ -691,8 +732,8 @@ def main() -> None:
         return
     summary = run_trial(prepared, args.barrier, args.parties)
     attempt = 1
-    while summary.get("mcp_available") is False and attempt < 3:
-        # The partner already ran, so a retry runs alone; analyses must treat retried pairs separately.
+    while (summary.get("mcp_available") is False or summary.get("api_failure")) and attempt < 3:
+        # Trials run one at a time (from h12), so a retry runs under the same conditions as its partner.
         run_dir.rename(run_dir.with_name(f"{run_dir.name}.infra-failure-{attempt}"))
         prepared = prepare(run_dir, args.task, args.condition, args.model, args.seconds, args.phase)
         summary = run_trial(prepared)

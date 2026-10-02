@@ -1,0 +1,1 @@
+Support lens distortion and non-square pixels in MCP `observe(backend='blender')` intrinsics by resampling a pinhole render through the calibrated camera's rays, so Blender images line up with the sensor backend's.

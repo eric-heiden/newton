@@ -21,7 +21,16 @@ import warp as wp
 
 import newton
 from newton._src.mcp.blender_bridge import find_blender as _blender_path
-from newton._src.mcp.observation import ObservationRenderer, _inverse_brown_conrady_rays, _project
+from newton._src.mcp.imaging import encode_png as _encode_png
+from newton._src.mcp.observation import (
+    ObservationRenderer,
+    _intrinsics,
+    _inverse_brown_conrady_rays,
+    _is_square_pinhole,
+    _pinhole_cover,
+    _project,
+    _sample_bilinear,
+)
 from newton._src.mcp.protocol import TOOLS
 from newton.mcp import SimulationSession
 from newton.solvers import SolverXPBD
@@ -29,6 +38,23 @@ from newton.solvers import SolverXPBD
 # Rotates a camera's local -Z (its viewing direction) onto world +Y, keeping +Z up.
 _LOOK_ALONG_Y = [float(v) for v in wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5 * math.pi)]
 _MAGENTA = (255, 0, 255)
+# A RealSense calibration at its full 848x480 stream size, as robot wrist cameras record.
+_REALSENSE_848 = {
+    "fx": 434.196,
+    "fy": 433.593,
+    "cx": 420.881,
+    "cy": 235.403,
+    "image_width": 848,
+    "image_height": 480,
+    "distortion_model": "inverse_brown_conrady",
+    "k1": -0.05299,
+    "k2": 0.05932,
+    "k3": -0.01946,
+    "p1": 0.00041,
+    "p2": 0.00046,
+}
+# Orientation of a ROS optical frame (+Z forward, +Y down) in the observation camera frame (-Z forward, +Y up).
+_OPTICAL = [1.0, 0.0, 0.0, 0.0]
 
 
 def _decode_png(result):
@@ -63,6 +89,91 @@ def _hit_centroid(image):
 
 def _has_color(image, color):
     return bool(np.all(np.asarray(image) == color, axis=-1).any())
+
+
+def _rotation(quaternion):
+    """Rotation matrix of an xyzw quaternion, computed without Warp."""
+    x, y, z, w = np.asarray(quaternion, dtype=np.float64) / np.linalg.norm(quaternion)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+def _mounted_pose(body_pose, offset):
+    """World position [m] and rotation matrix of a camera at ``offset`` in the frame of a body at ``body_pose``."""
+    body_pose, offset = np.asarray(body_pose, dtype=np.float64), np.asarray(offset, dtype=np.float64)
+    rotation = _rotation(body_pose[3:])
+    return body_pose[:3] + rotation @ offset[:3], rotation @ _rotation(offset[3:])
+
+
+def _matrix_quaternion(rotation):
+    """An xyzw quaternion of a proper rotation matrix (trace > -1)."""
+    w = 0.5 * math.sqrt(max(1.0 + np.trace(rotation), 0.0))
+    return [
+        (rotation[2, 1] - rotation[1, 2]) / (4 * w),
+        (rotation[0, 2] - rotation[2, 0]) / (4 * w),
+        (rotation[1, 0] - rotation[0, 1]) / (4 * w),
+        w,
+    ]
+
+
+# Undistorted normalized image coordinates (x right, y down) near the corners of an 848x480 RealSense image, where
+# its distortion moves points most, and at the center.
+_CORNERS = [(-0.85, -0.47), (0.85, -0.47), (-0.85, 0.47), (0.85, 0.47), (0.0, 0.0)]
+# Looks down from 1 m above the origin, so the corner spheres at z = 0.6 m sit 0.4 m in front of the camera.
+_CORNER_CAMERA = {"pose": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], "width": 848, "height": 480, "environment": False}
+
+
+def _corner_spheres():
+    """Small red spheres at :data:`_CORNERS` 0.4 m in front of :data:`_CORNER_CAMERA`."""
+    builder = newton.ModelBuilder()
+    for x, y in _CORNERS:
+        center = wp.vec3(0.4 * x, -0.4 * y, 0.6)
+        builder.add_shape_sphere(
+            -1, xform=wp.transform(center, wp.quat_identity()), radius=0.012, color=(0.9, 0.05, 0.05)
+        )
+    return builder.finalize(device="cpu")
+
+
+def _corner_centroids(mask):
+    """Centroids [px] of the corner spheres' silhouettes in a boolean image mask."""
+    ys, xs = np.nonzero(mask)
+    result = []
+    for x, y in _CORNERS:
+        near = (np.abs(xs - 424 - 434 * x) < 60) & (np.abs(ys - 240 - 434 * y) < 60)
+        result.append([xs[near].mean() + 0.5, ys[near].mean() + 0.5])
+    return np.array(result)
+
+
+def _red(image):
+    """Pixels redder than any gray or black background."""
+    image = np.asarray(image, dtype=int)
+    return image[..., 0] - np.maximum(image[..., 1], image[..., 2]) > 25
+
+
+# Blender look with flat red shapes on black, so silhouettes threshold at half coverage independent of lighting.
+_FLAT_BLENDER = """
+for obj in shape_objects:
+    for slot in obj.material_slots:
+        slot.material.use_nodes = True
+        tree = slot.material.node_tree
+        tree.nodes.clear()
+        emission = tree.nodes.new("ShaderNodeEmission")
+        emission.inputs["Color"].default_value = (1.0, 0.0, 0.0, 1.0)
+        tree.links.new(emission.outputs[0], tree.nodes.new("ShaderNodeOutputMaterial").inputs[0])
+for node in world.node_tree.nodes:
+    if node.type == "BACKGROUND":
+        node.inputs["Strength"].default_value = 0.0
+"""
+
+
+def _pinhole(intrinsics):
+    """The calibration without its lens distortion."""
+    return {key: intrinsics[key] for key in ("fx", "fy", "cx", "cy", "image_width", "image_height")}
 
 
 class TestMcpObservation(unittest.TestCase):
@@ -490,6 +601,72 @@ class TestMcpObservation(unittest.TestCase):
             np.testing.assert_allclose(red_center(blender), red_center(sensor), atol=1.0)
         self.assertEqual(session.blender("result = len(shape_objects)"), "1")
 
+    @unittest.skipUnless(_blender_path() is not None, "requires Blender (NEWTON_BLENDER or blender on PATH)")
+    def test_blender_backend_resamples_distorted_cameras(self):
+        """Blender renders of distorted and non-square-pixel cameras line up with the sensor's rays."""
+        model = _corner_spheres()
+        session = SimulationSession(model, model.state(), artifact_directory=Path(self.directory.name))
+        self.addCleanup(session.close)
+        session.blender(_FLAT_BLENDER)
+
+        def centroids(backend, intrinsics):
+            if backend == "sensor":
+                image = session.render(channel="shape_index", intrinsics=intrinsics, **_CORNER_CAMERA)
+                return _corner_centroids(image.any(axis=-1)), {}
+            image, metadata = session.render(
+                backend="blender", samples=4, intrinsics=intrinsics, metadata=True, **_CORNER_CAMERA
+            )
+            return _corner_centroids(image[..., 0] > 127), metadata
+
+        pinhole = _pinhole(_REALSENSE_848)
+        opencv = {**pinhole, "k1": -0.25, "k2": 0.08, "p1": 0.001, "p2": -0.0015}
+        for intrinsics in (_REALSENSE_848, opencv, pinhole):
+            with self.subTest(intrinsics=intrinsics):
+                blender, metadata = centroids("blender", intrinsics)
+                error = blender - centroids("sensor", intrinsics)[0]
+                self.assertLess(np.abs(error).max(), 0.35)
+                self.assertLess(np.abs(error.mean(axis=0)).max(), 0.15)
+                self.assertIn("pinhole render", metadata["lens"])
+        # Without the resampling, Blender's pinhole misses the distorted corners by several pixels.
+        undistorted = centroids("blender", pinhole)[0] - centroids("sensor", _REALSENSE_848)[0]
+        self.assertGreater(np.linalg.norm(undistorted, axis=1)[:4].min(), 3.0)
+        # Undistorted square-pixel cameras render directly.
+        self.assertNotIn("lens", centroids("blender", {**pinhole, "fx": pinhole["fy"]})[1])
+
+    def test_pinhole_cover_resamples_to_distorted_camera(self):
+        """A pinhole render covering a distorted camera's rays, resampled through them, matches that camera."""
+        model = _corner_spheres()
+        self.session.model, self.session.state = model, model.state()
+        pinhole = _pinhole(_REALSENSE_848)
+        opencv = {**pinhole, "k1": -0.25, "k2": 0.08, "p1": 0.001, "p2": -0.0015}
+        for camera in (_REALSENSE_848, opencv, pinhole):
+            with self.subTest(intrinsics=camera):
+                intrinsics = _intrinsics(camera, 848, 480)
+                self.assertFalse(_is_square_pinhole(intrinsics, 848, 480))
+                cover, coordinates = _pinhole_cover(848, 480, intrinsics, "cpu", ObservationRenderer.MAX_PIXELS)
+                self.assertEqual(coordinates.shape, (480, 848, 2))
+                self.assertEqual(cover["fx"], cover["fy"])
+                self.assertAlmostEqual(cover["fx"], intrinsics["fx"])
+                # The sensor stands in for a renderer without lens models.
+                size = {"width": int(cover["image_width"]), "height": int(cover["image_height"])}
+                wide = self.renderer.observe(intrinsics=cover, antialias=False, **{**_CORNER_CAMERA, **size})
+                resampled = _sample_bilinear(_decode_png(wide), coordinates)
+                direct = _decode_png(self.renderer.observe(intrinsics=camera, antialias=False, **_CORNER_CAMERA))
+                # Resampled silhouette edges move centroids by a few tenths of a pixel, but not systematically.
+                error = _corner_centroids(_red(resampled)) - _corner_centroids(_red(direct))
+                self.assertLess(np.abs(error).max(), 0.5)
+                self.assertLess(np.abs(error.mean(axis=0)).max(), 0.25)
+        self.assertTrue(_is_square_pinhole(_intrinsics({**pinhole, "fx": pinhole["fy"]}, 848, 480), 848, 480))
+        # Covering within a smaller budget lowers the pinhole's resolution, down to half; pixels without rays are black.
+        intrinsics = _intrinsics(_REALSENSE_848, 848, 480)
+        cover, _ = _pinhole_cover(848, 480, intrinsics, "cpu", 200_000)
+        self.assertLessEqual(cover["image_width"] * cover["image_height"], 200_000)
+        with self.assertRaisesRegex(ValueError, "too wide"):
+            _pinhole_cover(848, 480, intrinsics, "cpu", 50_000)
+        image = np.full((4, 4, 3), 200, dtype=np.uint8)
+        sampled = _sample_bilinear(image, np.array([[[2.0, 2.0], [np.nan, np.nan]]]))
+        np.testing.assert_array_equal(sampled, [[[200, 200, 200], [0, 0, 0]]])
+
     @unittest.skipUnless(
         importlib.util.find_spec("ovrtx") is not None and wp.is_cuda_available(), "requires ovrtx and CUDA"
     )
@@ -860,6 +1037,126 @@ class TestMcpObservation(unittest.TestCase):
         for frame in manifest["frames"]:
             self.assertEqual(frame["camera"]["mount"]["label"], "ball")
             np.testing.assert_allclose(frame["overlay"]["ball"], [20.0, 14.0], atol=0.05)
+
+    def test_mounted_realsense_camera_matches_its_rays(self):
+        """A body-mounted 848x480 RealSense camera takes its pose from the body and projects like its rays."""
+        builder = newton.ModelBuilder()
+        tilt = wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 0.4, 0.2)), 2.6)
+        body_pose = [0.3, -0.2, 0.9, *tilt]
+        builder.add_body(xform=wp.transform(*body_pose), label="arm/wrist_camera")
+        lens = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.2) * wp.quat(*_OPTICAL)
+        offset = [0.02, -0.01, 0.03, *lens]
+        position, rotation = _mounted_pose(body_pose, offset)
+        # Small spheres 0.4 m in front of the camera near the image corners and on the optical axis.
+        centers = [position + rotation @ (0.4 * np.array([x, -y, -1.0])) for x, y in _CORNERS]
+        spheres = [
+            builder.add_shape_sphere(-1, xform=wp.transform(c, wp.quat_identity()), radius=0.006) for c in centers
+        ]
+        model = builder.finalize(device="cpu")
+        self.session.model, self.session.state = model, model.state()
+        camera = {
+            "camera_body": "wrist_camera",
+            "camera_offset": offset,
+            "intrinsics": _REALSENSE_848,
+            "width": 848,
+            "height": 480,
+        }
+        overlay = {f"sphere{i}": center.tolist() for i, center in enumerate(centers)}
+        mounted = self.renderer.observe(channel="shape_index", raw=True, overlay=overlay, **camera)
+        self.assertEqual((mounted["width"], mounted["height"]), (848, 480))
+        pose = np.asarray(mounted["camera"]["pose"], dtype=np.float64)
+        np.testing.assert_allclose(pose[:3], position, atol=1.0e-6)
+        np.testing.assert_allclose(_rotation(pose[3:]), rotation, atol=1.0e-6)
+        self.assertEqual(mounted["camera"]["mount"]["label"], "arm/wrist_camera")
+        intrinsics = mounted["camera"]["intrinsics"]
+        self.assertEqual(intrinsics["distortion_model"], "inverse_brown_conrady")
+        # Points along every pixel's ray project back to that pixel's center.
+        directions = self.renderer._rays.numpy()[0, :, :, 1].reshape(-1, 3).astype(np.float64)
+        pixels, depth = _project(pose[:3] + 0.5 * directions @ _rotation(pose[3:]).T, pose, 848, 480, 0.0, intrinsics)
+        ys, xs = np.mgrid[0:480, 0:848]
+        np.testing.assert_allclose(pixels, np.stack([xs.ravel() + 0.5, ys.ravel() + 0.5], axis=-1), atol=1.0e-3)
+        self.assertTrue(np.all(depth > 0.0))
+        # Overlay rings sit on the rendered spheres, which the same camera without distortion would miss.
+        pinhole = _pinhole(intrinsics)
+        with np.load(mounted["raw_artifact"]) as artifact:
+            shape_index = artifact["shape_index"]
+        for i, shape in enumerate(spheres):
+            with self.subTest(sphere=i):
+                ys, xs = np.nonzero(shape_index == shape)
+                rendered = np.array([xs.mean() + 0.5, ys.mean() + 0.5])
+                marked = np.asarray(mounted["overlay"][f"sphere{i}"])
+                np.testing.assert_allclose(marked, rendered, atol=0.35)
+                if _CORNERS[i] != (0.0, 0.0):
+                    undistorted = _project(centers[i], pose, 848, 480, 0.0, pinhole)[0][0]
+                    self.assertGreater(np.linalg.norm(undistorted - rendered), 3.0)
+
+    def test_filmstrip_pages_mounted_realsense_camera_with_references(self):
+        """A filmstrip follows a falling, turning wrist camera at 848x480 and pages frames against references."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        # The body's +Z, the camera's optical axis, points down; the body falls and turns about the vertical.
+        down = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.pi)
+        wrist = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 1.2), down),
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3) * 0.01),
+            label="wrist",
+        )
+        builder.joint_qd[-6:] = [0.0, 0.0, 0.0, 0.0, 0.0, 1.5]
+        for x, y, color in ((0.0, 0.0, (0.9, 0.2, 0.1)), (0.25, 0.1, (0.1, 0.7, 0.2)), (-0.2, -0.15, (0.2, 0.3, 0.9))):
+            builder.add_shape_box(
+                -1, xform=wp.transform(wp.vec3(x, y, 0.05), wp.quat_identity()), hx=0.05, hy=0.05, hz=0.05, color=color
+            )
+        model = builder.finalize(device="cpu")
+        session = SimulationSession(model, SolverXPBD(model), dt=0.01, artifact_directory=self.directory.name)
+        self.addCleanup(session.close)
+        offset = [0.0, 0.0, 0.05, *_OPTICAL]
+        common = {"intrinsics": _REALSENSE_848, "antialias": False}
+        times = [round(0.05 * k, 2) for k in range(8)]
+        # References: renders from fixed poses composed from the simulated body pose at each time.
+        directory = Path(self.directory.name) / "wrist"
+        directory.mkdir()
+        poses = []
+        for index, t in enumerate(times):
+            while session.time < t - 0.005:
+                session.dispatch("step", {"count": 1})
+            position, rotation = _mounted_pose(session.state.body_q.numpy()[wrist], offset)
+            poses.append([*position, *_matrix_quaternion(rotation)])
+            frame = session.render(pose=poses[-1], width=848, height=480, **common)
+            (directory / f"{index:03d}.png").write_bytes(_encode_png(frame))
+        box = [0.25, 0.1, 0.1]
+        strip = session.dispatch(
+            "filmstrip",
+            {
+                "times": times,
+                "reset": True,
+                "references": str(directory),
+                "camera_body": "wrist",
+                "camera_offset": offset,
+                "overlay": {"box": box},
+                **common,
+            },
+        )
+        self.assertEqual(strip["times"], times)
+        # The mounted camera reproduces every fixed-pose reference.
+        for row in strip["mismatch"]:
+            self.assertLessEqual(row["mismatch_fraction"], 1.0e-4)
+        # Its markers follow the body: the projection through each time's composed pose, sweeping across the image.
+        intrinsics = _intrinsics(_REALSENSE_848, 848, 480)
+        expected = [_project(box, pose, 848, 480, 0.0, intrinsics)[0][0] for pose in poses]
+        # Reported pixels are rounded to 0.1 px.
+        np.testing.assert_allclose([row["pixels"]["box"] for row in strip["overlay"]], expected, atol=0.06)
+        self.assertGreater(np.linalg.norm(expected[-1] - expected[0]), 40.0)
+        # Eight 848x480 times with references fit two pages at half scale: 2 bands of 3 times, then 2 times.
+        self.assertEqual(strip["pages"], 2)
+        self.assertEqual(strip["thumbnail_scale"], 0.5)
+        self.assertIn("3 times per band, 2 bands per page", strip["layout"])
+        pages = [_decode_png(strip), *(_decode_png(page) for page in strip["images"])]
+        band = 3 * 240 + 2 * 4
+        self.assertEqual(pages[0].shape[:2], (2 * band + 12, 3 * 424 + 2 * 4))
+        self.assertEqual(pages[1].shape[:2], (band, 2 * 424 + 4))
+        for page in pages:
+            self.assertLessEqual(max(page.shape[:2]), ObservationRenderer.DISPLAY_EDGE)
 
     def test_tool_schemas_expose_mounted_cameras_and_overlays(self):
         """The structured observe, filmstrip, and record tools accept camera_body, camera_offset, and intrinsics."""

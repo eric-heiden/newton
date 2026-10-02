@@ -324,6 +324,8 @@ class TestMcpContactsBetween(unittest.TestCase):
             session, mass = self._session(use_mujoco_contacts)
             resting = session.rollout(seconds=0.5, record={"box": lambda s=session: s.contacts_between("box")})
             self.assertAlmostEqual(resting["box.normal_force"][-1], 9.81 * mass, delta=0.02 * 9.81 * mass)
+            # The same series is reachable through the probe's name.
+            self.assertIs(resting["box"]["normal_force"], resting["box.normal_force"])
             self.assertGreater(resting["box.touching"][-1], 0)
             self.assertLess(resting["box.slip_max"][-1], 1.0e-3)
             joint_qd = session.state.joint_qd.numpy()

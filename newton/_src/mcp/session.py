@@ -1433,7 +1433,8 @@ class SimulationSession:
             record: Series to sample, as ``name: callable`` (taking no arguments or
                 the session) or a Python expression evaluated in the workspace
                 (``"state.body_q.numpy()[3, 2]"``). A probe that returns a dictionary
-                records one series per numeric key, named ``name.key``.
+                records one series per numeric key, named ``name.key`` and also
+                available as ``result[name][key]``.
             every: Sample every ``every`` steps (the final step is always sampled).
             start: ``True`` resets to the initial state, a string restores that
                 checkpoint, ``False`` continues from the current state.
@@ -1495,11 +1496,15 @@ class SimulationSession:
         result = {"t": np.asarray(times)}
         for name, values in series.items():
             if values and isinstance(values[0], dict):
-                # Dictionary probes become one series per numeric key, e.g. "grip.normal_force".
+                # Dictionary probes become one series per numeric key, e.g. "grip.normal_force", also reachable as
+                # result["grip"]["normal_force"].
+                nested = {}
                 for key in values[0]:
                     column = [v.get(key) for v in values]
                     if all(isinstance(x, (int, float, np.number)) or x is None for x in column):
-                        result[f"{name}.{key}"] = np.asarray([np.nan if x is None else x for x in column], dtype=float)
+                        nested[key] = np.asarray([np.nan if x is None else x for x in column], dtype=float)
+                        result[f"{name}.{key}"] = nested[key]
+                result[name] = nested
             else:
                 result[name] = np.stack(values)
         result.update(frames=index + 1, stopped=stopped)

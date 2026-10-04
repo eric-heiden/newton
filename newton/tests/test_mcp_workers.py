@@ -113,17 +113,17 @@ class TestMcpWorkers(unittest.TestCase):
         )
         self.assertEqual(result["result"], [1, 1])
         started = time.perf_counter()
-        result = self.execute("workers.map('result = slow(args)', [1, 2, 3, 4])")
+        result = self.execute("workers.map('slow(args)', [1, 2, 3, 4])")
         elapsed = time.perf_counter() - started
         self.assertEqual(result["result"], [1, 4, 9, 16])
         # Four 0.4 s jobs on two workers take about 0.8 s, not 1.6 s.
         self.assertLess(elapsed, 1.4)
-        result = self.execute("workers.map('result = 1 / args', [1, 0, 2])")
+        result = self.execute("workers.map('1 / args', [1, 0, 2])")
         self.assertEqual(result["result"][0], 1)
         self.assertIn("ZeroDivisionError", result["result"][1]["error"])
         self.assertEqual(result["result"][2], 0.5)
         # The failed job did not block its worker.
-        self.assertEqual(self.execute("workers.map('result = args + 1', [1, 2, 3])")["result"], [2, 3, 4])
+        self.assertEqual(self.execute("workers.map('args + 1', [1, 2, 3])")["result"], [2, 3, 4])
 
     def test_functions_ship_by_source_with_helpers_and_globals(self):
         """Send cell functions, lambdas, and closures with the helpers and globals they read."""
@@ -217,7 +217,7 @@ class TestMcpWorkers(unittest.TestCase):
         """Start jobs that return at once, list finished ones in the next response, and collect results."""
         self.execute("import time\ndef slow(x):\n    time.sleep(0.3)\n    return x * 2")
         started = time.perf_counter()
-        result = self.execute("[jobs.start(slow, 1), jobs.start(slow, 2), jobs.start('result = 1 / args', 0)]")
+        result = self.execute("[jobs.start(slow, 1), jobs.start(slow, 2), jobs.start('1 / args', 0)]")
         self.assertLess(time.perf_counter() - started, 0.25)
         self.assertEqual(result["result"], [1, 2, 3])
         unfinished = result["jobs"].get("running", []) + result["jobs"].get("queued", [])
@@ -288,7 +288,7 @@ class TestMcpLaunchedWorkers(unittest.TestCase):
         self.execute("workers.broadcast('helper_value = 41')\nworkers.sync(TARGET=np.arange(3))")
         self.script.write_text(_SCRIPT.replace("self.speed = 1.0", "self.speed = 3.0"))
         rebuilt = self.session.dispatch("rebuild", {})
-        self.assertEqual(rebuilt["workers_rebuilt"]["rebuilt"], 1)
+        self.assertEqual(rebuilt["workers_rebuild"], {"build": 1, "pending": [0]})
         self.assertEqual(self.execute("workers.map(speed, [0])")["result"], [3.0])
         first_pid = self.pool.status()[0]["pid"]
         with self.assertRaisesRegex(RuntimeError, "exited with code 3"):
@@ -315,7 +315,7 @@ class TestMcpLaunchedWorkers(unittest.TestCase):
         """Workers rebuild with the session's overrides, and restarted or added workers start with them."""
         self.script.write_text("SPEED = 1.0\n" + _SCRIPT.replace("self.speed = 1.0", "self.speed = SPEED"))
         rebuilt = self.session.dispatch("rebuild", {"overrides": {"SPEED": 5.0}})
-        self.assertEqual(rebuilt["workers_rebuilt"]["rebuilt"], 1)
+        self.assertEqual(rebuilt["workers_rebuild"]["pending"], [0])
         self.assertEqual(rebuilt["overrides"], {"SPEED": 5.0})
         self.execute("def speed(_):\n    return example.speed")
         self.assertEqual(self.execute("workers.map(speed, [0])")["result"], [5.0])
@@ -344,21 +344,30 @@ class TestMcpLaunchedWorkers(unittest.TestCase):
         self.assertRegex(result["workers"][0], r"worker 0 CUDA context failed during broadcast code .*restarted")
         self.assertFalse(_alive(pid))
 
-    def test_rebuild_does_not_wait_for_busy_workers_and_jobs_report_their_build(self):
-        """Return from a rebuild while a job runs, and tag every job with the build its worker had."""
+    def test_rebuild_does_not_wait_for_workers_and_jobs_report_their_build(self):
+        """Return from rebuilds while a job runs, merge the queued worker rebuilds, and tag jobs with their build."""
         self.script.write_text("SPEED = 1.0\n" + _SCRIPT.replace("self.speed = 1.0", "self.speed = SPEED"))
-        self.session.dispatch("rebuild", {})
-        self.execute("import time\ndef job(seconds):\n    time.sleep(seconds)\n    return example.speed")
-        self.execute("first = jobs.start(job, 6.0)\nqueued = jobs.start(job, 0.0)\ntime.sleep(0.5)")
         started = time.perf_counter()
-        rebuilt = self.session.dispatch("rebuild", {"overrides": {"SPEED": 7.0}})["workers_rebuilt"]
+        # An idle worker rebuilds in the background too.
+        self.assertEqual(self.session.dispatch("rebuild", {})["workers_rebuild"], {"build": 1, "pending": [0]})
         self.assertLess(time.perf_counter() - started, 4.0)
-        self.assertEqual((rebuilt["build"], rebuilt["rebuilt"], rebuilt["pending"]), (2, 0, [0]))
-        response = self.execute("jobs.wait(timeout=60, any=False)")
+        self.execute("import time\ndef job(seconds):\n    time.sleep(seconds)\n    return example.speed")
+        self.execute(
+            "first = jobs.start(job, 6.0)\nwhile jobs.status()[0]['status'] != 'running':\n    time.sleep(0.05)"
+        )
+        started = time.perf_counter()
+        rebuilt = self.session.dispatch("rebuild", {"overrides": {"SPEED": 7.0}})["workers_rebuild"]
+        self.assertEqual(rebuilt, {"build": 2, "pending": [0]})
+        rebuilt = self.session.dispatch("rebuild", {})["workers_rebuild"]
+        self.assertLess(time.perf_counter() - started, 4.0)
+        self.assertEqual(rebuilt, {"build": 3, "pending": [0]})
+        # The second rebuild replaced the first one still queued behind the running job.
+        self.assertEqual([task.label for task in self.pool._workers[0].private], ["rebuild"])
+        response = self.execute("queued = jobs.start(job, 0.0)\njobs.wait(timeout=60, any=False)")
         finished = response["result"]["finished"]
-        self.assertEqual([(entry["result"], entry["build"]) for entry in finished], [(1.0, 1), (7.0, 2)])
-        self.assertRegex(response["workers"][0], r"worker 0 rebuilt .* after the rebuild request \(it was busy\)")
-        self.assertEqual(self.pool.status()[0]["build"], 2)
+        self.assertEqual([(entry["result"], entry["build"]) for entry in finished], [(1.0, 1), (7.0, 3)])
+        self.assertNotIn("workers", response)
+        self.assertEqual(self.pool.status()[0]["build"], 3)
 
     def test_job_progress_lines(self):
         """Return the lines a running job printed so far, then its result."""
@@ -373,6 +382,54 @@ class TestMcpLaunchedWorkers(unittest.TestCase):
         result = self.execute("jobs.wait(timeout=10)")["result"]
         self.assertEqual(result["finished"][0]["result"], 6)
         self.assertEqual(early + result["finished"][0]["lines"], [f"step {i}" for i in range(6)])
+
+
+class TestMcpLazyWorkers(unittest.TestCase):
+    """A pool whose worker processes start on first use, as ``python -m newton.mcp host --workers`` creates."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.script = Path(self.directory.name) / "tiny.py"
+        self.script.write_text("SPEED = 1.0\n" + _SCRIPT.replace("self.speed = 1.0", "self.speed = SPEED"))
+        self.pool = WorkerPool.launch(
+            self.script, [], count=2, max_count=3, directory=self.directory.name, name="session", lazy=True
+        )
+        self.addCleanup(self.pool.close)
+        self.session = ExampleHost(self.script).session(artifact_directory=self.directory.name, workers=self.pool)
+        self.addCleanup(self.session.close)
+
+    def execute(self, code):
+        return self.session.dispatch("execute", {"code": code})
+
+    def test_workers_start_on_first_use_with_the_latest_rebuild(self):
+        """Start no process until a worker is needed; rebuilds before that only record their arguments.
+
+        i15: idle workers of all four MCP trials were started at launch and rebuilt on every
+        newton_rebuild (118.7 s of rebuild time), although no trial used them.
+        """
+        self.assertFalse(self.pool.started)
+        self.assertEqual(
+            [(row["state"], row["pid"]) for row in self.execute("workers.status()")["result"]],
+            [("not started", None)] * 2,
+        )
+        self.assertEqual(self.session.dispatch("describe")["capabilities"]["workers"], 2)
+        self.assertEqual(list(Path(self.directory.name).glob("session.worker-*")), [])
+        result = self.session.dispatch("rebuild", {"overrides": {"SPEED": 4.0}})
+        self.assertNotIn("workers_rebuild", result)
+        self.assertFalse(self.pool.started)
+        result = self.execute("sorted(workers.map(lambda _: example.speed, range(4)))")
+        self.assertEqual(result["result"], [4.0] * 4)
+        self.assertTrue(self.pool.started)
+        # One worker may have run all four calls while the other was still starting.
+        self.assertEqual({row["state"] for row in self.pool.wait_ready(120)}, {"ready"})
+        self.assertEqual({row["build"] for row in self.pool.status()}, {1})
+
+    def test_resize_before_first_use_starts_only_the_requested_workers(self):
+        """Shrink a pool that has not started without starting the removed workers."""
+        self.assertEqual(self.execute("workers.resize(1)['count']")["result"], 1)
+        self.assertEqual([row["state"] for row in self.pool.status()], ["ready"])
+        self.assertEqual(len(list(Path(self.directory.name).glob("session.worker-*.ready"))), 1)
 
 
 class TestMcpShipping(unittest.TestCase):
@@ -427,6 +484,10 @@ class TestMcpHostWorkers(unittest.TestCase):
                     time.sleep(0.1)
                 self.assertTrue(ready.exists())
                 client = SimulationClient(connection, timeout=60)
+                # Worker processes start on first use.
+                status = client.request("execute", code="workers.status()")["result"]
+                self.assertEqual([row["state"] for row in status], ["not started"])
+                self.assertFalse((Path(directory) / "session.worker-0.json").exists())
                 result = client.request("execute", code="(workers.map(lambda x: x + 1, [1, 2]), workers.status())")
                 values, status = result["result"]
                 self.assertEqual(values, [2, 3])

@@ -86,8 +86,7 @@ class JobQueue:
     execution continues. Nothing here runs on, or touches, the calling
     session's simulation. Jobs that finished since the previous report are
     listed by :meth:`report`, which a session adds to its next execution
-    response. Other places to run a job (``where="fresh"`` for a new process
-    from the script on disk, for example) are added by the embedding
+    response. Other places to run a job are added by the embedding
     application with :meth:`register_backend`.
 
     Args:
@@ -109,7 +108,7 @@ class JobQueue:
         """Add a place to run jobs, selected by ``start(..., where=where)``.
 
         Args:
-            where: Backend name, e.g. ``"fresh"``.
+            where: Backend name, e.g. ``"cluster"``.
             launch: ``launch(function, args, kwargs, progress)`` starts the call and returns a
                 :class:`~concurrent.futures.Future` whose result is the call's value (or raises).
                 ``function`` is a callable or a code string; ``progress`` is a file that should

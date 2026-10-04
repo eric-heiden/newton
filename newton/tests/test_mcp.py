@@ -300,7 +300,7 @@ class TestMcp(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.session.dispatch("execute", {"code": "result = 1"})
         self.session.allow_execute = True
-        result = self.session.dispatch("execute", {"code": "print('x' * 50000); result = {'frame': session.frame}"})
+        result = self.session.dispatch("execute", {"code": "print('x' * 50000); {'frame': session.frame}"})
         self.assertEqual(len(result["stdout"]), 16384)
         self.assertTrue(result["truncated"])
         self.assertEqual(result["result"], {"frame": 0})
@@ -310,12 +310,13 @@ class TestMcp(unittest.TestCase):
         np.testing.assert_array_equal(self.session.model.gravity.numpy(), gravity)
         self.assertEqual(self.session.dispatch("reset")["frame"], 0)
 
-    def test_result_encoding_failure_preserves_completed_execution(self):
-        """Keep completed Python mutations valid when their result exceeds the output budget."""
+    def test_oversized_result_is_summarized_after_completed_execution(self):
+        """Keep completed Python mutations and summarize a value that exceeds the output budget."""
         self.session.allow_execute = True
         revision = self.session.revision
-        with self.assertRaisesRegex(RuntimeError, "Python completed"):
-            self.session.dispatch("execute", {"code": "model.gravity.zero_(); result = list(range(30000))"})
+        result = self.session.dispatch("execute", {"code": "model.gravity.zero_(); list(range(30000))"})
+        self.assertIsNone(result["result"])
+        self.assertIn("length=30000", result["result_repr"])
         self.assertTrue(self.session.valid)
         self.assertEqual(self.session.revision, revision + 1)
         np.testing.assert_array_equal(self.session.model.gravity.numpy(), 0)
@@ -439,9 +440,7 @@ class TestMcp(unittest.TestCase):
                 )
                 description = await client.call_tool("newton_describe", {})
                 self.assertIn("step", _payload(description)["operations"])
-                result = await client.call_tool(
-                    "newton_execute", {"code": "result = session.dispatch('step', {'count': 2})"}
-                )
+                result = await client.call_tool("newton_execute", {"code": "session.dispatch('step', {'count': 2})"})
                 self.assertFalse(result.isError)
                 self.assertEqual(_payload(result)["result"]["frame"], 2)
                 with self.assertRaises(McpError):

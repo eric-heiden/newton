@@ -183,7 +183,7 @@ class TestMcpModelWatch(unittest.TestCase):
                 self.assertEqual(self.gain(session), 80.0)
 
     def test_report_mode_and_covered_notifications(self):
-        """Report without notifying, and say when the cell's own notify_model_changed covered an edit."""
+        """Report without notifying, and stay silent when the cell's own notify_model_changed covered an edit."""
         session = self.make("cpu")
         session.watch.mode = "report"
         result = session.dispatch("execute", {"code": "model.joint_target_ke.fill_(70.0)"})
@@ -192,8 +192,8 @@ class TestMcpModelWatch(unittest.TestCase):
         session.watch.mode = "notify"
         code = "model.joint_target_ke.fill_(60.0)\nsolver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)"
         result = session.dispatch("execute", {"code": code})
-        self.assertIn("Covered by notify_model_changed (JOINT_DOF_PROPERTIES)", result["note"])
-        self.assertNotIn("host called", result["note"])
+        self.assertNotIn("note", result)
+        self.assertEqual(self.gain(session), 60.0)
         self.assertNotIn("note", session.dispatch("execute", {"code": "x = 1"}))
 
     def test_wrong_flag_is_reported_and_completed(self):
@@ -224,11 +224,9 @@ class TestMcpModelWatch(unittest.TestCase):
         )
         note = session.dispatch("execute", {"code": code})["note"]
         self.assertIn("a call on a SolverMuJoCo that is not the session's solver", note)
-        self.assertNotIn("Covered by", note)
         self.assertTrue(all(row["damping"] == 7.0 for row in session.solver_params("joint")["rows"]))
         code = f"model.joint_damping.fill_(9.0)\nsolver.notify_model_changed({flag})\nrollout(1)"
-        note = session.dispatch("execute", {"code": code})["note"]
-        self.assertIn("Covered by notify_model_changed (JOINT_DOF_PROPERTIES)", note)
+        self.assertNotIn("note", session.dispatch("execute", {"code": code}))
 
     def test_gain_edits_on_a_solver_without_actuators_are_stated(self):
         """State that joint target gains drive nothing when the MuJoCo model has no actuators."""
@@ -302,10 +300,8 @@ class TestMcpModelWatch(unittest.TestCase):
         self.addCleanup(session.close)
         note = session.dispatch("execute", {"code": "model.shape_material_mu.fill_(0.3)\nr = rollout(1)"})["note"]
         self.assertIn("newton.ModelFlags.SHAPE_PROPERTIES", note)
-        note = session.dispatch("execute", {"code": "model.body_mass.fill_(2.0)\nsolver.notify_model_changed(8)"})[
-            "note"
-        ]
-        self.assertIn("Covered by notify_model_changed (BODY_INERTIAL_PROPERTIES)", note)
+        result = session.dispatch("execute", {"code": "model.body_mass.fill_(2.0)\nsolver.notify_model_changed(8)"})
+        self.assertNotIn("note", result)
 
 
 _HOSTED_SCRIPT = textwrap.dedent(
@@ -395,7 +391,7 @@ class TestMcpHostedStepChecks(unittest.TestCase):
         self.assertNotIn("note", self.execute("for _ in range(3):\n    example.step()"))
         self.assertNotIn("note", self.execute("session.dispatch('step', {'count': 3})"))
         note = self.execute("model.body_mass.fill_(2.0)\nexample.step()")["note"]
-        self.assertIn("Model edits before example.step(): model.body_mass", note)
+        self.assertIn("model.body_mass [1 rows] changed before example.step(); no notify_model_changed call", note)
         self.assertNotIn("gravity", note)
 
     def test_stepping_checks_skip_settings_comparison_and_leave_checksums_unread(self):
@@ -434,7 +430,7 @@ class TestMcpHostedModelWatch(unittest.TestCase):
                 model.joint_target_ke.fill_(ke)
                 rollout(10, start=True)
                 angles[ke] = float(state.joint_q.numpy()[0])
-            result = angles
+            angles
             """
         )
         result = session.dispatch("execute", {"code": code})

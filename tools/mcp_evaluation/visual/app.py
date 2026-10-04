@@ -21,7 +21,7 @@ def worker_guide(count: int) -> str:
     return f"""
 Parallel workers: `workers` is a pool of {count} more copies of this application, each with its own `task` scene and persistent Python state. Use them to evaluate candidates concurrently:
 workers.broadcast("def evaluate(p):\\n    task.set_params(p)\\n    ...\\n    return loss")  # define helpers on every worker once
-losses = workers.map("result = evaluate(args)", [params_1, params_2, ...])  # runs in parallel, results in order
+losses = workers.map("evaluate(args)", [params_1, params_2, ...])  # runs in parallel, results in order
 workers.submit(code, args) returns a future. Worker results must be JSON data; failed jobs return {{"error": ...}}."""
 
 

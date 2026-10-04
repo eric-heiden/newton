@@ -97,7 +97,7 @@ def main() -> None:
                 restart_seconds = time.perf_counter() - before
                 (args.output / f"restart-{index}.log").write_text(baseline.stdout + baseline.stderr)
                 baseline_result = json.loads((args.output / "metrics.json").read_text())
-                code = f"session.scenario.apply_config({config!r})\nsession.dispatch('reset')\nsession.dispatch('step', {{'count': 1500}})\nresult = session.scenario.metrics()"
+                code = f"session.scenario.apply_config({config!r})\nsession.dispatch('reset')\nsession.dispatch('step', {{'count': 1500}})\nsession.scenario.metrics()"
                 before = time.perf_counter()
                 live_response = client.request("execute", code=code)
                 live_seconds = time.perf_counter() - before

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Write live results back into a hosted script, and report model edits since the last build.
+"""Write live results back into a hosted script.
 
 Trusted-execution cells are ``exec``'d strings, so their source lives only in
 :mod:`linecache`. This module also gives classes defined in a cell a per-cell
@@ -12,9 +12,7 @@ from __future__ import annotations
 
 import ast
 import builtins
-import collections
 import difflib
-import hashlib
 import inspect
 import io
 import itertools
@@ -27,7 +25,6 @@ import symtable
 import sys
 import time
 import tokenize
-import weakref
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
@@ -35,9 +32,6 @@ from typing import Any
 
 import numpy as np
 import warp as wp
-
-from ..sim.enums import ModelFlags
-from ..sim.model import Model
 
 MISSING = object()
 """Sentinel for an omitted ``persist`` value."""
@@ -526,8 +520,8 @@ def _commit(
         raise RuntimeError(f"Wrote {script.path}{where}, but rebuilding it failed: {error}") from error
     result["rebuilt"] = True
     result["rebuild_seconds"] = round(time.perf_counter() - started, 3)
-    if "workers_rebuilt" in rebuilt:
-        result["workers_rebuilt"] = rebuilt["workers_rebuilt"]
+    if "workers_rebuild" in rebuilt:
+        result["workers_rebuild"] = rebuilt["workers_rebuild"]
     if check is not None:
         rebuilt = _evaluate(session, check)
         reproduced, difference = _compare(live, rebuilt, tolerance)
@@ -837,233 +831,3 @@ def persist_source(
         if elsewhere:
             details["methods_from_other_cells"] = elsewhere
     return _commit(session, script, text, rebuild=rebuild, check=check, tolerance=tolerance, result=details)
-
-
-# ---------------------------------------------------------------------------
-# diff_model
-
-
-_DOCUMENTED_FLAGS: dict[str, ModelFlags] = {
-    # Fields listed in the ModelFlags docstrings that the model-edit checks do not watch.
-    **dict.fromkeys(("joint_q", "joint_X_p", "joint_X_c"), ModelFlags.JOINT_PROPERTIES),
-    **dict.fromkeys(("body_q", "body_qd", "body_flags"), ModelFlags.BODY_PROPERTIES),
-    **dict.fromkeys(
-        ("body_com", "body_inertia", "body_inv_inertia", "body_mass", "body_inv_mass"),
-        ModelFlags.BODY_INERTIAL_PROPERTIES,
-    ),
-    **dict.fromkeys(("shape_transform", "shape_scale", "shape_collision_radius"), ModelFlags.SHAPE_PROPERTIES),
-    **dict.fromkeys(
-        (
-            "mujoco.equality_constraint_anchor",
-            "mujoco.equality_constraint_relpose",
-            "mujoco.equality_constraint_polycoef",
-            "mujoco.equality_constraint_torquescale",
-            "mujoco.equality_constraint_enabled",
-            "mujoco.eq_solref",
-            "mujoco.eq_solimp",
-            "joint_mimic_coeffs",
-            "constraint_mimic_coef0",
-            "constraint_mimic_coef1",
-            "constraint_mimic_enabled",
-        ),
-        ModelFlags.CONSTRAINT_PROPERTIES,
-    ),
-}
-
-_BASELINE_BYTES = 128 * 1024 * 1024
-
-
-def _model_values(model: Model) -> tuple[dict[str, wp.array], dict[str, Any]]:
-    arrays, scalars = {}, {}
-    for name, value in vars(model).items():
-        if name.startswith("_"):
-            continue
-        if isinstance(value, wp.array):
-            arrays[name] = value
-        elif type(value) in (int, float, bool):
-            scalars[name] = value
-        elif isinstance(value, Model.AttributeNamespace):
-            for child, item in vars(value).items():
-                if child.startswith("_"):
-                    continue
-                if isinstance(item, wp.array):
-                    arrays[f"{name}.{child}"] = item
-                elif type(item) in (int, float, bool):
-                    scalars[f"{name}.{child}"] = item
-    return arrays, scalars
-
-
-def _host(array: wp.array) -> np.ndarray:
-    data = array.numpy()
-    # CPU arrays return a view of live memory.
-    return data.copy() if array.device.is_cpu else data
-
-
-class ModelBaseline:
-    """Host copies of a model's public arrays and scalars; arrays beyond a byte budget keep only a digest."""
-
-    def __init__(self, model: Model):
-        self.model = weakref.ref(model)
-        arrays, self.scalars = _model_values(model)
-        self.arrays = {}
-        total = 0
-        for name, array in sorted(arrays.items(), key=lambda item: item[1].capacity):
-            data = _host(array)
-            total += data.nbytes
-            digest = None
-            if total > _BASELINE_BYTES:
-                digest, data = hashlib.blake2b(np.ascontiguousarray(data), digest_size=16).digest(), None
-            self.arrays[name] = (weakref.ref(array), tuple(array.shape), str(array.dtype), data, digest)
-
-
-def _frequency(model: Model, name: str, rows: int) -> Any:
-    if name == "gravity":
-        return Model.AttributeFrequency.WORLD
-    try:
-        frequency = model.get_attribute_frequency(name.replace(".", ":", 1))
-    except KeyError:
-        return None
-    try:
-        count = model._attribute_frequency_count(frequency)
-    except (KeyError, ValueError, AttributeError):
-        return None
-    return frequency if count == rows else None
-
-
-def _row_keys(model: Model, frequency: Any, rows: np.ndarray) -> list[str]:
-    """Entity labels for array rows, suffixed with ``@world`` in multi-world models."""
-    name = getattr(frequency, "name", frequency)
-    labels = worlds = None
-    if name in ("BODY", "SHAPE", "JOINT", "ARTICULATION"):
-        labels = getattr(model, f"{name.lower()}_label", None)
-        worlds = getattr(model, f"{name.lower()}_world", None)
-        names = [None if labels is None or row >= len(labels) else labels[row] for row in rows]
-    elif name in ("JOINT_DOF", "JOINT_COORD"):
-        starts = (model.joint_qd_start if name == "JOINT_DOF" else model.joint_q_start).numpy()
-        joints = np.searchsorted(starts, rows, side="right") - 1
-        worlds = model.joint_world.numpy()[joints]
-        names = []
-        for row, joint in zip(rows, joints, strict=True):
-            label = model.joint_label[joint] if joint < len(model.joint_label) else f"joint {joint}"
-            width = starts[joint + 1] - starts[joint] if joint + 1 < len(starts) else 1
-            names.append(label if width == 1 else f"{label}[{row - starts[joint]}]")
-        worlds = list(worlds)
-        return _keys(model, rows, names, worlds)
-    elif name == "WORLD":
-        names = ["global" if row == model.world_count else f"world {row}" for row in rows]
-        return _keys(model, rows, names, None)
-    elif isinstance(name, str) and ":" in name:
-        namespace, kind = name.split(":", 1)
-        container = getattr(model, namespace, None)
-        labels = getattr(container, f"{kind}_label", None)
-        worlds = getattr(container, f"{kind}_world", None)
-        names = [None if not isinstance(labels, list) or row >= len(labels) else labels[row] for row in rows]
-    else:
-        names = [None] * len(rows)
-    if isinstance(worlds, wp.array):
-        worlds = worlds.numpy()
-        worlds = [int(worlds[row]) if row < len(worlds) else None for row in rows]
-    else:
-        worlds = None
-    return _keys(model, rows, names, worlds)
-
-
-def _keys(model: Model, rows: np.ndarray, names: list, worlds: list | None) -> list[str]:
-    keys = []
-    for index, row in enumerate(rows):
-        key = names[index] if names[index] else f"#{row}"
-        if model.world_count > 1 and worlds is not None and worlds[index] is not None:
-            key += "@global" if worlds[index] < 0 else f"@{worlds[index]}"
-        keys.append(key)
-    seen = collections.Counter(keys)
-    return [key if seen[key] == 1 else f"{key}#{row}" for key, row in zip(keys, rows, strict=True)]
-
-
-def _row(value: Any) -> Any:
-    try:
-        return _plain(value)
-    except (TypeError, ValueError):
-        return f"<{np.asarray(value).dtype} array shape={list(np.shape(value))}>"
-
-
-def _flag(name: str) -> ModelFlags | None:
-    from .solverview import FIELD_FLAGS  # noqa: PLC0415
-
-    # The model-edit checks' table, plus state-like fields the ModelFlags docstrings name.
-    return FIELD_FLAGS.get(name, _DOCUMENTED_FLAGS.get(name))
-
-
-def diff_model(session: Any, since: str = "build", *, limit: int = 16) -> dict:
-    """Implementation of :meth:`SimulationSession.diff_model`."""
-    if since not in ("build", "last"):
-        raise ValueError("since must be 'build' or 'last'")
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= 4096:
-        raise ValueError("limit must be an integer in [0, 4096]")
-    baselines = session._model_baselines
-    used = "last" if since == "last" and "last" in baselines else "build"
-    baseline = baselines.get(used)
-    if baseline is None:
-        raise ValueError(f"No model baseline was recorded at build time ({baselines.get('error', 'unavailable')})")
-    model = session.model
-    arrays, scalars = _model_values(model)
-    fields, flags, unflagged = {}, 0, []
-    for name, array in arrays.items():
-        entry = baseline.arrays.get(name)
-        if entry is None:
-            fields[name] = {"added": True, "shape": list(array.shape)}
-            continue
-        reference, shape, dtype, old, digest = entry
-        report = {}
-        if reference() is not array:
-            report["replaced"] = True
-        if tuple(array.shape) != shape or str(array.dtype) != dtype:
-            report.update(shape=[list(shape), list(array.shape)], dtype=[dtype, str(array.dtype)])
-        elif old is None:
-            current = hashlib.blake2b(np.ascontiguousarray(array.numpy()), digest_size=16).digest()
-            if current != digest:
-                report["changed"] = "yes (array beyond the baseline budget; rows were not compared)"
-        else:
-            new = array.numpy()
-            different = old != new
-            if old.dtype.kind in "fc":
-                different &= ~(np.isnan(old) & np.isnan(new))
-            rows = np.flatnonzero(different.reshape(len(old), -1).any(axis=1)) if old.size else np.zeros(0, int)
-            if rows.size:
-                report["changed_rows"] = int(rows.size)
-                report["rows"] = len(old)
-                shown = rows[:limit]
-                frequency = _frequency(model, name, len(old))
-                keys = _row_keys(model, frequency, shown) if frequency is not None else [f"#{r}" for r in shown]
-                report["values"] = {key: [_row(old[row]), _row(new[row])] for key, row in zip(keys, shown, strict=True)}
-        if not report:
-            continue
-        flag = _flag(name)
-        report["flag"] = flag.name if flag is not None else None
-        if flag is not None:
-            flags |= int(flag)
-        else:
-            unflagged.append(name)
-        fields[name] = report
-    for name in baseline.arrays.keys() - arrays.keys():
-        fields[name] = {"removed": True}
-    for name, value in scalars.items():
-        old = baseline.scalars.get(name, MISSING)
-        if old is MISSING or old != value or type(old) is not type(value):
-            flag = _flag(name)
-            fields[name] = {"values": [None if old is MISSING else old, value], "flag": flag.name if flag else None}
-            if flag is not None:
-                flags |= int(flag)
-            else:
-                unflagged.append(name)
-    baselines["last"] = ModelBaseline(model)
-    result = {
-        "since": used,
-        "fields": dict(sorted(fields.items())),
-        "flags": [flag.name for flag in ModelFlags if flag != ModelFlags.ALL and flags & int(flag)],
-        "flags_value": flags,
-    }
-    if baseline.model() is not model:
-        result["model_replaced"] = True
-    if unflagged:
-        result["fields_without_flag"] = sorted(unflagged)
-    return result

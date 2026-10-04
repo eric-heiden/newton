@@ -68,14 +68,16 @@ class TestMcpExecutor(unittest.TestCase):
         self.assertTrue(result["result"][1])
         self.assertIn("sample", result["workspace"]["variables"])
 
-    def test_last_expression_and_explicit_result_do_not_leak(self):
-        """Return the last expression and preserve explicit result precedence without stale output."""
+    def test_last_expression_is_returned_and_result_is_an_ordinary_variable(self):
+        """Return only the last expression; a variable named result is neither returned nor deleted."""
         self.assertEqual(self.execute("2 + 3")["result"], 5)
         self.assertEqual(self.execute("_ + 1")["result"], 6)
-        self.assertEqual(self.execute("result = 9\n42")["result"], 9)
+        self.assertEqual(self.execute("result = 9\n42")["result"], 42)
         self.assertIsNone(self.execute("value = 12")["result"])
         self.assertEqual(self.execute("value")["result"], 12)
-        self.assertIsNone(self.execute("result = None\n13")["result"])
+        self.assertEqual(self.execute("result")["result"], 9)
+        self.assertIsNone(self.execute("result = 13")["result"])
+        self.assertIn("result", self.execute("None")["workspace"]["variables"])
 
     def test_reset_preserves_workspace_and_refreshes_bindings(self):
         """Retain analysis variables through physical resets and update live function globals."""
@@ -193,13 +195,17 @@ class TestMcpExecutor(unittest.TestCase):
         self.assertTrue(self.session.valid)
         self.assertEqual(self.execute("rollout(2)['frames'], kept")["result"], [2, 7])
 
-    def test_result_budget_does_not_destroy_saved_work(self):
-        """Inspect a smaller slice of an already computed result without repeating the computation."""
-        with self.assertRaisesRegex(RuntimeError, "Python completed"):
-            self.execute("samples = np.arange(30000)\nresult = samples")
-        self.assertTrue(self.session.valid)
+    def test_large_variable_named_result_keeps_the_cell_and_its_value(self):
+        """Keep a large ``result`` variable and the cell's output (i15: the cell failed and the variable vanished)."""
+        result = self.execute("samples = np.arange(30000)\nresult = samples\nprint('size', result.size)")
+        self.assertTrue(result["valid"])
+        self.assertIsNone(result["result"])
+        self.assertEqual(result["stdout"], "size 30000\n")
+        self.assertEqual(self.execute("result[:3].tolist()")["result"], [0, 1, 2])
+        # A large last expression is summarized, and _ keeps it.
+        summary = self.execute("samples")
+        self.assertIn("30000", summary["result_repr"])
         self.assertEqual(self.execute("_[:3].tolist()")["result"], [0, 1, 2])
-        self.assertEqual(self.execute("samples.size")["result"], 30000)
 
     def test_function_source_and_error_stack_lines_remain_available(self):
         """Retain source for persistent functions and identify errors across cell boundaries."""
@@ -212,16 +218,13 @@ class TestMcpExecutor(unittest.TestCase):
         self.assertEqual([frame["line"] for frame in error["frames"]], [1, 3])
         self.assertEqual(error["frames"][-1]["source"], "return missing_value")
 
-    def test_automatic_expression_repr_and_strict_explicit_result(self):
-        """Display opaque expression values while retaining strict explicit JSON result validation."""
+    def test_automatic_expression_repr(self):
+        """Display opaque expression values as a bounded summary."""
         result = self.execute("object()")
         self.assertIsNone(result["result"])
         self.assertIn("object object", result["result_repr"])
         self.assertLessEqual(len(result["result_repr"]), 16384)
         self.assertTrue(result["valid"])
-        with self.assertRaisesRegex(RuntimeError, "Python completed"):
-            self.execute("result = object()")
-        self.assertTrue(self.session.valid)
 
     def test_automatic_display_never_calls_user_representation(self):
         """Summarize user objects without running noisy or mutating representation callbacks."""
@@ -246,17 +249,13 @@ Noisy()
         self.assertIn("Sample", dataclass["result_repr"])
         self.assertEqual(self.execute("_.count")["result"], 3)
 
-    def test_large_array_display_is_bounded_and_explicit_result_fails_early(self):
-        """Summarize large arrays and reject oversized explicit results before dense conversion."""
+    def test_large_array_display_is_bounded(self):
+        """Summarize large arrays and strings without dense conversion."""
         result = self.execute("samples = np.zeros(1_000_000, dtype=np.complex128)\nsamples")
         self.assertTrue(result["valid"])
         self.assertIsNone(result["result"])
         self.assertIn("1000000", result["result_repr"])
         self.assertIn("complex128", result["result_repr"])
-        self.assertEqual(self.execute("_.size")["result"], 1_000_000)
-        with self.assertRaisesRegex(RuntimeError, "component budget"):
-            self.execute("result = samples")
-        self.assertTrue(self.session.valid)
         self.assertEqual(self.execute("_.shape")["result"], [1_000_000])
         displayed = self.execute("'x' * 100000")
         self.assertIsNone(displayed["result"])
@@ -273,8 +272,10 @@ saved = {Key(): 1}
 """)
         gravity = self.session.model.gravity.numpy().copy()
         escaped = io.StringIO()
-        with contextlib.redirect_stdout(escaped), self.assertRaisesRegex(RuntimeError, "Python completed"):
-            self.execute("result = saved")
+        with contextlib.redirect_stdout(escaped):
+            result = self.execute("saved")
+        self.assertIsNone(result["result"])
+        self.assertIn("dict length=1", result["result_repr"])
         self.assertEqual(escaped.getvalue(), "")
         self.assertTrue(self.session.valid)
         np.testing.assert_array_equal(self.session.model.gravity.numpy(), gravity)

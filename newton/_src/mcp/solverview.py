@@ -385,6 +385,8 @@ class ModelWatch:
         self._depth = 0
         self.active = False
         self._notes: list[str] = []
+        self._facts: set[str] = set()
+        """Facts about edited fields already reported for the current model; each is reported once."""
         _WATCHES.add(self)
 
     @property
@@ -436,6 +438,8 @@ class ModelWatch:
     # -- checksums --------------------------------------------------------------------------------------------------
 
     def _discover(self, model) -> None:
+        if model is not self._model:
+            self._facts.clear()
         self._model = model
         fields = []
         for name in WATCHED_FIELDS:
@@ -685,46 +689,46 @@ class ModelWatch:
         mujoco = _is_mujoco(solver)
         flagged = [n for n in changed if n in FIELD_FLAGS and not (mujoco and n in MUJOCO_CONSTRUCTION_ONLY)]
         uncovered = [name for name in flagged if not self._covered(name, digests[name], solver)]
-        required, missing = inferred_flags(flagged), inferred_flags(uncovered)
-        described = []
-        for name in changed:
-            if self._baseline.get(name, (None,))[0] != digests[name][0]:
-                size = "new array object"
-            else:
-                size = f"{len(rows[name])} rows" if rows[name] is not None else "rows not tracked"
-            flag = FIELD_FLAGS.get(name)
-            described.append(f"model.{name} [{size}]" + (f" ({flag.name})" if name in flagged else ""))
-        line = f"Model edits {where}: {', '.join(described)}."
-        if required and not missing:
-            line += f" Covered by notify_model_changed ({flag_names(required)})."
-        elif missing and self._mode == "notify":
-            line += f" No notify_model_changed call covered {flag_names(missing)}{self._uncounted(uncovered, digests, solver)}; "
-            self._notifying = True
-            try:
-                solver.notify_model_changed(missing)
-                line += f"the host called solver.notify_model_changed({flag_expression(missing)})."
-            except Exception as error:  # the cell's edits stay; report instead of failing the cell
-                line += f"the host's notify_model_changed raised {type(error).__name__}: {error}"
-            finally:
-                self._notifying = False
-            # notify_model_changed may rewrite model arrays itself (e.g. MuJoCo solref modes).
-            notified = self._digests()
-            for name, value in notified.items():
-                if digests.get(name) != value and name not in rows:
-                    self._refresh_copy(name)
-            digests = notified
-        elif missing:
-            line += (
-                f" No notify_model_changed call covered {flag_names(missing)}{self._uncounted(uncovered, digests, solver)}; "
-                "the solver keeps its previous "
-                f"values until notify_model_changed({flag_expression(missing)})."
+        missing = inferred_flags(uncovered)
+        # Edits a notify_model_changed call covered are not reported: only facts the cell cannot see itself.
+        lines = []
+        if missing:
+            described = []
+            for name in uncovered:
+                if self._baseline.get(name, (None,))[0] != digests[name][0]:
+                    size = "new array object"
+                else:
+                    size = f"{len(rows[name])} rows" if rows[name] is not None else "rows not tracked"
+                described.append(f"model.{name} [{size}]")
+            line = (
+                f"{', '.join(described)} changed {where}; no notify_model_changed call covered "
+                f"{flag_names(missing)}{self._uncounted(uncovered, digests, solver)}; "
             )
+            if self._mode == "notify":
+                self._notifying = True
+                try:
+                    solver.notify_model_changed(missing)
+                    line += f"the host called solver.notify_model_changed({flag_expression(missing)})."
+                except Exception as error:  # the cell's edits stay; report instead of failing the cell
+                    line += f"the host's notify_model_changed raised {type(error).__name__}: {error}"
+                finally:
+                    self._notifying = False
+                # notify_model_changed may rewrite model arrays itself (e.g. MuJoCo solref modes).
+                notified = self._digests()
+                for name, value in notified.items():
+                    if digests.get(name) != value and name not in rows:
+                        self._refresh_copy(name)
+                digests = notified
+            else:
+                line += f"the solver keeps its previous values until notify_model_changed({flag_expression(missing)})."
+            lines.append(line)
         if mujoco:
-            facts = mujoco_change_facts(session.model, solver, rows)
-            if facts:
-                line += " Facts: " + " ".join(facts)
-        if line not in self._notes:
-            self._notes.append(line)
+            facts = [fact for fact in mujoco_change_facts(session.model, solver, rows) if fact not in self._facts]
+            self._facts.update(facts)
+            lines += facts
+        for line in lines:
+            if line not in self._notes:
+                self._notes.append(line)
         self._baseline = digests
         self._revision = session.revision
         self._forget_notifications()

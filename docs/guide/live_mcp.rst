@@ -68,6 +68,10 @@ Arguments after ``--`` go to the script's own parser. The host
 (:class:`newton.mcp.ExampleHost`) enables trusted execution, exposes the live
 ``example`` and its ``module``, and includes the example's own Warp arrays and
 scalar attributes in checkpoints so controller phases rewind with the physics.
+``reset`` and ``restore`` rewind the scalar attributes that ``step()`` changes
+(timers, phase counters), whether the session stepped or a cell called
+``example.step()``; attributes ``step()`` leaves alone, such as gains a cell
+assigned, keep their values. They do not call the example's own ``reset()``.
 
 Before the first step after a cell, the host compares the example's attributes,
 the script's module globals, and the attributes of the objects the example
@@ -110,17 +114,13 @@ with an active set.
 processes and exposes them as ``workers`` (see :class:`newton.mcp.WorkerPool`)
 for parallel parameter sweeps, plus ``jobs`` (:class:`newton.mcp.JobQueue`) for
 background calls; ``--max-workers M`` (default ``max(N, 4)``) bounds
-``workers.resize(n)``. Workers follow every successful ``newton_rebuild``,
-including its ``overrides`` and example arguments.
+``workers.resize(n)``. The worker processes start on first use, so an unused
+pool costs no processes or device memory. Workers follow every successful
+``newton_rebuild``, including its ``overrides`` and example arguments, without
+delaying it.
 
-``fresh(argv_list, call=..., frames=..., timeout=300, parallel=2, wait=True)``
-runs the script as saved on disk, without the session's live edits or build
-overrides (reported as ``overrides_not_applied``), in new Python processes
-through ``python -m newton.examples.headless`` (see :doc:`development`). It starts at most ``parallel`` of the session's processes
-at once and returns one report per argument list; ``wait=False`` returns a
-handle with ``done()``, ``result()``, and ``cancel()``. Processes still running
-at their timeout or when the session closes are killed together with the
-processes they started.
+``python -m newton.examples.headless`` (see :doc:`development`) runs the
+script as saved on disk in a new process, without the session's live edits.
 
 Connect an MCP client
 ---------------------
@@ -307,21 +307,16 @@ current call. It accepts arrays (``HxW``, ``HxWx3``, or ``HxWx4``; floats in
 ``observe``/``filmstrip`` results. MCP clients receive them as image content,
 so custom plots and composites need no file round trip.
 
-The last expression produces the returned value. Explicit ``result = ...``
-retains its previous behavior and takes precedence; it is cleared before the
-next call so an old result cannot leak into a new response. ``_`` holds the
-last non-``None`` value, including a value too large to return. JSON-compatible
-values use the ``result`` field. An opaque or oversized last expression uses a
-bounded ``result_repr`` summary instead, without calling user ``__repr__`` or
-converting large arrays to lists. Inspect selected attributes or slices of ``_``
-for details. Explicit ``result`` assignments remain strict about JSON
-serialization: use built-in scalar keys and containers, or NumPy values.
-Captured stdout/stderr is limited to 16384 characters, serialized JSON results
-to 65536 characters, and result conversion to 16384 components and 64 nesting
-levels. Arrays above the component limit or 1 MiB are rejected before conversion.
-If Python completes but its result cannot be returned, validity is unchanged
-and the error says execution completed.
-Inspect ``_[:10]`` or another saved variable rather than repeating a mutation.
+The value of the cell's last expression is returned; a cell that ends with a
+statement returns ``None``. A variable named ``result`` is an ordinary
+variable. ``_`` holds the last non-``None`` value, including a value too large
+to return. JSON-compatible values use the ``result`` field of the response. An
+opaque or oversized value uses a bounded ``result_repr`` summary instead,
+without calling user ``__repr__`` or converting large arrays to lists; selected
+attributes or slices of ``_`` can then be inspected. Captured stdout/stderr is
+limited to 16384 characters, serialized JSON results to 65536 characters, and
+result conversion to 16384 components and 64 nesting levels. Arrays above the
+component limit or 1 MiB are summarized without conversion.
 
 ``execute(reset_namespace=True, code=...)`` clears Python variables, imports,
 functions, classes, previous results, and source history before running the
@@ -379,27 +374,18 @@ Trusted cells can use these helpers without imports (``newton``, ``np``, and
   involved; ``twins=True`` also reports worlds whose joint state deviates from
   the others. It is :func:`newton.utils.report_health` applied to the session's
   model, state, solver, and contacts.
-- :meth:`~newton.mcp.SimulationSession.swap_solver` replaces the solver with
-  ``factory(model)``: it installs the new solver (a hosted example re-records
-  its CUDA graphs), steps a copy of the current state for two frames, runs
-  ``health()``, and restores the state. If any of this raises, or ``health()``
-  reports a warning the current state does not already show, the previous
-  solver, graphs, and state are reinstated and the error is raised.
-- :meth:`~newton.mcp.SimulationSession.diff_model` lists the model arrays and
-  scalars that differ from the last build (or from its previous call), keyed by
-  entity label with old and new values, plus the
-  :class:`~newton.ModelFlags` inferred for the changed fields.
 
 After each cell, and before each ``rollout``, step, or ``filmstrip`` inside a
 cell, the session compares device checksums of the model arrays solvers read
 with their previous values. Changed arrays whose :class:`~newton.ModelFlags`
 category no ``notify_model_changed`` call covered are notified with the inferred
-flags, and the execution result's ``note`` names the changed fields, the flags,
-and edited fields the current solver configuration does not read (for example
-``mujoco.actuator_gainprm`` of actuators driven by ``joint_target_ke``).
-A ``notify_model_changed`` call covers a changed array only if it was made on
-the session's solver with the array's category after the array's last change;
-calls on other solver objects, or before the edit, are listed in the note.
+flags, and the execution result's ``note`` has one line naming those fields and
+flags, plus one line per edited field the current solver configuration does not
+read (for example ``mujoco.actuator_gainprm`` of actuators driven by
+``joint_target_ke``), each such line once per scene. Edits a ``notify_model_changed`` call covered are not
+reported. A call covers a changed array only if it was made on the session's
+solver with the array's category after the array's last change; calls on other
+solver objects, or before the edit, are named in the note.
 ``session.watch.mode = "report"`` reports without notifying and ``"off"``
 disables the checks. Edits made by the application's own ``step()``, also when a
 cell calls ``example.step()``, are not reported. Reading the checksums before a
@@ -477,7 +463,8 @@ and Python workspace:
 * ``workers.sync(name=value)`` copies values into every worker's globals once;
   functions do not resend a synced global while the session still binds the
   same object.
-* Code strings run as cells on a worker with the item bound to ``args``.
+* Code strings run as cells on a worker with the item bound to ``args``; the
+  value of their last expression is returned.
 * A failed call rolls back its worker's simulation like any failed cell, and
   the error says what was restored; the worker's Python variables are kept. It
   returns ``{"error": ...}`` from ``map`` (with the worker's cell and line) and
@@ -485,10 +472,12 @@ and Python workspace:
 * Warp kernels sent with a function are defined in a module named after their
   source, so all workers (and restarted ones) share their kernel-cache entry.
 
-A launched pool follows ``newton_rebuild`` with the same arguments. Idle workers
-rebuild before the rebuild returns; a worker that is running a call or still
-starting rebuilds right after it, before any queued call, and is listed as
-``pending``. Each rebuild increments the pool's ``build`` count, which
+A launched pool follows ``newton_rebuild`` with the same arguments without
+delaying it. A started worker rebuilds in the background, after its running
+call and before any queued call; the rebuild response lists these workers under
+``workers_rebuild``, and a failed worker rebuild is listed under ``workers`` in
+a later response. Workers that have not started yet start with the new
+arguments. Each rebuild increments the pool's ``build`` count, which
 ``workers.status()`` and every job record report. A worker
 whose process exits or whose CUDA context fails is restarted, and earlier
 ``broadcast`` and ``sync`` calls are replayed on it in order;
@@ -511,12 +500,15 @@ Rollback after a failed call
 A syntax or compilation error runs no Python. Before a cell runs, the session
 copies the simulation's mutable arrays on their device: state, control, model
 arrays, and arrays the application registers (a hosted example's own Warp
-arrays). A hosted example also remembers its attributes and its script's module
-globals, including the contents of small plain-data lists and dictionaries.
+arrays). A hosted example also remembers its attributes, its script's module
+globals, and the attributes of the classes defined at the top level of the
+script and of the modules it imports from its own directory (so a method a cell
+rebinds, such as ``module.Controller.compute``, is restored), including the
+contents of small plain-data lists and dictionaries.
 If the cell raises, also inside ``rollout`` or a step, the session
 
-* rebinds replaced objects (the solver, state buffers, example attributes, and
-  module globals) and their CUDA graphs,
+* rebinds replaced objects (the solver, state buffers, example attributes,
+  module globals, and class attributes) and their CUDA graphs,
 * writes back the arrays whose contents changed and notifies the solver about
   restored model fields with the matching :class:`~newton.ModelFlags`,
 * restores time and frame and, if the state moved, resets solver caches and

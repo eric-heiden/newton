@@ -100,7 +100,7 @@ class TestMcpRebuildInsideACell(unittest.TestCase):
             "execute", {"code": "session.dispatch('rebuild', {})\nmodel.joint_target_ke.fill_(7.0)\nNone"}
         )
         self.assertNotIn("stopped", result["note"])
-        self.assertRegex(result["note"], r"Model edits in this cell: model\.joint_target_ke")
+        self.assertRegex(result["note"], r"model\.joint_target_ke .*changed in this cell")
 
 
 class TestMcpInstructions(unittest.TestCase):
@@ -121,14 +121,17 @@ class TestMcpInstructions(unittest.TestCase):
         """Name each preloaded helper in the instructions or the hosted guide, with its arguments."""
         for name in SimulationSession._HELPERS:
             self.assertRegex(self.lean + self.guide, rf"\b{name}\(", name)
-        for name in ("persist(", "persist_source(", "fresh(", "workers.map(", "workers.sync(", "jobs.start("):
+        for name in ("persist(", "persist_source(", "workers.map(", "workers.sync(", "jobs.start("):
             self.assertIn(name, self.guide)
         self.assertIn("overrides", self.guide)
 
     def test_removed_features_and_advice_are_absent(self):
         """Drop removed helpers, structured operations, and workflow coaching from the instructions."""
         text = "\n".join((self.lean, protocol._INSTRUCTIONS, self.guide, self.descriptions))
-        for removed in ("compare_images", "plot=", "recovery", "'query'", "'edit'", "recapture()"):
+        for removed in (
+            *("compare_images", "plot=", "recovery", "'query'", "'edit'", "recapture()"),
+            *("fresh(", "swap_solver", "diff_model"),
+        ):
             self.assertNotIn(removed, text)
         self.assertNotRegex(self.execute_description, r"\b(query|edit|contacts|collide|record|play|pause)\b")
         advice = r"(?i)\b(prefer|instead of|efficient|use it only|batch many|should|rather than|re-simulat)"

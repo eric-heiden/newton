@@ -14,7 +14,6 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-import warp as wp
 
 import newton
 from newton.mcp import ExampleHost, SimulationSession
@@ -212,9 +211,9 @@ class TestMcpPersist(_Base):
         class Pool:
             count = 2
 
-            def rebuild(self, arguments, timeout):
+            def rebuild(self, arguments):
                 calls.append(("workers", arguments))
-                return {"rebuilt": 2, "seconds": 0.0}
+                return {"build": 1, "pending": [0, 1]}
 
             def drain_events(self):
                 return []
@@ -228,7 +227,7 @@ class TestMcpPersist(_Base):
         with contextlib.redirect_stdout(io.StringIO()):
             result = self.session.persist("SUBSTEPS", 3, check="session.revision > 0")
         self.assertEqual(calls, ["main", ("workers", {"reset_namespace": False})])
-        self.assertEqual(result["workers_rebuilt"]["rebuilt"], 2)
+        self.assertEqual(result["workers_rebuild"]["pending"], [0, 1])
         self.assertTrue(result["check"]["reproduced"])
 
 
@@ -361,80 +360,6 @@ class TestMcpCellSource(_Base):
         self.session.dispatch("execute", {"code": "", "reset_namespace": True})
         self.assertNotIn(module_name, sys.modules)
         self.assertFalse(linecache.getlines(filename))
-
-
-class TestMcpDiffModel(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        robot = newton.ModelBuilder()
-        link = robot.add_link(label="arm")
-        robot.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1, label="box")
-        hinge = robot.add_joint_revolute(-1, link, label="hinge")
-        robot.add_articulation([hinge], label="robot")
-        builder = newton.ModelBuilder()
-        builder.replicate(robot, 2)
-        model = builder.finalize(device="cpu")
-        self.session = SimulationSession(
-            model, newton.solvers.SolverXPBD(model), allow_execute=True, artifact_directory=self.directory.name
-        )
-        self.addCleanup(self.session.close)
-
-    def test_reports_changed_rows_by_label_with_inferred_flags(self):
-        """Key changed rows by label and world, infer ModelFlags, and reset the baseline on rebuild."""
-        self.assertEqual(self.session.diff_model()["fields"], {})
-        old_ke = float(self.session.model.joint_target_ke.numpy()[1])
-        self.session.dispatch(
-            "edit",
-            {
-                "patches": [
-                    {"field": "joint_target_ke", "indices": [1], "values": [150.0]},
-                    {"field": "body_mass", "indices": [0], "values": [2.0]},
-                ]
-            },
-        )
-        model = self.session.model
-        mu = model.shape_material_mu.numpy()
-        mu[:] = 0.25
-        model.shape_material_mu.assign(mu)
-        model.joint_X_p = wp.clone(model.joint_X_p)
-        result = self.session.diff_model()
-        fields = result["fields"]
-        self.assertEqual(fields["joint_target_ke"]["values"], {"hinge@1": [old_ke, 150.0]})
-        self.assertEqual(fields["joint_target_ke"]["flag"], "JOINT_DOF_PROPERTIES")
-        self.assertEqual(fields["shape_material_mu"]["changed_rows"], 2)
-        self.assertEqual(set(fields["shape_material_mu"]["values"]), {"box@0", "box@1"})
-        self.assertEqual(fields["body_mass"]["values"]["arm@0"][1], 2.0)
-        self.assertIn("body_inv_mass", fields)
-        self.assertIn("body_inertia", fields)
-        self.assertEqual(fields["joint_X_p"], {"replaced": True, "flag": "JOINT_PROPERTIES"})
-        self.assertEqual(
-            result["flags"],
-            ["JOINT_PROPERTIES", "JOINT_DOF_PROPERTIES", "BODY_INERTIAL_PROPERTIES", "SHAPE_PROPERTIES"],
-        )
-        self.assertNotIn("fields_without_flag", result)
-        # since="last" compares with the previous call.
-        self.assertEqual(self.session.diff_model(since="last")["fields"], {})
-        old_mu = model.particle_mu
-        model.particle_mu = 0.7
-        later = self.session.diff_model(since="last", limit=0)
-        self.assertEqual(later["fields"], {"particle_mu": {"values": [old_mu, 0.7], "flag": None}})
-        self.assertEqual(later["fields_without_flag"], ["particle_mu"])
-        self.session.replace(model, self.session.solver)
-        self.assertEqual(self.session.diff_model()["fields"], {})
-
-    def test_large_arrays_are_tracked_by_digest(self):
-        """Report changes of arrays beyond the baseline budget without row details."""
-        from newton._src.mcp import persist  # noqa: PLC0415
-
-        budget = persist._BASELINE_BYTES
-        persist._BASELINE_BYTES = 0
-        self.addCleanup(setattr, persist, "_BASELINE_BYTES", budget)
-        self.session.replace(self.session.model, self.session.solver)
-        ke = self.session.model.joint_target_ke
-        ke.assign(np.full(ke.shape, 3.0, dtype=np.float32))
-        field = self.session.diff_model()["fields"]["joint_target_ke"]
-        self.assertIn("rows were not compared", field["changed"])
 
 
 class TestMcpPersistHosted(unittest.TestCase):

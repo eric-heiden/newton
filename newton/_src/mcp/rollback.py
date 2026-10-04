@@ -14,7 +14,6 @@ the state moved.
 from __future__ import annotations
 
 import functools
-import re
 import sysconfig
 import traceback
 from collections.abc import Callable
@@ -160,6 +159,29 @@ def restore_attributes(current: dict, saved: dict, label: str) -> list[str]:
     return changed
 
 
+def restore_class_attributes(cls: type, saved: dict, label: str) -> list[str]:
+    """Return a class to its saved attributes (shallow), e.g. a method a cell rebound, and list what changed.
+
+    Attributes that cannot be set or deleted on ``cls`` are listed with ``(not restored)``.
+    """
+    changed = []
+    current = vars(cls)
+    for name in [name for name in current if name not in saved]:
+        try:
+            delattr(cls, name)
+            changed.append(f"{label}.{name}")
+        except (AttributeError, TypeError):
+            changed.append(f"{label}.{name} (not restored)")
+    for name, value in saved.items():
+        if _differs(current.get(name, _MISSING), value):
+            try:
+                setattr(cls, name, value)
+                changed.append(f"{label}.{name}")
+            except (AttributeError, TypeError):
+                changed.append(f"{label}.{name} (not restored)")
+    return changed
+
+
 class UndoPoint:
     """Everything needed to return ``session`` to the moment this object was created.
 
@@ -274,8 +296,3 @@ def describe_exception(error: BaseException, *, limit: int = 8) -> str:
         last = frames[-1]
         lines.append(f"  (raised in {last.filename}:{last.lineno} in {last.name})")
     return "\n".join(lines)
-
-
-def warning_kind(warning: str) -> str:
-    """A health warning without its numbers, to compare warnings across states."""
-    return re.sub(r"[-+]?\d[\d.]*(e[-+]?\d+)?", "#", warning)

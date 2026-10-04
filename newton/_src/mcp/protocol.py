@@ -338,9 +338,7 @@ _HELPERS = """- If a cell raises, the simulation (time, state, control, model ar
 - health(solver=None, state=None, per_world=True, twins=False): non-finite values, runaway speeds, full solver buffers, and penetrating shape pairs, by world, for any solver.
 - solver_params(kind='actuator'|'joint'|'geom'|'body'|'equality'|'option', select='label*', world=0): values the solver integrates, the model array and ModelFlags behind each, whether they can differ per world, and unapplied edits (`pending`).
 - solver_contacts(): active contacts per shape pair with the parameters the solver integrates and the material that decided them.
-- contacts_between(a, b=None): contact count, normal and friction force, slip speed, and penetration between two shape sets (label substrings); usable as a rollout() probe.
-- diff_model(since='build'|'last'): model values changed since the build, by entity label ([old, new]), with the inferred ModelFlags.
-- swap_solver(factory, frames=2): installs factory(model) as the solver after stepping a copy of the state and running health(); keeps the previous solver if that fails."""
+- contacts_between(a, b=None): contact count, normal and friction force, slip speed, and penetration between two shape sets (label substrings); usable as a rollout() probe."""
 
 _INSTRUCTIONS = (
     """Live Newton simulation running in another process. newton_execute runs Python cells in it; variables persist between calls (preloaded: session, model, state, control, solver, contacts, newton, np, wp, show, and the helpers below).

@@ -547,11 +547,9 @@ def _run_code(namespace: dict, code: str, arguments: Any) -> Any:
     register_cell_source(filename, code)
     if arguments is not _MISSING:
         namespace["args"] = arguments
-    namespace.pop("result", None)
     namespace.pop(_CODE_RESULT, None)
     exec(compile(tree, filename, "exec"), namespace)
-    if "result" in namespace:
-        return namespace.pop("result")
+    # As in a cell, only the last expression is returned; ``result`` is an ordinary variable.
     return namespace.pop(_CODE_RESULT, None)
 
 

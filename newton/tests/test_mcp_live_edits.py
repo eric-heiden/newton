@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Failed-cell rollback, rebuild overrides, solver swaps, and automatic CUDA-graph recapture."""
+"""Failed-cell rollback, rebuild overrides, reset of step-advanced scalars, and automatic CUDA-graph recapture."""
 
 import json
 import os
@@ -17,10 +17,9 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-import newton
-from newton._src.mcp.host import _restart_command
+from newton._src.mcp.host import _outermost, _restart_command
 from newton._src.mcp.protocol import _Protocol
-from newton.mcp import ExampleHost, SimulationClient, SimulationServer, SimulationSession
+from newton.mcp import ExampleHost, SimulationClient, SimulationServer
 
 _SCRIPT = textwrap.dedent(
     """
@@ -87,14 +86,6 @@ _SCRIPT = textwrap.dedent(
 
 def _line(script: str, text: str) -> int:
     return next(number for number, line in enumerate(script.splitlines(), 1) if text in line)
-
-
-class _Exploding(newton.solvers.SolverSemiImplicit):
-    """A solver whose steps produce non-finite body poses."""
-
-    def step(self, state_in, state_out, control, contacts, dt):
-        super().step(state_in, state_out, control, contacts, dt)
-        state_out.body_q.fill_(float("nan"))
 
 
 class _HostedTest(unittest.TestCase):
@@ -168,6 +159,41 @@ class TestMcpRollback(_HostedTest):
         self.assertIn("to t=0 s (frame 0)", message)
         self.assertEqual((session.frame, host.example.ticks, host.module.FAIL_AT), (0, 0, -1))
         self.assertEqual(self.execute(session, "rollout(4)['frames']")["result"], 4)
+
+    def test_failed_cell_restores_rebound_class_attributes(self):
+        """Undo methods a failed cell rebound on a script class, so rerunning the cell wraps the original.
+
+        i15 (g1_mpc): the rollback restored ``example.controller`` but kept ``module.Controller.compute``
+        rebound, so the retried cell wrapped its own patch and recursed.
+        """
+        self.script.write_text(
+            _SCRIPT.replace(
+                "        self.gain = 1.0\n",
+                "        self.gain = 1.0\n\n    def output(self):\n        return self.gain\n",
+            )
+        )
+        _, session = self.host()
+        code = (
+            "Drive = module.Drive\n"
+            "_original = Drive.output\n"
+            "def output(self):\n"
+            "    return 2.0 * _original(self)\n"
+            "Drive.output = output\n"
+            "Drive.limit = 3.0\n"
+            "patched = example.drive.output()\n"
+            "raise KeyError('after the patch')"
+        )
+        with self.assertRaises(RuntimeError) as raised:
+            self.execute(session, code)
+        message = str(raised.exception)
+        self.assertIn("Drive.output", message)
+        self.assertIn("Drive.limit", message)
+        result = self.execute(session, "patched, example.drive.output(), hasattr(module.Drive, 'limit')")
+        self.assertEqual(result["result"], [2.0, 1.0, False])
+        with self.assertRaises(RuntimeError) as raised:
+            self.execute(session, code)
+        self.assertIn("KeyError", str(raised.exception))
+        self.assertNotIn("RecursionError", str(raised.exception))
 
     def test_cell_without_simulation_changes_reports_nothing_restored(self):
         """Keep the hidden solver state and say so when a failing cell changed nothing."""
@@ -434,69 +460,64 @@ class TestMcpRebuild(_HostedTest):
         session = host.session(artifact_directory=self.directory.name, workers=paths)
         self.addCleanup(session.close)
         result = session.dispatch("rebuild", {"overrides": {"SUBSTEPS": 4}})
-        self.assertEqual(result["workers_rebuilt"]["rebuilt"], 1)
+        self.assertEqual(result["workers_rebuild"]["pending"], [0])
+        # The worker rebuilds in the background, before this call.
         self.assertEqual(self.execute(session, "workers.broadcast('module.SUBSTEPS')")["result"], [4])
         session.dispatch("rebuild", {"overrides": {}})
         self.assertEqual(self.execute(session, "workers.broadcast('module.SUBSTEPS')")["result"], [2])
 
 
-class TestMcpSwapSolver(_HostedTest):
-    def test_swap_solver_installs_after_a_trial_and_keeps_the_state(self):
-        """Install a new solver on the live model without advancing time or changing the state."""
-        host, session = self.host()
-        self.execute(session, "rollout(2)")
-        body_q = session.state.body_q.numpy().copy()
-        result = self.execute(session, "swap_solver(lambda m: newton.solvers.SolverXPBD(m))")
-        self.assertEqual(
-            {key: result["result"][key] for key in ("solver", "previous", "frames")},
-            {"solver": "SolverXPBD", "previous": "SolverSemiImplicit", "frames": 2},
+class TestMcpReset(_HostedTest):
+    def setUp(self):
+        super().setUp()
+        timed = _SCRIPT.replace("        self.ticks = 0\n", "        self.ticks = 0\n        self.sim_time = 0.0\n")
+        timed = timed.replace(
+            "        self.ticks += 1\n", "        self.ticks += 1\n        self.sim_time += self.frame_dt\n"
         )
-        self.assertTrue(result["result"]["health"]["ok"])
-        if host.example.graph is not None:
-            self.assertEqual(result["note"], "CUDA graphs recaptured after changes to example.solver")
-        self.assertIsInstance(host.example.solver, newton.solvers.SolverXPBD)
-        self.assertIs(session.solver, host.example.solver)
-        self.assertEqual((session.frame, host.example.ticks), (2, 2))
-        np.testing.assert_array_equal(session.state.body_q.numpy(), body_q)
-        self.assertAlmostEqual(self.advance(session)[0], 0.1, places=4)
+        self.script.write_text(timed)
 
-    def test_swap_solver_keeps_previous_solver_on_failure(self):
-        """Reinstate the previous solver, graph, and state when the factory or the trial fails."""
+    def test_reset_rewinds_scalars_advanced_by_direct_example_steps(self):
+        """Rewind timers that cells advanced through example.step() (i15 g1_mpc: records started at 1.01 s)."""
         host, session = self.host()
-        self.execute(session, "rollout(2)")
-        body_q = session.state.body_q.numpy().copy()
-        previous, graph = host.example.solver, host.example.graph
-        with self.assertRaisesRegex(RuntimeError, "swap_solver kept SolverSemiImplicit: building the new solver"):
-            self.execute(session, "def broken(model):\n    raise ValueError('no solver')\nswap_solver(broken)")
-        self.assertIs(host.example.solver, previous)
-        session.namespace["Exploding"] = _Exploding
-        with self.assertRaisesRegex(
-            RuntimeError, "kept SolverSemiImplicit: health\\(\\) after 2 trial frames .* reported .*non-finite"
-        ):
-            self.execute(session, "swap_solver(Exploding)")
-        self.assertIs(host.example.solver, previous)
-        self.assertIs(session.solver, previous)
-        self.assertIs(host.example.graph, graph)
-        self.assertEqual(session.frame, 2)
-        np.testing.assert_array_equal(session.state.body_q.numpy(), body_q)
-        self.assertAlmostEqual(self.advance(session)[0], 0.1, places=4)
+        session.dispatch("rebuild", {})
+        self.execute(session, "for _ in range(10):\n    example.step()")
+        self.assertAlmostEqual(host.example.sim_time, 1.0)
+        code = (
+            "example.speed = 2.0\n"
+            "session.dispatch('reset', {})\n"
+            "records = []\n"
+            "for _ in range(3):\n"
+            "    example.step()\n"
+            "    records.append(round(example.sim_time, 2))\n"
+            "records, example.ticks, example.speed"
+        )
+        self.assertEqual(self.execute(session, code)["result"], [[0.1, 0.2, 0.3], 3, 2.0])
+        code = (
+            "session.dispatch('checkpoint', {'name': 'three'})\n"
+            "for _ in range(4):\n"
+            "    example.step()\n"
+            "session.dispatch('restore', {'name': 'three'})\n"
+            "round(example.sim_time, 2), example.ticks"
+        )
+        self.assertEqual(self.execute(session, code)["result"], [0.3, 3])
 
-    def test_swap_solver_in_a_plain_session(self):
-        """Rebind the session's own solver when no application installs it."""
-        builder = newton.ModelBuilder()
-        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()))
-        builder.add_shape_sphere(body, radius=0.1)
-        model = builder.finalize(device="cpu")
-        session = SimulationSession(model, newton.solvers.SolverXPBD(model), dt=0.01, allow_execute=True)
-        self.addCleanup(session.close)
-        result = session.swap_solver(newton.solvers.SolverSemiImplicit)
-        self.assertEqual(result["solver"], "SolverSemiImplicit")
-        self.assertIsInstance(session.solver, newton.solvers.SolverSemiImplicit)
-        self.assertEqual(session.frame, 0)
-        self.assertEqual(session.dispatch("execute", {"code": "type(solver).__name__"})["result"], "SolverSemiImplicit")
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA graphs need a CUDA device")
+    def test_direct_steps_do_not_recapture_graphs(self):
+        """Treat timers that example.step() advances as state, not as settings baked into the CUDA graph."""
+        host, session = self.host(overrides={"DEVICE": "cuda:0"})
+        self.assertIsNotNone(host.example.graph)
+        self.execute(session, "for _ in range(3):\n    example.step()")
+        result = self.execute(session, "rollout(2)\nsession.dispatch('reset', {})\nexample.step()")
+        self.assertNotIn("note", result)
+        self.assertEqual(host.recaptures, 0)
 
 
 class TestMcpRecapture(_HostedTest):
+    def test_notes_name_only_the_outermost_changed_settings(self):
+        """Name a replaced object once, not every setting below it (i15: 'example.model, ..., 502 more')."""
+        keys = ["example.model", "example.model.actuators", "example.model.mujoco.solref", "example.solver.iterations"]
+        self.assertEqual(_outermost(keys), ["example.model", "example.solver.iterations"])
+
     def test_fingerprint_covers_module_globals_and_solver_settings(self):
         """Track module globals, nested plain data, solver settings, and the script's own objects."""
         host, _ = self.host()

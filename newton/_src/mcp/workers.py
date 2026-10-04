@@ -25,9 +25,10 @@ from .transport import SimulationClient
 
 _MISSING = object()
 _RESTART = object()
-_SERVE = "result = __import__('newton._src.mcp.shipping', fromlist=['serve']).serve(globals(), {request!r})"
+# The cell's last expression is its returned value.
+_SERVE = "__import__('newton._src.mcp.shipping', fromlist=['serve']).serve(globals(), {request!r})"
 _SERVE_FILE = (
-    "result = __import__('newton._src.mcp.shipping', fromlist=['serve']).serve("
+    "__import__('newton._src.mcp.shipping', fromlist=['serve']).serve("
     "globals(), __import__('pickle').loads(__import__('pathlib').Path({path!r}).read_bytes()))"
 )
 _DEVICE_CHECK = (
@@ -56,14 +57,11 @@ _DEFAULT_BOUND = frozenset(
         "solver_params",
         "render",
         "contacts_between",
-        "swap_solver",
         "persist",
         "persist_source",
-        "diff_model",
         "example",
         "module",
         "recapture",
-        "fresh",
         "workers",
         "jobs",
     )
@@ -114,15 +112,22 @@ class _Setup:
 
 
 class _Task:
-    def __init__(self, label: str, run: Callable, future: Future, setup: _Setup | None = None):
+    def __init__(
+        self, label: str, run: Callable, future: Future, setup: _Setup | None = None, arguments: dict | None = None
+    ):
         self.label = label
         self.run = run
         self.future = future
         self.setup = setup
+        self.arguments = arguments
+        """Arguments of a queued rebuild, so a later rebuild can merge into it."""
+
+
+_NOT_STARTED = "not started"
 
 
 class _Worker:
-    def __init__(self, slot: int, connection: Path | None = None):
+    def __init__(self, slot: int, connection: Path | None = None, *, state: str = "starting"):
         self.slot = slot
         self.connection = connection
         self.process: subprocess.Popen | None = None
@@ -130,7 +135,7 @@ class _Worker:
         self.private: collections.deque[_Task] = collections.deque()
         self.applied = 0
         self.replayed: dict[int, Any] = {}
-        self.state = "starting"
+        self.state = state
         self.reason: str | None = None
         self.retire = False
         self.task: _Task | None = None
@@ -189,17 +194,18 @@ class WorkerPool:
     as NumPy data). Globals that name a session's own live objects
     (``example``, ``model``, ``state``, ...) are not sent: on a worker they
     refer to the worker's scene. Code strings run as cells on the worker, with
-    the call's argument bound to ``args`` and ``result`` (or the last
-    expression) returned. Text a call prints is echoed with a ``[worker i]``
+    the call's argument bound to ``args`` and the value of the last
+    expression returned. Text a call prints is echoed with a ``[worker i]``
     prefix when its result is collected. A call that raises rolls its
     worker's simulation back like any failed cell, so later calls on that
     worker are unaffected.
 
-    A pool created by :meth:`launch` owns its worker processes: they follow
-    :meth:`rebuild`, a worker whose process exits or whose CUDA context fails
-    is restarted with earlier :meth:`broadcast` and :meth:`sync` calls
-    replayed in order, and :meth:`resize` changes the worker count. Such events
-    are collected by :meth:`drain_events`. A pool attached to existing
+    A pool created by :meth:`launch` owns its worker processes: they can start
+    on first use, they follow :meth:`rebuild` without blocking it, a worker
+    whose process exits or whose CUDA context fails is restarted with earlier
+    :meth:`broadcast` and :meth:`sync` calls replayed in order, and
+    :meth:`resize` changes the worker count. Such events are collected by
+    :meth:`drain_events`. A pool attached to existing
     sessions through connection files has a fixed size and cannot restart them.
 
     Args:
@@ -252,6 +258,7 @@ class WorkerPool:
         name: str = "session",
         timeout: float = 300.0,
         overrides: dict | None = None,
+        lazy: bool = False,
     ) -> WorkerPool:
         """Start ``count`` worker processes that host ``script`` (``python -m newton.mcp host``).
 
@@ -268,6 +275,9 @@ class WorkerPool:
             name: Prefix of those files.
             timeout: Maximum queue waiting time per request [s].
             overrides: Module globals the workers set before constructing the example.
+            lazy: Start no process until the first call that needs a worker (:meth:`submit`, :meth:`map`,
+                :meth:`broadcast`, :meth:`sync`, :meth:`resize`, :meth:`restart`, :meth:`wait_ready`, or a
+                background job); until then :meth:`status` lists the workers as ``"not started"``.
         """
         pool = cls(timeout=timeout)
         directory = Path(directory) if directory is not None else pool._exchange
@@ -280,7 +290,7 @@ class WorkerPool:
         pool.overrides = dict(overrides or {})
         pool.max_count = max(count, max_count if max_count is not None else count)
         for _ in range(count):
-            pool._add(_Worker(pool._free_slot()))
+            pool._add(_Worker(pool._free_slot(), state=_NOT_STARTED if lazy else "starting"))
         return pool
 
     # ------------------------------------------------------------------
@@ -291,13 +301,19 @@ class WorkerPool:
 
     @property
     def count(self) -> int:
-        """Number of workers that are running or starting."""
+        """Number of workers that are running, starting, or not started yet (see ``lazy`` in :meth:`launch`)."""
         with self._lock:
             return len(self._active())
 
+    @property
+    def started(self) -> bool:
+        """Whether any worker process was started (or attached)."""
+        with self._lock:
+            return any(worker.state != _NOT_STARTED for worker in self._workers)
+
     def status(self) -> list[dict]:
-        """State of every worker: ``worker``, ``state`` (starting/ready/failed), ``pid``, ``restarts``, ``running``,
-        and ``build`` (the last :meth:`rebuild` its scene followed; see :attr:`build`)."""
+        """State of every worker: ``worker``, ``state`` (not started/starting/ready/failed), ``pid``, ``restarts``,
+        ``running``, and ``build`` (the last :meth:`rebuild` its scene followed; see :attr:`build`)."""
         with self._lock:
             return [
                 {
@@ -432,7 +448,8 @@ class WorkerPool:
         """Change the number of workers at run time, within ``max_count``.
 
         New workers replay earlier broadcast and sync calls before they take work. Removed workers
-        finish their running call first.
+        finish their running call first. Workers that have not started yet (see ``lazy`` in
+        :meth:`launch`) start now.
 
         Args:
             count: New number of workers.
@@ -445,20 +462,25 @@ class WorkerPool:
             raise ValueError("This pool attaches to existing sessions; its size is fixed")
         if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= self.max_count:
             raise ValueError(f"count must be an integer in [0, {self.max_count}]")
-        added = []
         with self._condition:
             active = self._active()
             for worker in active[count:]:
                 worker.retire = True
+                if worker.state == _NOT_STARTED:
+                    # No thread or process to stop.
+                    self._workers.remove(worker)
+            started = [worker for worker in active[:count] if worker.state == _NOT_STARTED]
             for _ in range(count - len(active)):
                 worker = _Worker(self._free_slot())
                 self._add(worker)
-                added.append(worker)
+                started.append(worker)
             self._condition.notify_all()
+        # Workers that had not started yet start now, with the ones added.
+        self._ensure_started()
         if count < len(active):
             self._fail_if_starved()
         if wait:
-            for worker in added:
+            for worker in started:
                 worker.ready.wait(self.startup_timeout)
         return {"count": self.count, "max_count": self.max_count, "workers": self.status()}
 
@@ -468,6 +490,7 @@ class WorkerPool:
         Returns:
             :meth:`status` after the restart.
         """
+        self._ensure_started()
         stale = []
         with self._condition:
             targets = [w for w in self._workers if not w.retire and (worker is None or w.slot == worker)]
@@ -494,27 +517,28 @@ class WorkerPool:
         return self.status()
 
     def wait_ready(self, timeout: float | None = None) -> list[dict]:
-        """Wait until every worker has started (or failed to); returns :meth:`status`."""
+        """Start workers that have not started, wait until every worker has started (or failed to), and return
+        :meth:`status`."""
+        self._ensure_started()
         deadline = None if timeout is None else time.monotonic() + timeout
         for worker in list(self._workers):
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             worker.ready.wait(remaining)
         return self.status()
 
-    def rebuild(self, arguments: dict | None = None, *, timeout: float = 60.0) -> dict:
-        """Rebuild every worker's scene with ``arguments`` (as ``newton_rebuild``), waiting up to ``timeout``.
+    def rebuild(self, arguments: dict | None = None) -> dict:
+        """Make every worker's scene follow a rebuild with ``arguments`` (as ``newton_rebuild``), without waiting.
 
-        Idle workers are waited for. A worker that is running a call or still starting rebuilds after it,
-        before any queued call, and is listed as ``pending`` at once; pending rebuilds and rebuilds that
-        finish after ``timeout`` are reported by :meth:`drain_events`. Later restarts use the same arguments.
+        A started worker rebuilds in the background, after its running call and before any queued call; a
+        rebuild still queued for it is merged into this one. Workers that have not started yet start with
+        these arguments, as do later restarts. Failed worker rebuilds are reported by :meth:`drain_events`.
         Each rebuild increments :attr:`build`; calls report the build their worker had (``jobs``).
 
         Returns:
-            ``build``, ``rebuilt`` count, ``seconds``, ``pending`` workers, and ``errors``.
+            ``build`` and the ``pending`` workers that rebuild in the background.
         """
         arguments = {k: v for k, v in (arguments or {}).items() if k != "restart"}
-        started = time.perf_counter()
-        futures, busy = [], []
+        pending = []
         with self._condition:
             self.build += 1
             build = self.build
@@ -531,38 +555,30 @@ class WorkerPool:
                     self._forget(setup)
                 self._synced.clear()
             for worker in self._active():
-                if self._launch is None and not worker.can_rebuild:
+                if worker.state == _NOT_STARTED or (self._launch is None and not worker.can_rebuild):
                     continue
+                request = dict(arguments)
+                queued = worker.private[-1] if worker.private else None
+                if queued is not None and queued.arguments is not None and queued.future.cancel():
+                    # Not started yet and last in line: one rebuild with the newest arguments replaces both.
+                    worker.private.pop()
+                    request = {**queued.arguments, **{k: v for k, v in arguments.items() if v is not None}}
+                    request["reset_namespace"] = bool(
+                        queued.arguments.get("reset_namespace") or arguments.get("reset_namespace")
+                    )
                 future: Future = Future()
                 worker.private.append(
-                    _Task("rebuild", lambda w, a=arguments, b=build: self._rebuild_worker(w, a, b), future)
+                    _Task(
+                        "rebuild",
+                        lambda w, a=request, b=build: self._rebuild_worker(w, a, b),
+                        future,
+                        arguments=request,
+                    )
                 )
-                # Waiting for a running call (a background job, say) would stall this response.
-                if worker.task is not None or worker.state == "starting":
-                    busy.append((worker.slot, future))
-                else:
-                    futures.append((worker.slot, future))
+                future.add_done_callback(lambda f, slot=worker.slot: self._late_rebuild(slot, f))
+                pending.append(worker.slot)
             self._condition.notify_all()
-        rebuilt, errors, pending = 0, [], []
-        deadline = time.monotonic() + timeout
-        for slot, future in futures:
-            try:
-                future.result(max(0.0, deadline - time.monotonic()))
-                rebuilt += 1
-            except TimeoutError:
-                busy.append((slot, future))
-            except Exception as error:
-                errors.append(f"worker {slot}: {type(error).__name__}: {str(error)[:500]}")
-        for slot, future in sorted(busy):
-            pending.append(slot)
-            future.add_done_callback(lambda f, s=slot: self._late_rebuild(s, f, started))
-        return {
-            "build": build,
-            "rebuilt": rebuilt,
-            "seconds": round(time.perf_counter() - started, 2),
-            **({"pending": pending} if pending else {}),
-            **({"errors": errors} if errors else {}),
-        }
+        return {"build": build, "pending": pending}
 
     def _rebuild_worker(self, worker: _Worker, arguments: dict, build: int) -> dict:
         result = self._operation(worker, "rebuild", **arguments)
@@ -592,6 +608,9 @@ class WorkerPool:
                 task.future.set_exception(RuntimeError("Worker pool closed"))
         for worker in list(self._workers):
             self._kill(worker)
+            if worker.state == _NOT_STARTED:
+                # Never starts now; wait_ready() must not wait for it.
+                worker.ready.set()
         for worker in list(self._workers):
             if worker.thread is not None and worker.thread is not threading.current_thread():
                 worker.thread.join(timeout=10)
@@ -606,7 +625,17 @@ class WorkerPool:
     # Scheduling
 
     def _active(self) -> list[_Worker]:
-        return [w for w in self._workers if not w.retire and w.state in ("starting", "ready")]
+        return [w for w in self._workers if not w.retire and w.state in (_NOT_STARTED, "starting", "ready")]
+
+    def _ensure_started(self) -> None:
+        """Start the processes of workers that have not started yet (see ``lazy`` in :meth:`launch`)."""
+        with self._condition:
+            if self._closed:
+                return
+            for worker in self._workers:
+                if worker.state == _NOT_STARTED and not worker.retire:
+                    worker.state = "starting"
+                    self._start_thread(worker)
 
     def _free_slot(self) -> int:
         used = {w.slot for w in self._workers if not w.retire}
@@ -615,7 +644,8 @@ class WorkerPool:
     def _add(self, worker: _Worker) -> None:
         self._workers.append(worker)
         self._workers.sort(key=lambda w: w.slot)
-        self._start_thread(worker)
+        if worker.state != _NOT_STARTED:
+            self._start_thread(worker)
 
     def _start_thread(self, worker: _Worker) -> None:
         worker.thread = threading.Thread(
@@ -916,18 +946,22 @@ class WorkerPool:
         finally:
             if path is not None:
                 path.unlink(missing_ok=True)
-        return _Outcome(worker.slot, response.get("result") or {}, response.get("stdout") or "")
+        result = response.get("result")
+        if not isinstance(result, dict):
+            # serve() returns a small JSON dictionary; anything else means the worker could not report.
+            raise RuntimeError(f"worker {worker.slot} returned no call report ({response.get('result_repr')})")
+        return _Outcome(worker.slot, result, response.get("stdout") or "")
 
     def _event(self, text: str) -> None:
         with self._lock:
             self._events.append(text)
 
-    def _late_rebuild(self, slot: int, future: Future, started: float) -> None:
+    def _late_rebuild(self, slot: int, future: Future) -> None:
+        """Report a background worker rebuild that failed (merged rebuilds are cancelled, not failed)."""
+        if future.cancelled():
+            return
         error = future.exception()
-        seconds = time.perf_counter() - started
-        if error is None:
-            self._event(f"worker {slot} rebuilt {seconds:.1f} s after the rebuild request (it was busy)")
-        else:
+        if error is not None:
             self._event(f"worker {slot} rebuild failed: {type(error).__name__}: {str(error)[:500]}")
 
     # ------------------------------------------------------------------
@@ -968,6 +1002,7 @@ class WorkerPool:
     def _submit(self, function: Callable | str, calls: list, *, progress: list | None = None, echo=True):
         if self._closed:
             raise RuntimeError("Worker pool closed")
+        self._ensure_started()
         if not self.count:
             raise RuntimeError("No worker session is running (see workers.status())")
         code = function if isinstance(function, str) else None
@@ -1043,6 +1078,7 @@ class WorkerPool:
             shipping.discard(reference)
 
     def _run_setup(self, setup: _Setup) -> list[_Outcome]:
+        self._ensure_started()
         futures = []
         with self._condition:
             workers = self._active()

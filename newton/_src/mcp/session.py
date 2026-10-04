@@ -166,10 +166,6 @@ def _result_summary(value: Any) -> str:
     return f"<{name} object; inspect selected attributes of _>"
 
 
-class _HealthWarnings(RuntimeError):
-    """New health() warnings during a solver swap trial."""
-
-
 class SimulationSession:
     """Own the live bindings and serialize simulation operations on one thread.
 
@@ -229,9 +225,6 @@ class SimulationSession:
             ``copies.capture(label, owner)`` and returns a function that
             restores the application's Python attributes when the call fails
             and returns the names it restored.
-        solver_callback: Optional ``callback(session, solver)`` that installs a
-            replacement solver in the application for :meth:`swap_solver`
-            (default: rebind ``session.solver``).
         batch_callback: Optional ``callback(session)`` run after the session
             itself changed the scene: a batch of consecutive steps (one ``step``
             call or one :meth:`rollout`) or a rebuild.
@@ -303,7 +296,6 @@ class SimulationSession:
         execute_callback: Callable | None = None,
         overlay_callback: Callable | None = None,
         undo_callback: Callable | None = None,
-        solver_callback: Callable | None = None,
         batch_callback: Callable | None = None,
         close_callback: Callable | None = None,
         sync_callback: Callable | None = None,
@@ -320,7 +312,6 @@ class SimulationSession:
         self._workspace_warp_module = None
         self._workspace_sources = []
         self._cell_modules = {}
-        self._model_baselines = {}
         self._workspace_generation = 0
         self._cell_count = 0
         self._execution_error = None
@@ -338,7 +329,6 @@ class SimulationSession:
         """Returns ``[(name, points, indices, color), ...]`` meshes drawn by the application itself,
         which color observations composite over the model's shapes."""
         self.undo_callback = undo_callback
-        self.solver_callback = solver_callback
         self.batch_callback = batch_callback
         self.status_fields: dict[str, Any] = {}
         """Extra fields included in every status and appended to every error sent to clients
@@ -462,14 +452,6 @@ class SimulationSession:
         self.revision += 1
         self._checkpoints.clear()
         self._initial = self._snapshot()
-        self._model_baselines = {}
-        if self.allow_execute:
-            from .persist import ModelBaseline  # noqa: PLC0415
-
-            try:
-                self._model_baselines["build"] = ModelBaseline(model)
-            except Exception as error:
-                self._model_baselines["error"] = f"{type(error).__name__}: {str(error)[:200]}"
         self._contact_frame = None
         self._contact_revision = None
         self.last_error: str | None = None
@@ -1052,10 +1034,8 @@ class SimulationSession:
         "solver_params",
         "render",
         "contacts_between",
-        "swap_solver",
         "persist",
         "persist_source",
-        "diff_model",
     )
     """Session methods bound under the same name in trusted execution."""
     _WORKSPACE_BINDINGS: ClassVar[tuple[str, ...]] = ("session", *_SCENE_BINDINGS, "np", "wp", "newton", *_HELPERS)
@@ -1113,7 +1093,7 @@ class SimulationSession:
         self._refresh_workspace()
 
     def _workspace_info(self) -> dict:
-        reserved = {*self._WORKSPACE_BINDINGS, *self.namespace, "result", "_"}
+        reserved = {*self._WORKSPACE_BINDINGS, *self.namespace, "_"}
         variables = sorted(
             name
             for name in self._workspace
@@ -1218,7 +1198,6 @@ class SimulationSession:
         self._refresh_workspace()
         self._cache_cell_source(filename, code)
         scope = self._workspace
-        scope.pop("result", None)
         scope.pop(self._EXPRESSION_RESULT, None)
         if defines_classes:
             # Gives cell classes a source file for inspect.getsource() (see persist.bind_cell_class).
@@ -1282,26 +1261,19 @@ class SimulationSession:
         if self._renderer is not None:
             self._renderer.invalidate()
         images, self._shown_images = self._shown_images, None
-        explicit_result = "result" in scope
-        value = scope.get("result") if explicit_result else scope.pop(self._EXPRESSION_RESULT, None)
+        # Only the last expression is returned; a variable named ``result`` is an ordinary variable.
+        value = scope.pop(self._EXPRESSION_RESULT, None)
         if value is not None:
             scope["_"] = value
         representation = None
         try:
-            try:
-                result = _result_json(value)
-                if len(json.dumps(result)) > 65536:
-                    raise ValueError("result exceeds 65536 characters")
-            except (ValueError, TypeError, RecursionError):
-                if explicit_result:
-                    raise
-                result = None
-                representation = _result_summary(value)
-        except Exception as error:
-            raise RuntimeError(
-                f"Python completed; result cannot be returned: {str(error)[:4096]}. "
-                "Validity is unchanged; do not retry the mutation. Query a smaller result from _ or saved variables."
-            ) from error
+            result = _result_json(value)
+            if len(json.dumps(result)) > 65536:
+                raise ValueError("result exceeds 65536 characters")
+        except Exception:
+            # The cell completed; a value that cannot be converted is summarized instead of failing it.
+            result = None
+            representation = _result_summary(value)
         return {
             **self._status(),
             "result": result,
@@ -1323,7 +1295,6 @@ class SimulationSession:
             raise ValueError("No rebuild callback was registered")
         from .rollback import describe_exception  # noqa: PLC0415
 
-        started = time.perf_counter()
         try:
             bindings = self.rebuild_callback(self, **kwargs)
             if not isinstance(bindings, dict):
@@ -1343,14 +1314,10 @@ class SimulationSession:
             raise
         workers = None
         if self.workers is not None and not kwargs.get("restart"):
-            # Workers rebuild after this session succeeded, from the kernels it just compiled; with no
-            # running workers this only records the arguments for workers started later.
-            count = self.workers.count
-            seconds = time.perf_counter() - started
-            workers = self.workers.rebuild(
-                {**kwargs, "reset_namespace": reset_namespace}, timeout=max(30.0, 3.0 * seconds)
-            )
-            workers = workers if count else None
+            # Started workers rebuild in the background after this session succeeded, from the kernels it just
+            # compiled; workers not started yet only record the arguments.
+            workers = self.workers.rebuild({**kwargs, "reset_namespace": reset_namespace})
+            workers = workers if workers["pending"] else None
         # Rebuilds repeat often while iterating on a script; the full describe payload (guide,
         # operation list, limits) would be re-sent into the agent's context every time.
         return {
@@ -1361,7 +1328,7 @@ class SimulationSession:
                 for name in ("world_count", "body_count", "shape_count", "joint_count", "joint_dof_count")
             },
             "solver": self._describe_solver(self.solver),
-            **({"workers_rebuilt": workers} if workers is not None else {}),
+            **({"workers_rebuild": workers} if workers is not None else {}),
             **self._background_report(),
         }
 
@@ -1871,66 +1838,6 @@ class SimulationSession:
         model = getattr(solver, "model", None) or self.model
         return solver_params(model, solver, kind, select, world=world, limit=limit)
 
-    def swap_solver(self, factory: Callable[[Model], Any], *, frames: int = 2) -> dict:
-        """Replace the live solver with ``factory(model)`` after a trial run (trusted execution helper).
-
-        The new solver is built on the live model and installed in the application, which re-records
-        its CUDA graphs. A scratch copy of the current state is then stepped for ``frames`` frames and
-        checked with :meth:`health`; afterwards state, time, and application timers return to where they
-        were, now with the new solver. If building, installing, stepping, or the health check fails (a
-        warning the current state does not already show), the previous solver, graphs, state, and model
-        arrays are reinstated and the error is raised.
-
-        Args:
-            factory: ``factory(model) -> solver``, e.g. ``lambda m: newton.solvers.SolverXPBD(m, iterations=4)``
-                or a solver class.
-            frames: Trial frames to step before keeping the new solver.
-
-        Returns:
-            ``{"solver", "previous", "frames", "health"}``: solver type names and the trial's health report.
-        """
-        from .diagnostics import health  # noqa: PLC0415
-        from .rollback import UndoPoint, warning_kind  # noqa: PLC0415
-
-        self._assert_owner()
-        _integer(frames, "frames", 1, 1000)
-        if not callable(factory):
-            raise TypeError("factory must be a callable factory(model) -> solver")
-        if not self.valid:
-            raise RuntimeError(self._invalid_message())
-        undo = UndoPoint(self)
-        previous = type(self.solver).__name__
-        baseline = {warning_kind(warning) for warning in health(self)["warnings"]}
-        checkpoint = self._snapshot()
-        stage = "building the new solver"
-        self._transaction_depth += 1
-        try:
-            solver = factory(self.model)
-            stage = "installing the new solver and re-recording CUDA graphs"
-            if self.solver_callback is not None:
-                self.solver_callback(self, solver)
-            else:
-                self.solver = solver
-            self._refresh_workspace()
-            stage = f"stepping {frames} trial frames with the new solver"
-            self._advance(frames, self.dt)
-            stage = f"health() after {frames} trial frames with the new solver"
-            report = health(self)
-            new_warnings = [warning for warning in report["warnings"] if warning_kind(warning) not in baseline]
-            if new_warnings:
-                raise _HealthWarnings("reported " + "; ".join(new_warnings))
-            stage = "restoring the state with the new solver"
-            self._restore(checkpoint)
-        except Exception as error:
-            outcome = self._roll_back(undo, quiet=True)
-            kept = f"kept {previous}" if self.valid else "failed"
-            detail = str(error) if isinstance(error, _HealthWarnings) else f"raised {type(error).__name__}: {error}"
-            detail = detail[:2048].rstrip(". ")
-            raise RuntimeError(f"swap_solver {kept}: {stage} {detail}." + (f" {outcome}" if outcome else "")) from error
-        finally:
-            self._transaction_depth -= 1
-        return {"solver": type(solver).__name__, "previous": previous, "frames": frames, "health": report}
-
     def render(self, *, metadata: bool = False, **options):
         """Render the current state to an RGB array without PNG encoding (trusted execution helper).
 
@@ -2038,26 +1945,6 @@ class SimulationSession:
 
         self._assert_owner()
         return persist_source(self, obj, target=target, rebuild=rebuild, check=check, tolerance=tolerance, path=path)
-
-    def diff_model(self, since: str = "build", *, limit: int = 16) -> dict:
-        """Model arrays and scalars that differ from the last build (trusted execution helper).
-
-        Changed rows are keyed by entity label (``@world`` is appended in multi-world models, ``#row``
-        when labels repeat) with ``[old, new]`` values for at most ``limit`` rows per field, plus
-        ``changed_rows`` and ``rows`` counts. ``replaced`` marks attributes that now refer to a different
-        array object than at the baseline. ``flags`` lists the :class:`~newton.ModelFlags` inferred from
-        the changed fields (the categories ``edit`` uses, plus the fields named in the ModelFlags
-        docstrings); ``fields_without_flag`` lists changed fields with no inferred category.
-
-        Args:
-            since: ``"build"`` compares with the model as built; ``"last"`` with the previous
-                ``diff_model`` call (the build if there was none).
-            limit: Maximum rows listed per field.
-        """
-        from .persist import diff_model  # noqa: PLC0415
-
-        self._assert_owner()
-        return diff_model(self, since, limit=limit)
 
     def solver_contacts(self, limit: int = 20) -> dict:
         """Active solver contacts grouped by shape pair, with the effective solver parameters."""

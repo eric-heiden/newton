@@ -143,54 +143,306 @@ def solver_contacts(session, *, limit: int = 20) -> dict:
     return result
 
 
-def health(session) -> dict:
-    """Quick checks for non-finite state, runaway velocities, penetration, and solver buffer overflow.
+_STATE_ROWS = {
+    "body_q": "body",
+    "body_qd": "body",
+    "joint_q": "coord",
+    "joint_qd": "dof",
+    "particle_q": "particle",
+    "particle_qd": "particle",
+}
+
+
+def _row_worlds(model, kind: str) -> np.ndarray | None:
+    """World index of each row of a state array of the given kind, or ``None``."""
+    if kind == "body":
+        return model.body_world.numpy() if model.body_count else None
+    if kind == "particle":
+        return model.particle_world.numpy() if getattr(model, "particle_world", None) is not None else None
+    starts = (model.joint_q_start if kind == "coord" else model.joint_qd_start).numpy()
+    return np.repeat(model.joint_world.numpy(), np.diff(starts)) if model.joint_count else None
+
+
+def _worlds_text(worlds, limit: int = 8) -> str:
+    worlds = sorted(int(w) for w in worlds)
+    text = ", ".join(str(w) for w in worlds[:limit])
+    return f"[{text}{', ...' if len(worlds) > limit else ''}] ({len(worlds)} worlds)"
+
+
+def _penetration_pairs(pairs: dict, depth: np.ndarray, first, second, worlds, labels, threshold: float) -> None:
+    """Accumulate the deepest overlap [m] per shape pair for contacts deeper than ``threshold``."""
+    for i in np.flatnonzero(depth > threshold):
+        a, b = int(first[i]), int(second[i])
+        key = (min(a, b), max(a, b))
+        entry = pairs.setdefault(
+            key,
+            {"shapes": [_final(_label(labels, key[0])), _final(_label(labels, key[1]))], "depth": 0.0, "worlds": set()},
+        )
+        entry["depth"] = max(entry["depth"], float(depth[i]))
+        entry["worlds"].add(int(worlds[i]))
+
+
+def _mujoco_health(model, solver, report: dict, *, per_world: bool, threshold: float, limit: int) -> None:
+    warnings, stats, worlds = report["warnings"], report["stats"], report["worlds"]
+    labels = getattr(model, "shape_label", None)
+    cpu = bool(getattr(solver, "use_mujoco_cpu", False))
+    report["checked"] += ["MuJoCo qpos/qvel/qacc", "MuJoCo contact and constraint buffers", "MuJoCo penetration"]
+    if cpu:
+        data = solver.mj_data
+        arrays = {name: np.asarray(getattr(data, name))[None] for name in ("qpos", "qvel", "qacc")}
+        count = int(data.ncon)
+        contact = data.contact
+        geoms, dist = np.asarray(contact.geom)[:count], np.asarray(contact.dist)[:count]
+        contact_worlds = np.zeros(count, dtype=int)
+        report["unsupported"].append("MuJoCo CPU backend: buffers grow dynamically; capacities are not checked")
+    else:
+        data = solver.mjw_data
+        arrays = {name: getattr(data, name).numpy() for name in ("qpos", "qvel", "qacc")}
+        nacon, capacity = int(data.nacon.numpy()[0]), int(data.naconmax)
+        count = min(nacon, capacity)
+        stats["solver_contacts"], stats["solver_contact_capacity"] = nacon, capacity
+        if nacon >= capacity:
+            warnings.append(
+                f"MuJoCo contact buffer full: nacon {nacon} >= naconmax {capacity} (shared by all worlds, "
+                "SolverMuJoCo nconmax per world); contacts beyond it are dropped"
+            )
+        geoms = data.contact.geom.numpy()[:count]
+        dist = data.contact.dist.numpy()[:count]
+        contact_worlds = data.contact.worldid.numpy()[:count]
+        nworld = int(data.nworld)
+        if per_world and count:
+            per = np.bincount(contact_worlds, minlength=nworld)
+            stats["max_contacts_per_world"] = int(per.max())
+            stats["nconmax_per_world"] = capacity // max(nworld, 1)
+        nefc, njmax = data.nefc.numpy(), int(data.njmax)
+        stats["solver_constraint_rows_max"], stats["njmax"] = int(nefc.max()), njmax
+        full = np.flatnonzero(nefc >= njmax)
+        if len(full):
+            worlds["constraint_buffer_full"] = full[:64].tolist()
+            warnings.append(f"MuJoCo constraint rows reached njmax {njmax} in worlds {_worlds_text(full)}")
+        overflow = getattr(data, "overflow", None)
+        if overflow is not None:
+            _overflow_flags(overflow.numpy(), report)
+        if getattr(data, "solver_niter", None) is not None:
+            niter = data.solver_niter.numpy()
+            cap = int(solver.mj_model.opt.iterations)
+            stats["solver_iterations_max"], stats["solver_iterations_cap"] = int(niter.max()), cap
+            capped = np.flatnonzero(niter >= cap)
+            if per_world and len(capped):
+                worlds["iteration_cap"] = capped[:64].tolist()
+    for name, values in arrays.items():
+        bad = np.flatnonzero(~np.isfinite(values.reshape(values.shape[0], -1)).all(axis=1))
+        if len(bad):
+            worlds.setdefault("nonfinite", set()).update(bad.tolist())
+            warnings.append(f"MuJoCo {name} non-finite in worlds {_worlds_text(bad)}")
+    if count:
+        geom_map = solver.mjc_geom_to_newton_shape.numpy()
+        rows = np.minimum(contact_worlds, geom_map.shape[0] - 1)
+        first = np.where(geoms[:, 0] >= 0, geom_map[rows, np.maximum(geoms[:, 0], 0)], -1)
+        second = np.where(geoms[:, 1] >= 0, geom_map[rows, np.maximum(geoms[:, 1], 0)], -1)
+        stats["deepest_penetration"] = float(max(0.0, -dist.min()))
+        _penetration_pairs(report["_pairs"], -dist, first, second, contact_worlds, labels, threshold)
+
+
+_ITERATION_FLAGS = ("ITERATIONS", "LS_ITERATIONS")
+
+
+def _overflow_flags(flags: np.ndarray, report: dict) -> None:
+    """Per-world MuJoCo Warp overflow bits; they stay set from data creation until a data reset."""
+    raised = np.flatnonzero(flags)
+    if not len(raised):
+        return
+    import mujoco_warp
+
+    names = {int(bit): bit.name for bit in mujoco_warp.OverflowType}
+    per_world = {int(w): [name for bit, name in names.items() if int(flags[w]) & bit] for w in raised}
+    report["worlds"]["overflow_flags"] = {str(w): per_world[w] for w in list(per_world)[:64]}
+    by_flag: dict[str, list[int]] = {}
+    for world, raised_names in per_world.items():
+        for name in raised_names:
+            by_flag.setdefault(name, []).append(world)
+    buffers = {name: worlds for name, worlds in by_flag.items() if name not in _ITERATION_FLAGS}
+    if buffers:
+        listed = "; ".join(f"{name} in worlds {_worlds_text(worlds)}" for name, worlds in buffers.items())
+        report["warnings"].append(f"MuJoCo Warp overflow flags (set since the solver data was created): {listed}")
+    for name in _ITERATION_FLAGS:
+        if name in by_flag:
+            report["stats"][f"worlds_flagged_{name.lower()}"] = len(by_flag[name])
+
+
+def _newton_contacts_health(model, state, contacts, report: dict, *, threshold: float) -> None:
+    from ..sim.contact_kinematics import eval_rigid_contact_kinematics  # noqa: PLC0415
+
+    report["checked"].append("collision-pipeline contacts: buffer and penetration")
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    capacity = int(contacts.rigid_contact_max)
+    report["stats"]["contacts"], report["stats"]["contact_capacity"] = count, capacity
+    if capacity and count >= capacity:
+        report["warnings"].append(f"Newton contact buffer full: {count} >= rigid_contact_max {capacity}")
+    count = min(count, capacity)
+    if not count:
+        return
+    import warp as wp  # noqa: PLC0415
+
+    distance = wp.empty(capacity, dtype=float, device=model.device)
+    point0 = wp.empty(capacity, dtype=wp.vec3, device=model.device)
+    point1 = wp.empty_like(point0)
+    eval_rigid_contact_kinematics(
+        model, state, contacts, out_distance=distance, out_point0_world=point0, out_point1_world=point1
+    )
+    depth = -distance.numpy()[:count]
+    shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+    shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+    shape_world = model.shape_world.numpy()
+    worlds = np.maximum(shape_world[np.maximum(shape0, 0)], shape_world[np.maximum(shape1, 0)])
+    report["stats"]["deepest_penetration"] = float(max(0.0, depth.max()))
+    _penetration_pairs(report["_pairs"], depth, shape0, shape1, worlds, getattr(model, "shape_label", None), threshold)
+
+
+def _twins(model, state, initial: dict | None, report: dict, tolerance: float) -> None:
+    """Flag worlds whose joint state deviates from the per-coordinate median over all worlds."""
+    if model.world_count < 2 or not model.joint_count:
+        report["unsupported"].append("twins: needs at least two worlds with joints")
+        return
+    deviation = np.zeros(model.world_count)
+    compared = []
+    for name, kind in (("joint_q", "coord"), ("joint_qd", "dof")):
+        array = getattr(state, name, None)
+        if array is None or not array.size:
+            continue
+        values = array.numpy().astype(np.float64)
+        if name == "joint_q":
+            reference = initial.get(name) if initial else None
+            if reference is None or reference.shape != values.shape:
+                continue
+            # Displacement from the start removes per-world placement offsets of the roots.
+            values = values - reference
+        row_world = _row_worlds(model, kind)
+        local = row_world >= 0
+        counts = np.bincount(row_world[local], minlength=model.world_count)
+        if counts.min() != counts.max():
+            report["unsupported"].append("twins: worlds are not structurally identical")
+            return
+        per_world = values[local][np.argsort(row_world[local], kind="stable")].reshape(model.world_count, -1)
+        spread = np.abs(per_world - np.median(per_world, axis=0))
+        deviation = np.maximum(deviation, np.nan_to_num(spread, nan=np.inf).max(axis=1))
+        compared.append(name)
+    if not compared:
+        report["unsupported"].append("twins: no joint state to compare")
+        return
+    report["checked"].append(f"twins: {' and '.join(compared)} against the median over worlds")
+    report["stats"]["twins_max_deviation"] = float(deviation.max())
+    outliers = np.flatnonzero(deviation > tolerance)
+    if len(outliers):
+        report["worlds"]["twins_disagree"] = outliers[np.argsort(-deviation[outliers])][:64].tolist()
+        report["warnings"].append(
+            f"worlds {_worlds_text(outliers)} deviate from the median over worlds by more than {tolerance:g} "
+            f"(max {deviation.max():.3g}) in {' or '.join(compared)}"
+        )
+
+
+def health(
+    session,
+    solver=None,
+    state=None,
+    *,
+    per_world: bool = True,
+    twins: bool = False,
+    penetration: float = 0.01,
+    twins_tolerance: float = 1e-3,
+    limit: int = 8,
+) -> dict:
+    """Check for non-finite state, runaway velocities, solver buffer overflow, and deep penetration.
+
+    Args:
+        session: Live :class:`SimulationSession`.
+        solver: Solver to inspect (default: the session's). Any solver works; MuJoCo solvers add
+            checks of their own data and buffers.
+        state: State to inspect (default: the session's).
+        per_world: Name the worlds behind each finding.
+        twins: Also compare the worlds' joint states with each other, for scenes whose worlds were
+            built identical: worlds deviating from the per-coordinate median are listed.
+        penetration: Overlap [m] above which contacts are reported by shape pair.
+        twins_tolerance: Deviation [m, rad, m/s or rad/s] above which a world counts as disagreeing.
+        limit: Maximum number of shape pairs listed.
 
     Returns:
-        ``{"ok": bool, "warnings": [...], "stats": {...}}``.
+        ``{"ok", "warnings", "stats", "checked", "worlds", "penetration", "unsupported"}``; ``checked``
+        lists what was inspected and ``unsupported`` what could not be for this solver.
     """
-    warnings, stats = [], {}
-    state, model = session.state, session.model
-    for name in ("body_q", "body_qd", "joint_q", "joint_qd", "particle_q", "particle_qd"):
+    solver = session.solver if solver is None else solver
+    state = session.state if state is None else state
+    model = getattr(solver, "model", None) or session.model
+    report = {
+        "warnings": [],
+        "stats": {},
+        "checked": ["state: non-finite values and body speeds"],
+        "worlds": {},
+        "unsupported": [],
+        "_pairs": {},
+    }
+    warnings, stats, worlds = report["warnings"], report["stats"], report["worlds"]
+    for name, kind in _STATE_ROWS.items():
         array = getattr(state, name, None)
         if array is None or array.size == 0:
             continue
         values = array.numpy()
-        if not np.isfinite(values).all():
+        bad = ~np.isfinite(values.reshape(values.shape[0], -1)).all(axis=1)
+        if not bad.any():
+            continue
+        row_world = _row_worlds(model, kind) if per_world else None
+        if row_world is not None and len(row_world) == len(values):
+            affected = np.unique(row_world[bad])
+            worlds.setdefault("nonfinite", set()).update(affected.tolist())
+            warnings.append(f"state.{name} non-finite in {int(bad.sum())} rows, worlds {_worlds_text(affected)}")
+        else:
             warnings.append(f"state.{name} contains non-finite values")
     if getattr(state, "body_qd", None) is not None and state.body_qd.size:
         qd = state.body_qd.numpy()
-        linear = np.linalg.norm(qd[:, :3], axis=1)
-        angular = np.linalg.norm(qd[:, 3:], axis=1)
-        stats["max_body_speed"] = float(np.nanmax(linear))
-        stats["max_body_angular_speed"] = float(np.nanmax(angular))
-        fastest = int(np.nanargmax(linear))
+        linear = np.nan_to_num(np.linalg.norm(qd[:, :3], axis=1), nan=0.0)
+        angular = np.nan_to_num(np.linalg.norm(qd[:, 3:], axis=1), nan=0.0)
+        stats["max_body_speed"] = float(linear.max())
+        stats["max_body_angular_speed"] = float(angular.max())
+        fastest = int(np.argmax(linear))
         stats["fastest_body"] = _label(getattr(model, "body_label", None), fastest)
-        if stats["max_body_speed"] > 50.0 or stats["max_body_angular_speed"] > 200.0:
-            warnings.append(f"runaway body velocity (max {stats['max_body_speed']:.3g} m/s at {stats['fastest_body']})")
-    data = getattr(session.solver, "mjw_data", None)
-    if data is not None:
-        nacon = int(data.nacon.numpy()[0])
-        stats["solver_contacts"] = nacon
-        capacity = getattr(data, "naconmax", None)
-        if capacity:
-            stats["solver_contact_capacity"] = int(capacity)
-            if nacon >= int(capacity):
-                warnings.append("MuJoCo contact buffer full (nacon >= naconmax); raise nconmax")
-        njmax = getattr(data, "njmax", None)
-        if njmax and getattr(data, "nefc", None) is not None:
-            nefc = int(data.nefc.numpy().max())
-            stats["solver_constraint_rows"] = nefc
-            if nefc >= int(njmax):
-                warnings.append("MuJoCo constraint buffer full (nefc >= njmax); raise njmax")
-        if nacon:
-            dist = data.contact.dist.numpy()[:nacon]
-            stats["deepest_penetration"] = float(max(0.0, -dist.min()))
-            if -dist.min() > 0.01:
-                warnings.append(f"deep penetration {-dist.min() * 1000:.1f} mm")
-        if getattr(data, "solver_niter", None) is not None:
-            stats["solver_iterations"] = int(data.solver_niter.numpy().max())
-    return {"ok": not warnings, "warnings": warnings, "stats": stats}
+        runaway = (linear > 50.0) | (angular > 200.0)
+        if runaway.any():
+            body_world = model.body_world.numpy()
+            affected = np.unique(body_world[runaway])
+            if per_world:
+                worlds["runaway"] = affected[:64].tolist()
+            warnings.append(
+                f"runaway body velocity (max {stats['max_body_speed']:.3g} m/s at {stats['fastest_body']}) in worlds "
+                f"{_worlds_text(affected)}"
+            )
+    if getattr(solver, "mjw_model", None) is not None and hasattr(solver, "mjc_geom_to_newton_shape"):
+        _mujoco_health(model, solver, report, per_world=per_world, threshold=penetration, limit=limit)
+    else:
+        name = type(solver).__name__
+        report["unsupported"].append(f"{name}: no solver contact or constraint buffers to check")
+        contacts = session.contacts if solver is session.solver else None
+        if contacts is not None and getattr(contacts, "rigid_contact_max", 0):
+            _newton_contacts_health(model, state, contacts, report, threshold=penetration)
+    if twins:
+        initial = session._initial.get("state") if state is session.state else None
+        _twins(model, state, initial, report, twins_tolerance)
+    pairs = sorted(report.pop("_pairs").values(), key=lambda entry: -entry["depth"])
+    if pairs:
+        report["penetration"] = [
+            {"shapes": p["shapes"], "depth": round(p["depth"], 6), "worlds": sorted(p["worlds"])[:16]}
+            for p in pairs[:limit]
+        ]
+        listed = "; ".join(f"{p['shapes'][0]} | {p['shapes'][1]} {p['depth'] * 1000:.1f} mm" for p in pairs[:3])
+        warnings.append(f"deep penetration (> {penetration * 1000:g} mm) in {len(pairs)} shape pairs: {listed}")
+    if "nonfinite" in worlds:
+        worlds["nonfinite"] = sorted(worlds["nonfinite"])[:64]
+    if not per_world:
+        report.pop("worlds")
+    elif not worlds:
+        report.pop("worlds")
+    if not report["unsupported"]:
+        report.pop("unsupported")
+    return {"ok": not warnings, **report}
 
 
 def _final(label: str | None) -> str:

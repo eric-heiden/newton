@@ -306,6 +306,7 @@ class SimulationSession:
         solver_callback: Callable | None = None,
         batch_callback: Callable | None = None,
         close_callback: Callable | None = None,
+        sync_callback: Callable | None = None,
     ):
         self._owner = threading.get_ident()
         self._queue = queue.Queue(maxsize=64)
@@ -344,6 +345,14 @@ class SimulationSession:
         self.close_callback = close_callback
         """Called once as ``close_callback(session)`` when the session closes, e.g. to stop application
         subprocesses."""
+        self.sync_callback = sync_callback
+        """Called as ``sync_callback(session)`` before model-edit checks so ``solver``/``state`` bindings are
+        current when application code replaced them."""
+        from .solverview import ModelWatch  # noqa: PLC0415
+
+        self.watch = ModelWatch(self)
+        """Model-edit detection around trusted execution; ``watch.mode`` is ``"notify"``, ``"report"`` or
+        ``"off"``."""
         self.namespace = dict(namespace or {})
         """Extra names available in trusted execution, refreshed before each cell."""
         self.guide = guide
@@ -438,6 +447,7 @@ class SimulationSession:
             self._renderer = None
         self._scene_generation += 1
         self.model, self.solver = model, solver
+        self.watch.reset()
         self.state = state if state is not None else model.state()
         self.state_next = state_next if state_next is not None else model.state()
         self.control = control if control is not None else model.control()
@@ -874,7 +884,9 @@ class SimulationSession:
     def _step(self, *, count: int = 1, dt: float | None = None) -> dict:
         _integer(count, "count", 1, 10000)
         dt = self.dt if dt is None else self._timestep(dt)
-        self._undoable("step", lambda: self._advance(count, dt))
+        # Edits made earlier in the same cell are checked (and notified) before stepping.
+        with self.watch.stepping("step"):
+            self._undoable("step", lambda: self._advance(count, dt))
         return self._status()
 
     def _advance(self, count: int, dt: float, *, first: bool = True, last: bool = True) -> None:
@@ -949,7 +961,8 @@ class SimulationSession:
         return self._renderer_get().record(**kwargs)
 
     def _filmstrip(self, **kwargs) -> dict:
-        return self._undoable("filmstrip", lambda: self._renderer_get().filmstrip(**kwargs))
+        with self.watch.stepping("filmstrip"):
+            return self._undoable("filmstrip", lambda: self._renderer_get().filmstrip(**kwargs))
 
     def _guide(self) -> dict:
         return {"guide": self.guide}
@@ -1013,6 +1026,7 @@ class SimulationSession:
         "rollout",
         "health",
         "solver_contacts",
+        "solver_params",
         "render",
         "compare_images",
         "contacts_between",
@@ -1041,6 +1055,7 @@ class SimulationSession:
                     "rollout",
                     "health",
                     "solver_contacts",
+                    "solver_params",
                     "render",
                     "compare_images",
                     "contacts_between",
@@ -1060,6 +1075,7 @@ class SimulationSession:
             rollout=self.rollout,
             health=self.health,
             solver_contacts=self.solver_contacts,
+            solver_params=self.solver_params,
             render=self.render,
             compare_images=self.compare_images,
             contacts_between=self.contacts_between,
@@ -1228,6 +1244,8 @@ class SimulationSession:
         self._shown_images = []
         self._transaction_depth += 1
         completed = False
+        if not nested:
+            self.watch.begin()
         try:
             try:
                 with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -1238,6 +1256,9 @@ class SimulationSession:
                 self._refresh_workspace()
             # Re-recording CUDA graphs after the cell can fail too; it then rolls back like the cell.
             note = self.execute_callback(self) if self.execute_callback is not None and self.valid else None
+            if not nested:
+                edits = self.watch.end() if self.valid else self.watch.abort()
+                note = "\n".join(part for part in (note, edits) if part) or None
         except Exception as error:
             self._shown_images = None
             self._execution_error = self._execution_diagnostic(error, filename)
@@ -1247,6 +1268,9 @@ class SimulationSession:
             else:
                 message = f"Python {diagnostic['type']} at line {diagnostic['line']}: {diagnostic['message']}"
             message = message[:4096].rstrip(". ")
+            if not nested:
+                # The rollback restores model arrays itself; the next cell starts from a fresh baseline.
+                self.watch.abort()
             outcome = self._roll_back(undo, nested=nested)
             raise RuntimeError(
                 f"{message}. {outcome} Python variables assigned before the error are kept. "
@@ -1289,7 +1313,7 @@ class SimulationSession:
             "stdout": "".join(output.parts),
             "truncated": output.truncated,
             "workspace": self._workspace_info(),
-            **({"note": str(note)[:1024]} if note else {}),
+            **({"note": str(note)[:4096]} if note else {}),
             **({"images": images} if images else {}),
             **self._background_report(),
         }
@@ -1755,7 +1779,8 @@ class SimulationSession:
                 self.batch_callback(self)
             return index + 1
 
-        count = self._undoable("rollout", run)
+        with self.watch.stepping("rollout()"):
+            count = self._undoable("rollout", run)
         result = {"t": np.asarray(times)}
         for name, values in series.items():
             if values and isinstance(values[0], dict):
@@ -1809,11 +1834,76 @@ class SimulationSession:
             self.show(figure)
         plt.close(figure)
 
-    def health(self) -> dict:
-        """Check for non-finite state, runaway velocities, deep penetration, and solver buffer overflow."""
+    def health(
+        self,
+        solver: Any = None,
+        state: Any = None,
+        *,
+        per_world: bool = True,
+        twins: bool = False,
+        penetration: float = 0.01,
+        twins_tolerance: float = 1e-3,
+    ) -> dict:
+        """Check state and solver for non-finite values, runaway speeds, buffer overflow, and deep penetration.
+
+        Works on any solver object, including ones built in trusted execution; MuJoCo solvers add
+        per-world checks of their own data, ``njmax``/``nconmax`` buffers, and penetrating shape pairs.
+
+        Args:
+            solver: Solver to inspect (default: the session's).
+            state: State to inspect (default: the session's).
+            per_world: Name the worlds behind each finding.
+            twins: Compare the worlds' joint states with each other, for worlds built identical.
+            penetration: Overlap [m] above which contacts are reported by shape pair.
+            twins_tolerance: Deviation [m or rad, and per second for velocities] that counts as disagreement.
+
+        Returns:
+            ``{"ok", "warnings", "stats", "checked", ...}`` with ``worlds``, ``penetration`` and
+            ``unsupported`` entries when they apply.
+        """
         from .diagnostics import health  # noqa: PLC0415
 
-        return health(self)
+        self._assert_owner()
+        return health(
+            self,
+            solver,
+            state,
+            per_world=per_world,
+            twins=twins,
+            penetration=penetration,
+            twins_tolerance=twins_tolerance,
+        )
+
+    def solver_params(
+        self, kind: str, select: str | list[str] | None = None, world: int = 0, *, solver: Any = None, limit: int = 64
+    ) -> dict:
+        """What the solver integrates for one kind of entity, where each value comes from, and what refreshes it.
+
+        For :class:`~newton.solvers.SolverMuJoCo` each row holds the compiled MuJoCo value, ``from``
+        (the Newton model array and index it is computed from), and ``pending`` (values whose model
+        array differs from the compiled value, i.e. edits no ``notify_model_changed`` has applied).
+        The result also lists the :class:`~newton.ModelFlags` that refresh each source, whether the
+        MuJoCo field can differ between worlds, and fields that are read only at construction or
+        not at all. Other solvers report the Newton model values and say that compiled values are
+        unavailable.
+
+        Args:
+            kind: ``"actuator"``, ``"joint"``, ``"geom"``, ``"body"``, ``"equality"``, or ``"option"``.
+            select: Label glob(s) matched against full labels or their last path component; a
+                pattern without wildcards also matches as a substring of the last component.
+            world: World whose rows are reported.
+            solver: Solver to inspect (default: the session's); its own ``model`` is used.
+            limit: Maximum number of rows.
+
+        Returns:
+            Dictionary with ``rows`` (``options`` for ``kind="option"``) and the facts above.
+        """
+        from .solverview import solver_params  # noqa: PLC0415
+
+        self._assert_owner()
+        solver = self.solver if solver is None else solver
+        model = getattr(solver, "model", None) or self.model
+        return solver_params(model, solver, kind, select, world=world, limit=limit)
 
     def swap_solver(self, factory: Callable[[Model], Any], *, frames: int = 2) -> dict:
         """Replace the live solver with ``factory(model)`` after a trial run (trusted execution helper).

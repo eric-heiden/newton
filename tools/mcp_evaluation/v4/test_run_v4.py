@@ -106,6 +106,30 @@ class TestSnapshots(TemporaryDirectory):
         self.assertAlmostEqual(seconds[1], 0.2, delta=0.1)
         self.assertEqual(store.errors, [])
 
+    def test_file_changing_during_every_copy_is_copied_again_later(self):
+        workspace = self.workspace()
+        store = snap.WorkspaceSnapshots(workspace, self.root / "snapshots")
+        script = workspace / "script.py"
+        store_file = store._store
+        versions = iter(range(1, 10))
+
+        def rewritten_while_copied(path):
+            name = store_file(path)
+            if path == script:
+                time.sleep(0.01)
+                script.write_text(f"GAIN = {next(versions)}\n")
+            return name
+
+        with mock.patch.object(store, "_store", side_effect=rewritten_while_copied):
+            first = store.take(0.0)
+        second = store.take(300.0)
+        stored = self.root / "snapshots" / "objects" / second["files"]["script.py"]["sha256"]
+        self.assertEqual(stored.read_text(), script.read_text())
+        self.assertEqual(second["skipped"], [])
+        self.assertNotIn("unstable", second["files"]["script.py"])
+        self.assertEqual(first["skipped"], [{"path": "script.py", "reason": "changed while copied"}])
+        self.assertTrue(first["files"]["script.py"]["unstable"])
+
     def test_ignore_patterns(self):
         patterns = ["photos/", "episode.npz", "*.png"]
         self.assertTrue(snap.ignored("photos/a/b.json", patterns))
@@ -175,6 +199,29 @@ class TestSearch(unittest.TestCase):
         result = snap.search(snapshots, digests, check, exhaustive=True)
         self.assertEqual(result["first_pass_seconds"], 600.0)
         self.assertEqual(calls, [0, 1, 2, 3, 4])
+
+    def test_reverted_submission_that_passed_earlier(self):
+        outcome = {"A": True, "B": False, "C": False, "X": False}
+        for digests, first, last_fail in (
+            (["A", "B", "A"], 0.0, None),
+            (["X", "A", "B", "C", "A"], 300.0, 0.0),
+            (["X", "A", "B"], None, None),
+        ):
+            with self.subTest(digests=digests):
+                check, _ = self.check(lambda i, digests=digests: outcome[digests[i]])
+                result = snap.search(self.snapshots(len(digests)), digests, check)
+                self.assertEqual(result["first_pass_seconds"], first)
+                self.assertEqual(result["last_fail_seconds"], last_fail)
+                self.assertEqual(result["monotonicity_violated"], first is not None and digests[-1] == "A")
+                for row in result["snapshots"]:
+                    if row["source"] != "inferred":
+                        self.assertEqual(row["success"], outcome[row["digest"]])
+        # A pass known from an earlier verification counts even when the last version fails.
+        known = {"A": {"snapshot": "t00300", "success": True}}
+        check, _ = self.check(lambda i: ["X", "A", "B"][i] == "A")
+        result = snap.search(self.snapshots(3), ["X", "A", "B"], check, known=known)
+        self.assertEqual(result["first_pass_seconds"], 300.0)
+        self.assertTrue(result["monotonicity_violated"])
 
     def test_known_results_are_reused(self):
         known = {f"d{i}": {"snapshot": f"t{300 * i:05d}", "success": i >= 1} for i in range(4)}
@@ -269,6 +316,34 @@ class TestTrialSnapshots(TemporaryDirectory):
         everything = run_v4.verify_snapshots(run_dir, exhaustive=True)
         self.assertEqual(len(everything["verifications"]), 3)
         self.assertEqual(everything["first_pass_seconds"], result["first_pass_seconds"])
+
+    def test_no_periodic_snapshot_after_the_agent_ends(self):
+        stop = snap.WorkspaceSnapshots.stop
+
+        def slow_stop(store):
+            time.sleep(0.8)  # longer than SNAPSHOT_SECONDS: ticks in this window would follow the final snapshot
+            stop(store)
+
+        run_dir = self.root / "loop" / "fake-opus-restart-p0"
+        with mock.patch.object(snap.WorkspaceSnapshots, "stop", slow_stop):
+            run_v4.run_trial(run_v4.prepare(run_dir, "fake", "restart", "opus", 60, "test"))
+        manifests = snap.load(run_dir / "snapshots")
+        self.assertTrue(manifests[-1]["final"])
+        self.assertEqual(sum(m["final"] for m in manifests), 1)
+
+    def test_final_snapshot_is_the_last_version(self):
+        run_dir = self.root / "loop" / "fake-opus-restart-p0"
+        summary = run_v4.run_trial(run_v4.prepare(run_dir, "fake", "restart", "opus", 60, "test"))
+        final = next(m for m in snap.load(run_dir / "snapshots") if m["final"])
+        # A periodic snapshot labelled after the final one, of a workspace that no longer passes.
+        late = dict(final, name="t99999", seconds=final["seconds"] + 1.0, final=False)
+        late["files"] = {name: entry for name, entry in final["files"].items() if name != "s.py"}
+        (run_dir / "snapshots" / "t99999.json").write_text(json.dumps(late))
+        result = run_v4.verify_snapshots(run_dir)
+        self.assertNotIn("t99999", [row["name"] for row in result["snapshots"]])
+        self.assertEqual(result["snapshots"][-1]["name"], final["name"])
+        self.assertEqual(result["snapshots"][-1]["source"], "trial")
+        self.assertEqual(result["snapshots"][-1]["success"], summary["verification"]["success"])
 
     def test_refuses_while_trials_run(self):
         run_dir = self.root / "loop" / "fake-opus-restart-p0"

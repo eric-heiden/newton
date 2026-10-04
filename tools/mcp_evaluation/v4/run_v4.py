@@ -894,6 +894,9 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
                     pass
             finally:
                 _stop(agent)
+                if snapshots is not None:
+                    # No periodic snapshot may be labelled after the final one, which is labelled agent_end.
+                    snapshots.request_stop()
                 agent_end = time.time()
                 reader.join(timeout=10)
         elapsed = time.perf_counter() - agent_start
@@ -1138,11 +1141,17 @@ def verify_snapshots(run_dir: Path, exhaustive: bool = False) -> dict:
     manifests = snap.load(run_dir / "snapshots")
     if not manifests:
         raise RuntimeError(f"{run_dir} has no workspace snapshots")
-    digests = [snap.submission_digest(manifest, task["snapshot_ignore"]) for manifest in manifests]
     output = run_dir / "snapshot_verification.json"
     verifications = json.loads(output.read_text())["verifications"] if output.exists() else []
     known = {record["digest"]: record for record in verifications}
+    finals = [manifest for manifest in manifests if manifest.get("final")]
+    if finals:
+        # The final snapshot is the last version; a periodic one labelled after it (taken before the agent's
+        # leftover processes were stopped) is dropped.
+        final = finals[-1]
+        manifests = [m for m in manifests if not m.get("final") and m["seconds"] <= final["seconds"]] + [final]
     final, trial = manifests[-1], summary.get("verification")
+    digests = [snap.submission_digest(manifest, task["snapshot_ignore"]) for manifest in manifests]
     if final.get("final") and trial is not None and digests[-1] not in known:
         record = {"snapshot": final["name"], "seconds": final["seconds"], "digest": digests[-1], "source": "trial"}
         record.update({key: trial.get(key) for key in ("success", "failed_checks", "normalized_worst", "error")})

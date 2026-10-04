@@ -12,7 +12,9 @@ Layout of ``RUN_DIR/snapshots/``:
 - ``objects/<sha256>``: file contents, each stored once.
 - ``t<seconds>.json``: one manifest per snapshot: ``name``, ``seconds`` (since the budget start), ``unix``,
   ``final`` (taken after the agent ended), ``files`` (relative path -> ``{"sha256", "size", "mode"}`` or
-  ``{"link": target}``), ``skipped`` (files not copied, with the reason), ``copy_seconds``.
+  ``{"link": target}``), ``skipped`` (files not copied, or copied while they changed, with the reason),
+  ``copy_seconds``. A file that changed during each of three copies keeps its last copy with ``unstable: true``
+  (it may mix two versions); the next snapshot copies it again.
 - ``caches/``: the trial's compile caches after its own verification, so snapshot verifications see the
   kernels that verification saw (verifiers time setup and rollouts).
 
@@ -28,7 +30,10 @@ verifies the snapshots with the task's sandboxed verifier and writes ``RUN_DIR/s
 - ``last_fail_seconds``: seconds of the snapshot before the first passing one (``None`` if that is the first).
 - ``mode``: ``binary`` (default) or ``all``. Binary mode assumes that once a version passes, every later version
   passes (``assumption``), and verifies O(log n) versions; ``all`` verifies every version, so a pass that a
-  later edit broke is found too.
+  later edit broke is found too. A submission that recurs (e.g. an edit that was reverted) has the same digest
+  as before, so binary mode can know a version before its search result passes; it then searches below that
+  version.
+- ``monotonicity_violated``: a verified (or equal) version after the first pass failed.
 - ``snapshots``: every snapshot with its version, submission digest, and result (``success``; ``source`` says
   whether it was verified, equal to a verified version, taken from the trial's own verification, or inferred
   from the monotonicity assumption, in which case ``success`` is ``None`` and ``inferred_success`` is set).
@@ -99,19 +104,19 @@ class WorkspaceSnapshots:
             return None
         key = (relative, info.st_size, info.st_mtime_ns, info.st_ino)
         name = self._hashes.get(key)
-        if name is None:
-            # A file the agent rewrites while it is copied is copied again (twice at most).
-            for _ in range(3):
-                name = self._store(path)
-                after = path.stat()
-                if (after.st_size, after.st_mtime_ns) == (info.st_size, info.st_mtime_ns):
-                    break
-                info = after
-            else:
-                skipped.append({"path": relative, "reason": "changed while copied"})
-            key = (relative, info.st_size, info.st_mtime_ns, info.st_ino)
-            self._hashes[key] = name
-        return {"sha256": name, "size": info.st_size, "mode": stat.S_IMODE(info.st_mode)}
+        if name is not None:
+            return {"sha256": name, "size": info.st_size, "mode": stat.S_IMODE(info.st_mode)}
+        # A file the agent rewrites while it is copied is copied again (twice at most).
+        for _ in range(3):
+            name = self._store(path)
+            after = path.stat()
+            if (after.st_size, after.st_mtime_ns, after.st_ino) == (info.st_size, info.st_mtime_ns, info.st_ino):
+                self._hashes[(relative, info.st_size, info.st_mtime_ns, info.st_ino)] = name
+                return {"sha256": name, "size": info.st_size, "mode": stat.S_IMODE(info.st_mode)}
+            info = after
+        # The last copy may mix two versions: keep it, but do not reuse its hash, so the next snapshot copies again.
+        skipped.append({"path": relative, "reason": "changed while copied"})
+        return {"sha256": name, "size": info.st_size, "mode": stat.S_IMODE(info.st_mode), "unstable": True}
 
     def _scan(self) -> tuple[dict, list[dict]]:
         files, skipped = {}, []
@@ -163,8 +168,13 @@ class WorkspaceSnapshots:
         def run():
             tick = 0
             while True:
+                # Read the clock before the stop flag: a tick that sees no stop request is labelled before the
+                # agent's end, which run_trial records after request_stop(), so it sorts before the final snapshot.
+                seconds = max(0.0, time.time() - budget_start)
+                if self._stop.is_set():
+                    return
                 try:
-                    self.take(max(0.0, time.time() - budget_start))
+                    self.take(seconds)
                 except Exception as error:
                     self.errors.append(repr(error))
                 # Ticks missed while copying are skipped rather than taken late in a burst.
@@ -175,8 +185,12 @@ class WorkspaceSnapshots:
         self._thread = threading.Thread(target=run, name="workspace-snapshots", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        """Take no periodic snapshot labelled later than now; returns without waiting for a running copy."""
         self._stop.set()
+
+    def stop(self) -> None:
+        self.request_stop()
         if self._thread is not None:
             self._thread.join()
 
@@ -244,7 +258,8 @@ def search(
         known: Results by digest from earlier verifications (updated in place).
 
     Returns:
-        ``first_pass_seconds``, ``last_fail_seconds``, and per snapshot its ``version`` and result.
+        ``first_pass_seconds``, ``last_fail_seconds``, ``monotonicity_violated``, and per snapshot its
+        ``version`` and result.
     """
     known = {} if known is None else known
     versions: list[int] = []  # index of each version's first snapshot
@@ -258,19 +273,39 @@ def search(
             known[digest] = check(versions[version])
         return bool(known[digest].get("success"))
 
-    first = None
-    if exhaustive:
-        outcomes = [passes(version) for version in range(len(versions))]
-        first = outcomes.index(True) if True in outcomes else None
-    elif versions and passes(len(versions) - 1):
-        low, high = 0, len(versions) - 1
+    def known_outcome(version: int) -> bool | None:
+        result = known.get(digests[versions[version]])
+        return None if result is None else bool(result.get("success"))
+
+    def first_below(high: int) -> int:
+        """First passing version up to ``high`` (which passes), assuming :data:`MONOTONE`."""
+        low = 0
         while low < high:
             middle = (low + high) // 2
             if passes(middle):
                 high = middle
             else:
                 low = middle + 1
-        first = low
+        return low
+
+    first = None
+    if exhaustive:
+        outcomes = [passes(version) for version in range(len(versions))]
+        first = outcomes.index(True) if True in outcomes else None
+    elif versions:
+        if passes(len(versions) - 1):
+            first = first_below(len(versions) - 1)
+        # A submission that recurs (e.g. a reverted experiment) shares its digest, so a version before ``first`` can
+        # already be known to pass; search again below it.
+        while True:
+            earlier = next(
+                (version for version in range(len(versions) if first is None else first) if known_outcome(version)),
+                None,
+            )
+            if earlier is None:
+                break
+            first = first_below(earlier)
+    violated = first is not None and any(known_outcome(version) is False for version in range(first + 1, len(versions)))
     rows = []
     for index, snapshot in enumerate(snapshots):
         version = max(v for v, start in enumerate(versions) if start <= index)
@@ -290,6 +325,7 @@ def search(
         "first_pass_seconds": snapshots[first_index]["seconds"] if first_index is not None else None,
         "first_pass_snapshot": snapshots[first_index]["name"] if first_index is not None else None,
         "last_fail_seconds": snapshots[first_index - 1]["seconds"] if first_index else None,
+        "monotonicity_violated": violated,
         "versions": len(versions),
         "snapshots": rows,
     }

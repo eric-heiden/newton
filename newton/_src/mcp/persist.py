@@ -232,31 +232,33 @@ def _same_keys(a: dict, b: dict) -> bool:
     return all(type(key) is type(keys[key]) for key in a)
 
 
-def _quote(text: str) -> str:
+def _quote(text: str, single: bool) -> str:
     literal = repr(text)
-    # Prefer double quotes (ruff style). A single-quoted repr of text without " has no quote escapes.
-    if literal.startswith("'") and '"' not in text:
+    # repr single-quotes unless text has ' but no "; without " inside, the delimiters can be swapped freely.
+    if not single and literal.startswith("'") and '"' not in text:
         literal = '"' + literal[1:-1] + '"'
     return literal
 
 
-def _inline(value: Any) -> str:
+def _inline(value: Any, single: bool = False) -> str:
+    """One-line literal source; ``single`` keeps a script's single-quote string style."""
     if isinstance(value, dict):
-        return "{" + ", ".join(f"{_inline(key)}: {_inline(item)}" for key, item in value.items()) + "}"
-    if isinstance(value, list):
-        return "[" + ", ".join(_inline(item) for item in value) + "]"
-    if isinstance(value, tuple):
-        return "(" + ", ".join(_inline(item) for item in value) + ("," if len(value) == 1 else "") + ")"
-    if isinstance(value, set):
-        return "{" + ", ".join(sorted(_inline(item) for item in value)) + "}"
+        return "{" + ", ".join(f"{_inline(key, single)}: {_inline(item, single)}" for key, item in value.items()) + "}"
+    if isinstance(value, list | tuple | set):
+        items = [_inline(item, single) for item in value]
+        if isinstance(value, set):
+            return "{" + ", ".join(sorted(items)) + "}"
+        if isinstance(value, tuple):
+            return "(" + ", ".join(items) + ("," if len(items) == 1 else "") + ")"
+        return "[" + ", ".join(items) + "]"
     if isinstance(value, str):
-        return _quote(value)
+        return _quote(value, single)
     return repr(value)
 
 
-def _format(value: Any, indent: str, column: int, multiline: bool, newline: str) -> str:
+def _format(value: Any, indent: str, column: int, multiline: bool, newline: str, single: bool = False) -> str:
     """Literal source for ``value`` starting at ``column``; continuation lines use ``indent``."""
-    text = _inline(value)
+    text = _inline(value, single)
     if not isinstance(value, dict | list | tuple | set) or not value:
         return text
     if not multiline and column + len(text) <= _WIDTH:
@@ -266,19 +268,20 @@ def _format(value: Any, indent: str, column: int, multiline: bool, newline: str)
     if isinstance(value, dict):
         items = []
         for key, item in value.items():
-            head = f"{_inline(key)}: "
-            items.append(head + _format(item, inner, len(inner) + len(head), False, newline))
+            head = f"{_inline(key, single)}: "
+            items.append(head + _format(item, inner, len(inner) + len(head), False, newline, single))
     elif all(not isinstance(item, dict | list | tuple | set) for item in value):
         # Pack scalar sequences (arrays) into lines instead of one number per line.
         items, line = [], ""
-        for item in sorted(map(_inline, value)) if isinstance(value, set) else map(_inline, value):
+        texts = [_inline(item, single) for item in value]
+        for item in sorted(texts) if isinstance(value, set) else texts:
             if line and len(inner) + len(line) + len(item) + 3 > _WIDTH:
                 items.append(line)
                 line = ""
             line = f"{line}, {item}" if line else item
         items.append(line)
     else:
-        items = [_format(item, inner, len(inner), False, newline) for item in value]
+        items = [_format(item, inner, len(inner), False, newline, single) for item in value]
     body = "".join(f"{inner}{item},{newline}" for item in items)
     return brackets[0] + newline + body + indent + brackets[1]
 
@@ -561,7 +564,7 @@ def _commit(
 # persist: literal assignments
 
 
-def _patch(script: _Script, node: ast.expr, old: Any, new: Any, edits: list) -> None:
+def _patch(script: _Script, node: ast.expr, old: Any, new: Any, edits: list, single: bool) -> None:
     """Rewrite only the parts of a literal that differ, keeping comments and layout elsewhere."""
     if _same(old, new):
         return
@@ -569,7 +572,7 @@ def _patch(script: _Script, node: ast.expr, old: Any, new: Any, edits: list) -> 
         keys = [ast.literal_eval(key) for key in node.keys]
         if len(set(keys)) == len(keys) and _same_keys(dict.fromkeys(keys), new):
             for key, value in zip(keys, node.values, strict=True):
-                _patch(script, value, old[key], new[key], edits)
+                _patch(script, value, old[key], new[key], edits, single)
             return
     if (
         isinstance(node, ast.List | ast.Tuple)
@@ -578,10 +581,11 @@ def _patch(script: _Script, node: ast.expr, old: Any, new: Any, edits: list) -> 
         and len(node.elts) == len(old)
     ):
         for element, x, y in zip(node.elts, old, new, strict=True):
-            _patch(script, element, x, y, edits)
+            _patch(script, element, x, y, edits, single)
         return
     multiline = node.end_lineno > node.lineno
-    replacement = _format(new, script.indent(node.lineno), node.col_offset, multiline, script.newline(node.lineno))
+    indent, newline = script.indent(node.lineno), script.newline(node.lineno)
+    replacement = _format(new, indent, node.col_offset, multiline, newline, single)
     edits.append(
         (
             script.offset(node.lineno, node.col_offset),
@@ -643,8 +647,15 @@ def persist(
     script = _Script(script_path(session, path))
     node = _assignment(script, name)
     old = ast.literal_eval(node.value)
+    # Keep the literal's quote style when all its strings use single quotes.
+    strings = [
+        ast.get_source_segment(script.text, item) or ""
+        for item in ast.walk(node.value)
+        if isinstance(item, ast.Constant) and isinstance(item.value, str)
+    ]
+    single = bool(strings) and all(segment.startswith("'") for segment in strings)
     edits = []
-    _patch(script, node.value, old, new, edits)
+    _patch(script, node.value, old, new, edits, single)
     text = _Script.splice(script.text, edits)
     # Re-parse to prove the file still compiles and now holds exactly the requested value.
     check_script = ast.parse(text)

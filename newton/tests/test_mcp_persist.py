@@ -200,11 +200,11 @@ class TestMcpPersist(_Base):
         self.script.write_bytes(source.encode("utf-8"))
         self.execute("persist('PARAMS', {'k': 2}, rebuild=False)")
         self.assertEqual(self.script.read_bytes(), source.replace("'k': 1", "'k': 2").encode("utf-8"))
-        self.execute("persist('PARAMS', {'k': 2, 'new': [1, 2]}, rebuild=False)")
+        self.execute("persist('PARAMS', {'k': 2, 'new': ['x', 'y']}, rebuild=False)")
         data = self.script.read_bytes()
-        self.assertTrue(data.startswith(b"\xef\xbb\xbf# \xc3\x9cn\xc3\xafcode header\r\nPARAMS = {\r\n"))
-        self.assertNotIn(b"\n", data.replace(b"\r\n", b""))
-        self.assertTrue(data.endswith("}\r\nOTHER = 'ö'\r\n".encode()))
+        # The rewritten literal keeps the file's line endings and its single-quote style.
+        expected = "PARAMS = {\r\n    'k': 2,\r\n    'new': ['x', 'y'],\r\n}\r\nOTHER = 'ö'\r\n"
+        self.assertEqual(data, b"\xef\xbb\xbf# \xc3\x9cn\xc3\xafcode header\r\n" + expected.encode("utf-8"))
 
     def test_workers_are_rebuilt_after_the_main_scene(self):
         """Rebuild the scene through the rebuild callback, then broadcast a rebuild to worker sessions."""

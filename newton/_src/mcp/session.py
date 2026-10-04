@@ -235,6 +235,8 @@ class SimulationSession:
         batch_callback: Optional ``callback(session)`` run after the session
             itself changed the scene: a batch of consecutive steps (one ``step``
             call or one :meth:`rollout`) or a rebuild.
+        close_callback: Optional ``callback(session)`` called once on the
+            owning thread when the session closes.
     """
 
     class _Request:
@@ -303,6 +305,7 @@ class SimulationSession:
         undo_callback: Callable | None = None,
         solver_callback: Callable | None = None,
         batch_callback: Callable | None = None,
+        close_callback: Callable | None = None,
     ):
         self._owner = threading.get_ident()
         self._queue = queue.Queue(maxsize=64)
@@ -338,6 +341,9 @@ class SimulationSession:
         self.status_fields: dict[str, Any] = {}
         """Extra fields included in every status and appended to every error sent to clients
         (e.g. a hosted script's active build overrides)."""
+        self.close_callback = close_callback
+        """Called once as ``close_callback(session)`` when the session closes, e.g. to stop application
+        subprocesses."""
         self.namespace = dict(namespace or {})
         """Extra names available in trusted execution, refreshed before each cell."""
         self.guide = guide
@@ -620,6 +626,9 @@ class SimulationSession:
                     break
                 request.error = RuntimeError("Session closed before request execution")
                 request.done.set()
+        if self.close_callback is not None:
+            callback, self.close_callback = self.close_callback, None
+            callback(self)
         if self._renderer is not None:
             self._renderer.close()
         if self._owns_workers:

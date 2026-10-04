@@ -1,0 +1,1 @@
+Add `python -m newton.examples.headless` to run an example script in a clean process with a null viewer and write a JSON report: status, exit code, wall time, frames stepped, the value of `--call`, the exception with its traceback, and output tails. `--timeout` records the Python stack of the hung process and kills it with everything it started.

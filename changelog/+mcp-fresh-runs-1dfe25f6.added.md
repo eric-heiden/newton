@@ -1,0 +1,1 @@
+Add the `fresh()` MCP workspace helper for hosted scripts: it runs the script as saved on disk in clean processes through `newton.examples.headless`, at most `parallel` at a time, and returns one report per argument list or, with `wait=False`, a handle with `done()`, `result()`, and `cancel()`.

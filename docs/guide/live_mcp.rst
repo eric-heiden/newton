@@ -105,6 +105,15 @@ background calls; ``--max-workers M`` (default ``max(N, 4)``) bounds
 ``workers.resize(n)``. Workers follow every successful ``newton_rebuild``,
 including its ``overrides`` and example arguments.
 
+``fresh(argv_list, call=..., frames=..., timeout=300, parallel=2, wait=True)``
+runs the script as saved on disk, without the session's live edits, in new
+Python processes through ``python -m newton.examples.headless`` (see
+:doc:`development`). It starts at most ``parallel`` of the session's processes
+at once and returns one report per argument list; ``wait=False`` returns a
+handle with ``done()``, ``result()``, and ``cancel()``. Processes still running
+at their timeout or when the session closes are killed together with the
+processes they started.
+
 Connect an MCP client
 ---------------------
 

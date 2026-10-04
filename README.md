@@ -993,6 +993,9 @@ python -m newton.examples basic_urdf --device cuda:0
 
 # Combine options
 python -m newton.examples basic_viewer --viewer gl --num-frames 500 --device cpu
+
+# Run a script or example in a clean headless process and write a JSON report
+python -m newton.examples.headless basic_pendulum --frames 300 --json report.json --timeout 120
 ```
 
 ## Contributing and Development

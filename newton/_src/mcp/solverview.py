@@ -393,11 +393,14 @@ class ModelWatch:
         self._baseline = None
 
     def reset(self) -> None:
-        """Forget the baseline (scene replaced)."""
+        """Forget the baseline (scene replaced); inside a cell, start a new one so later edits in it are checked."""
         self._model = None
         self._baseline = None
         self._copies.clear()
         self._segments = None
+        if self.active:
+            # E.g. persist() or a rebuild dispatched from a cell.
+            self._guard(self._start)
 
     # -- checksums --------------------------------------------------------------------------------------------------
 
@@ -565,6 +568,9 @@ class ModelWatch:
                 self._guard(self._rebaseline)
 
     def _rebaseline(self) -> None:
+        if self._baseline is None:
+            self._start()
+            return
         digests, changed = self._changes()
         self._set_baseline(digests, changed=changed)
 
@@ -575,6 +581,9 @@ class ModelWatch:
         session = self._session()
         if session.sync_callback is not None:
             session.sync_callback(session)
+        if self._baseline is None:
+            self._start()
+            return
         digests, changed = self._changes()
         if not changed:
             self.notified = 0

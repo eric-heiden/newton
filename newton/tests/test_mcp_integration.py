@@ -65,6 +65,44 @@ class TestMcpRollbackWithEditChecks(unittest.TestCase):
         self.assertEqual(self.servo_gain(), (20.0, False))
 
 
+_HINGE_SCRIPT = """
+import newton
+
+
+class Example:
+    def __init__(self, viewer, args):
+        builder = newton.ModelBuilder()
+        body = builder.add_link(mass=1.0)
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_articulation([builder.add_joint_revolute(-1, body, axis=(0.0, 1.0, 0.0))])
+        self.model = builder.finalize(device="cpu")
+        self.solver = newton.solvers.SolverSemiImplicit(self.model)
+        self.state_0, self.state_1 = self.model.state(), self.model.state()
+        self.control = self.model.control()
+        self.frame_dt = 0.01
+
+    def step(self):
+        self.solver.step(self.state_0, self.state_1, self.control, None, self.frame_dt)
+        self.state_0, self.state_1 = self.state_1, self.state_0
+"""
+
+
+class TestMcpRebuildInsideACell(unittest.TestCase):
+    def test_edits_after_a_rebuild_in_the_same_cell_are_checked(self):
+        """A rebuild dispatched from a cell (as persist() does) restarts the model-edit checks on the new model."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        script = Path(directory.name) / "hinge.py"
+        script.write_text(_HINGE_SCRIPT)
+        session = ExampleHost(script).session(artifact_directory=directory.name)
+        self.addCleanup(session.close)
+        result = session.dispatch(
+            "execute", {"code": "session.dispatch('rebuild', {})\nmodel.joint_target_ke.fill_(7.0)\nNone"}
+        )
+        self.assertNotIn("stopped", result["note"])
+        self.assertRegex(result["note"], r"Model edits in this cell: model\.joint_target_ke")
+
+
 class TestMcpInstructions(unittest.TestCase):
     """The text agents receive: tool semantics for every helper, no removed names, no workflow advice."""
 

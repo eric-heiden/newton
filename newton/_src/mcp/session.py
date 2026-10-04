@@ -447,7 +447,6 @@ class SimulationSession:
             self._renderer = None
         self._scene_generation += 1
         self.model, self.solver = model, solver
-        self.watch.reset()
         self.state = state if state is not None else model.state()
         self.state_next = state_next if state_next is not None else model.state()
         self.control = control if control is not None else model.control()
@@ -475,6 +474,7 @@ class SimulationSession:
         self.last_error: str | None = None
         self._requires_rebuild = False
         self.valid = True
+        self.watch.reset()
         if keep_workspace:
             self._refresh_workspace()
         else:

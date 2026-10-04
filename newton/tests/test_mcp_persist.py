@@ -176,7 +176,7 @@ class TestMcpPersist(_Base):
         )
         original = self.script.read_bytes()
         cases = {
-            "persist('PARAM', {}, rebuild=False)": "no assignment named 'PARAM' at module level. Similar names: PARAMS",
+            "persist('PARAM', {}, rebuild=False)": "no assignment named 'PARAM' at module level; similar names: PARAMS",
             "persist('TWICE', 3, rebuild=False)": "bound 2 times",
             "persist('A', 4, rebuild=False)": "not a plain NAME",
             "persist('COMPUTED', {'a': 2}, rebuild=False)": "is not a literal",
@@ -298,7 +298,7 @@ class TestMcpPersistSource(_Base):
         original = self.script.read_bytes()
         self.execute("def helpr():\n    pass\ndef value():\n    pass\ndef step(self):\n    pass")
         cases = {
-            "persist_source(helpr, rebuild=False)": "no def or class named 'helpr' at the top level. Similar names: helper",
+            "persist_source(helpr, rebuild=False)": "no def or class named 'helpr' at the top level; similar names: helper",
             "persist_source(value, rebuild=False)": "bound by a Assign statement",
             "persist_source(helpr, target='helper', rebuild=False)": "bound 2 times",
             "persist_source(step, target='Missing.step', rebuild=False)": "no class named 'Missing' at the top level",

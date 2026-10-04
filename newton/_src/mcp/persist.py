@@ -394,8 +394,8 @@ def _lines_of(nodes: list[ast.stmt]) -> str:
 
 def _missing(filename: str, body: list[ast.stmt], name: str, what: str, where: str) -> ValueError:
     close = difflib.get_close_matches(name, sorted(_all_bound(body)), n=4, cutoff=0.6)
-    hint = f" Similar names: {', '.join(close)}." if close else ""
-    return ValueError(f"{filename} has no {what} named {name!r} {where}.{hint}")
+    hint = f"; similar names: {', '.join(close)}" if close else ""
+    return ValueError(f"{filename} has no {what} named {name!r} {where}{hint}")
 
 
 # ---------------------------------------------------------------------------
@@ -998,6 +998,13 @@ def _keys(model: Model, rows: np.ndarray, names: list, worlds: list | None) -> l
     return [key if seen[key] == 1 else f"{key}#{row}" for key, row in zip(keys, rows, strict=True)]
 
 
+def _row(value: Any) -> Any:
+    try:
+        return _plain(value)
+    except (TypeError, ValueError):
+        return f"<{np.asarray(value).dtype} array shape={list(np.shape(value))}>"
+
+
 def _flag(name: str) -> ModelFlags | None:
     from .session import SimulationSession  # noqa: PLC0415
 
@@ -1045,9 +1052,7 @@ def diff_model(session: Any, since: str = "build", *, limit: int = 16) -> dict:
                 shown = rows[:limit]
                 frequency = _frequency(model, name, len(old))
                 keys = _row_keys(model, frequency, shown) if frequency is not None else [f"#{r}" for r in shown]
-                report["values"] = {
-                    key: [_plain(old[row]), _plain(new[row])] for key, row in zip(keys, shown, strict=True)
-                }
+                report["values"] = {key: [_row(old[row]), _row(new[row])] for key, row in zip(keys, shown, strict=True)}
         if not report:
             continue
         flag = _flag(name)

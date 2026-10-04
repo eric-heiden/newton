@@ -1116,6 +1116,18 @@ The solver does not read :attr:`~newton.Model.joint_velocity_limit`,
 It reads :attr:`~newton.Model.shape_material_kf` only with
 ``use_mujoco_contacts=False`` (see :ref:`mujoco-contact-friction-solreffriction`).
 
+:meth:`~newton.solvers.SolverMuJoCo.check_world_values` raises
+:class:`ValueError` for model attributes whose per-world values would not take
+effect after :meth:`~newton.solvers.SolverBase.notify_model_changed`: the
+construction-only and unread attributes above, ``joint_target_ke`` and
+``joint_target_kd`` of DOFs without a joint-target actuator that reads them,
+actuator parameters of ``JOINT_TARGET`` actuators, and ``shape_scale`` of
+cones, of sites in models
+with several worlds, and, with ``use_mujoco_contacts=True``, of mesh,
+convex-mesh, and heightfield shapes, whose MuJoCo assets are built from the
+first world. :meth:`newton.selection.WorldView.set_attribute` calls it when
+given the solver.
+
 Actuator gains and control source
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

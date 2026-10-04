@@ -69,6 +69,144 @@ class ModelFlags(IntEnum):
             "and use ModelFlags.ALL for every flag."
         )
 
+    @classmethod
+    def from_attributes(cls, *names: str) -> int:
+        """Return the flags that cover edits of the given model attributes.
+
+        Pass the result to :meth:`~newton.solvers.SolverBase.notify_model_changed`
+        after editing these :class:`~newton.Model` arrays. Custom attributes may
+        be named with ``":"`` or ``"."`` after their namespace, e.g.
+        ``"mujoco:gravcomp"`` or ``"mujoco.gravcomp"``.
+
+        Example:
+
+        .. code-block:: python
+
+            model.body_mass.assign(masses)
+            solver.notify_model_changed(newton.ModelFlags.from_attributes("body_mass"))
+
+        Args:
+            names: Model attribute names.
+
+        Returns:
+            Bit mask of :class:`ModelFlags`. Attributes without a documented
+            category map to :attr:`ALL`.
+        """
+        flags = 0
+        for name in names:
+            flags |= int(_MODEL_FLAGS_BY_ATTRIBUTE.get(name.replace(".", ":", 1), cls.ALL))
+        return flags
+
+
+def _model_flags_by_attribute() -> dict[str, ModelFlags]:
+    flags = ModelFlags
+    categories = {
+        flags.JOINT_PROPERTIES: ("joint_q", "joint_X_p", "joint_X_c", "joint_axis"),
+        flags.JOINT_DOF_PROPERTIES: (
+            "joint_qd",
+            "joint_f",
+            "joint_target_q",
+            "joint_target_qd",
+            "joint_target_ke",
+            "joint_target_kd",
+            "joint_target_mode",
+            "joint_damping",
+            "joint_armature",
+            "joint_friction",
+            "joint_effort_limit",
+            "joint_velocity_limit",
+            "joint_limit_ke",
+            "joint_limit_kd",
+            "joint_limit_lower",
+            "joint_limit_upper",
+            "mujoco:solimplimit",
+            "mujoco:solreflimit",
+            "mujoco:solreflimit_mode",
+            "mujoco:limit_margin",
+            "mujoco:dof_passive_stiffness",
+            "mujoco:solreffriction",
+            "mujoco:solimpfriction",
+            "mujoco:dof_ref",
+            "mujoco:dof_springref",
+        ),
+        flags.BODY_PROPERTIES: ("body_q", "body_qd", "body_flags"),
+        flags.BODY_INERTIAL_PROPERTIES: (
+            "body_mass",
+            "body_inv_mass",
+            "body_com",
+            "body_inertia",
+            "body_inv_inertia",
+            "mujoco:gravcomp",
+        ),
+        flags.SHAPE_PROPERTIES: (
+            "shape_transform",
+            "shape_scale",
+            "shape_collision_radius",
+            "shape_margin",
+            "shape_gap",
+            "shape_material_mu",
+            "shape_material_ke",
+            "shape_material_kd",
+            "shape_material_kf",
+            "shape_material_ka",
+            "shape_material_kh",
+            "shape_material_restitution",
+            "shape_material_mu_torsional",
+            "shape_material_mu_rolling",
+            "mujoco:geom_solimp",
+            "mujoco:geom_solmix",
+            "mujoco:solref",
+            "mujoco:solref_mode",
+            "mujoco:pair_solref",
+            "mujoco:pair_solreffriction",
+            "mujoco:pair_solimp",
+            "mujoco:pair_margin",
+            "mujoco:pair_gap",
+            "mujoco:pair_friction",
+        ),
+        flags.MODEL_PROPERTIES: ("gravity",),
+        flags.CONSTRAINT_PROPERTIES: (
+            "joint_mimic_coeffs",
+            "constraint_mimic_coef0",
+            "constraint_mimic_coef1",
+            "constraint_mimic_enabled",
+            "mujoco:eq_solref",
+            "mujoco:eq_solimp",
+            "mujoco:equality_constraint_anchor",
+            "mujoco:equality_constraint_relpose",
+            "mujoco:equality_constraint_polycoef",
+            "mujoco:equality_constraint_torquescale",
+            "mujoco:equality_constraint_enabled",
+        ),
+        flags.TENDON_PROPERTIES: (
+            "mujoco:tendon_stiffness",
+            "mujoco:tendon_damping",
+            "mujoco:tendon_frictionloss",
+            "mujoco:tendon_range",
+            "mujoco:tendon_margin",
+            "mujoco:tendon_solref_limit",
+            "mujoco:tendon_solimp_limit",
+            "mujoco:tendon_solref_friction",
+            "mujoco:tendon_solimp_friction",
+            "mujoco:tendon_armature",
+            "mujoco:tendon_actuator_force_range",
+        ),
+        flags.ACTUATOR_PROPERTIES: (
+            "mujoco:actuator_gainprm",
+            "mujoco:actuator_biasprm",
+            "mujoco:actuator_dynprm",
+            "mujoco:actuator_ctrlrange",
+            "mujoco:actuator_forcerange",
+            "mujoco:actuator_actrange",
+            "mujoco:actuator_gear",
+            "mujoco:actuator_cranklength",
+        ),
+    }
+    return {name: flag for flag, names in categories.items() for name in names}
+
+
+_MODEL_FLAGS_BY_ATTRIBUTE = _model_flags_by_attribute()
+
 
 class StateFlags(IntEnum):
     """Flags indicating which state attributes were updated or should be reset.

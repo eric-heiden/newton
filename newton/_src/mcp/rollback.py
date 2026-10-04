@@ -159,14 +159,19 @@ def restore_attributes(current: dict, saved: dict, label: str) -> list[str]:
     return changed
 
 
+# Python creates these in a class's __dict__ on first read (e.g. typing.get_type_hints), not only on assignment.
+_LAZY_CLASS_ATTRIBUTES = frozenset({"__annotations__", "__annotate__", "__annotate_func__", "__annotations_cache__"})
+
+
 def restore_class_attributes(cls: type, saved: dict, label: str) -> list[str]:
     """Return a class to its saved attributes (shallow), e.g. a method a cell rebound, and list what changed.
 
-    Attributes that cannot be set or deleted on ``cls`` are listed with ``(not restored)``.
+    Attributes that cannot be set or deleted on ``cls`` are listed with ``(not restored)``. Annotation
+    attributes that Python adds when they are first read are left in place.
     """
     changed = []
     current = vars(cls)
-    for name in [name for name in current if name not in saved]:
+    for name in [name for name in current if name not in saved and name not in _LAZY_CLASS_ATTRIBUTES]:
         try:
             delattr(cls, name)
             changed.append(f"{label}.{name}")

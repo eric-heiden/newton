@@ -195,6 +195,14 @@ class TestMcpRollback(_HostedTest):
         self.assertIn("KeyError", str(raised.exception))
         self.assertNotIn("RecursionError", str(raised.exception))
 
+    def test_failed_cell_that_reads_class_annotations_reports_nothing_restored(self):
+        """Reading type hints adds ``__annotations__`` to a class's ``__dict__``; that is not a change of the cell."""
+        _, session = self.host()
+        code = "import typing\nhints = typing.get_type_hints(module.Drive)\nmodule.Drive.__annotations__\n[][1]"
+        with self.assertRaisesRegex(RuntimeError, "nothing was restored") as raised:
+            self.execute(session, code)
+        self.assertNotIn("__annotations__", str(raised.exception))
+
     def test_cell_without_simulation_changes_reports_nothing_restored(self):
         """Keep the hidden solver state and say so when a failing cell changed nothing."""
         _, session = self.host()

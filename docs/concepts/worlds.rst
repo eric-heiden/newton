@@ -443,12 +443,19 @@ When a solver is passed, the view first calls
 selected rows, and then calls
 :meth:`~newton.solvers.SolverBase.notify_model_changed`. Solvers that read the
 model arrays directly accept every attribute. :class:`~newton.solvers.SolverMuJoCo`
-raises for attributes it reads only when it is constructed, such as
-``joint_target_mode``, ``mujoco:condim``, and the solver options
-``model.mujoco.<option>``; for attributes it does not read; and for
-``shape_scale`` of cone, site, and, with ``use_mujoco_contacts=True``, mesh,
-convex-mesh, and heightfield shapes, whose MuJoCo assets come from the first
-world (see :ref:`mujoco-limits-and-known-behaviors`).
+accepts the attributes that its
+:meth:`~newton.solvers.SolverMuJoCo.notify_model_changed` copies into every
+MuJoCo world, ``joint_q`` and ``joint_qd`` (which its
+:meth:`~newton.solvers.SolverMuJoCo.reset` reads), and, with
+``use_mujoco_contacts=False``, the shape attributes that
+:class:`~newton.CollisionPipeline` reads. It raises for all other attributes,
+such as ``joint_target_mode``, ``mujoco:condim``, and the solver options
+``model.mujoco.<option>``, which it reads only when it is constructed, and
+``joint_enabled`` or ``shape_material_restitution``, which it does not read. It
+also raises for ``shape_scale`` of cone, site, and, with
+``use_mujoco_contacts=True``, mesh, convex-mesh, and heightfield shapes, whose
+MuJoCo assets come from the first world (see
+:ref:`mujoco-limits-and-known-behaviors`).
 
 Other facts that apply to all worlds of a model:
 

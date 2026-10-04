@@ -5130,10 +5130,46 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
     _UNREAD_ATTRIBUTES: ClassVar[dict[str, str]] = {
         "joint_velocity_limit": "SolverMuJoCo does not read joint_velocity_limit.",
+        "joint_enabled": "SolverMuJoCo does not read joint_enabled.",
+        "joint_twist_lower": "SolverMuJoCo does not read joint_twist_lower.",
+        "joint_twist_upper": "SolverMuJoCo does not read joint_twist_upper.",
         "shape_material_restitution": "SolverMuJoCo does not read shape_material_restitution.",
+        "shape_material_ka": "SolverMuJoCo does not read shape_material_ka.",
         "body_inv_mass": "SolverMuJoCo reads body_mass, not body_inv_mass.",
         "body_inv_inertia": "SolverMuJoCo reads body_inertia, not body_inv_inertia.",
+        "body_q": (
+            "SolverMuJoCo steps from State.joint_q and State.joint_qd and computes the body state from them; "
+            "Model.body_q holds the initial value that Model.state() copies."
+        ),
+        "body_qd": (
+            "SolverMuJoCo steps from State.joint_q and State.joint_qd and computes the body state from them; "
+            "Model.body_qd holds the initial value that Model.state() copies."
+        ),
+        **{
+            name: (
+                f"SolverMuJoCo reads Control.{name}, not Model.{name}; Model.control() copies the model's values "
+                "(or references them with clone_variables=False)."
+            )
+            for name in ("joint_target_q", "joint_target_qd", "joint_f")
+        },
     }
+    """Messages for model attributes whose per-world values SolverMuJoCo does not read."""
+
+    _MODEL_ROW_ATTRIBUTES: ClassVar[frozenset[str]] = frozenset({"joint_q", "joint_qd", "particle_mass"})
+    """Model attributes read by row when used: ``joint_q`` and ``joint_qd`` by :meth:`reset`, ``particle_mass``
+    by the coupling methods."""
+
+    _COLLISION_PIPELINE_ATTRIBUTES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "shape_collision_group",
+            "shape_collision_radius",
+            "shape_collision_aabb_lower",
+            "shape_collision_aabb_upper",
+            "shape_material_kh",
+        }
+    )
+    """Shape attributes that :class:`~newton.CollisionPipeline` reads when it detects contacts and SolverMuJoCo's own
+    contact detection does not."""
 
     _DIRECT_ACTUATOR_ATTRIBUTES: ClassVar[frozenset[str]] = frozenset(
         f"mujoco:actuator_{name}"
@@ -5145,13 +5181,24 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
     def check_world_values(self, name: str, indices: Sequence[int] | None = None) -> None:
         """Check that this solver uses per-world values of a model attribute.
 
-        Raises for attributes that the solver reads only when it is
-        constructed (for example ``joint_target_mode``, ``mujoco:condim``, and
-        the solver options ``mujoco:<option>``), for attributes it does not
-        read (for example ``shape_material_restitution``), for
-        ``joint_target_ke`` and ``joint_target_kd`` of DOFs that have no
-        joint-target actuator reading them, for actuator parameters of
-        ``JOINT_TARGET`` actuators, and for ``shape_scale`` of
+        Accepts the attributes that :meth:`notify_model_changed` copies into
+        every world of the MuJoCo model, ``joint_q`` and ``joint_qd`` (which
+        :meth:`reset` reads per world), ``particle_mass`` (which the coupling
+        methods read), and, with ``use_mujoco_contacts=False``, the shape
+        attributes that :class:`~newton.CollisionPipeline` reads, such as
+        ``shape_collision_group``.
+
+        Raises for every other attribute: attributes the solver reads only
+        when it is constructed (for example ``joint_target_mode``,
+        ``mujoco:condim``, the solver options ``mujoco:<option>``, and, with
+        ``use_mujoco_contacts=True``, ``shape_collision_group``) and
+        attributes it does not read (for example
+        ``shape_material_restitution``, ``joint_enabled``, and the initial
+        values ``body_q`` and ``joint_target_q`` that :meth:`Model.state()
+        <newton.Model.state>` and :meth:`Model.control() <newton.Model.control>`
+        copy). Also raises for ``joint_target_ke`` and ``joint_target_kd`` of
+        DOFs that have no joint-target actuator reading them, for actuator
+        parameters of ``JOINT_TARGET`` actuators, and for ``shape_scale`` of
         cones, of sites in models with several worlds, and, with
         ``use_mujoco_contacts=True``, of mesh, convex-mesh, and heightfield
         shapes, whose MuJoCo assets are built from the first world. See
@@ -5171,6 +5218,20 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         message = self._UNREAD_ATTRIBUTES.get(name)
         if message is None and name == "shape_material_kf" and self._use_mujoco_contacts:
             message = "SolverMuJoCo reads shape_material_kf only with use_mujoco_contacts=False."
+        if message is None and name in self._COLLISION_PIPELINE_ATTRIBUTES:
+            if not self._use_mujoco_contacts:
+                return
+            if name == "shape_collision_group":
+                message = (
+                    "With use_mujoco_contacts=True, SolverMuJoCo reads shape_collision_group only when it is "
+                    "constructed and builds the collision masks of every world from the first world's values; "
+                    "no ModelFlags refreshes it."
+                )
+            else:
+                message = (
+                    f"With use_mujoco_contacts=True, SolverMuJoCo does not read {name}; CollisionPipeline reads it "
+                    "for use_mujoco_contacts=False."
+                )
         if message is not None:
             raise ValueError(message)
 
@@ -5189,6 +5250,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             raise ValueError(
                 f"SolverMuJoCo reads {name} only when it is constructed and builds every world from the first "
                 "world's values; no ModelFlags refreshes it."
+            )
+        if name not in self._WORLD_VALUE_ATTRIBUTES and name not in self._MODEL_ROW_ATTRIBUTES:
+            raise ValueError(
+                f"SolverMuJoCo does not apply edited values of {name}: it reads {name} only when it is "
+                "constructed or not at all; no ModelFlags refreshes it."
             )
 
         rows = None if indices is None else np.unique(np.asarray(list(indices), dtype=np.int64))

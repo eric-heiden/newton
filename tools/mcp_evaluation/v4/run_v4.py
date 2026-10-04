@@ -586,7 +586,7 @@ NEWTON_UTILITIES = (
         ("newton.selection.WorldView",),
         "newton.selection.WorldView(model) reads and writes per-world values of model, state and control attributes "
         "selected by label as [world, row, ...] arrays and copies one world's state into many worlds; with solver= "
-        "it raises for values the solver shares across worlds.",
+        "it raises for values the solver shares across worlds, reads only when constructed, or does not read.",
     ),
     (
         (

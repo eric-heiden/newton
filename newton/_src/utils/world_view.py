@@ -244,8 +244,8 @@ class WorldView:
 
         When ``target`` is the model and ``solver`` is given, the view first
         calls :meth:`~newton.solvers.SolverBase.check_world_values`, which
-        raises for attributes the solver shares across worlds or reads only at
-        construction, and after writing calls
+        raises for attributes the solver shares across worlds, reads only at
+        construction, or does not read, and after writing calls
         :meth:`~newton.solvers.SolverBase.notify_model_changed` with the
         returned flags.
 

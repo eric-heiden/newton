@@ -1124,18 +1124,29 @@ Changing ``mujoco.geom_priority``, ``mujoco.condim``, ``mujoco.ctrl_source``, or
 :meth:`~newton.solvers.SolverMuJoCo.step` on every step.
 
 The solver does not read :attr:`~newton.Model.joint_velocity_limit`,
+:attr:`~newton.Model.joint_enabled`,
 :attr:`~newton.Model.shape_material_restitution`,
+:attr:`~newton.Model.shape_material_ka`,
 :attr:`~newton.Model.body_inv_mass`, or :attr:`~newton.Model.body_inv_inertia`.
 It reads :attr:`~newton.Model.shape_material_kf` only with
 ``use_mujoco_contacts=False`` (see :ref:`mujoco-contact-friction-solreffriction`).
+With ``use_mujoco_contacts=True``, it reads
+:attr:`~newton.Model.shape_collision_group` only when it is constructed, and
+does not read :attr:`~newton.Model.shape_collision_radius` or
+:attr:`~newton.Model.shape_material_kh`; with ``use_mujoco_contacts=False``,
+:class:`~newton.CollisionPipeline` reads them.
 
 :meth:`~newton.solvers.SolverMuJoCo.check_world_values` raises
 :class:`ValueError` for model attributes whose per-world values would not take
-effect after :meth:`~newton.solvers.SolverBase.notify_model_changed`: the
-construction-only and unread attributes above, ``joint_target_ke`` and
-``joint_target_kd`` of DOFs without a joint-target actuator that reads them,
-actuator parameters of ``JOINT_TARGET`` actuators, and ``shape_scale`` of
-cones, of sites in models
+effect after :meth:`~newton.solvers.SolverBase.notify_model_changed`: every
+attribute that the solver does not copy into each MuJoCo world, except
+``joint_q`` and ``joint_qd`` (which :meth:`~newton.solvers.SolverMuJoCo.reset`
+reads) and, with ``use_mujoco_contacts=False``, the shape attributes that
+:class:`~newton.CollisionPipeline` reads; this includes the
+construction-only and unread attributes above. It also raises for
+``joint_target_ke`` and ``joint_target_kd`` of DOFs without a joint-target
+actuator that reads them, for actuator parameters of ``JOINT_TARGET``
+actuators, and for ``shape_scale`` of cones, of sites in models
 with several worlds, and, with ``use_mujoco_contacts=True``, of mesh,
 convex-mesh, and heightfield shapes, whose MuJoCo assets are built from the
 first world. :meth:`newton.selection.WorldView.set_attribute` calls it when

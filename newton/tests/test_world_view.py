@@ -296,6 +296,50 @@ def test_mujoco_check_world_values(test, device):
         view.set_attribute("joint_target_ke", model, [10.0, 20.0], labels="arm/*", solver=solver)
 
 
+def test_mujoco_refuses_attributes_it_does_not_apply(test, device):
+    """Attributes outside the values SolverMuJoCo copies per world raise instead of being silently accepted."""
+    model = _replicated(device, 2, mujoco=True)
+    view = WorldView(model)
+    solver = SolverMuJoCo(model, use_mujoco_contacts=True)
+    contype = solver.mjw_model.geom_contype.numpy().copy()
+
+    refusals = {
+        "shape_collision_group": ("box_geom", [1, 2], "only when it is constructed"),
+        "joint_enabled": ("arm/*", [True, False], "does not read joint_enabled"),
+        "shape_material_ka": ("box_geom", [0.0, 0.5], "does not read shape_material_ka"),
+        "shape_collision_radius": ("box_geom", [0.1, 0.9], "does not read shape_collision_radius"),
+        "shape_material_kh": ("box_geom", [1.0e8, 2.0e8], "does not read shape_material_kh"),
+        "body_q": ("box", [[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]] * 2, "State.joint_q"),
+        "joint_target_q": ("arm/*", [0.0, 0.5], "reads Control.joint_target_q"),
+        "shape_color": ("box_geom", [[1.0, 0.0, 0.0]] * 2, "does not apply edited values of shape_color"),
+    }
+    for name, (labels, value, message) in refusals.items():
+        with test.subTest(name=name):
+            before = view.get_attribute(name, model, labels=labels)
+            with test.assertRaises(ValueError) as caught:
+                view.set_attribute(name, model, value, labels=labels, solver=solver)
+            test.assertIn(message, str(caught.exception))
+            np.testing.assert_array_equal(view.get_attribute(name, model, labels=labels), before)
+    np.testing.assert_array_equal(solver.mjw_model.geom_contype.numpy(), contype)
+    with test.assertRaisesRegex(ValueError, "does not read joint_twist_lower"):
+        solver.check_world_values("joint_twist_lower")
+
+    # joint_q and joint_qd of the model are read per world by reset().
+    view.set_attribute("joint_q", model, [[0.1, 0.2], [0.3, 0.4]], labels="arm/*", solver=solver)
+    state = model.state()
+    solver.reset(state)
+    np.testing.assert_allclose(view.get_attribute("joint_q", state, labels="arm/*"), [[0.1, 0.2], [0.3, 0.4]])
+
+    # With Newton contacts, the collision pipeline reads collision groups and radii; SolverMuJoCo accepts them.
+    newton_contacts = SolverMuJoCo(model, use_mujoco_contacts=False)
+    newton_contacts.check_world_values("shape_collision_group")
+    newton_contacts.check_world_values("shape_collision_radius")
+    with test.assertRaisesRegex(ValueError, "does not read shape_material_ka"):
+        newton_contacts.check_world_values("shape_material_ka")
+    with test.assertRaisesRegex(ValueError, "does not read joint_enabled"):
+        newton_contacts.check_world_values("joint_enabled")
+
+
 _SERVO_MJCF = """
 <mujoco>
   <worldbody>
@@ -404,6 +448,7 @@ for _name, _func in (
     ("test_copy_state", test_copy_state),
     ("test_model_flags_from_attributes", test_model_flags_from_attributes),
     ("test_mujoco_check_world_values", test_mujoco_check_world_values),
+    ("test_mujoco_refuses_attributes_it_does_not_apply", test_mujoco_refuses_attributes_it_does_not_apply),
     ("test_mujoco_joint_target_actuator_rows", test_mujoco_joint_target_actuator_rows),
     ("test_candidates_match_sequential_runs", test_candidates_match_sequential_runs),
 ):

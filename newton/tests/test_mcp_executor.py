@@ -21,6 +21,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.mcp.cells import register_cell_source, retain_cell_sources
 from newton.mcp import SimulationServer, SimulationSession
 
 
@@ -270,14 +271,22 @@ values = wp.array([1.0, 2.0, 3.0], dtype=float, device='cpu')
         self.assertEqual(result["result"], [4, 8, 12])
 
     def test_cell_source_cache_is_bounded_and_cleared(self):
-        """Bound cached cell source and remove it when clearing or closing the workspace."""
+        """Bound cached cell source, keep cells of live definitions, and clear it with the workspace."""
         first = self.execute("def first():\n    return 7\nfirst.__code__.co_filename")["result"]
+        dropped = self.execute("def dropped():\n    return 1\ndropped.__code__.co_filename")["result"]
+        self.execute("del dropped")
         self.assertTrue(linecache.getlines(first))
         for index in range(70):
             self.execute(f"counter = {index}")
+        # The 64 most recent cells plus the cell that still defines `first`.
+        self.assertEqual(self.session.dispatch("describe")["workspace"]["source_cells"], 65)
+        self.assertTrue(linecache.getlines(first))
+        self.assertFalse(linecache.getlines(dropped))
+        self.assertEqual(self.execute("first()")["result"], 7)
+        self.execute("first = None")
+        self.execute("counter = 0")
         self.assertEqual(self.session.dispatch("describe")["workspace"]["source_cells"], 64)
         self.assertFalse(linecache.getlines(first))
-        self.assertEqual(self.execute("first()")["result"], 7)
         self.execute("counter = 0", reset_namespace=True)
         self.assertEqual(self.session.dispatch("describe")["workspace"]["source_cells"], 1)
         latest = self.execute("def latest():\n    return 1\nlatest.__code__.co_filename")["result"]
@@ -469,6 +478,25 @@ values = wp.array([1.0, 2.0, 3.0], dtype=float, device='cpu')
             thread.join(timeout=1)
         if errors:
             raise errors[0]
+
+
+class TestMcpCellSources(unittest.TestCase):
+    def test_registration_is_idempotent_and_keeps_live_definitions(self):
+        """Register cell source once under a stable name and keep only cells that live definitions need."""
+        names = [f"<_newton_mcp_test:cell-{i}>" for i in range(5)]
+        for index, name in enumerate(names):
+            register_cell_source(name, f"def f{index}():\n    return {index}")
+        entry = linecache.cache[names[0]]
+        register_cell_source(names[0], "def f0():\n    return 0")
+        self.assertIs(linecache.cache[names[0]], entry)
+        namespace = {}
+        exec(compile("def f1():\n    return 1", names[1], "exec"), namespace)
+        kept = retain_cell_sources(names, namespace, recent=2)
+        self.assertEqual(kept, [names[1], names[3], names[4]])
+        self.assertFalse(linecache.getlines(names[0]))
+        self.assertTrue(linecache.getlines(names[1]))
+        for name in kept:
+            linecache.cache.pop(name, None)
 
 
 if __name__ == "__main__":

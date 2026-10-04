@@ -12,7 +12,6 @@ import contextlib
 import inspect
 import io
 import json
-import linecache
 import math
 import queue
 import sys
@@ -32,6 +31,7 @@ from ..sim.collide import CollisionPipeline
 from ..sim.contact_kinematics import eval_rigid_contact_kinematics
 from ..sim.enums import JointType, ModelFlags, StateFlags
 from ..sim.model import Model
+from .cells import cell_filename, forget_cell_source, register_cell_source, retain_cell_sources
 
 
 def _integer(value: Any, name: str, minimum: int, maximum: int) -> int:
@@ -900,7 +900,7 @@ class SimulationSession:
 
     def _clear_workspace(self) -> None:
         for filename in self._workspace_sources:
-            linecache.cache.pop(filename, None)
+            forget_cell_source(filename)
         self._workspace_sources.clear()
         self._workspace.clear()
         self._workspace_generation += 1
@@ -932,13 +932,12 @@ class SimulationSession:
         }
 
     def _cache_cell_source(self, filename: str, code: str) -> None:
-        lines = code.splitlines(keepends=True)
-        if lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
-        linecache.cache[filename] = (len(code), None, lines, filename)
-        self._workspace_sources.append(filename)
-        if len(self._workspace_sources) > 64:
-            linecache.cache.pop(self._workspace_sources.pop(0), None)
+        register_cell_source(filename, code)
+        if filename not in self._workspace_sources:
+            self._workspace_sources.append(filename)
+        # Older cells stay cached while a workspace function or class still comes from them, so
+        # inspect.getsource() and tracebacks keep working for them; at most 512 cells are kept.
+        self._workspace_sources = retain_cell_sources(self._workspace_sources, self._workspace)
 
     def _execution_diagnostic(self, error: BaseException, filename: str) -> dict:
         frames = [
@@ -965,7 +964,7 @@ class SimulationSession:
         if not isinstance(recovery, str) or recovery not in ("none", "inspect", "acknowledge"):
             raise ValueError("recovery must be none, inspect, or acknowledge")
         self._cell_count += 1
-        filename = f"<{self._workspace_name}:cell-{self._cell_count}>"
+        filename = cell_filename(self._workspace_name, self._cell_count)
         try:
             tree = ast.parse(code, filename=filename, mode="exec")
             if tree.body and isinstance(tree.body[-1], ast.Expr):

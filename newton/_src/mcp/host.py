@@ -543,7 +543,7 @@ class ExampleHost:
             max_workers: Upper bound of ``workers.resize()``; ``0`` omits the worker and job notes.
         """
         text = f"""Hosted script {self.script} (class {self.example_class}, args {self.argv}).
-- `example` is the live Example instance and `module` the loaded script module. One step is one example frame ({_frame_dt(self.example)}); example.step() called directly does not advance session time or rebind `state`.
+- `example` is the live Example instance and `module` the loaded script module. One step is one example frame ({_frame_dt(self.example)}); example.step() called directly does not advance session.time.
 - reset, checkpoint and restore also rewind the example's Warp arrays and the scalar attributes step() changes (timers, phase counters); assigned settings and model edits are kept, and meshes, SDFs and Python containers are not rewound.
 - Before the first step after a cell, the example's attributes, the module globals, and the settings of the solver, model, their option objects and the script's own objects are compared with their values when the CUDA graphs were recorded; if any changed, the graphs are re-recorded (reported in `note`).
 - Rollback after a failed cell also covers the example's attributes and Warp arrays and the module globals (including in-place edits of small dicts and lists); solver internals, meshes and SDFs are not covered.

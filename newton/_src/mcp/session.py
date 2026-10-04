@@ -1302,7 +1302,6 @@ class SimulationSession:
             raise RuntimeError(
                 f"Rebuild failed; the previous scene {previous}.\n{describe_exception(error)}"
             ) from error
-        note = bindings.pop("note", None)
         try:
             self.replace(**bindings, keep_workspace=not reset_namespace)
             if self.batch_callback is not None:
@@ -1330,7 +1329,6 @@ class SimulationSession:
                 for name in ("world_count", "body_count", "shape_count", "joint_count", "joint_dof_count")
             },
             "solver": self._describe_solver(self.solver),
-            **({"note": str(note)[:2048]} if note else {}),
             **({"workers_rebuilt": workers} if workers is not None else {}),
             **self._background_report(),
         }

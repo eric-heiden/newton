@@ -300,8 +300,8 @@ TOOLS = [
         "are summarized; _ keeps the value). show(img, label) returns images inline: numpy arrays, matplotlib figures, "
         "PNG paths, or observe/filmstrip results. Batch many evaluations per call and print compact numbers. "
         "session.dispatch(op, args) runs structured operations (observe, filmstrip, step, reset, checkpoint, restore, "
-        "query, edit). A runtime error keeps variables and states whether the scene stayed valid; if invalid, fix "
-        "with recovery='inspect' then 'acknowledge', or rebuild. Not a sandbox.",
+        "query, edit). If the cell raises, the simulation is rolled back to its state before the cell and the "
+        "error lists what was restored; Python variables are kept. Not a sandbox.",
         {
             "code": {"type": "string", "maxLength": 65536},
             "reset_namespace": {
@@ -309,19 +309,22 @@ TOOLS = [
                 "default": False,
                 "description": "Clear variables, imports, functions and source history before executing. Does not reset or repair physics.",
             },
-            "recovery": {
-                "type": "string",
-                "enum": ["none", "inspect", "acknowledge"],
-                "default": "none",
-                "description": "Explicit trusted recovery while invalid. Inspect does not automatically resume; acknowledge accepts responsibility for model/solver coherence after successful code and leaves playback paused. No rollback.",
-            },
         },
         ("code",),
     ),
     _tool(
         "rebuild",
-        "Invoke the application rebuild callback for topology/solver changes within the same process. Callback arguments are application-specific and new bindings replace the scene, contacts, render caches and checkpoints. Python variables survive unless reset_namespace=true.",
-        {"arguments": {"type": "object"}, "reset_namespace": {"type": "boolean", "default": False}},
+        "Invoke the application rebuild callback for topology/solver changes within the same process. Callback arguments are application-specific and new bindings replace the scene, contacts, render caches and checkpoints. Python variables survive unless reset_namespace=true. If the rebuild fails, the previous scene keeps running and the error shows the traceback.",
+        {
+            "arguments": {"type": "object"},
+            "overrides": {
+                "type": "object",
+                "description": "Hosted scripts: module globals to set after the script loads and before Example() is "
+                "constructed (a dict merges into a dict global; other values replace it). Active until replaced and "
+                "echoed in every response; {} clears them. Same as arguments.overrides.",
+            },
+            "reset_namespace": {"type": "boolean", "default": False},
+        },
     ),
 ]
 
@@ -333,7 +336,7 @@ Efficient workflow:
 - newton_execute runs Python in the app: batch several parameter candidates in one call, compute numeric comparisons, and call show(image_or_figure, label) to see custom plots or composites inline. Prefer one larger call over many small ones.
 - session.dispatch('checkpoint', {'name': ...}) / ('restore', ...) branches from a saved state instead of re-simulating.
 - Built-in helpers (no import needed; newton, np, wp are preloaded): rollout(frames or seconds=..., record={'name': 'expr' or fn}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the solver's effective parameters (MuJoCo solref/solimp/friction after priority and mixing) next to the authored materials; health() flags NaNs, runaway velocities, deep penetration, and solver buffer overflow.
-If a cell raises, the error states whether the scene stayed valid. If invalid, use execute(recovery='inspect') to diagnose and 'acknowledge' after repair, or rebuild."""
+If a cell raises, the simulation is rolled back to its state before the cell and the error lists what was restored; Python variables are kept."""
 
 
 _RTX_NOTE = (
@@ -348,7 +351,7 @@ def rtx_available() -> bool:
 
 
 _INSTRUCTIONS_LEAN = """Live Newton simulation running in another process; its Python state persists between calls.
-newton_execute runs Python in it (preloaded: session, model, state, control, solver, newton, np, wp, show, rollout, health, solver_contacts, render, compare_images, contacts_between). Batch many evaluations per call and print compact numbers.
+newton_execute runs Python in it (preloaded: session, model, state, control, solver, newton, np, wp, show, rollout, health, solver_contacts, render, compare_images, contacts_between, swap_solver). Batch many evaluations per call and print compact numbers. If a cell raises, the simulation is rolled back to its state before the cell and the error lists what was restored; Python variables are kept.
 - render(**observe_options) returns an RGB numpy image directly (fast path for fitting loops); compare_images(sim, ref, mask=None, panel='edges'|'blend'|'mismatch') returns PSNR, SSIM and edge NCC (geometric alignment) and shows a comparison panel.
 - rollout(frames or seconds=..., record={'name': 'expr' or fn}, start=True|'checkpoint', until='expr', plot=True) steps and returns NumPy series.
 - solver_contacts(): active contacts per shape pair with the parameters the solver integrates and which material decided them. contacts_between(a, b=None): contact count, solver normal/friction force, slip speed, and penetration between two shape sets (label substrings), recordable over time in rollout(record=...). health(): NaNs, runaway velocities, penetration, full solver buffers.
@@ -430,10 +433,13 @@ class _Protocol:
             try:
                 if name == "newton_rebuild":
                     reset_namespace = arguments.get("reset_namespace", False)
+                    overrides = arguments.get("overrides")
                     arguments = arguments.get("arguments", {})
                     if not isinstance(arguments, dict):
                         raise ValueError("Rebuild arguments must be an object")
                     arguments = {**arguments, "reset_namespace": reset_namespace}
+                    if overrides is not None:
+                        arguments["overrides"] = overrides
                 data = dict(self.client.request(name.removeprefix("newton_"), **arguments))
                 content = []
                 if "image_base64" in data:

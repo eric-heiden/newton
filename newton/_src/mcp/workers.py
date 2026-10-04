@@ -21,10 +21,9 @@ class WorkerPool:
     Each worker is another instance of the same application with its own scene
     and persistent Python workspace, reached through its connection file. A
     cell's ``result`` (or last expression) is returned; ``args`` holds the
-    JSON arguments of a :meth:`map` job. Jobs run with
-    ``recovery="acknowledge"`` so a failed job does not block later jobs on
-    that worker: an exception is returned for that item, and code that may
-    have left a worker's scene inconsistent should rebuild or reset it.
+    JSON arguments of a :meth:`map` job. A failed job rolls its worker's
+    simulation back like any failed cell, so it does not affect later jobs on
+    that worker; the exception is returned for that item.
 
     Args:
         connection_files: Connection descriptors of the worker sessions.
@@ -47,7 +46,7 @@ class WorkerPool:
 
     def _run(self, index: int, code: str, arguments: Any) -> Any:
         prefix = "" if arguments is None else f"args = __import__('json').loads({json.dumps(json.dumps(arguments))})\n"
-        response = self._clients[index].request("execute", code=prefix + code, recovery="acknowledge")
+        response = self._clients[index].request("execute", code=prefix + code)
         return response.get("result") if response.get("result") is not None else response.get("result_repr")
 
     def broadcast(self, code: str) -> list[Any]:

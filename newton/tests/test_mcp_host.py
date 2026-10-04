@@ -97,7 +97,7 @@ class TestMcpHost(unittest.TestCase):
         host = ExampleHost(self.script)
         session = host.session(artifact_directory=self.directory.name)
         self.addCleanup(session.close)
-        with self.assertRaisesRegex(RuntimeError, "stays valid"):
+        with self.assertRaisesRegex(RuntimeError, "nothing was restored"):
             session.dispatch("execute", {"code": "kept = 3\nmissing_name"})
         self.assertTrue(session.valid)
         self.assertEqual(session.dispatch("execute", {"code": "kept"})["result"], 3)

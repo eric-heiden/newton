@@ -13,17 +13,20 @@ and reload the edited script in the same process.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import linecache
 import os
 import sys
 import time
 from pathlib import Path
-from types import ModuleType
+from types import FunctionType, MethodType, ModuleType
 from typing import Any
 
 import numpy as np
 import warp as wp
+
+import newton
 
 from .protocol import rtx_available
 
@@ -49,6 +52,101 @@ def _load_module(path: Path, generation: int):
     finally:
         sys.path.remove(str(path.parent))
     return module
+
+
+_SCALARS = (int, float, bool, str, type(None))
+
+
+def _overridden(current: Any, value: Any) -> Any:
+    """``value`` as the new value of a module global that is ``current``: dicts merge, other values replace."""
+    if isinstance(current, dict) and isinstance(value, dict):
+        merged = copy.copy(current)
+        for key, item in value.items():
+            merged[key] = _overridden(current[key], item) if key in current else item
+        return merged
+    # JSON has no tuples or integer floats; keep the script's own types where that is unambiguous.
+    if type(current) is float and type(value) is int:
+        return float(value)
+    if isinstance(current, tuple) and isinstance(value, list):
+        return tuple(value)
+    if isinstance(current, np.ndarray) and isinstance(value, list | int | float):
+        return np.asarray(value, dtype=current.dtype)
+    return value
+
+
+def _apply_overrides(module: ModuleType, overrides: dict) -> None:
+    namespace = vars(module)
+    unknown = sorted(name for name in overrides if name not in namespace)
+    if unknown:
+        data = sorted(
+            name
+            for name, value in namespace.items()
+            if not name.startswith("_") and isinstance(value, (*_SCALARS, list, tuple, dict))
+        )
+        raise ValueError(
+            f"The script defines no module global {', '.join(unknown)}; its data globals are {', '.join(data[:80])}"
+        )
+    for name, value in overrides.items():
+        namespace[name] = _overridden(namespace[name], value)
+
+
+def _checked_overrides(overrides: Any) -> dict:
+    if not isinstance(overrides, dict) or not all(isinstance(name, str) and name.isidentifier() for name in overrides):
+        raise ValueError("overrides must map module global names to values, e.g. {'SUBSTEPS': 32}")
+    return copy.deepcopy(overrides)
+
+
+_UNFROZEN = object()
+
+
+def _frozen(value: Any, budget: list[int]) -> Any:
+    """Hashable copy of a small structure of scalars, lists, tuples, and dicts, or ``_UNFROZEN``."""
+    kind = type(value)
+    budget[0] -= 1
+    if budget[0] < 0:
+        return _UNFROZEN
+    if kind in _SCALARS:
+        return value if value == value else "nan"
+    if isinstance(value, np.generic):
+        return value.item()
+    if kind is np.ndarray and value.size <= 64:
+        return ("ndarray", value.dtype.str, value.shape, value.tobytes())
+    if kind in (list, tuple, dict):
+        frozen = []
+        for item in value.items() if kind is dict else value:
+            entry = _frozen(item, budget)
+            if entry is _UNFROZEN:
+                return _UNFROZEN
+            frozen.append(entry)
+        return (kind.__name__, tuple(frozen))
+    return _UNFROZEN
+
+
+def _setting(value: Any) -> tuple:
+    """Fingerprint entry: scalars and small plain-data containers by value, everything else by identity."""
+    if type(value) in _SCALARS:
+        return ("value", value if value == value else "nan")
+    frozen = _frozen(value, [64])
+    return ("object", id(value)) if frozen is _UNFROZEN else ("value", frozen)
+
+
+def _settings_object(value: Any) -> bool:
+    """Whether the fingerprint walks into ``value``'s attributes.
+
+    These are objects whose settings and buffers a CUDA graph may bake in: Newton and MuJoCo-Warp objects
+    (solvers, models, options) and instances of classes from the hosted script, its local modules, or cells.
+    """
+    if isinstance(value, (*_SCALARS, wp.array, np.ndarray, wp.Graph, ModuleType, type, FunctionType, MethodType)):
+        return False
+    if not hasattr(value, "__dict__") or isinstance(value, newton.viewer.ViewerBase):
+        return False
+    name = getattr(type(value), "__module__", "") or ""
+    if name.startswith(("newton", "mujoco_warp", "_newton_hosted_", "_newton_mcp_")):
+        return True
+    from .rollback import user_frame  # noqa: PLC0415
+
+    path = getattr(sys.modules.get(name), "__file__", None)
+    return bool(path) and user_frame(path)
 
 
 class _RecordingViewer:
@@ -105,52 +203,124 @@ class ExampleHost:
         script: Path to a Python file defining ``Example`` (or ``example_class``).
         argv: Command-line arguments for the example's own parser.
         example_class: Class name inside the script.
+        overrides: Module globals to set on every build (see :meth:`build`).
     """
 
-    def __init__(self, script: str | Path, argv: list[str] | None = None, *, example_class: str = "Example"):
+    def __init__(
+        self,
+        script: str | Path,
+        argv: list[str] | None = None,
+        *,
+        example_class: str = "Example",
+        overrides: dict | None = None,
+    ):
         self.script = Path(script).resolve()
         self.argv = list(argv or [])
         self.example_class = example_class
+        self.overrides = _checked_overrides(overrides or {})
+        """Active module-global overrides, applied by every build until replaced."""
         self.generation = 0
         self.module = None
         self.example = None
         self.build_seconds = 0.0
         self.recaptures = 0
-        self._fingerprint = None
+        self._fingerprint = {}
+        self._batch_start = None
         self._notes = []
         self._dynamic_scalars: set[str] = set()
+        self._dynamic_keys: set[str] = set()
         self._no_solver = _NoSolver()
         self.restart_requested = False
 
-    def build(self, argv: list[str] | None = None) -> Any:
-        """(Re)load the script from disk and construct its example with a null viewer."""
-        if argv is not None:
-            self.argv = list(argv)
+    def build(self, argv: list[str] | None = None, overrides: dict | None = None) -> Any:
+        """(Re)load the script from disk and construct its example with a null viewer.
+
+        Nothing changes if loading or construction raises.
+
+        Args:
+            argv: Example arguments; ``None`` keeps the current ones.
+            overrides: Module globals to set after the script is loaded and before ``Example()`` is
+                constructed, e.g. ``{"SUBSTEPS": 32, "PARAMS": {"dt": 0.001}}``. A dictionary merges into a
+                dictionary global (recursively); other values replace the global. The mapping becomes the
+                active set used by later builds; ``None`` keeps the active set and ``{}`` clears it. Module
+                code that already ran while loading (constants computed from the original value, default
+                arguments) keeps the original values.
+        """
+        argv = self.argv if argv is None else list(argv)
+        overrides = self.overrides if overrides is None else _checked_overrides(overrides)
         started = time.perf_counter()
         self.generation += 1
         module = _load_module(self.script, self.generation)
+        _apply_overrides(module, copy.deepcopy(overrides))
         cls = getattr(module, self.example_class)
         import newton.examples  # noqa: PLC0415
 
         parser = cls.create_parser() if hasattr(cls, "create_parser") else newton.examples.create_parser()
-        args, _ = parser.parse_known_args(self.argv)
+        args, _ = parser.parse_known_args(argv)
         args.viewer = "null"
         viewer_class = type("RecordingViewerNull", (_RecordingViewer, newton.viewer.ViewerNull), {})
         viewer = viewer_class(num_frames=1 << 62)
         example = cls(viewer, args)
+        self.argv, self.overrides = argv, overrides
         self.module, self.example, self.args = module, example, args
         self._dynamic_scalars = set()
+        self._dynamic_keys = set()
         self.build_seconds = time.perf_counter() - started
         self._fingerprint = self.fingerprint()
         return example
 
-    def fingerprint(self) -> dict:
-        """Identity of the example's objects and values of its scalars, to detect edits a CUDA graph missed."""
-        return {
-            name: ("value", value) if type(value) in (int, float, bool, str) else ("object", id(value))
-            for name, value in vars(self.example).items()
+    def fingerprint(self, *, deep: bool = True) -> dict:
+        """Settings a CUDA graph may have baked in, to detect edits that require re-recording it.
+
+        Covers the example's attributes and, with ``deep``, the script's module globals and the
+        attributes of the objects the example holds (solver, model, collision pipeline, the script's own
+        controller objects) and of their option objects, three levels deep. Scalars and small plain-data
+        containers are compared by value, other objects by identity.
+        """
+        example = self.example
+        entries = {
+            f"example.{name}": _setting(value)
+            for name, value in vars(example).items()
             if not isinstance(value, wp.Graph)
         }
+        if not deep:
+            return entries
+        for name, value in vars(self.module).items():
+            if not name.startswith("__") and not isinstance(value, ModuleType):
+                entries[f"module.{name}"] = _setting(value)
+        visited = {id(example)}
+        budget = [50_000]
+
+        def walk(prefix: str, obj: Any, depth: int) -> None:
+            for name, value in vars(obj).items():
+                if budget[0] <= 0:
+                    return
+                budget[0] -= 1
+                kind = type(value)
+                # Fast paths for the common leaves (the rest of the walk runs once per step batch).
+                if kind is wp.array:
+                    entries[f"{prefix}.{name}"] = ("object", id(value))
+                    continue
+                if kind in _SCALARS:
+                    entries[f"{prefix}.{name}"] = ("value", value if value == value else "nan")
+                    continue
+                if kind is wp.Graph:
+                    continue
+                key = f"{prefix}.{name}"
+                entries[key] = _setting(value)
+                if depth < 3 and id(value) not in visited and _settings_object(value):
+                    visited.add(id(value))
+                    walk(key, value, depth + 1)
+
+        for name, value in vars(example).items():
+            if id(value) not in visited and _settings_object(value):
+                visited.add(id(value))
+                walk(f"example.{name}", value, 1)
+        return entries
+
+    @staticmethod
+    def _shallow(key: str) -> bool:
+        return key.startswith("example.") and key.count(".") == 1
 
     def recapture(self) -> bool:
         """Re-record the example's CUDA graphs so they use its current solver, arrays, and scalars.
@@ -175,7 +345,8 @@ class ExampleHost:
         elif isinstance(getattr(example, "graph", None), wp.Graph) and callable(getattr(example, "simulate", None)):
             # The graph replays from the buffers bound at capture time.
             bound = {name: getattr(example, name) for name in ("state_0", "state_1") if hasattr(example, name)}
-            with wp.ScopedCapture() as capture:
+            # Record on the old graph's device, which need not be Warp's current default device.
+            with wp.ScopedCapture(device=getattr(example.graph, "device", None)) as capture:
                 example.simulate()
             for name, value in bound.items():
                 setattr(example, name, value)
@@ -186,15 +357,27 @@ class ExampleHost:
         self._fingerprint = self.fingerprint()
         return True
 
-    def sync(self, session) -> None:
-        """Rebind the session and recapture CUDA graphs if example attributes changed since the last step."""
-        current = self.fingerprint()
-        if current == self._fingerprint:
+    def sync(self, session, *, deep: bool = True) -> None:
+        """Rebind the session and re-record CUDA graphs if settings changed since the last step.
+
+        Args:
+            session: The hosted session.
+            deep: Compare all settings, not only the example's own attributes.
+        """
+        current = self.fingerprint(deep=deep)
+        baseline = self._fingerprint
+        keys = current.keys() | (baseline.keys() if deep else {key for key in baseline if self._shallow(key)})
+        changed = [key for key in keys if current.get(key) != baseline.get(key)]
+        if not changed:
             return
-        changed = sorted(
-            k for k in current.keys() | self._fingerprint.keys() if current.get(k) != self._fingerprint.get(k)
-        )
-        self._fingerprint = current
+        if deep:
+            self._fingerprint = current
+        else:
+            for key in changed:
+                if key in current:
+                    baseline[key] = current[key]
+                else:
+                    baseline.pop(key, None)
         state = getattr(self.example, "state_0", None) or getattr(self.example, "state", None)
         solver = getattr(self.example, "solver", None) or self._no_solver
         if session.solver is not solver or session.state is not state:
@@ -203,12 +386,30 @@ class ExampleHost:
             session.control = getattr(self.example, "control", session.control)
         if not any(isinstance(value, wp.Graph) for value in vars(self.example).values()):
             return
-        # Timers and phase counters that step() itself advances do not require a new graph.
-        edited = [k for k in changed if k not in self._dynamic_scalars or current.get(k, ("",))[0] == "object"]
+        # Timers and phase counters that stepping itself advances do not require a new graph.
+        edited = [key for key in changed if key not in self._dynamic_keys or current.get(key, ("",))[0] == "object"]
         if edited and self.recapture():
-            note = f"CUDA graphs recaptured after changes to example.{', example.'.join(edited[:6])}"
+            # A replaced object implies new values for everything below it; name only the object.
+            replaced = [key for key in edited if current.get(key, ("",))[0] == "object"]
+            edited = [key for key in edited if not any(key.startswith(f"{parent}.") for parent in replaced)]
+            public = sorted((key for key in edited if "._" not in key), key=lambda key: (key.count("."), key))
+            names = public[:6] + ([f"{len(public) - 6} more"] if len(public) > 6 else [])
+            # Private solver bookkeeping (e.g. snapshots refreshed by notify_model_changed) is summarized.
+            owners = sorted({key.split("._", 1)[0] for key in edited if "._" in key})
+            names += [f"private attributes of {owner}" for owner in owners[:3]]
+            note = f"CUDA graphs recaptured after changes to {', '.join(names)}"
             if note not in self._notes:
                 self._notes.append(note)
+
+    def end_batch(self, session) -> None:
+        """Refresh the settings baseline after consecutive steps; settings that stepping changed are dynamic."""
+        current = self.fingerprint()
+        start = self._batch_start or {}
+        self._dynamic_keys.update(
+            key for key, value in current.items() if value[0] == "value" and key in start and start[key] != value
+        )
+        self._fingerprint = current
+        self._batch_start = None
 
     def overlay_meshes(self, session) -> list:
         """Meshes the example draws itself in ``render()`` (e.g. extracted surfaces), as NumPy arrays."""
@@ -230,6 +431,62 @@ class ExampleHost:
         self.sync(session)
         notes, self._notes = self._notes, []
         return "; ".join(notes) or None
+
+    def undo_point(self, session, copies) -> Any:
+        """Remember the example's and module's attributes and copy the example's arrays, for a rollback."""
+        from .rollback import restore_attributes  # noqa: PLC0415
+
+        example, module = self.example, self.module
+        attributes, module_globals = dict(vars(example)), dict(vars(module))
+        # Small plain-data lists and dicts (e.g. a PARAMS dict) are also restored when edited in place.
+        contents = {
+            (label, name): (value, copy.deepcopy(value), frozen)
+            for label, namespace in (("example", attributes), ("module", module_globals))
+            for name, value in namespace.items()
+            if type(value) in (list, dict) and (frozen := _frozen(value, [256])) is not _UNFROZEN
+        }
+        copies.capture("example", example)
+        saved = (dict(self._fingerprint), set(self._dynamic_scalars), set(self._dynamic_keys), list(self._notes))
+
+        def undo() -> list[str]:
+            if self.example is not example:
+                return []
+            restored = restore_attributes(vars(example), attributes, "example")
+            restored += restore_attributes(vars(module), module_globals, "module")
+            for (label, name), (value, original, frozen) in contents.items():
+                if _frozen(value, [256]) != frozen:
+                    if isinstance(value, dict):
+                        value.clear()
+                        value.update(original)
+                    else:
+                        value[:] = original
+                    if f"{label}.{name}" not in restored:
+                        restored.append(f"{label}.{name}")
+            self._fingerprint, self._dynamic_scalars, self._dynamic_keys, self._notes = saved
+            return restored
+
+        return undo
+
+    def install_solver(self, session, solver) -> None:
+        """Make ``solver`` the example's solver and re-record its CUDA graphs (for ``swap_solver``)."""
+        self.example.solver = solver
+        self.sync(session)
+
+    def echo(self, session) -> None:
+        """Report the active overrides in every response of ``session``."""
+        if self.overrides:
+            session.status_fields["overrides"] = copy.deepcopy(self.overrides)
+        else:
+            session.status_fields.pop("overrides", None)
+
+    def rebuild_workers(self, session) -> str:
+        """Rebuild the sibling workers with this host's overrides and arguments, through their own rebuild."""
+        arguments = json.dumps({"overrides": self.overrides, "argv": self.argv})
+        try:
+            session.workers.broadcast(f"session.dispatch('rebuild', __import__('json').loads({arguments!r}))\nNone")
+        except Exception as error:
+            return f"workers: rebuild with these overrides failed: {type(error).__name__}: {str(error)[:1024]}"
+        return f"workers: {session.workers.count} rebuilt with these overrides and arguments"
 
     def bindings(self) -> dict:
         example = self.example
@@ -272,16 +529,17 @@ class ExampleHost:
         text = f"""Hosted Newton example: {self.script} (class {self.example_class}, args {self.argv}).
 - `example` is the live Example instance and `module` its script module; one step is one example frame ({_frame_dt(self.example)}). Use rollout(...) or session.dispatch('step', {{'count': n}}) rather than example.step() so time, recordings, and bindings stay in sync.
 - Checkpoints (session.dispatch('checkpoint'/'restore', {{'name': ...}})) and reset rewind the physics state, the example's own Warp arrays, and the scalar attributes that step() changes (timers, phase counters). Scalar settings you assign (gains, amplitudes, look-ahead) are kept across reset/restore; model arrays you edit are kept too. Other objects (meshes, SDFs, textures, Python containers) are not rewound; newton_rebuild gives a fresh scene. Branch candidates from one checkpoint instead of re-simulating the approach each time.
-- Live edits: change model arrays and call example.solver.notify_model_changed(newton.ModelFlags....) (arrays are read at run time, so this works with CUDA graphs); assign example attributes (gains, amplitudes) or a new example.solver. After such a cell the host re-records the example's CUDA graphs so captured kernel arguments pick up the change (reported as `note`); call recapture() after in-place changes it cannot see.
-- Helpers (preloaded with newton, np, wp): rollout(frames or seconds=..., record={{'name': 'expr' or fn}}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the parameters the solver actually integrates and which shape's material decided them; contacts_between(a, b=None, detail=False) summarizes contacts between two shape sets (count, solver normal and friction force, slip speed, penetration) and works as a rollout(record=...) probe; health() flags NaNs, runaway velocities, deep penetration, and full solver buffers.
+- Live edits: change model arrays and call example.solver.notify_model_changed(newton.ModelFlags....) (arrays are read at run time, so this works with CUDA graphs); assign example attributes (gains, amplitudes, substeps), module globals, or a new example.solver. Before the next step, the host compares the example's attributes, the script's module globals, and the scalar settings and buffers of the solver, model, their option objects, and the script's own objects (e.g. controllers) with their values when the CUDA graphs were recorded, and re-records the graphs if any changed (reported as `note`).
+- Helpers (preloaded with newton, np, wp): rollout(frames or seconds=..., record={{'name': 'expr' or fn}}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the parameters the solver actually integrates and which shape's material decided them; contacts_between(a, b=None, detail=False) summarizes contacts between two shape sets (count, solver normal and friction force, slip speed, penetration) and works as a rollout(record=...) probe; health() flags NaNs, runaway velocities, deep penetration, and full solver buffers; swap_solver(factory, frames=2) replaces example.solver with factory(model): it re-records the CUDA graphs, steps a copy of the current state for two frames, runs health(), and restores the state, keeping the previous solver if any of this fails or health() reports a new warning.
 - Observations (session.dispatch('observe'/'filmstrip', ...), shown with show()) draw the model's visible shapes plus meshes the example logs in its own render() (e.g. extracted surfaces), auto-framed, with a sky and a ground checker of reported cell size (environment=False for plain renders).{rtx} intrinsics={{fx, fy, cx, cy, ...}} matches a calibrated real camera (distortion_model='inverse_brown_conrady' for RealSense). render(**observe_options) returns a numpy image for fitting loops; compare_images(sim, ref, mask=None, panel='edges') scores PSNR, SSIM, and edge NCC against a real frame; observe(reference='frame.png', comparison='edges' or 'blend') shows the comparison panel. filmstrip(times=..., reset=True, references=video_frames, stride=k, comparison='edges', pose=..., intrinsics=...) steps the simulation to each recorded time and scores every frame against the video. camera_body='label' (with an optional camera_offset pose in the body frame) mounts the camera on a body such as a wrist camera link instead of a fixed pose, and overlay={{'name': 'expr' or fn or {{'body': label, 'point': [x, y, z]}}}} draws labeled rings at simulated points on the simulated and reference frames and returns their pixel coordinates.
 - In models with several worlds, world_id selects the world in observations, and body labels resolve within it.
-- Python errors in a cell are reported but keep the scene valid; statements before the failing line keep their effects.
+- If a cell raises (also inside rollout or a step), the simulation returns to its state before the cell: time, state, control, model arrays (the solver is notified of restored fields), the example's attributes and Warp arrays, and the script's module globals; the error lists what was restored. Python variables assigned before the error are kept, and objects changed in place (dicts, lists, solver internals) are not restored.
 - newton_rebuild(arguments={{"restart": true}}) restarts the whole host process (fresh CUDA context, same script and arguments; Python variables are lost, and the next call waits for the new process). Use it only if the process is broken, e.g. after a CUDA error.
-- After editing the script on disk, newton_rebuild reloads and reconstructs it in this process (Python variables survive; pass arguments={{"argv": [...]}} to change example arguments). Rebuild once to confirm the edited script reproduces your live result."""
+- After editing the script on disk, newton_rebuild reloads and reconstructs it in this process (Python variables survive; pass arguments={{"argv": [...]}} to change example arguments). If loading or constructing fails, the previous scene keeps running and the error shows the traceback with file:line.
+- newton_rebuild(arguments={{"overrides": {{"NAME": value, ...}}}}) sets module globals of the script after it loads and before Example() is constructed: a dict merges into a dict global, other values replace the global. Module code that already ran while loading keeps values computed from the originals. The overrides stay active for later rebuilds (and restarts) and are echoed as `overrides` in every response until replaced; "overrides": {{}} clears them."""
         if workers:
             text += f"""
-- `workers` holds {workers} sibling live copies of this example (same script and arguments, separate processes and scenes). For a sweep, one call to workers.map(code, [args, ...]) runs a code string once per item in parallel (the item is `args` inside; `example`, `rollout`, ... exist there too) and returns all results in the same response; workers.broadcast(code) defines helpers on all of them. workers.submit(code, args) returns a Future instead; use it only when you will do other work in this call before collecting .result(), since polling costs an extra turn. Workers do not see this session's Python variables or live edits: send the settings to test in `args`, and rebuild them (workers.broadcast("session.dispatch('rebuild', {{}})")) after editing the script."""
+- `workers` holds {workers} sibling live copies of this example (same script and arguments, separate processes and scenes). For a sweep, one call to workers.map(code, [args, ...]) runs a code string once per item in parallel (the item is `args` inside; `example`, `rollout`, ... exist there too) and returns all results in the same response; workers.broadcast(code) defines helpers on all of them. workers.submit(code, args) returns a Future instead; use it only when you will do other work in this call before collecting .result(), since polling costs an extra turn. Workers do not see this session's Python variables or live edits: send the settings to test in `args`, and rebuild them (workers.broadcast("session.dispatch('rebuild', {{}})")) after editing the script. A newton_rebuild with overrides rebuilds the workers with the same overrides and arguments."""
         return text
 
     def session(self, *, artifact_directory=None, workers=None, allow_execute: bool = True):
@@ -291,23 +549,39 @@ class ExampleHost:
         host = self
 
         def step(session, dt):
-            host.sync(session)
+            first = session._batch_step == 0
+            # Settings beyond the example's own attributes can only change between batches of steps.
+            host.sync(session, deep=first)
+            if first:
+                host._batch_start = dict(host._fingerprint)
             before = host._scalars()
             host.example.step()
-            host._dynamic_scalars.update(k for k, v in host._scalars().items() if before.get(k, v) != v)
+            advanced = {k for k, v in host._scalars().items() if before.get(k, v) != v}
+            host._dynamic_scalars.update(advanced)
+            host._dynamic_keys.update(f"example.{name}" for name in advanced)
             session.state = getattr(host.example, "state_0", None) or getattr(host.example, "state", None)
             session.state_next = getattr(host.example, "state_1", None) or session.state_next
-            host._fingerprint = host.fingerprint()
+            shallow = host.fingerprint(deep=False)
+            for key in [key for key in host._fingerprint if host._shallow(key) and key not in shallow]:
+                del host._fingerprint[key]
+            host._fingerprint.update(shallow)
 
-        def rebuild(session, argv=None, restart=False, **_):
+        def rebuild(session, argv=None, restart=False, overrides=None):
             if restart:
+                if overrides is not None:
+                    host.overrides = _checked_overrides(overrides)
+                    host.echo(session)
                 # The host process re-executes itself once this response has been sent.
                 host.restart_requested = True
                 return host.bindings()
-            host.build(argv)
+            host.build(argv, overrides)
             session.namespace.update(example=host.example, module=host.module)
             session.dt = getattr(host.example, "frame_dt", session.dt)
-            return host.bindings()
+            host.echo(session)
+            bindings = host.bindings()
+            if overrides is not None and session.workers is not None:
+                bindings["note"] = host.rebuild_workers(session)
+            return bindings
 
         if self.example is None:
             self.build()
@@ -325,8 +599,13 @@ class ExampleHost:
             workers=workers,
             execute_callback=self.after_execute,
             overlay_callback=self.overlay_meshes,
-            invalidate_on_error=False,
+            undo_callback=self.undo_point,
+            solver_callback=self.install_solver,
+            batch_callback=self.end_batch,
         )
+        self.echo(session)
+        # The session may have adjusted the model (e.g. contact capacity for its collision pipeline).
+        self._fingerprint = self.fingerprint()
         session.host = self
         return session
 
@@ -340,6 +619,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--workers", type=int, default=0, help="Also host this many sibling copies as a worker pool")
     parser.add_argument("--ready-file", type=Path)
+    parser.add_argument(
+        "--overrides",
+        type=json.loads,
+        help="JSON object of module globals to set before Example() is constructed (as newton_rebuild overrides)",
+    )
     argv = list(sys.argv[1:] if argv is None else argv)
     # Everything after "--" belongs to the example's own argument parser.
     split = argv.index("--") if "--" in argv else len(argv)
@@ -372,12 +656,13 @@ def main(argv: list[str] | None = None) -> None:
                     args.example_class,
                     "--ready-file",
                     str(ready),
+                    *(["--overrides", json.dumps(args.overrides)] if args.overrides else []),
                     "--",
                     *example_args,
                 ]
             )
         )
-    host = ExampleHost(args.script, example_args, example_class=args.example_class)
+    host = ExampleHost(args.script, example_args, example_class=args.example_class, overrides=args.overrides)
     host.build()
     for index, child in enumerate(children):
         ready = args.connection_file.with_name(f"{args.connection_file.stem}.worker-{index}.ready")
@@ -406,4 +691,21 @@ def main(argv: list[str] | None = None) -> None:
     if host.restart_requested:
         marker.unlink(missing_ok=True)
         print("RESTART: re-executing the host process", flush=True)
-        os.execv(sys.executable, [sys.executable, "-m", "newton.mcp", "host", *argv])
+        os.execv(sys.executable, [sys.executable, "-m", "newton.mcp", "host", *_with_overrides(argv, host.overrides)])
+
+
+def _with_overrides(argv: list[str], overrides: dict) -> list[str]:
+    """Host command line ``argv`` with its ``--overrides`` option replaced by ``overrides`` (dropped if empty)."""
+    split = argv.index("--") if "--" in argv else len(argv)
+    head, tail = argv[:split], argv[split:]
+    kept, skip = [], False
+    for item in head:
+        if skip:
+            skip = False
+        elif item == "--overrides":
+            skip = True
+        elif not item.startswith("--overrides="):
+            kept.append(item)
+    if overrides:
+        kept += ["--overrides", json.dumps(overrides)]
+    return kept + tail

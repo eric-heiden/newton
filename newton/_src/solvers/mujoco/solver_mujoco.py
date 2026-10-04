@@ -12,7 +12,7 @@ import warnings
 from collections.abc import Iterable
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import warp as wp
@@ -8175,11 +8175,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         initial_jacobian = self.mj_data.efc_J.reshape((-1, self.mj_model.nv))[: self.mj_data.nefc]
         return int(np.count_nonzero(initial_jacobian))
 
-    def _expand_model_fields(self, mj_model: MjWarpModel, nworld: int):
-        if nworld == 1:
-            return
-
-        model_fields_to_expand = {
+    _PER_WORLD_MODEL_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
             "qpos0",
             "qpos_spring",
             "body_pos",
@@ -8265,9 +8262,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             "tendon_invweight0",  # Derived from inertia, computed by set_const_0
             # "mat_rgba",
         }
+    )
+    """MuJoCo Warp model fields tiled to one row per world, so their values can differ between worlds; other fields are shared."""
 
-        # Solver option fields to expand (nested in mj_model.opt)
-        opt_fields_to_expand = {
+    _PER_WORLD_OPTION_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
             # "timestep",  # Excluded: conflicts with step() function parameter
             "impratio_invsqrt",
             "tolerance",
@@ -8280,6 +8279,16 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             "wind",
             "magnetic",
         }
+    )
+    """MuJoCo Warp ``opt`` fields tiled to one row per world."""
+
+    def _expand_model_fields(self, mj_model: MjWarpModel, nworld: int):
+        if nworld == 1:
+            return
+
+        model_fields_to_expand = self._PER_WORLD_MODEL_FIELDS
+
+        opt_fields_to_expand = self._PER_WORLD_OPTION_FIELDS
 
         def tile(x: wp.array):
             # Create new array with same shape but first dim multiplied by nworld

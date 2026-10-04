@@ -25,6 +25,7 @@ import time
 import uuid
 from pathlib import Path
 
+from tools.mcp_evaluation.v4 import snapshots as snap
 from tools.mcp_evaluation.v4 import trial_isolation as ti
 from tools.mcp_evaluation.visual.run_visual import (
     MODELS,
@@ -41,8 +42,12 @@ HERE = Path(__file__).resolve().parent
 PYTHON = ROOT / ".venv/bin/python"
 # MCP tool profile: "lean" advertises only execute and rebuild to keep per-turn context small.
 PROFILE = os.environ.get("NEWTON_MCP_PROFILE", "lean")
-# Sibling live copies the MCP condition may use for parallel sweeps.
+# Sibling live copies the MCP condition may use for parallel sweeps, and the most workers.resize() may set (the
+# host's own default); both reach the host and the guide in the prompt, so the guide describes the hosted pool.
 WORKERS = int(os.environ.get("NEWTON_MCP_WORKERS", "2"))
+MAX_WORKERS = int(os.environ.get("NEWTON_MCP_MAX_WORKERS", max(WORKERS, 4) if WORKERS else 0))
+# Seconds of budget between workspace snapshots (0: none); see snapshots.py.
+SNAPSHOT_SECONDS = float(os.environ.get("NEWTON_SNAPSHOT_SECONDS", snap.PERIOD))
 CUBE_DATA = Path(os.environ.get("NEWTON_CUBE_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/cube_toss_task"))
 DP_DATA = Path(os.environ.get("NEWTON_DP_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/dp_real_task"))
 ABC_DATA = Path(os.environ.get("NEWTON_ABC_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_twin_task"))
@@ -66,6 +71,67 @@ START = "__START_UTC__"
 # not depend on the launcher's environment (v4 trials inherited 30 min from the operator session).
 BG_WAIT_CEILING_MS = 1_800_000
 """Placeholder for the budget start time, filled in when the agent launches."""
+
+# Objects added to the ABC station in i15 (three free fruits, a static tray), with the contact pipelines, cones,
+# and solver settings of the final submissions, plus every shape kind on three free bodies (MuJoCo Warp compiles
+# a collision kernel per pair of geometry types and sparse-Jacobian solver kernels once fruits add 18 DOFs).
+# One process per shape set: MuJoCo Warp's primitive collision kernel depends on the set of pair types present.
+_TABLE = [0.55, 0.0, 0.75]
+_KINDS = ["sphere", "ellipsoid", "capsule", "cylinder", "box", "convex", "mesh"]
+STATION_SHAPE_SEEDS = [
+    # Every shape kind on every fruit and in the tray, with both contact pipelines and cones.
+    (
+        {"bodies": [_KINDS] * 3, "static": ["box", "capsule", "cylinder", "convex", "mesh"], "origin": _TABLE},
+        [
+            {"use_mujoco_contacts": False, "cone": "elliptic"},
+            {"use_mujoco_contacts": True},
+            {"use_mujoco_contacts": True, "cone": "elliptic"},
+        ],
+    ),
+    # Sphere-cluster fruits, box (and capsule) tray, Newton's pipeline (i15 abc_scratch Opus, all four trials).
+    (
+        {"bodies": [["sphere", "sphere"]] * 3, "static": ["box", "capsule"], "origin": _TABLE},
+        [
+            {"use_mujoco_contacts": False, "cone": "elliptic"},
+            {"use_mujoco_contacts": False, "cone": "elliptic", "impratio": 1.0, "iterations": 100, "ls_iterations": 50},
+        ],
+    ),
+    # Ellipsoid fruits, mesh-prism and box tray, MuJoCo's contacts (i15 abc_scratch Astra MCP).
+    (
+        {"bodies": [["ellipsoid"]] * 3, "static": ["mesh", "box"], "origin": _TABLE},
+        [
+            {"use_mujoco_contacts": True, "cone": "elliptic"},
+            {
+                "use_mujoco_contacts": True,
+                "cone": "elliptic",
+                "iterations": 40,
+                "ls_iterations": 30,
+                "nconmax": 128,
+                "njmax": 768,
+            },
+        ],
+    ),
+    # Convex-hull, sphere, and ellipsoid fruits, convex-hull tray, MuJoCo's contacts (i15 abc_scratch Astra restart).
+    (
+        {"bodies": [["convex"], ["sphere"], ["ellipsoid"]], "static": ["convex"], "origin": _TABLE},
+        [
+            {"use_mujoco_contacts": True, "cone": "elliptic"},
+            {
+                "use_mujoco_contacts": True,
+                "cone": "elliptic",
+                "solver": "newton",
+                "iterations": 50,
+                "ls_iterations": 15,
+            },
+        ],
+    ),
+]
+
+
+def _shape_warmups(script: str, seeds: list) -> list[list[str]]:
+    """Warm-up commands that step ``script`` with added objects under each listed solver setting."""
+    command = ["-m", "tools.mcp_evaluation.v4.trial_isolation", "warm-solvers", script]
+    return [[*command, json.dumps(variants), json.dumps(shapes)] for shapes, variants in seeds]
 
 
 def _task(name: str) -> dict:
@@ -252,7 +318,7 @@ Constraints (checked): appearance only. Materials, lights, world, and color mana
                     "fruit_replay.py",
                     json.dumps(
                         [
-                            {"cone": "elliptic"},
+                            {"use_mujoco_contacts": False, "cone": "elliptic"},
                             {"use_mujoco_contacts": True},
                             {"use_mujoco_contacts": True, "cone": "elliptic"},
                         ]
@@ -290,7 +356,7 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
                     "screwdriver_replay.py",
                     json.dumps(
                         [
-                            {"cone": "elliptic"},
+                            {"use_mujoco_contacts": False, "cone": "elliptic"},
                             {"use_mujoco_contacts": True},
                             {"use_mujoco_contacts": True, "cone": "elliptic"},
                         ]
@@ -326,12 +392,13 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
                     "scene_replay.py",
                     json.dumps(
                         [
-                            {"cone": "elliptic"},
+                            {"use_mujoco_contacts": False, "cone": "elliptic"},
                             {"use_mujoco_contacts": True},
                             {"use_mujoco_contacts": True, "cone": "elliptic"},
                         ]
                     ),
                 ],
+                *_shape_warmups("scene_replay.py", STATION_SHAPE_SEEDS),
             ],
             "goal": """scene_replay.py replays a real robot episode from the ABC-130k dataset (https://abc.bot) in Newton, open loop. At a bimanual station (two 6-DoF YAM arms with parallel grippers, filmed from above and from both wrists), a teleoperator picks up three fake fruits one after another, a pear and an orange with the left arm and a dark round fruit with the right, and puts them into a wedge-shaped wooden tray on the table. photos/ holds {photos} frames of the recording (the top camera at the start, before each grasp, after each release, and at the end; the wrist cameras at each grasp; photos/index.json gives the state sample each one shows); episode.npz the measured joint positions, velocities, and torques (including the gripper motor's effort), the gripper openings, and the logged joint and gripper commands (about 30 Hz); camera.json the calibrated cameras (intrinsics with RealSense distortion, the top camera's pose in the world, and the wrist cameras' mounts); station/ the ABC simulator's MJCF of the station (arms, grippers, table, and enclosure; no objects); and arm_logs/ 64 recorded YAM arm logs (32 episodes of various tasks, both arms; measured joints, velocities, torques, and commands) for calibrating the arms. FORMAT.md describes the files and their frames. scene_replay.py builds the station in identical worlds (build_model(num_worlds)), steps them with make_solver(model) and make_pipeline(model), and drives the arms with the logged commands as joint position targets (its docstring states the command rule). Problem: the scene is empty. Only the station is modeled, with the ABC simulator's arm and gripper defaults; the fruits and the tray are missing.
 
@@ -436,6 +503,12 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
             tray_top_cm=f"{100 * b['tray_top_m']:g}",
             runtime_s=f"{scratch.RUNTIME_LIMIT_S:g}",
         )
+        # Files the verifier does not copy into its clean workspace (top-level names, and images; nested .jpeg and
+        # .mp4 files, which it would copy, are ignored as well).
+        tasks[name]["snapshot_ignore"] = [f"{item}/" for item in sorted(scratch.WORKSPACE_SKIP)] + [
+            *sorted(scratch.WORKSPACE_SKIP),
+            *(f"*{suffix}" for suffix in scratch.IMAGE_SUFFIXES),
+        ]
     if name == "g1_mpc":
         from tools.mcp_evaluation.v4.g1_mpc import verify as mpc  # noqa: PLC0415
 
@@ -463,6 +536,8 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
         ],
     )
     task.setdefault("private", [name])
+    # Workspace files a verifier never reads: snapshots that differ only in these are not verified again.
+    task.setdefault("snapshot_ignore", [".git/"])
     if name == "abc_look":
         task["warmup"].append(["render_look.py", "--frames", "0"])  # EEVEE shaders (GL cache: 23 s cold)
         task["private"] = ["abc_look", "abc_twin"]
@@ -491,7 +566,23 @@ def _newton_tools() -> str:
     )
 
 
-def prompt_for(name: str, condition: str, workspace: Path, seconds: int, guide: str | None) -> str:
+def _environment(facts: dict) -> str:
+    """Hardware and tool facts, the same in both conditions (``facts`` from :func:`trial_isolation.hardware`)."""
+    cores = facts["cpu_cores"]
+    cpus = f"{cores} CPU cores"
+    if facts.get("cpu_count_reported") not in (None, cores):
+        cpus += f" (a CPU-time quota; os.cpu_count() reports {facts['cpu_count_reported']})"
+    hardware = f"{facts['gpu']} and {cpus}" if facts.get("gpu") else cpus
+    text = f"Hardware: {hardware}, shared by every process of this task, including background jobs.\n"
+    text += f"Python: `python` and `python3` on PATH run the project's environment (the one `uv run --no-sync --project {ROOT}` uses)."
+    if not facts.get("gnu_time", True):
+        text += " GNU time (/usr/bin/time) is not installed."
+    return text + "\n"
+
+
+def prompt_for(
+    name: str, condition: str, workspace: Path, seconds: int, guide: str | None, facts: dict | None = None
+) -> str:
     task = _task(name)
     common = f"""You are working on a Newton physics simulation task.
 
@@ -501,7 +592,7 @@ Newton source tree (read-only reference, including docs and examples): {ROOT}
 {task["goal"]}
 
 Deliverable: the edited {task["script"]} in the workspace, then a brief report. You have {seconds // 60} minutes, starting {START} (check with `date -u`); working efficiently matters. Do not modify files outside the workspace, do not look for other trials or hidden verification data, and do not use subagents.
-{_renderers()}{_newton_tools()}"""
+{_renderers()}{_newton_tools()}{_environment(facts or ti.hardware())}"""
     run_args = task.get("run_args", "--num-frames <N>")
     run = f"uv run --no-sync --project {ROOT} python {task['script']} --viewer null {run_args} {' '.join(task['host_args'])}"
     run = run.rstrip()
@@ -546,7 +637,8 @@ def prepare(run_dir: Path, name: str, condition: str, model: str, seconds: int |
     guide = None
     if condition == "mcp":
         guide = _host_guide(workspace, task)
-    prompt = prompt_for(name, condition, workspace, seconds, guide)
+    facts = ti.hardware()
+    prompt = prompt_for(name, condition, workspace, seconds, guide, facts)
     spec = {
         "task": name,
         "condition": condition,
@@ -562,6 +654,9 @@ def prepare(run_dir: Path, name: str, condition: str, model: str, seconds: int |
         },
         "cache_seed": str(seed),
         "mcp_workers": WORKERS if condition == "mcp" else None,
+        "mcp_max_workers": MAX_WORKERS if condition == "mcp" else None,
+        "hardware": facts,
+        "snapshot_seconds": SNAPSHOT_SECONDS,
         "mcp_profile": PROFILE if condition == "mcp" else None,
         "sandbox": SANDBOX,
         "harness_version": os.environ.get("NEWTON_HARNESS_VERSION", "unversioned"),
@@ -574,15 +669,46 @@ def prepare(run_dir: Path, name: str, condition: str, model: str, seconds: int |
     return {"spec": spec, "prompt": prompt, "run_dir": run_dir}
 
 
+def _host_command(workspace: Path, task: dict, connection: Path) -> list[str]:
+    """The MCP host of a trial: the workspace script with WORKERS workers (at most MAX_WORKERS)."""
+    return [
+        str(PYTHON),
+        *("-m", "newton.mcp", "host", task["script"], "--connection-file", str(connection)),
+        *("--artifacts", str(workspace / "observations")),
+        *("--workers", str(WORKERS), "--max-workers", str(MAX_WORKERS)),
+        "--",
+        *task["host_args"],
+    ]
+
+
 def _host_guide(workspace: Path, task: dict) -> str:
-    """The same application guide the MCP server sends in its instructions."""
+    """The application guide the MCP server would send in its instructions, for the hosted worker pool."""
     code = (
         "import sys; from newton.mcp import ExampleHost; "
         f"host = ExampleHost({str(workspace / task['script'])!r}, {task['host_args']!r}); "
-        f"host.example = type('E', (), {{'frame_dt': '?'}})(); print(host.guide({WORKERS}))"
+        "host.example = type('E', (), {'frame_dt': '?'})(); "
+        f"print(host.guide(workers={WORKERS}, max_workers={MAX_WORKERS}))"
     )
     result = subprocess.run([str(PYTHON), "-c", code], capture_output=True, text=True, cwd=ROOT, check=True)
     return result.stdout.strip()
+
+
+def _container(sandbox_root: Path, run_dir: Path):
+    """Wraps commands in the trial's sandbox: ``sandbox_root`` writable, other trials and records hidden."""
+
+    def contained(command: list[str], extra_ro: list[Path] = (), harness: bool = False) -> list[str]:
+        # The host runs the agent's code too, so it shares the agent's filesystem view, including /tmp.
+        if not SANDBOX:
+            return command
+        # Hide the run directory's parent too (other trials' records), wherever the iteration directory lives.
+        hidden = [TRIALS, run_dir.parent]
+        # The study's harness (verifiers, data generators) is only for the verifier itself.
+        masked = [] if harness else [ROOT / "tools" / "mcp_evaluation"]
+        return ti.sandbox(
+            command, sandbox_root, ROOT, PRIVATE, extra_ro=list(extra_ro), extra_hidden=hidden, masked=masked
+        )
+
+    return contained
 
 
 def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> dict:
@@ -596,18 +722,14 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
     env["MCP_TOOL_TIMEOUT"] = "300000"
     env["MAX_MCP_OUTPUT_TOKENS"] = "60000"
     env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = str(BG_WAIT_CEILING_MS)
-
-    def contained(command: list[str], extra_ro: list[Path] = (), harness: bool = False) -> list[str]:
-        # The host runs the agent's code too, so it shares the agent's filesystem view, including /tmp.
-        if not SANDBOX:
-            return command
-        # Hide the run directory's parent too (other trials' records), wherever the iteration directory lives.
-        hidden = [TRIALS, run_dir.parent]
-        # The study's harness (verifiers, data generators) is only for the verifier itself.
-        masked = [] if harness else [ROOT / "tools" / "mcp_evaluation"]
-        return ti.sandbox(
-            command, sandbox_root, ROOT, PRIVATE, extra_ro=list(extra_ro), extra_hidden=hidden, masked=masked
-        )
+    # `python` and `python3` run the project's environment in both conditions (system Python lacks its packages).
+    env["PATH"] = f"{ti.python_wrappers(sandbox_root / 'bin', PYTHON)}{os.pathsep}{env.get('PATH', os.defpath)}"
+    contained = _container(sandbox_root, run_dir)
+    snapshots = None
+    if SNAPSHOT_SECONDS > 0:
+        snapshots = snap.WorkspaceSnapshots(workspace, run_dir / "snapshots", SNAPSHOT_SECONDS)
+        # Copy the starter files before the clock starts; later snapshots copy only what changed.
+        snapshots.prime()
 
     host, sampler, agent = None, None, None
     # Mount namespaces of the trial's sandboxes: cleanup also finds detached jobs that cleared their env.
@@ -633,15 +755,7 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
             before = time.perf_counter()
             log = (run_dir / "host.log").open("w")
             host = subprocess.Popen(
-                contained(
-                    [
-                        str(PYTHON),
-                        *("-m", "newton.mcp", "host", task["script"], "--connection-file", str(connection)),
-                        *("--artifacts", str(workspace / "observations"), "--workers", str(WORKERS)),
-                        "--",
-                        *task["host_args"],
-                    ]
-                ),
+                contained(_host_command(workspace, task, connection)),
                 cwd=workspace,
                 env=env,
                 stdout=log,
@@ -680,6 +794,8 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
         budget_start = ti.pair_barrier(barrier, spec["condition"], parties) if barrier else time.time()
         prompt = prepared["prompt"].replace(START, time.strftime("%H:%M:%S UTC", time.gmtime(budget_start)))
         (workspace / "TASK.md").write_text(prompt)
+        if snapshots is not None:
+            snapshots.start(budget_start)
         sampler = ti.ResourceSampler(run_dir / "resources.jsonl", trial_id)
         sampler.start()
         agent_start = time.perf_counter()
@@ -726,9 +842,12 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
                     pass
             finally:
                 _stop(agent)
+                agent_end = time.time()
                 reader.join(timeout=10)
         elapsed = time.perf_counter() - agent_start
     finally:
+        if snapshots is not None:
+            snapshots.stop()
         if host is not None:
             _stop(host)
         # Shell commands run in their own sessions, so background jobs survive the agent's process group.
@@ -741,6 +860,15 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
     load_end = os.getloadavg()
     activity = parse_events(run_dir / "agent.jsonl", spec["cli"])
     activity["mcp_available"] = mcp_available(run_dir / "agent.jsonl", spec) if mcp is not None else None
+    snapshot_info = None
+    if snapshots is not None:
+        # What the trial's verification sees: after the agent and its leftover processes stopped.
+        final = snapshots.take(agent_end - budget_start, final=True)
+        snapshot_info = {
+            "count": len(snap.load(snapshots.directory)),
+            "final": final["name"],
+            "errors": snapshots.errors,
+        }
     verification = verify(workspace, run_dir, task, env, contained)
     samples = [json.loads(line) for line in (run_dir / "resources.jsonl").read_text().splitlines()]
     summary = {
@@ -762,13 +890,17 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
         "downloads": _downloads(run_dir / "agent.jsonl"),
         "api_failure": api_failure(run_dir / "agent.jsonl"),
         **activity,
+        "snapshots": snapshot_info,
         "verification": verification,
         "success": bool(verification.get("success")) and not timed_out,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=float) + "\n")
-    # Archive the workspace with the records; drop the trial's caches and private temp directories.
+    # Archive the workspace with the records; drop the trial's private temp directories. Its compile caches are
+    # kept for snapshot verification (verifiers time setup and rollouts, so they should see the same kernels).
     (run_dir / "workspace").unlink()
     shutil.move(str(workspace), str(run_dir / "workspace"))
+    if snapshots is not None and (sandbox_root / "caches").is_dir():
+        shutil.move(str(sandbox_root / "caches"), str(snapshots.directory / "caches"))
     shutil.rmtree(sandbox_root, ignore_errors=True)
     return summary
 
@@ -865,8 +997,9 @@ def _agent_inputs(event: dict) -> list:
 def verify(workspace: Path, run_dir: Path, task: dict, env: dict, contained=None) -> dict:
     """Run the task's verifier on the submission, sandboxed with only this task's hidden data readable.
 
-    Tasks with ``verify_lock`` verify one submission at a time on this machine (their verifiers time the
-    submission); the wait does not count against the verifier's timeout (``verify_seconds``, default 1800 s).
+    The verifier's log and result are written to ``run_dir``. Tasks with ``verify_lock`` verify one submission at
+    a time on this machine (their verifiers time the submission); the wait does not count against the verifier's
+    timeout (``verify_seconds``, default 1800 s).
     """
     if not task.get("verify_lock"):
         return _verify(workspace, run_dir, task, env, contained)
@@ -915,7 +1048,92 @@ def _verify(workspace: Path, run_dir: Path, task: dict, env: dict, contained=Non
     return {k: data[k] for k in ("success", "integrity", "failed_checks", "metrics", "normalized_worst")}
 
 
-def main() -> None:
+def _verify_snapshot(run_dir: Path, spec: dict, task: dict, manifest: dict) -> dict:
+    """Verify one snapshot as the trial's own verification ran: same workspace path, sandbox, and caches."""
+    # The submission may name its own absolute paths, so the snapshot is restored where the trial's workspace was.
+    sandbox_root = TRIALS / spec["trial_id"]
+    if sandbox_root.exists():
+        raise RuntimeError(f"{sandbox_root} exists: the trial is still running or was not cleaned up")
+    records = run_dir / "snapshots" / "verify" / manifest["name"]
+    records.mkdir(parents=True, exist_ok=True)
+    try:
+        workspace = sandbox_root / "work"
+        snap.materialize(run_dir / "snapshots", manifest, workspace)
+        caches = run_dir / "snapshots" / "caches"
+        if not caches.is_dir() and spec.get("cache_seed") and Path(spec["cache_seed"]).is_dir():
+            caches = Path(spec["cache_seed"])  # trials from before caches were kept
+        if caches.is_dir():
+            shutil.copytree(caches, sandbox_root / "caches", symlinks=True)
+        env = ti.trial_env(ROOT, sandbox_root / "caches", f"{spec['trial_id']}-snapshot")
+        return verify(workspace, records, task, env, _container(sandbox_root, run_dir))
+    finally:
+        shutil.rmtree(sandbox_root, ignore_errors=True)
+
+
+def verify_snapshots(run_dir: Path, exhaustive: bool = False) -> dict:
+    """Verify a finished trial's workspace snapshots and write ``snapshot_verification.json`` (see snapshots.py).
+
+    Results already in that file are reused (delete it to verify again), and the final snapshot, taken right
+    before the trial's own verification, takes that verification's result. Refuses to start or continue while
+    any trial process runs on this machine: verifications would compete with it for the GPU.
+    """
+    run_dir = Path(run_dir).resolve()
+    if not (run_dir / "summary.json").exists():
+        raise RuntimeError(f"{run_dir} has no summary.json (the trial has not finished)")
+    spec = json.loads((run_dir / "spec.json").read_text())
+    summary = json.loads((run_dir / "summary.json").read_text())
+    task = _task(spec["task"])
+    manifests = snap.load(run_dir / "snapshots")
+    if not manifests:
+        raise RuntimeError(f"{run_dir} has no workspace snapshots")
+    digests = [snap.submission_digest(manifest, task["snapshot_ignore"]) for manifest in manifests]
+    output = run_dir / "snapshot_verification.json"
+    verifications = json.loads(output.read_text())["verifications"] if output.exists() else []
+    known = {record["digest"]: record for record in verifications}
+    final, trial = manifests[-1], summary.get("verification")
+    if final.get("final") and trial is not None and digests[-1] not in known:
+        record = {"snapshot": final["name"], "seconds": final["seconds"], "digest": digests[-1], "source": "trial"}
+        record.update({key: trial.get(key) for key in ("success", "failed_checks", "normalized_worst", "error")})
+        verifications.append(record)
+        known[digests[-1]] = record
+    report = {
+        "task": spec["task"],
+        "condition": spec["condition"],
+        "model": spec["model"],
+        "mode": "all" if exhaustive else "binary",
+        "assumption": None if exhaustive else snap.MONOTONE,
+        "budget_seconds": spec["budget_seconds"],
+        "agent_seconds": summary.get("agent_seconds"),
+        "snapshot_seconds": spec.get("snapshot_seconds"),
+        "snapshot_ignore": task["snapshot_ignore"],
+        "verifications": verifications,
+    }
+
+    def write(result: dict | None) -> None:
+        temporary = output.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps({**report, **(result or {"complete": False})}, indent=2, default=float) + "\n")
+        temporary.replace(output)
+
+    def check(index: int) -> dict:
+        live = ti.live_trials()
+        if live:
+            raise RuntimeError(f"trial processes are running ({sorted(live)}); verify snapshots between iterations")
+        manifest = manifests[index]
+        started = time.perf_counter()
+        result = _verify_snapshot(run_dir, spec, task, manifest)
+        record = {"snapshot": manifest["name"], "seconds": manifest["seconds"], "digest": digests[index]}
+        record.update(source="verifier", verify_seconds=round(time.perf_counter() - started, 1))
+        record.update({key: result.get(key) for key in ("success", "failed_checks", "normalized_worst", "error")})
+        verifications.append(record)
+        write(None)
+        return record
+
+    result = snap.search(manifests, digests, check, exhaustive=exhaustive, known=known)
+    write({"complete": True, **result})
+    return {**report, "complete": True, **result}
+
+
+def main() -> int | None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--spec",
@@ -949,7 +1167,40 @@ def main() -> None:
     parser.add_argument("--barrier", type=Path, help="Shared directory that starts both conditions of a pair together")
     parser.add_argument("--parties", type=int, default=2)
     parser.add_argument("--run", action="store_true")
+    parser.add_argument(
+        "--verify-snapshots",
+        nargs="+",
+        type=Path,
+        metavar="RUN_DIR",
+        help="After an iteration (never during a trial): verify finished trials' workspace snapshots and write "
+        "snapshot_verification.json with first_pass_seconds into each run directory",
+    )
+    parser.add_argument(
+        "--all", action="store_true", help="With --verify-snapshots: verify every version, not a binary search"
+    )
     args = parser.parse_args()
+    if args.verify_snapshots:
+        live = ti.live_trials()
+        if live:
+            parser.error(f"trial processes are running ({sorted(live)}); verify snapshots between iterations")
+        failed = 0
+        for run_dir in args.verify_snapshots:
+            if not (run_dir / "snapshots").is_dir():
+                print(f"{run_dir}: no snapshots")
+                continue
+            try:
+                result = verify_snapshots(run_dir, exhaustive=args.all)
+            except RuntimeError as error:
+                # Results verified so far stay in snapshot_verification.json; a later call continues from them.
+                print(f"{run_dir}: {error}")
+                failed += 1
+                continue
+            verified = sum(record["source"] == "verifier" for record in result["verifications"])
+            print(
+                f"{run_dir}: first_pass_seconds={result['first_pass_seconds']} "
+                f"(versions {result['versions']}, verifier runs {verified})"
+            )
+        return 1 if failed else 0
     if args.spec is not None:
         for key, value in json.loads(args.spec.read_text()).items():
             setattr(args, key, Path(value) if key in ("workspace", "barrier") and value else value)

@@ -13,6 +13,9 @@
   shell command in its own session, so killing the agent's process group misses them).
 - ``pair_barrier``: both conditions launch their agents at the same instant, after both are ready.
 - ``ResourceSampler``: load, the trial's CPU seconds, and live trials sampled through the whole trial.
+- ``live_trials``: trial ids of running processes, so post-trial work can refuse to run during a trial.
+- ``python_wrappers``: ``python``/``python3`` commands that run the project's environment.
+- ``hardware``: the GPU and CPU facts both prompts state.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -103,6 +107,70 @@ def trial_env(root: Path, caches: Path, trial_id: str, extra: dict[str, str] | N
     env.update(cache_env(caches))
     env.update(extra or {})
     return env
+
+
+def python_wrappers(directory: Path, python: Path) -> Path:
+    """Write ``python`` and ``python3`` commands into ``directory`` that run ``python`` (a venv interpreter).
+
+    Scripts rather than symlinks: Python finds its venv relative to the path it was started from, so a link
+    outside the venv would start the bare base interpreter without the project's packages.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in ("python", "python3"):
+        path = directory / name
+        path.write_text(f'#!/bin/sh\nexec "{python}" "$@"\n')
+        path.chmod(0o755)
+    return directory
+
+
+def _cpu_cores() -> float:
+    """CPU cores this process may use: the cgroup's CPU-time quota if it has one, else its affinity mask."""
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()[:2]
+        if quota != "max":
+            return int(quota) / int(period)
+    except (OSError, ValueError):
+        pass
+    return float(len(os.sched_getaffinity(0)))
+
+
+def _gpu() -> str | None:
+    """The visible GPU or MIG slice, as ``nvidia-smi -L`` lists it (None without nvidia-smi)."""
+    try:
+        listing = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=30, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    gpus = re.findall(r"^GPU \d+: (.+?) \(UUID", listing, re.MULTILINE)
+    slices = re.findall(r"^\s+MIG (\d+g\.(\d+)gb)\s+Device", listing, re.MULTILINE)
+    if len(gpus) == 1 and len(slices) == 1:
+        profile, memory = slices[0]
+        return f"one MIG {profile} slice ({memory} GB of GPU memory) of an {gpus[0]}"
+    if len(gpus) == 1 and not slices:
+        try:
+            memory = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            ).stdout.strip()
+            return f"one {gpus[0]} ({round(float(memory) / 1024)} GB of GPU memory)"
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return f"one {gpus[0]}"
+    if gpus:
+        return f"{len(gpus)} GPUs ({', '.join(gpus)})" + (f" with {len(slices)} MIG slices" if slices else "")
+    return None
+
+
+def hardware() -> dict:
+    """GPU and CPU facts for both prompts; ``NEWTON_TRIAL_GPU`` and ``NEWTON_TRIAL_CPUS`` override detection."""
+    cores = float(os.environ.get("NEWTON_TRIAL_CPUS") or _cpu_cores())
+    return {
+        "gpu": os.environ.get("NEWTON_TRIAL_GPU") or _gpu(),
+        "cpu_cores": int(cores) if cores.is_integer() else cores,
+        "cpu_count_reported": os.cpu_count(),
+        "gnu_time": Path("/usr/bin/time").exists(),
+    }
 
 
 def provenance(root: Path, python: Path) -> dict:
@@ -368,6 +436,20 @@ def _tagged_cpu() -> dict[str, dict[int, float]]:
     return usage
 
 
+def live_trials() -> set[str]:
+    """NEWTON_TRIAL_ID values of other running processes (trials, their verifications, and seed warm-ups)."""
+    found = set()
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit() or int(proc.name) == os.getpid():
+            continue
+        try:
+            environ = (proc / "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        found.update(entry.split(b"=", 1)[1].decode() for entry in environ if entry.startswith(b"NEWTON_TRIAL_ID="))
+    return found
+
+
 class ResourceSampler(threading.Thread):
     """Append load, the trial's accumulated CPU seconds, and the number of live trials, every ``period`` s.
 
@@ -436,19 +518,110 @@ def warm(script: str, args: list[str]) -> None:
     cls(newton.viewer.ViewerNull(), parsed).step()
 
 
-def warm_solvers(script: str, variants: list[dict]) -> None:
+# Size [m] of every shape the warm-up adds: about the size of the objects agents add to the station.
+_WARM_SIZE = 0.02
+
+
+def _warm_mesh():
+    """A closed cube of half-extent ``_WARM_SIZE`` as a triangle mesh (for mesh and convex-hull shapes)."""
+    import numpy as np  # noqa: PLC0415
+
+    import newton  # noqa: PLC0415
+
+    s = _WARM_SIZE
+    vertices = np.array([[x, y, z] for x in (-s, s) for y in (-s, s) for z in (-s, s)], dtype=np.float32)
+    faces = [(0, 1, 3), (0, 3, 2), (4, 6, 7), (4, 7, 5), (0, 4, 5), (0, 5, 1)]
+    faces += [(2, 3, 7), (2, 7, 6), (0, 2, 6), (0, 6, 4), (1, 5, 7), (1, 7, 3)]
+    return newton.Mesh(vertices, np.array(faces, dtype=np.int32).ravel())
+
+
+def _add_warm_shape(builder, body: int, kind: str, position) -> None:
+    import warp as wp  # noqa: PLC0415
+
+    s, xform = _WARM_SIZE, wp.transform(wp.vec3(*position), wp.quat_identity())
+    if kind == "sphere":
+        builder.add_shape_sphere(body, xform=xform, radius=s)
+    elif kind == "ellipsoid":
+        builder.add_shape_ellipsoid(body, xform=xform, rx=1.5 * s, ry=s, rz=0.8 * s)
+    elif kind == "capsule":
+        builder.add_shape_capsule(body, xform=xform, radius=0.5 * s, half_height=s)
+    elif kind == "cylinder":
+        builder.add_shape_cylinder(body, xform=xform, radius=s, half_height=s)
+    elif kind == "box":
+        builder.add_shape_box(body, xform=xform, hx=s, hy=0.8 * s, hz=0.6 * s)
+    elif kind == "convex":
+        builder.add_shape_convex_hull(body, xform=xform, mesh=_warm_mesh())
+    elif kind == "mesh":
+        builder.add_shape_mesh(body, xform=xform, mesh=_warm_mesh())
+    else:
+        raise ValueError(f"unknown warm-up shape {kind!r}")
+
+
+def add_warm_shapes(builder, shapes: dict) -> None:
+    """Add free bodies and static shapes of the given kinds above a table.
+
+    ``shapes`` holds ``bodies`` (one list of shape kinds per free body), ``static`` (shape kinds on the world
+    body), and ``origin`` (the table-top point [m] they are placed around). Kinds: sphere, ellipsoid,
+    capsule, cylinder, box, convex (convex hull), mesh.
+    """
+    import warp as wp  # noqa: PLC0415
+
+    x, y, z = shapes.get("origin", (0.0, 0.0, 0.0))
+    step = 4.0 * _WARM_SIZE
+    bodies = shapes.get("bodies", [])
+    for i, kinds in enumerate(bodies):
+        row = y + (i - 0.5 * (len(bodies) - 1)) * step * 3.0
+        body = builder.add_body(xform=wp.transform(wp.vec3(x, row, z + 2.0 * _WARM_SIZE), wp.quat_identity()))
+        for k, kind in enumerate(kinds):
+            # Shapes of one body never collide with each other, so they may overlap less carefully.
+            _add_warm_shape(builder, body, kind, ((k - 0.5 * (len(kinds) - 1)) * step, 0.0, 0.0))
+    static = shapes.get("static", [])
+    for k, kind in enumerate(static):
+        _add_warm_shape(builder, -1, kind, (x + 2.0 * step, y + (k - 0.5 * (len(static) - 1)) * step, z + _WARM_SIZE))
+
+
+def _patch_add_mjcf(shapes: dict) -> None:
+    """Make every ``ModelBuilder.add_mjcf`` call in this process also add the warm-up shapes.
+
+    Scripts build each world from an MJCF import, so the shapes then land in every world, as agents' own
+    objects do.
+    """
+    import newton  # noqa: PLC0415
+
+    original = newton.ModelBuilder.add_mjcf
+
+    def add_mjcf(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        add_warm_shapes(self, shapes)
+        return result
+
+    newton.ModelBuilder.add_mjcf = add_mjcf
+
+
+def warm_solvers(script: str, variants: list[dict], shapes: dict | None = None) -> None:
     """Step the starter with other SolverMuJoCo settings, so their kernels land in the seed too.
 
     Which solver variants an agent happens to try (MuJoCo's own contacts compile for minutes) should not decide
     its time; both conditions start from the same seed, so warming them keeps the comparison fair. Solver kernels
     live in Newton's and MuJoCo Warp's modules, so the starter's module name does not matter here.
+
+    With ``shapes`` (see :func:`add_warm_shapes`), every MJCF import of the starter also gets those bodies and
+    shapes. MuJoCo Warp compiles collision kernels per pair of geometry types and solver kernels per model size
+    (more degrees of freedom switch to sparse Jacobians), so objects added to a scene compile kernels the bare
+    starter never does. Its primitive collision kernel depends on the set of pair types present and that set
+    accumulates within a process, so run each shape set in a process of its own.
     """
+    import warp as wp  # noqa: PLC0415
+
     import newton  # noqa: PLC0415
     from newton.mcp import ExampleHost  # noqa: PLC0415
 
+    if shapes:
+        _patch_add_mjcf(shapes)
     host = ExampleHost(script, [])
     host.build()
     example = host.example
+    pipeline = getattr(example, "collision_pipeline", None)
     for options in variants:
         solver = newton.solvers.SolverMuJoCo(example.model, **options)
         try:
@@ -459,16 +632,36 @@ def warm_solvers(script: str, variants: list[dict]) -> None:
             state_0, state_1, control = model.state(), model.state(), model.control()
             contacts = None
             if not options.get("use_mujoco_contacts", True):
-                pipeline = newton.CollisionPipeline(model)
-                contacts = pipeline.contacts()
-                pipeline.collide(state_0, contacts)
+                variant_pipeline = newton.CollisionPipeline(model)
+                contacts = variant_pipeline.contacts()
+                variant_pipeline.collide(state_0, contacts)
             solver.step(state_0, state_1, control, contacts, getattr(example, "sim_dt", 1.0e-3))
             continue
-        if options.get("use_mujoco_contacts"):
-            example.collision_pipeline = None
-        if hasattr(example, "capture"):
+        if hasattr(example, "collision_pipeline"):
+            # SolverMuJoCo finds its own contacts unless use_mujoco_contacts=False (its default is True).
+            example.collision_pipeline = pipeline if options.get("use_mujoco_contacts") is False else None
+        # Scripts record CUDA graphs only on CUDA devices (CPU warm-ups serve tests of this harness).
+        if hasattr(example, "capture") and wp.get_device().is_cuda:
             example.capture()
         example.step()
+
+
+# Warp's module-load lines; the hash is the module's cache key (``wp_<name>_<hash>`` directories).
+_MODULE_LOAD = re.compile(r"Module (\S+) ([0-9a-f]{7}) load on device '[^']+' took [0-9.]+ ms\s+\(compiled\)")
+
+
+def seed_coverage(seed: Path, logs: list[Path]) -> dict:
+    """Which modules that ``logs`` (transcripts, host logs) show being compiled a cache seed already holds.
+
+    Run on the GPU's seed: module hashes depend on the device (CPU builds differ in launch bounds).
+    """
+    compiled = set()
+    for path in logs:
+        compiled.update(
+            f"{name}_{digest}" for name, digest in _MODULE_LOAD.findall(Path(path).read_text(errors="replace"))
+        )
+    cached = {path.name.removeprefix("wp_") for path in Path(seed).glob("warp/*/wp_*")}
+    return {"compiled": len(compiled), "in_seed": sorted(compiled & cached), "missing": sorted(compiled - cached)}
 
 
 if __name__ == "__main__":
@@ -476,9 +669,12 @@ if __name__ == "__main__":
 
     if len(sys.argv) >= 3 and sys.argv[1] == "warm":
         warm(sys.argv[2], sys.argv[3:])
-    elif len(sys.argv) == 4 and sys.argv[1] == "warm-solvers":
-        warm_solvers(sys.argv[2], json.loads(sys.argv[3]))
+    elif len(sys.argv) in (4, 5) and sys.argv[1] == "warm-solvers":
+        warm_solvers(sys.argv[2], json.loads(sys.argv[3]), json.loads(sys.argv[4]) if len(sys.argv) == 5 else None)
+    elif len(sys.argv) >= 4 and sys.argv[1] == "seed-coverage":
+        print(json.dumps(seed_coverage(Path(sys.argv[2]), [Path(arg) for arg in sys.argv[3:]]), indent=2))
     else:
         raise SystemExit(
-            "usage: python -m tools.mcp_evaluation.v4.trial_isolation warm SCRIPT [ARGS...] | warm-solvers SCRIPT JSON"
+            "usage: python -m tools.mcp_evaluation.v4.trial_isolation warm SCRIPT [ARGS...] | "
+            "warm-solvers SCRIPT VARIANTS_JSON [SHAPES_JSON] | seed-coverage SEED_CACHES LOG..."
         )

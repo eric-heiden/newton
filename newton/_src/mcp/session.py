@@ -208,6 +208,8 @@ class SimulationSession:
             of the same application). Trusted execution receives a ``workers``
             pool whose ``broadcast``/``map``/``submit`` run cells on them
             concurrently.
+        close_callback: Optional ``callback(session)`` called once on the
+            owning thread when the session closes.
     """
 
     class _Request:
@@ -274,6 +276,7 @@ class SimulationSession:
         execute_callback: Callable | None = None,
         invalidate_on_error: bool = True,
         overlay_callback: Callable | None = None,
+        close_callback: Callable | None = None,
     ):
         self._owner = threading.get_ident()
         self._queue = queue.Queue(maxsize=64)
@@ -296,11 +299,14 @@ class SimulationSession:
         """Called as ``execute_callback(session)`` after each successful trusted execution; a returned
         string is added to the execution result as ``note``."""
         self.invalidate_on_error = invalidate_on_error
+        """Invalidate the scene when trusted execution raises. ``False`` reports the error and keeps the
+        scene valid; statements before the failing line keep their effects."""
         self.overlay_callback = overlay_callback
         """Returns ``[(name, points, indices, color), ...]`` meshes drawn by the application itself,
         which color observations composite over the model's shapes."""
-        """Invalidate the scene when trusted execution raises. ``False`` reports the error and keeps the
-        scene valid; statements before the failing line keep their effects."""
+        self.close_callback = close_callback
+        """Called once as ``close_callback(session)`` when the session closes, e.g. to stop application
+        subprocesses."""
         self.namespace = dict(namespace or {})
         """Extra names available in trusted execution, refreshed before each cell."""
         self.guide = guide
@@ -553,6 +559,9 @@ class SimulationSession:
                     break
                 request.error = RuntimeError("Session closed before request execution")
                 request.done.set()
+        if self.close_callback is not None:
+            callback, self.close_callback = self.close_callback, None
+            callback(self)
         if self._renderer is not None:
             self._renderer.close()
         self._clear_workspace()

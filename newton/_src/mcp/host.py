@@ -13,6 +13,7 @@ and reload the edited script in the same process.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import linecache
 import os
@@ -25,6 +26,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+from .fresh import FreshRunner
 from .protocol import rtx_available
 
 _RTX_GUIDE = (
@@ -33,7 +35,7 @@ _RTX_GUIDE = (
 )
 
 
-def _load_module(path: Path, generation: int):
+def _load_module(path: Path, generation: int, source: bytes):
     # A fresh module name per load keeps Warp kernels of the old and new script apart.
     name = f"_newton_hosted_{path.stem}_{generation}"
     module = ModuleType(name)
@@ -42,7 +44,7 @@ def _load_module(path: Path, generation: int):
     # Compile from source rather than __pycache__: an edit within the same second
     # that keeps the file size would otherwise load stale bytecode.
     linecache.checkcache(str(path))
-    code = compile(path.read_bytes(), str(path), "exec", dont_inherit=True)
+    code = compile(source, str(path), "exec", dont_inherit=True)
     sys.path.insert(0, str(path.parent))
     try:
         exec(code, module.__dict__)
@@ -121,6 +123,18 @@ class ExampleHost:
         self._dynamic_scalars: set[str] = set()
         self._no_solver = _NoSolver()
         self.restart_requested = False
+        self.source_sha256: str | None = None
+        """SHA-256 of the script source the current example was built from."""
+        self.fresh = self._fresh_runner()
+        """Runs the script from disk in clean subprocesses (``fresh`` in trusted execution)."""
+
+    def _fresh_runner(self) -> FreshRunner:
+        return FreshRunner(
+            self.script,
+            argv=lambda: self.argv,
+            example_class=self.example_class,
+            build_digest=lambda: self.source_sha256,
+        )
 
     def build(self, argv: list[str] | None = None) -> Any:
         """(Re)load the script from disk and construct its example with a null viewer."""
@@ -128,7 +142,9 @@ class ExampleHost:
             self.argv = list(argv)
         started = time.perf_counter()
         self.generation += 1
-        module = _load_module(self.script, self.generation)
+        source = self.script.read_bytes()
+        module = _load_module(self.script, self.generation, source)
+        self.source_sha256 = hashlib.sha256(source).hexdigest()
         cls = getattr(module, self.example_class)
         import newton.examples  # noqa: PLC0415
 
@@ -277,6 +293,7 @@ class ExampleHost:
 - Observations (session.dispatch('observe'/'filmstrip', ...), shown with show()) draw the model's visible shapes plus meshes the example logs in its own render() (e.g. extracted surfaces), auto-framed, with a sky and a ground checker of reported cell size (environment=False for plain renders).{rtx} intrinsics={{fx, fy, cx, cy, ...}} matches a calibrated real camera (distortion_model='inverse_brown_conrady' for RealSense). render(**observe_options) returns a numpy image for fitting loops; compare_images(sim, ref, mask=None, panel='edges') scores PSNR, SSIM, and edge NCC against a real frame; observe(reference='frame.png', comparison='edges' or 'blend') shows the comparison panel. filmstrip(times=..., reset=True, references=video_frames, stride=k, comparison='edges', pose=..., intrinsics=...) steps the simulation to each recorded time and scores every frame against the video. camera_body='label' (with an optional camera_offset pose in the body frame) mounts the camera on a body such as a wrist camera link instead of a fixed pose, and overlay={{'name': 'expr' or fn or {{'body': label, 'point': [x, y, z]}}}} draws labeled rings at simulated points on the simulated and reference frames and returns their pixel coordinates.
 - In models with several worlds, world_id selects the world in observations, and body labels resolve within it.
 - Python errors in a cell are reported but keep the scene valid; statements before the failing line keep their effects.
+- fresh(argv_list=None, call=None, frames=None, timeout=300, parallel=2, wait=True) runs the script file as saved on disk (not this session's live edits) in new Python processes through `python -m newton.examples.headless`, one per argument list (default: this session's arguments), at most `parallel` at a time. Each process constructs Example with a null viewer, steps `frames` frames (default: the script's --num-frames), then evaluates the code string `call` with `example`, `module`, and `args` in scope. It returns one dict per argument list: status, exit_code, wall_seconds, frames, value (the JSON-converted value of `call`), exception with traceback, stdout/stderr tails, and after a timeout the Python stack the process was in; a timeout kills the process and everything it started. wait=False returns a handle with done(), result(), and cancel().
 - newton_rebuild(arguments={{"restart": true}}) restarts the whole host process (fresh CUDA context, same script and arguments; Python variables are lost, and the next call waits for the new process). Use it only if the process is broken, e.g. after a CUDA error.
 - After editing the script on disk, newton_rebuild reloads and reconstructs it in this process (Python variables survive; pass arguments={{"argv": [...]}} to change example arguments). Rebuild once to confirm the edited script reproduces your live result."""
         if workers:
@@ -311,6 +328,8 @@ class ExampleHost:
 
         if self.example is None:
             self.build()
+        if self.fresh.closed:
+            self.fresh = self._fresh_runner()
         session = SimulationSession(
             **self.bindings(),
             dt=getattr(self.example, "frame_dt", 1.0 / 60.0),
@@ -320,12 +339,18 @@ class ExampleHost:
             restore_callback=self.restore,
             allow_execute=allow_execute,
             artifact_directory=artifact_directory,
-            namespace={"example": self.example, "module": self.module, "recapture": self.recapture},
+            namespace={
+                "example": self.example,
+                "module": self.module,
+                "recapture": self.recapture,
+                "fresh": self.fresh,
+            },
             guide=self.guide(len(workers or [])),
             workers=workers,
             execute_callback=self.after_execute,
             overlay_callback=self.overlay_meshes,
             invalidate_on_error=False,
+            close_callback=lambda _session: self.fresh.close(),
         )
         session.host = self
         return session

@@ -11,7 +11,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import warp as wp
 
-from ..core.types import Devicelike
+from ..core.types import Devicelike, Transform
+from .camera_intrinsics import Intrinsics, transform_values
 from .sensor_camera_render import Utils
 from .sensor_camera_render.types import (
     ClearData,
@@ -80,6 +81,11 @@ class SensorCamera:
     ``SensorCamera.WorldRenderFlag``); they are not part of the top-level
     ``newton`` namespace.
 
+    :class:`SensorCamera.Intrinsics <newton.sensors.SensorCamera.Intrinsics>`
+    describes a calibrated camera with lens distortion: it projects world
+    points to image coordinates, unprojects image coordinates to rays, depths,
+    or plane points, and builds the matching ray bundle.
+
     Example::
 
         import warp as wp
@@ -99,6 +105,7 @@ class SensorCamera:
 
     ClearData = ClearData
     GaussianRenderMode = GaussianRenderMode
+    Intrinsics = Intrinsics
     RenderConfig = RenderConfig
     RenderOrder = RenderOrder
     TextureProjectionMode = TextureProjectionMode
@@ -415,6 +422,15 @@ class SensorCamera:
         variants are represented by leaving unused coefficients at zero. Pixels
         whose inverse cannot be verified within the solver tolerance receive a
         zero direction.
+
+        Pixel ``(i, j)`` looks through calibration image coordinates
+        ``((i + 0.5) * image_width / width, (j + 0.5) * image_height / height)``,
+        so integer coordinates fall on pixel corners. OpenCV calibrations put
+        integer coordinates on pixel centers;
+        :meth:`Intrinsics.compute_camera_rays()
+        <newton.sensors.SensorCamera.Intrinsics.compute_camera_rays>` samples
+        those and matches :meth:`Intrinsics.project()
+        <newton.sensors.SensorCamera.Intrinsics.project>`.
 
         Args:
             width: Output image width [px].
@@ -766,6 +782,92 @@ class SensorCamera:
             time=time,
             xform=xform,
         )
+
+    @staticmethod
+    def compute_camera_transforms_body(
+        body_q: wp.array[wp.transformf],
+        bodies: Sequence[int] | wp.array[wp.int32],
+        xforms: Sequence[Transform | Sequence[float]] | wp.array[wp.transformf] | None = None,
+        *,
+        out_transforms: wp.array[wp.transformf] | None = None,
+    ) -> wp.array[wp.transformf]:
+        """Compute world-space transforms of cameras mounted on bodies.
+
+        View ``i`` gets ``body_q[bodies[i]] * xforms[i]``: ``xforms[i]`` is the
+        camera pose in the frame of body ``bodies[i]``, and the body pose moves
+        it, as for a wrist camera. A body index of ``-1`` places the camera at
+        ``xforms[i]`` in world space. The camera looks along its local -Z axis
+        with +Y up; an OpenCV or ROS optical frame (+Z forward, +Y down) needs
+        the orientation ``q_optical * wp.quat(1.0, 0.0, 0.0, 0.0)``.
+
+        Use the result as the ``camera_transforms`` argument to :meth:`update`,
+        or one entry as the camera transform of :meth:`Intrinsics.project()
+        <newton.sensors.SensorCamera.Intrinsics.project>`.
+        With Warp arrays for ``bodies`` and ``xforms`` and a preallocated
+        ``out_transforms``, the call allocates nothing and can be captured in
+        a CUDA graph.
+
+        Args:
+            body_q: Body transforms [m, rad], e.g. :attr:`newton.State.body_q`,
+                shape ``(body_count,)``.
+            bodies: Body index per view, shape ``(view_count,)``; ``-1`` for a
+                camera fixed in the world.
+            xforms: Camera pose in its body's frame per view [m, rad], shape
+                ``(view_count,)``, as transforms, ``(position, quaternion)``
+                pairs, or seven values ``(px, py, pz, qx, qy, qz, qw)`` each.
+                If ``None``, every camera sits at its body's origin with the
+                body's orientation.
+            out_transforms: Optional output buffer, shape ``(view_count,)``.
+
+        Returns:
+            World-space camera transforms [m, rad], shape ``(view_count,)``,
+            on the device of ``body_q``.
+        """
+        from .sensor_camera_render import camera_utils  # noqa: PLC0415
+
+        if not isinstance(body_q, wp.array) or body_q.dtype != wp.transformf or body_q.ndim != 1:
+            raise TypeError("body_q must be a 1-D Warp array of transformf, e.g. State.body_q")
+        device = body_q.device
+        if isinstance(bodies, wp.array):
+            if bodies.dtype != wp.int32 or bodies.ndim != 1 or bodies.device != device:
+                raise ValueError(f"bodies must be a 1-D int32 Warp array on {device}")
+        else:
+            indices = np.asarray(bodies, dtype=np.int64).reshape(-1)
+            if indices.size and (indices.min() < -1 or indices.max() >= body_q.shape[0]):
+                raise ValueError(f"body indices must be in [-1, {body_q.shape[0]}), got {indices.tolist()}")
+            bodies = wp.array(indices.astype(np.int32), dtype=wp.int32, device=device)
+        view_count = bodies.shape[0]
+        if xforms is None:
+            xforms = wp.array(
+                np.tile(np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32), (view_count, 1)),
+                dtype=wp.transformf,
+                device=device,
+            )
+        elif isinstance(xforms, wp.array):
+            if xforms.dtype != wp.transformf or xforms.ndim != 1 or xforms.device != device:
+                raise ValueError(f"xforms must be a 1-D transformf Warp array on {device}")
+        else:
+            values = [transform_values(xform, "xforms entry") for xform in xforms]
+            xforms = wp.array(np.asarray(values, dtype=np.float32).reshape(-1, 7), dtype=wp.transformf, device=device)
+        if xforms.shape[0] != view_count:
+            raise ValueError(f"xforms has {xforms.shape[0]} entries for {view_count} bodies")
+        if out_transforms is None:
+            out_transforms = wp.empty(view_count, dtype=wp.transformf, device=device)
+        elif (
+            not isinstance(out_transforms, wp.array)
+            or out_transforms.dtype != wp.transformf
+            or out_transforms.shape != (view_count,)
+            or out_transforms.device != device
+        ):
+            raise ValueError(f"out_transforms must be a transformf Warp array of shape ({view_count},) on {device}")
+        wp.launch(
+            camera_utils.compute_camera_transforms_body_kernel,
+            dim=view_count,
+            inputs=[body_q, bodies, xforms],
+            outputs=[out_transforms],
+            device=device,
+        )
+        return out_transforms
 
     def create_default_light(
         self,

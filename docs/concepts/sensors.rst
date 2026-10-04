@@ -165,6 +165,70 @@ For fisheye cameras, extract the calibration values from your chosen USD attribu
 :meth:`~newton.sensors.SensorCamera.compute_camera_rays_fisheye_kannala_brandt`. Each helper builds a single-camera
 ``(height, width, 2)`` ray bundle.
 
+Calibrated Camera Geometry
+--------------------------
+
+:class:`SensorCamera.Intrinsics <newton.sensors.SensorCamera.Intrinsics>` describes a calibrated pinhole camera:
+image size, focal lengths, principal point, and either OpenCV distortion (radial ``k1``-``k6``, tangential ``p1``,
+``p2``, thin-prism ``s1``-``s4``) or the RealSense inverse Brown-Conrady model, whose polynomial maps recorded
+(distorted) pixels to rays. It converts between world points and image coordinates on the host in float64 NumPy and
+builds the ray bundle that renders through the same lens:
+
+* :meth:`~newton.sensors.SensorCamera.Intrinsics.project` -- world points [m] to image coordinates [px] and forward
+  depth [m];
+* :meth:`~newton.sensors.SensorCamera.Intrinsics.unproject` -- image coordinates to world-space unit ray directions
+  from the camera position;
+* :meth:`~newton.sensors.SensorCamera.Intrinsics.unproject_to_depth` -- image coordinates and forward depths to world
+  points;
+* :meth:`~newton.sensors.SensorCamera.Intrinsics.unproject_to_plane` -- image coordinates to the points where their
+  rays meet a plane ``a*x + b*y + c*z + d = 0``;
+* :meth:`~newton.sensors.SensorCamera.Intrinsics.resize` -- the same camera for a resampled image;
+* :meth:`~newton.sensors.SensorCamera.Intrinsics.compute_camera_rays` -- the camera-space ray bundle for
+  :meth:`~newton.sensors.SensorCamera.update`.
+
+Image coordinates follow OpenCV: x right, y down, and the center of the top-left pixel at ``(0, 0)``, so pixel
+``(i, j)`` of an image array (column ``i``, row ``j``) is centered at ``(i, j)``. Results that do not exist, such as
+points behind the camera, points past the radius where a distortion polynomial folds back, or rays that miss a plane,
+are NaN.
+
+Camera transforms use the :class:`~newton.sensors.SensorCamera` frame: the camera looks along its local -Z axis with
++Y up. An OpenCV or ROS optical frame (+Z forward, +Y down) is that frame rotated by 180 degrees about X. For cameras
+mounted on bodies, :meth:`~newton.sensors.SensorCamera.compute_camera_transforms_body` composes each body pose in a
+state with the camera pose in the body frame:
+
+.. code-block:: python
+
+   import numpy as np
+   import warp as wp
+
+   from newton.sensors import SensorCamera
+
+   # A RealSense calibration: camera matrix K and coefficients (k1, k2, p1, p2, k3) at 640x480.
+   intrinsics = SensorCamera.Intrinsics.from_camera_matrix(
+       K, D, width=640, height=480, distortion_model="inverse_brown_conrady"
+   )
+
+   # A fixed camera: position [m] and xyzw quaternion of the camera frame in the world.
+   top = wp.transform(wp.vec3(0.05, 0.02, 1.77), wp.quat(-0.19, 0.17, 0.68, -0.68))
+   pixels, forward_depth = intrinsics.project(points, top)
+   on_table = intrinsics.unproject_to_plane(pixels, top, plane=(0.0, 0.0, 1.0, -0.75))
+
+   # A wrist camera whose optical frame sits at `offset` in the frame of body `wrist`.
+   mount = wp.transform(offset.p, offset.q * wp.quat(1.0, 0.0, 0.0, 0.0))
+   wrist_transforms = SensorCamera.compute_camera_transforms_body(state.body_q, [wrist], [mount])
+   wrist_pixels, _ = intrinsics.project(points, wrist_transforms.numpy()[0])
+
+   # Render through the same lens; points rendered at a pixel project to its center.
+   camera = SensorCamera(model)
+   camera.create_default_light()
+   rays = intrinsics.compute_camera_rays(device=model.device)
+   color = camera.create_color_image_output(1, intrinsics.width, intrinsics.height)
+   camera.update(state, wrist_transforms, rays, color_image=color)
+
+:meth:`~newton.sensors.SensorCamera.compute_camera_rays_pinhole_opencv` samples pixel ``(i, j)`` at calibration image
+coordinates ``(i + 0.5, j + 0.5)`` (scaled to the output size), half a pixel from the OpenCV pixel centers that
+:class:`SensorCamera.Intrinsics <newton.sensors.SensorCamera.Intrinsics>` uses.
+
 Camera Lighting
 ---------------
 

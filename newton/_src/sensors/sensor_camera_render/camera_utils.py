@@ -550,6 +550,63 @@ def compute_camera_rays_pinhole_opencv_kernel(
 
 
 @wp.kernel(enable_backward=False)
+def compute_camera_rays_pinhole_inverse_brown_conrady_kernel(
+    width: int,
+    height: int,
+    image_width: wp.float32,
+    image_height: wp.float32,
+    fx: wp.float32,
+    fy: wp.float32,
+    cx: wp.float32,
+    cy: wp.float32,
+    k1: wp.float32,
+    k2: wp.float32,
+    k3: wp.float32,
+    p1: wp.float32,
+    p2: wp.float32,
+    out_rays: wp.array3d[wp.vec3f],
+):
+    # The inverse Brown-Conrady polynomial maps distorted coordinates to undistorted ones, so it
+    # is OpenCV's distortion polynomial applied in the opposite direction; no solve is needed.
+    py, px = wp.tid()
+    u = ((float(px) + 0.5) / float(width)) * image_width
+    v = ((float(py) + 0.5) / float(height)) * image_height
+    zero = wp.float32(0.0)
+    undistorted = _distort_pinhole_opencv(
+        (u - cx) / fx, (v - cy) / fy, k1, k2, k3, zero, zero, zero, p1, p2, zero, zero, zero, zero
+    )
+
+    out_rays[py, px, 0] = wp.vec3f(0.0)
+    out_rays[py, px, 1] = wp.normalize(wp.vec3f(undistorted[0], -undistorted[1], -1.0))
+
+
+@wp.kernel(enable_backward=False)
+def mask_folded_camera_rays_kernel(fold_radius_squared: wp.float32, out_rays: wp.array3d[wp.vec3f]):
+    # Rays farther off-axis than the fold radius of a distortion polynomial reach their pixel only
+    # because the polynomial folds back; they are not rays of the calibrated lens.
+    py, px = wp.tid()
+    direction = out_rays[py, px, 1]
+    off_axis_squared = direction[0] * direction[0] + direction[1] * direction[1]
+    if off_axis_squared >= fold_radius_squared * direction[2] * direction[2]:
+        out_rays[py, px, 1] = wp.vec3f(0.0)
+
+
+@wp.kernel(enable_backward=False)
+def compute_camera_transforms_body_kernel(
+    body_q: wp.array[wp.transformf],
+    bodies: wp.array[wp.int32],
+    xforms: wp.array[wp.transformf],
+    out_transforms: wp.array[wp.transformf],
+):
+    view = wp.tid()
+    body = bodies[view]
+    if body < 0:
+        out_transforms[view] = xforms[view]
+    else:
+        out_transforms[view] = wp.transform_multiply(body_q[body], xforms[view])
+
+
+@wp.kernel(enable_backward=False)
 def compute_camera_rays_fisheye_opencv_kernel(
     width: int,
     height: int,

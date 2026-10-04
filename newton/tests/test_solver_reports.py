@@ -43,6 +43,108 @@ class TestSolverReports(unittest.TestCase):
         self.assertEqual(row["gainprm"][0], 80.0)
         self.assertNotIn("pending", row)
 
+    @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
+    def test_actuator_rows_show_the_joint_effort_limit(self):
+        """An effort limit on the joint's actfrcrange is reported on the joint's actuators, not as unlimited."""
+        from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_mjcf(
+            _MJCF.replace('range="-60 60"', 'range="-60 60" actuatorfrcrange="-12 12"').replace(
+                "</actuator>", '<motor name="torque" joint="hinge"/></actuator>'
+            )
+        )
+        model = builder.finalize(device="cpu")
+        solver = SolverMuJoCo(model)
+        report = newton.utils.report_solver_params(solver, "actuator")
+        self.assertIn("jnt_actfrcrange", report["per_world"])
+        self.assertEqual(len(report["rows"]), 2)
+        for row in report["rows"]:
+            with self.subTest(actuator=row["label"]):
+                self.assertEqual(row["forcerange"], "unlimited")
+                self.assertEqual(row["joint_actfrcrange"], [-12.0, 12.0])
+                self.assertEqual(row["from"]["joint_actfrcrange"], "+-model.joint_effort_limit[0]")
+        model.joint_effort_limit.fill_(5.0)
+        for row in newton.utils.report_solver_params(solver, "actuator")["rows"]:
+            self.assertIn("joint_actfrcrange", row["pending"])
+        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+        for row in newton.utils.report_solver_params(solver, "actuator")["rows"]:
+            self.assertEqual(row["joint_actfrcrange"], [-5.0, 5.0])
+            self.assertNotIn("pending", row)
+
+    @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
+    def test_health_skips_overlap_between_static_shapes(self):
+        """A welded base overlapping the ground does not fail the health check; a penetrating free body does."""
+        from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        base = builder.add_link(label="base")
+        upright = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5 * wp.pi)
+        # 30 mm into the ground; unfiltered, so MuJoCo collides the (mocap) base with the plane.
+        builder.add_shape_capsule(base, xform=wp.transform(wp.vec3(), upright), radius=0.03, half_height=0.1)
+        weld = builder.add_joint_fixed(-1, base, collision_filter_parent=False)
+        arm = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity()), label="arm")
+        builder.add_shape_box(arm, hx=0.1, hy=0.02, hz=0.02)
+        hinge = builder.add_joint_revolute(
+            base, arm, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity()), axis=(0.0, 1.0, 0.0)
+        )
+        builder.add_articulation([weld, hinge])
+        model = builder.finalize(device="cpu")
+        solver = SolverMuJoCo(model)
+        state_0, state_1 = model.state(), model.state()
+        solver.step(state_0, state_1, model.control(), None, 0.002)
+        self.assertGreater(int(solver.mjw_data.nacon.numpy()[0]), 0)
+        report = newton.utils.report_health(model, state_1, solver)
+        self.assertTrue(report["ok"], report)
+        self.assertNotIn("penetration", report)
+        self.assertGreater(report["stats"]["penetration_skipped_contacts"]["static_pairs"], 0)
+        self.assertEqual(report["stats"]["deepest_penetration"], 0.0)
+
+    def test_health_skips_pairs_filtered_from_colliding(self):
+        """Explicit filter pairs, shared bodies, groups, worlds, and non-colliding shapes are skipped; others are kept."""
+        from newton._src.mcp.diagnostics import _skipped_pairs  # noqa: PLC0415
+
+        template = newton.ModelBuilder()
+        body = template.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()))
+        a = template.add_shape_sphere(body, radius=0.1)
+        b = template.add_shape_sphere(body, radius=0.1)
+        other = template.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 1.1), wp.quat_identity()))
+        c = template.add_shape_sphere(other, radius=0.1)
+        d = template.add_shape_sphere(other, radius=0.1, cfg=newton.ModelBuilder.ShapeConfig(collision_group=2))
+        e = template.add_shape_sphere(other, radius=0.1, cfg=newton.ModelBuilder.ShapeConfig(has_shape_collision=False))
+        f = template.add_shape_sphere(other, radius=0.1)
+        template.add_shape_collision_filter_pair(a, f)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        builder.replicate(template, 2)
+        model = builder.finalize(device="cpu")
+        per_world = template.shape_count
+        offset = model.shape_count - 2 * per_world  # the ground plane comes first
+
+        def shape(index, world=0):
+            return offset + world * per_world + index
+
+        pairs = {
+            "kept": (shape(a), shape(c)),
+            "kept_ground": (shape(c), 0),
+            "same_body": (shape(a), shape(b)),
+            "group": (shape(a), shape(d)),
+            "no_collision": (shape(a), shape(e)),
+            "explicit": (shape(a), shape(f)),
+            "other_world": (shape(a), shape(c, world=1)),
+            "unmapped": (-1, shape(c)),
+        }
+        first = np.array([p[0] for p in pairs.values()])
+        second = np.array([p[1] for p in pairs.values()])
+        static, filtered = _skipped_pairs(model, first, second)
+        self.assertFalse(static.any())
+        self.assertEqual(
+            {name for name, skip in zip(pairs, filtered, strict=True) if skip},
+            {"same_body", "group", "no_collision", "explicit", "other_world"},
+        )
+
     def test_health_names_non_finite_worlds_and_diverging_twins(self):
         """Name the world with non-finite state and the world that left its identical twins, with no solver."""
         template = newton.ModelBuilder()

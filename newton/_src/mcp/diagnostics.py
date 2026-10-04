@@ -169,6 +169,64 @@ def _worlds_text(worlds, limit: int = 8) -> str:
     return f"[{text}{', ...' if len(worlds) > limit else ''}] ({len(worlds)} worlds)"
 
 
+def _static_bodies(model) -> np.ndarray:
+    """Bodies joined to the world through joints without degrees of freedom only."""
+    static = np.zeros(model.body_count, dtype=bool)
+    if not model.joint_count or not model.body_count:
+        return static
+    child, parent = model.joint_child.numpy(), model.joint_parent.numpy()
+    fixed = np.diff(model.joint_qd_start.numpy()) == 0
+    moving = np.zeros(model.body_count, dtype=bool)
+    moving[child[~fixed & (child >= 0)]] = True
+    fixed_child, fixed_parent = child[fixed & (child >= 0)], parent[fixed & (child >= 0)]
+    while True:
+        attached = (fixed_parent < 0) | static[np.maximum(fixed_parent, 0)]
+        new = fixed_child[attached & ~moving[fixed_child] & ~static[fixed_child]]
+        if not len(new):
+            return static
+        static[new] = True
+
+
+def _skipped_pairs(model, first: np.ndarray, second: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Masks of contacts between two static shapes, and between shapes the model filters from colliding.
+
+    Contact forces cannot separate two shapes that are static (on no body, or on bodies joined to the
+    world without degrees of freedom), and filtered pairs never collide in Newton, so neither
+    overlap is a sign of failure. Unmapped shapes (``-1``) are never skipped.
+    """
+    from ..geometry.flags import ShapeFlags  # noqa: PLC0415
+
+    valid = (first >= 0) & (second >= 0)
+    a, b = np.where(valid, first, 0).astype(np.int64), np.where(valid, second, 0).astype(np.int64)
+    body = model.shape_body.numpy()
+    shape_static = (body < 0) | _static_bodies(model)[np.maximum(body, 0)]
+    static = valid & shape_static[a] & shape_static[b]
+    collide = (model.shape_flags.numpy() & int(ShapeFlags.COLLIDE_SHAPES)) != 0
+    world, group = model.shape_world.numpy(), model.shape_collision_group.numpy()
+    group_a, group_b = group[a], group[b]
+    groups_collide = (
+        (group_a != 0)
+        & (group_b != 0)
+        & np.where(group_a > 0, (group_a == group_b) | (group_b < 0), group_a != group_b)
+    )
+    filtered = (
+        ~(collide[a] & collide[b])
+        | ((body[a] == body[b]) & (body[a] >= 0))
+        | ((world[a] != world[b]) & (world[a] >= 0) & (world[b] >= 0))
+        | ~groups_collide
+        | model.shape_collision_filter_mask(np.stack([a, b], axis=1))
+    )
+    return static, valid & ~static & filtered
+
+
+def _skip_note(stats: dict, static: np.ndarray, filtered: np.ndarray) -> None:
+    if static.any() or filtered.any():
+        stats["penetration_skipped_contacts"] = {
+            "static_pairs": int(static.sum()),
+            "filtered_pairs": int(filtered.sum()),
+        }
+
+
 def _penetration_pairs(pairs: dict, depth: np.ndarray, first, second, worlds, labels, threshold: float) -> None:
     """Accumulate the deepest overlap [m] per shape pair for contacts deeper than ``threshold``."""
     for i in np.flatnonzero(depth > threshold):
@@ -240,8 +298,13 @@ def _mujoco_health(model, solver, report: dict, *, per_world: bool, threshold: f
         rows = np.minimum(contact_worlds, geom_map.shape[0] - 1)
         first = np.where(geoms[:, 0] >= 0, geom_map[rows, np.maximum(geoms[:, 0], 0)], -1)
         second = np.where(geoms[:, 1] >= 0, geom_map[rows, np.maximum(geoms[:, 1], 0)], -1)
-        stats["deepest_penetration"] = float(max(0.0, -dist.min()))
-        _penetration_pairs(report["_pairs"], -dist, first, second, contact_worlds, labels, threshold)
+        static, filtered = _skipped_pairs(model, first, second)
+        _skip_note(stats, static, filtered)
+        keep = ~(static | filtered)
+        stats["deepest_penetration"] = float(max(0.0, -dist[keep].min())) if keep.any() else 0.0
+        _penetration_pairs(
+            report["_pairs"], -dist[keep], first[keep], second[keep], contact_worlds[keep], labels, threshold
+        )
 
 
 _ITERATION_FLAGS = ("ITERATIONS", "LS_ITERATIONS")
@@ -295,8 +358,19 @@ def _newton_contacts_health(model, state, contacts, report: dict, *, threshold: 
     shape1 = contacts.rigid_contact_shape1.numpy()[:count]
     shape_world = model.shape_world.numpy()
     worlds = np.maximum(shape_world[np.maximum(shape0, 0)], shape_world[np.maximum(shape1, 0)])
-    report["stats"]["deepest_penetration"] = float(max(0.0, depth.max()))
-    _penetration_pairs(report["_pairs"], depth, shape0, shape1, worlds, getattr(model, "shape_label", None), threshold)
+    static, filtered = _skipped_pairs(model, shape0, shape1)
+    _skip_note(report["stats"], static, filtered)
+    keep = ~(static | filtered)
+    report["stats"]["deepest_penetration"] = float(max(0.0, depth[keep].max())) if keep.any() else 0.0
+    _penetration_pairs(
+        report["_pairs"],
+        depth[keep],
+        shape0[keep],
+        shape1[keep],
+        worlds[keep],
+        getattr(model, "shape_label", None),
+        threshold,
+    )
 
 
 def _twins(model, state, initial: dict | None, report: dict, tolerance: float) -> None:
@@ -407,7 +481,9 @@ def health_report(
         per_world: Name the worlds behind each finding.
         twins: Also compare the worlds' joint states with each other, for scenes whose worlds were
             built identical: worlds deviating from the per-coordinate median are listed.
-        penetration: Overlap [m] above which contacts are reported by shape pair.
+        penetration: Overlap [m] above which contacts are reported by shape pair. Contacts between
+            two static shapes and between shapes the model filters from colliding are skipped (see
+            :func:`_skipped_pairs`).
         twins_tolerance: Deviation [m, rad, m/s or rad/s] above which a world counts as disagreeing.
         limit: Maximum number of shape pairs listed.
 

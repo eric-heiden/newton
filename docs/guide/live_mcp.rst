@@ -74,8 +74,9 @@ before the next step and reports this as ``note`` in the execution result; call
 ``recapture()`` after in-place changes it cannot detect. Python errors are
 reported without invalidating the scene. ``newton_rebuild`` reloads the edited
 script from disk in the same process. ``--workers N`` also hosts ``N`` sibling
-copies of the script and exposes them as ``workers`` (see
-:class:`newton.mcp.WorkerPool`) for parallel parameter sweeps.
+copies of the script in separate processes and exposes them as ``workers`` (see
+:class:`newton.mcp.WorkerPool`) for parallel parameter sweeps; ``--max-workers M``
+(default ``max(N, 4)``) bounds ``workers.resize(n)``.
 
 Connect an MCP client
 ---------------------
@@ -323,22 +324,51 @@ Parallel worker sessions
 Every request to one session runs on its owner thread, so candidate
 evaluations issued through one live application run one after another.
 Script-based workflows can instead run several simulator processes at once.
-To recover that parallelism without giving up persistent state, pass the
-connection files of sibling sessions (typically more instances of the same
-application) as ``SimulationSession(..., workers=[...])``. Trusted execution
-then receives a :class:`newton.mcp.WorkerPool` named ``workers``:
+To recover that parallelism without giving up persistent state, a session can
+own a :class:`newton.mcp.WorkerPool` of sibling sessions (typically more
+instances of the same application). ``python -m newton.mcp host ... --workers N``
+launches one with :meth:`~newton.mcp.WorkerPool.launch`; an embedding
+application can also attach existing sessions by passing their connection files
+as ``SimulationSession(..., workers=[...])``. Trusted execution receives the
+pool as ``workers``:
 
 .. code-block:: python
 
-   workers.broadcast("def evaluate(p):\n    task.set_params(p)\n    ...\n    return loss")
-   losses = workers.map("result = evaluate(args)", candidates)
+   def evaluate(stiffness):
+       model.joint_target_ke.fill_(stiffness)
+       solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+       series = rollout(seconds=2.0, start=True, record={"x": "state.body_q.numpy()[0, 0]"})
+       return float(abs(series["x"][-1] - TARGET))
 
-``broadcast`` runs a cell on every worker, ``map`` spreads one cell per
-argument over idle workers and returns results in input order, and ``submit``
-returns a future. Each worker keeps its own scene and Python workspace.
-Worker jobs run with ``recovery="acknowledge"`` so a failed job does not block
-that worker; ``map`` returns ``{"error": ...}`` for the failed item. Rebuild or
-reset a worker whose scene a failed job may have left inconsistent.
+   TARGET = 0.25
+   losses = workers.map(evaluate, np.linspace(100.0, 1000.0, 16))
+
+``map`` calls a function once per item on the free workers and returns the
+results in input order, ``submit`` returns a future, and ``broadcast`` runs a
+function or code string once on every worker. Each worker keeps its own scene
+and Python workspace:
+
+* Functions defined in trusted-execution cells, including lambdas and
+  closures, are sent by source. Their cells stay registered in
+  :mod:`linecache`, so :func:`inspect.getsource` and tracebacks also work for
+  them. The cell functions and classes a function uses and the session globals
+  it reads (``TARGET`` above) are sent with it; arguments, those globals, and
+  results are pickled, and Warp arrays travel as NumPy data.
+* Names bound to a session's live objects (``example``, ``model``, ``state``,
+  ``solver``, ``rollout``, ...) are not sent: on a worker they refer to the
+  worker's own scene, which does not have the main session's live edits.
+* ``workers.sync(name=value)`` copies values into every worker's globals once;
+  functions do not resend a synced global while the session still binds the
+  same object.
+* Code strings run as cells on a worker with the item bound to ``args``.
+* A failed call returns ``{"error": ...}`` from ``map`` (with the worker's cell
+  and line) and raises from ``submit`` and ``broadcast``.
+
+A launched pool follows ``newton_rebuild`` with the same arguments. A worker
+whose process exits or whose CUDA context fails is restarted, and earlier
+``broadcast`` and ``sync`` calls are replayed on it in order;
+``workers.resize(n)`` adds or removes workers the same way. The session lists
+such events under ``workers`` in its next execution response.
 
 Explicit recovery after an execution error
 ------------------------------------------

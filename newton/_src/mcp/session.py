@@ -22,7 +22,7 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import warp as wp
@@ -32,6 +32,9 @@ from ..sim.contact_kinematics import eval_rigid_contact_kinematics
 from ..sim.enums import JointType, ModelFlags, StateFlags
 from ..sim.model import Model
 from .cells import cell_filename, forget_cell_source, register_cell_source, retain_cell_sources
+
+if TYPE_CHECKING:
+    from .workers import WorkerPool
 
 
 def _integer(value: Any, name: str, minimum: int, maximum: int) -> int:
@@ -205,9 +208,11 @@ class SimulationSession:
         restore_callback: Optional ``callback(session, data)`` restoring what
             ``snapshot_callback`` captured, before ``reset_callback`` runs.
         workers: Connection files of sibling sessions (usually more instances
-            of the same application). Trusted execution receives a ``workers``
-            pool whose ``broadcast``/``map``/``submit`` run cells on them
-            concurrently.
+            of the same application), or a :class:`WorkerPool`. Trusted
+            execution receives it as ``workers``, whose ``map``/``submit``/
+            ``broadcast`` run functions and cells on them concurrently. Worker
+            sessions follow :meth:`dispatch` ``rebuild``; worker restarts are
+            added to the next execution response.
     """
 
     class _Request:
@@ -268,7 +273,7 @@ class SimulationSession:
         artifact_directory: str | Path | None = None,
         namespace: dict[str, Any] | None = None,
         guide: str | None = None,
-        workers: list[str | Path] | None = None,
+        workers: list[str | Path] | WorkerPool | None = None,
         snapshot_callback: Callable | None = None,
         restore_callback: Callable | None = None,
         execute_callback: Callable | None = None,
@@ -307,10 +312,16 @@ class SimulationSession:
         """Application usage notes appended to the MCP server instructions."""
         self.workers = None
         """Optional :class:`WorkerPool` of sibling sessions, exposed as ``workers`` in trusted execution."""
-        if workers:
+        self._owns_workers = False
+        if workers is not None and not isinstance(workers, list | tuple):
+            self.workers = workers
+        elif workers:
             from .workers import WorkerPool  # noqa: PLC0415
 
-            self.workers = WorkerPool(workers)
+            self.workers = WorkerPool(list(workers))
+            self._owns_workers = True
+        if self.workers is not None:
+            self.workers.attach(lambda: self._workspace, self._session_names)
             self.namespace.setdefault("workers", self.workers)
         self.artifact_directory = Path(artifact_directory or tempfile.mkdtemp(prefix="newton-mcp-"))
         self.dt = self._timestep(dt)
@@ -555,6 +566,8 @@ class SimulationSession:
                 request.done.set()
         if self._renderer is not None:
             self._renderer.close()
+        if self._owns_workers:
+            self.workers.close()
         self._clear_workspace()
         if self._workspace_module is not None and sys.modules.get(self._workspace_name) is self._workspace_module:
             del sys.modules[self._workspace_name]
@@ -636,6 +649,7 @@ class SimulationSession:
             "capabilities": {
                 "execute": self.allow_execute,
                 "workers": 0 if self.workers is None else self.workers.count,
+                "workers_max": 0 if self.workers is None else self.workers.max_count,
                 "rebuild": self.rebuild_callback is not None,
                 "observation": {"sensor": True, "viewer": self.viewer is not None},
                 "record": True,
@@ -898,6 +912,17 @@ class SimulationSession:
             __builtins__=builtins.__dict__,
         )
 
+    def _session_names(self) -> set[str]:
+        """Names bound to this session's own objects, which worker calls resolve in their own session."""
+        return {*self._WORKSPACE_BINDINGS, *self.namespace, "collision_pipeline"}
+
+    def _background_report(self) -> dict:
+        report = {}
+        events = self.workers.drain_events() if self.workers is not None else []
+        if events:
+            report["workers"] = events
+        return report
+
     def _clear_workspace(self) -> None:
         for filename in self._workspace_sources:
             forget_cell_source(filename)
@@ -936,7 +961,7 @@ class SimulationSession:
         if filename not in self._workspace_sources:
             self._workspace_sources.append(filename)
         # Older cells stay cached while a workspace function or class still comes from them, so
-        # inspect.getsource() and tracebacks keep working for them; at most 512 cells are kept.
+        # inspect.getsource(), tracebacks, and workers.map(fn) keep working; at most 512 cells are kept.
         self._workspace_sources = retain_cell_sources(self._workspace_sources, self._workspace)
 
     def _execution_diagnostic(self, error: BaseException, filename: str) -> dict:
@@ -1014,6 +1039,7 @@ class SimulationSession:
                     f"{message}. The scene stays valid; statements before the failing line kept their effects "
                     "(restore a checkpoint to roll back). "
                     f"frames={json.dumps(diagnostic['frames'])}; stdout={''.join(output.parts)!r}"
+                    f"{self._background_suffix()}"
                 ) from error
             self._invalidate(requires_rebuild=True)
             self.last_error = message
@@ -1022,6 +1048,7 @@ class SimulationSession:
                 "Workspace variables remain available. Use recovery='inspect' for diagnosis; acknowledge only "
                 "after verifying or repairing model/solver coherence, or rebuild. "
                 f"frames={json.dumps(diagnostic['frames'])}; stdout={''.join(output.parts)!r}"
+                f"{self._background_suffix()}"
             ) from error
         finally:
             self._refresh_workspace()
@@ -1066,11 +1093,17 @@ class SimulationSession:
             "workspace": self._workspace_info(),
             **({"note": str(note)[:1024]} if note else {}),
             **({"images": images} if images else {}),
+            **self._background_report(),
         }
+
+    def _background_suffix(self) -> str:
+        report = self._background_report()
+        return f"; background={json.dumps(_result_json(report))}" if report else ""
 
     def _rebuild(self, *, reset_namespace: bool = False, **kwargs) -> dict:
         if self.rebuild_callback is None:
             raise ValueError("No rebuild callback was registered")
+        started = time.perf_counter()
         try:
             bindings = self.rebuild_callback(self, **kwargs)
             if not isinstance(bindings, dict):
@@ -1079,6 +1112,16 @@ class SimulationSession:
         except Exception:
             self._invalidate(requires_rebuild=True)
             raise
+        workers = None
+        if self.workers is not None and not kwargs.get("restart"):
+            # Workers rebuild after this session succeeded, from the kernels it just compiled; with no
+            # running workers this only records the arguments for workers started later.
+            count = self.workers.count
+            seconds = time.perf_counter() - started
+            workers = self.workers.rebuild(
+                {**kwargs, "reset_namespace": reset_namespace}, timeout=max(30.0, 3.0 * seconds)
+            )
+            workers = workers if count else None
         # Rebuilds repeat often while iterating on a script; the full describe payload (guide,
         # operation list, limits) would be re-sent into the agent's context every time.
         return {
@@ -1089,6 +1132,8 @@ class SimulationSession:
                 for name in ("world_count", "body_count", "shape_count", "joint_count", "joint_dof_count")
             },
             "solver": self._describe_solver(self.solver),
+            **({"workers_rebuilt": workers} if workers is not None else {}),
+            **self._background_report(),
         }
 
     def _query(

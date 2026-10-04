@@ -17,6 +17,7 @@ import json
 import linecache
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from types import ModuleType
@@ -96,6 +97,14 @@ class _NoSolver:
 def _frame_dt(example) -> str:
     frame_dt = getattr(example, "frame_dt", None)
     return f"{frame_dt:g} s" if isinstance(frame_dt, (int, float)) else "example.frame_dt"
+
+
+def _worker_counts(workers) -> tuple[int, int]:
+    if workers is None:
+        return 0, 0
+    if isinstance(workers, list | tuple):
+        return len(workers), len(workers)
+    return workers.count, workers.max_count
 
 
 class ExampleHost:
@@ -267,7 +276,7 @@ class ExampleHost:
             if name in self._dynamic_scalars:
                 setattr(self.example, name, value)
 
-    def guide(self, workers: int = 0) -> str:
+    def guide(self, workers: int = 0, max_workers: int = 0) -> str:
         rtx = _RTX_GUIDE if rtx_available() else ""
         text = f"""Hosted Newton example: {self.script} (class {self.example_class}, args {self.argv}).
 - `example` is the live Example instance and `module` its script module; one step is one example frame ({_frame_dt(self.example)}). Use rollout(...) or session.dispatch('step', {{'count': n}}) rather than example.step() so time, recordings, and bindings stay in sync.
@@ -279,9 +288,9 @@ class ExampleHost:
 - Python errors in a cell are reported but keep the scene valid; statements before the failing line keep their effects.
 - newton_rebuild(arguments={{"restart": true}}) restarts the whole host process (fresh CUDA context, same script and arguments; Python variables are lost, and the next call waits for the new process). Use it only if the process is broken, e.g. after a CUDA error.
 - After editing the script on disk, newton_rebuild reloads and reconstructs it in this process (Python variables survive; pass arguments={{"argv": [...]}} to change example arguments). Rebuild once to confirm the edited script reproduces your live result."""
-        if workers:
+        if max_workers:
             text += f"""
-- `workers` holds {workers} sibling live copies of this example (same script and arguments, separate processes and scenes). For a sweep, one call to workers.map(code, [args, ...]) runs a code string once per item in parallel (the item is `args` inside; `example`, `rollout`, ... exist there too) and returns all results in the same response; workers.broadcast(code) defines helpers on all of them. workers.submit(code, args) returns a Future instead; use it only when you will do other work in this call before collecting .result(), since polling costs an extra turn. Workers do not see this session's Python variables or live edits: send the settings to test in `args`, and rebuild them (workers.broadcast("session.dispatch('rebuild', {{}})")) after editing the script."""
+- `workers`: {workers} sibling copies of this example (same script and arguments; own processes, scenes, and globals); workers.resize(n) sets the count (0 to {max_workers}), workers.status() lists them. workers.map(fn, items) (or map(fn, xs, ys)) calls fn per item on free workers and returns results in input order ({{'error': ...}} for a call that raised); workers.submit(fn, *args, **kwargs) returns a Future; workers.broadcast(fn_or_code, *args) runs on every worker. Cell functions (lambdas and closures too) are sent by source with the cell functions and classes they use and the session globals they read; arguments, globals, and results are pickled. On a worker, example, model, state, solver, module, rollout and the other preloaded names are that worker's own (without this session's live edits). A code string runs as a cell with the item as `args`. workers.sync(name=value) or workers.sync('name') copies values to every worker; functions do not resend a synced name while it is bound to the same object. Printed text is echoed as `[worker i] ...`. newton_rebuild also rebuilds the workers. A worker whose process exits or whose CUDA context fails is restarted and replays earlier broadcast/sync calls; restarts are listed under `workers` in the next response."""
         return text
 
     def session(self, *, artifact_directory=None, workers=None, allow_execute: bool = True):
@@ -321,7 +330,7 @@ class ExampleHost:
             allow_execute=allow_execute,
             artifact_directory=artifact_directory,
             namespace={"example": self.example, "module": self.module, "recapture": self.recapture},
-            guide=self.guide(len(workers or [])),
+            guide=self.guide(*_worker_counts(workers)),
             workers=workers,
             execute_callback=self.after_execute,
             overlay_callback=self.overlay_meshes,
@@ -329,6 +338,17 @@ class ExampleHost:
         )
         session.host = self
         return session
+
+
+def _exit_with_parent(parent: int) -> None:
+    """End this worker process when the host that launched it is gone, even if it was killed."""
+
+    def watch():
+        while os.getppid() == parent:
+            time.sleep(1.0)
+        os._exit(0)
+
+    threading.Thread(target=watch, name="newton-mcp-parent-watch", daemon=True).start()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -339,70 +359,70 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--class", dest="example_class", default="Example")
     parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--workers", type=int, default=0, help="Also host this many sibling copies as a worker pool")
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        help="Largest worker count workers.resize() may set (default: max(--workers, 4) with workers, else 0)",
+    )
     parser.add_argument("--ready-file", type=Path)
+    parser.add_argument("--parent-pid", type=int, help=argparse.SUPPRESS)
     argv = list(sys.argv[1:] if argv is None else argv)
     # Everything after "--" belongs to the example's own argument parser.
     split = argv.index("--") if "--" in argv else len(argv)
     args = parser.parse_args(argv[:split])
     example_args = argv[split + 1 :]
     started = time.perf_counter()
+    if args.parent_pid is not None:
+        _exit_with_parent(args.parent_pid)
     # Kernel-load messages would otherwise flood every execute result.
     if hasattr(wp, "LOG_WARNING"):
         wp.config.log_level = wp.LOG_WARNING
     else:
         wp.config.quiet = True
-    children, worker_files = [], []
-    import subprocess  # noqa: PLC0415
+    max_workers = args.max_workers if args.max_workers is not None else (max(args.workers, 4) if args.workers else 0)
+    if args.workers < 0 or max_workers < args.workers:
+        parser.error("--workers must be in [0, --max-workers]")
+    pool = None
+    if max_workers:
+        import signal  # noqa: PLC0415
 
-    for index in range(args.workers):
-        connection = args.connection_file.with_name(f"{args.connection_file.stem}.worker-{index}.json")
-        ready = args.connection_file.with_name(f"{args.connection_file.stem}.worker-{index}.ready")
-        worker_files.append(connection)
-        children.append(
-            subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "newton.mcp",
-                    "host",
-                    str(args.script),
-                    "--connection-file",
-                    str(connection),
-                    "--class",
-                    args.example_class,
-                    "--ready-file",
-                    str(ready),
-                    "--",
-                    *example_args,
-                ]
-            )
+        from .workers import WorkerPool  # noqa: PLC0415
+
+        # SIGTERM unwinds through the cleanup below, which stops the worker processes by PID.
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+
+        # Workers start (and compile kernels) while this process builds its own example.
+        pool = WorkerPool.launch(
+            args.script,
+            example_args,
+            count=args.workers,
+            max_count=max_workers,
+            example_class=args.example_class,
+            directory=args.connection_file.parent,
+            name=args.connection_file.stem,
         )
-    host = ExampleHost(args.script, example_args, example_class=args.example_class)
-    host.build()
-    for index, child in enumerate(children):
-        ready = args.connection_file.with_name(f"{args.connection_file.stem}.worker-{index}.ready")
-        while not ready.exists():
-            if child.poll() is not None:
-                raise RuntimeError(f"Worker {index} exited during startup")
-            time.sleep(0.05)
-    session = host.session(artifact_directory=args.artifacts, workers=worker_files or None)
-    from .transport import SimulationServer  # noqa: PLC0415
-
-    server = SimulationServer(session, connection_file=args.connection_file)
-    server.start()
-    marker = args.ready_file or args.connection_file.with_suffix(".ready")
-    marker.write_text(json.dumps({"pid": os.getpid(), "startup_seconds": time.perf_counter() - started}))
-    print(f"READY: {args.connection_file}", flush=True)
+    server = None
     try:
+        host = ExampleHost(args.script, example_args, example_class=args.example_class)
+        host.build()
+        if pool is not None:
+            pool.wait_ready()
+        session = host.session(artifact_directory=args.artifacts, workers=pool)
+        from .transport import SimulationServer  # noqa: PLC0415
+
+        server = SimulationServer(session, connection_file=args.connection_file)
+        server.start()
+        marker = args.ready_file or args.connection_file.with_suffix(".ready")
+        marker.write_text(json.dumps({"pid": os.getpid(), "startup_seconds": time.perf_counter() - started}))
+        print(f"READY: {args.connection_file}", flush=True)
         session.run(until=lambda: host.restart_requested)
     finally:
-        if host.restart_requested:
-            time.sleep(0.5)  # let the transport thread deliver the rebuild response
-        server.close()
-        for child in children:
-            child.terminate()
-        for child in children:
-            child.wait(timeout=30)
+        if server is not None:
+            if host.restart_requested:
+                time.sleep(0.5)  # let the transport thread deliver the rebuild response
+            server.close()
+        if pool is not None:
+            pool.close()
     if host.restart_requested:
         marker.unlink(missing_ok=True)
         print("RESTART: re-executing the host process", flush=True)

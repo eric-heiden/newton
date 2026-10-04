@@ -224,7 +224,7 @@ at the current state. Solver-native contacts that are not exposed as Newton
 ``Contacts`` are not converted into these rows. ``include_global=True`` includes
 global-global contacts when filtering a local world.
 
-``observe`` defaults to ``SensorTiledCamera`` and needs no GL context. Camera
+``observe`` defaults to :class:`~newton.sensors.SensorCamera` and needs no GL context. Camera
 positions and targets use world coordinates in meters. ``pose`` contains
 ``[x, y, z, qx, qy, qz, qw]`` with local -Z forward and +Y up; ``fov_y`` is in
 degrees. Select a scene with ``world_id`` and request color, albedo, depth,

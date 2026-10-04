@@ -12,6 +12,7 @@ import struct
 import tempfile
 import threading
 import unittest
+import warnings
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -232,6 +233,22 @@ class TestMcpObservation(unittest.TestCase):
         self.assertIs(self.renderer._sensor, sensor)
         self.assertIs(self.renderer._rays, rays)
         self.assertIs(self.renderer._outputs["depth"], output)
+
+    def test_observations_emit_no_deprecation_warnings(self):
+        """Sensor renders, logged overlay meshes, and calibrated cameras use only current Newton APIs."""
+        quad = np.array([[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]], dtype=np.float32)
+        self.session.overlay_callback = lambda session: [("quad", quad, np.array([0, 1, 2, 0, 2, 3]), (0, 1, 0))]
+        focal = 32.5 / math.tan(math.radians(30.0))
+        ideal = {"fx": focal, "fy": focal, "cx": 32.5, "cy": 32.5}
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.renderer.observe(**self.camera)
+            self.renderer.observe(channel="depth", intrinsics={**ideal, "k1": -0.1}, **self.camera)
+            self.renderer.observe(
+                intrinsics={**ideal, "distortion_model": "inverse_brown_conrady", "k1": 0.1}, **self.camera
+            )
+        messages = [str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)]
+        self.assertEqual(messages, [])
 
     def test_hiding_shape_after_finalize(self):
         """Clearing a shape's VISIBLE flag on the finalized model removes it from the next observation."""
@@ -560,7 +577,7 @@ class TestMcpObservation(unittest.TestCase):
         x, y = (0.5 - 32.5) / focal, (0.5 - 32.5) / focal
         r2 = x * x + y * y
         expected = np.array([x * (1 + 0.2 * r2), -y * (1 + 0.2 * r2), -1.0])
-        np.testing.assert_allclose(rays[0, 0, 0, 1], expected / np.linalg.norm(expected), atol=1e-6)
+        np.testing.assert_allclose(rays[0, 0, 1], expected / np.linalg.norm(expected), atol=1e-6)
         with self.assertRaises(ValueError):
             self.renderer.observe(intrinsics={**realsense, "k4": 0.1}, **self.camera)
 
@@ -968,7 +985,7 @@ class TestMcpObservation(unittest.TestCase):
         intrinsics = mounted["camera"]["intrinsics"]
         self.assertEqual(intrinsics["distortion_model"], "inverse_brown_conrady")
         # Points along every pixel's ray project back to that pixel's center.
-        directions = self.renderer._rays.numpy()[0, :, :, 1].reshape(-1, 3).astype(np.float64)
+        directions = self.renderer._rays.numpy()[:, :, 1].reshape(-1, 3).astype(np.float64)
         pixels, depth = _project(pose[:3] + 0.5 * directions @ _rotation(pose[3:]).T, pose, 848, 480, 0.0, intrinsics)
         ys, xs = np.mgrid[0:480, 0:848]
         np.testing.assert_allclose(pixels, np.stack([xs.ravel() + 0.5, ys.ravel() + 0.5], axis=-1), atol=1.0e-3)

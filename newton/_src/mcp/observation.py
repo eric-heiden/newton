@@ -19,7 +19,7 @@ import numpy as np
 import warp as wp
 
 from newton import ShapeFlags
-from newton.sensors import SensorTiledCamera
+from newton.sensors import SensorCamera
 
 from .imaging import compare as _compare_images
 from .imaging import comparison_panel as _comparison_panel
@@ -168,7 +168,7 @@ def _inverse_brown_conrady_rays(width: int, height: int, intrinsics: dict) -> np
     """Camera rays for RealSense's inverse Brown-Conrady model, which maps distorted pixels directly to rays.
 
     Returns ray origins and directions in the sensor's camera frame (x right, y up, looking along -z),
-    shape [1, height, width, 2, 3].
+    shape [height, width, 2, 3].
     """
     k = {name: intrinsics.get(name, 0.0) for name in ("k1", "k2", "k3", "p1", "p2")}
     u = (np.arange(width) + 0.5) / width * intrinsics["image_width"]
@@ -179,8 +179,8 @@ def _inverse_brown_conrady_rays(width: int, height: int, intrinsics: dict) -> np
     ux = x * radial + 2.0 * k["p1"] * x * y + k["p2"] * (r2 + 2.0 * x * x)
     uy = y * radial + 2.0 * k["p2"] * x * y + k["p1"] * (r2 + 2.0 * y * y)
     directions = np.stack([ux, -uy, -np.ones_like(ux)], axis=-1)
-    rays = np.zeros((1, height, width, 2, 3), dtype=np.float32)
-    rays[0, :, :, 1] = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
+    rays = np.zeros((height, width, 2, 3), dtype=np.float32)
+    rays[:, :, 1] = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
     return rays
 
 
@@ -724,7 +724,7 @@ class ObservationRenderer:
         }
         if backend == "sensor":
             if wireframe:
-                raise ValueError("SensorTiledCamera does not support mesh wireframe; use an attached ViewerGL backend")
+                raise ValueError("SensorCamera does not support mesh wireframe; use an attached ViewerGL backend")
             # Supersample color 2x2 when the budget allows; other channels stay exact per pixel.
             supersample = 2 if antialias and channel == "color" and 4 * aggregate_pixels <= self.MAX_PIXELS else 1
             arrays, environment_metadata = self._render_sensor(
@@ -1273,17 +1273,17 @@ class ObservationRenderer:
         model, state = self.session.model, self.session.state
         if self._sensor is None or self._sensor_model is not model:
             self.invalidate()
-            config = SensorTiledCamera.RenderConfig(enable_shadows=True)
-            self._sensor = SensorTiledCamera(model, default_render_config=config, load_textures=True)
-            self._sensor.utils.create_default_light(enable_shadows=True)
+            config = SensorCamera.RenderConfig(enable_shadows=True)
+            self._sensor = SensorCamera(model, default_render_config=config, load_textures=True)
+            self._sensor.create_default_light(enable_shadows=True)
             self._sensor_model = model
             self._visibility_signature = None
         key = (width, height, fov_y, json.dumps(intrinsics, sort_keys=True))
         if key != self._buffer_key:
             self._outputs = {}
             if intrinsics is None:
-                self._rays = self._sensor.utils.compute_camera_rays_pinhole(
-                    width, height, camera_fovs=math.radians(fov_y)
+                self._rays = SensorCamera.compute_camera_rays_pinhole(
+                    width, height, camera_fov=math.radians(fov_y), device=model.device
                 )
             elif intrinsics.get("distortion_model") == "inverse_brown_conrady":
                 self._rays = wp.array(
@@ -1291,11 +1291,13 @@ class ObservationRenderer:
                 )
             else:
                 # The helper rescales the calibration to the (supersampled) output size.
-                self._rays = self._sensor.utils.compute_camera_rays_pinhole_opencv(width, height, **intrinsics)
-            self._transforms = wp.empty((1, 1), dtype=wp.transform, device=model.device)
+                self._rays = SensorCamera.compute_camera_rays_pinhole_opencv(
+                    width, height, **intrinsics, device=model.device
+                )
+            self._transforms = wp.empty(1, dtype=wp.transformf, device=model.device)
             self._buffer_key = key
-        self._transforms.assign(np.asarray(pose, dtype=np.float32).reshape(1, 1, 7))
-        world_ids = wp.array([world_id], dtype=wp.int32, device=model.device)
+        self._transforms.assign(np.asarray(pose, dtype=np.float32).reshape(1, 7))
+        world_indices = wp.array([world_id], dtype=wp.int32, device=model.device)
         overlay = self._overlay_meshes() if channel == "color" else []
         needed = {channel}
         if contacts or overlay:
@@ -1308,8 +1310,8 @@ class ObservationRenderer:
         self._outputs = {name: value for name, value in self._outputs.items() if name in needed}
         for name in needed:
             if name not in self._outputs:
-                create = getattr(self._sensor.utils, f"create_{name}_image_output")
-                self._outputs[name] = create(width, height, world_count=1)
+                create = getattr(self._sensor, f"create_{name}_image_output")
+                self._outputs[name] = create(1, width, height)
         # Shapes hidden or made transparent after finalize() only leave the render BVH on a rebuild.
         visible = model.shape_flags.numpy() & int(ShapeFlags.VISIBLE) != 0
         if model.shape_opacity is not None:
@@ -1321,20 +1323,20 @@ class ObservationRenderer:
             self._visibility_signature = signature
         model.bvh_refit_shapes(state)
         model.bvh_refit_particles(state)
-        config = SensorTiledCamera.RenderConfig(enable_shadows=shadows, enable_textures=textures)
+        config = SensorCamera.RenderConfig(enable_shadows=shadows, enable_textures=textures)
         self._sensor.update(
             state,
             self._transforms,
             self._rays,
             render_config=config,
-            world_ids=world_ids,
+            world_indices=world_indices,
             **{f"{name}_image": output for name, output in self._outputs.items()},
         )
         if overlay:
-            arrays = {name: output[0, 0].numpy() for name, output in self._outputs.items()}
+            arrays = {name: output[0].numpy() for name, output in self._outputs.items()}
             self._composite_overlay(arrays, overlay, width, height, pose, shadows)
             for name, values in arrays.items():
-                self._outputs[name][0, 0].assign(values)
+                self._outputs[name][0].assign(values)
         environment_metadata = {}
         if channel == "color" and (environment or supersample > 1):
             color, environment_metadata = self._finish_color(
@@ -1342,7 +1344,7 @@ class ObservationRenderer:
             )
         arrays = {}
         for name, output in self._outputs.items():
-            values = output[0, 0].numpy()
+            values = output[0].numpy()
             arrays[name] = values[supersample // 2 :: supersample, supersample // 2 :: supersample][
                 :base_height, :base_width
             ]
@@ -1380,10 +1382,10 @@ class ObservationRenderer:
             _finish_color,
             dim=(height, width),
             inputs=[
-                self._outputs["color"][0, 0],
-                self._outputs["shape_index"][0, 0] if environment else dummy,
-                self._outputs["depth"][0, 0] if environment else dummy_depth,
-                self._rays[0],
+                self._outputs["color"][0],
+                self._outputs["shape_index"][0] if environment else dummy,
+                self._outputs["depth"][0] if environment else dummy_depth,
+                self._rays,
                 wp.mat33f(*rotation.flatten()),
                 wp.vec3f(*np.asarray(pose[:3], dtype=np.float32)),
                 wp.vec3f(*np.eye(3, dtype=np.float32)[int(model.up_axis)]),
@@ -1471,32 +1473,23 @@ class ObservationRenderer:
             mesh = newton.Mesh(points, indices, compute_inertia=False)
             builder.add_shape_mesh(-1, mesh=mesh, cfg=cfg, color=color, label=str(name))
         overlay = builder.finalize(device=model.device)
-        sensor = SensorTiledCamera(
-            overlay, default_render_config=SensorTiledCamera.RenderConfig(enable_shadows=shadows)
-        )
-        sensor.utils.create_default_light(enable_shadows=shadows)
+        sensor = SensorCamera(overlay, default_render_config=SensorCamera.RenderConfig(enable_shadows=shadows))
+        sensor.create_default_light(enable_shadows=shadows)
         rays = self._rays  # the same camera rays as the main render, including any intrinsics
         transforms = wp.array(
-            np.asarray(pose, dtype=np.float32).reshape(1, 1, 7), dtype=wp.transform, device=model.device
+            np.asarray(pose, dtype=np.float32).reshape(1, 7), dtype=wp.transformf, device=model.device
         )
-        color = sensor.utils.create_color_image_output(width, height)
-        depth = sensor.utils.create_forward_depth_image_output(width, height)
+        color = sensor.create_color_image_output(1, width, height)
+        depth = sensor.create_forward_depth_image_output(1, width, height)
         state = overlay.state()
         overlay.bvh_refit_shapes(state)
-        sensor.update(
-            state,
-            transforms,
-            rays,
-            render_config=SensorTiledCamera.RenderConfig(enable_shadows=shadows),
-            color_image=color,
-            forward_depth_image=depth,
-        )
-        overlay_depth = depth[0, 0].numpy()
+        sensor.update(state, transforms, rays, color_image=color, forward_depth_image=depth)
+        overlay_depth = depth[0].numpy()
         base_depth = arrays["forward_depth"]
         hit = np.isfinite(overlay_depth) & (overlay_depth > 0)
         base_hit = np.isfinite(base_depth) & (base_depth > 0)
         nearer = hit & (~base_hit | (overlay_depth < base_depth))
-        arrays["color"] = np.where(nearer, color[0, 0].numpy(), arrays["color"])
+        arrays["color"] = np.where(nearer, color[0].numpy(), arrays["color"])
         arrays["forward_depth"] = np.where(nearer, overlay_depth, base_depth)
         if "shape_index" in arrays:
             # Mark overlay pixels as hits that are not model shapes, so the sky pass keeps them.

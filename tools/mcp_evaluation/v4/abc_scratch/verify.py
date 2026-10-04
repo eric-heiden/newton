@@ -1052,7 +1052,8 @@ def _audit_world(sub: Submission, station: Station, scene: Scene, w: int, truth:
         ok = int(sub.kind[t]) == GEO.PLANE and abs(sub.transform[t][2] - table_z) <= BOUNDS["table_z_m"] and up > 0.999
         audit.check("table", ok, f"world {w}: table plane at z {sub.transform[t][2]:.4f}")
 
-    # The tray: every added shape inside the real tray's footprint + tray_margin_m, at most tray_top_m high.
+    # The tray: every added shape inside the real tray's footprint (at the start or the end of the episode, as for
+    # placement) + tray_margin_m, at most tray_top_m high.
     tray = truth["tray"]
     count = len(roles["tray"])
     audit.check("tray", count <= BOUNDS["tray_shapes_max"], f"world {w}: {count} added tray shapes")
@@ -1062,7 +1063,7 @@ def _audit_world(sub: Submission, station: Station, scene: Scene, w: int, truth:
             audit.check("tray", False, f"world {w}: unbounded added shape {ix.shape_leaf[s]}")
             continue
         stride = max(1, len(points) // 400)
-        outside = max(core.sector_distance(p[:2], tray, tray["start"]) for p in points[::stride])
+        outside = max(core.tray_distance(p[:2], tray) for p in points[::stride])
         top = float(points[:, 2].max() - table_z)
         ok = outside <= BOUNDS["tray_margin_m"] and top <= BOUNDS["tray_top_m"]
         message = f"{1000 * outside:.0f} mm outside the tray, top {1000 * top:.0f} mm above the table"

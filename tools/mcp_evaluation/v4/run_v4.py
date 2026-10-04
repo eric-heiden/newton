@@ -475,7 +475,7 @@ def _renderers() -> str:
     if not blender or not Path(blender).exists():
         return ""
     return (
-        "Renderers: newton.sensors.SensorTiledCamera (ray-cast, GPU) and Blender (headless, scriptable with bpy; "
+        "Renderers: newton.sensors.SensorCamera (ray-cast, GPU) and Blender (headless, scriptable with bpy; "
         f"executable in $NEWTON_BLENDER = {blender}).\n"
     )
 
@@ -511,7 +511,7 @@ Deliverable: the edited {task["script"]} in the workspace, then a brief report. 
             + f"""
 Workflow: this is a script-based setup. Run the simulation with
   {run}
-or write your own scripts that import the Example class; each run starts a fresh simulator process. There is no display; to look at the scene, render images yourself (for example with newton.sensors.SensorTiledCamera) and open them with your image-viewing tool.
+or write your own scripts that import the Example class; each run starts a fresh simulator process. There is no display; to look at the scene, render images yourself (for example with newton.sensors.SensorCamera) and open them with your image-viewing tool.
 """
         )
     return (

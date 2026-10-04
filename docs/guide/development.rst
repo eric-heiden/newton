@@ -713,6 +713,30 @@ New examples must also be registered in the examples ``README.md`` with a
             # run in headless test mode (used by CI)
             python -m newton.examples basic_pendulum --viewer null --test
 
+Running a script in a clean headless process
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``python -m newton.examples.headless`` runs an example script, or a bundled
+example by short name, in a new Python process with a null viewer and writes a
+JSON report:
+
+.. code-block:: console
+
+    python -m newton.examples.headless my_scene.py --seed 3 --frames 600 \
+        --call "example.state_0.body_q.numpy()[0]" --json report.json --timeout 300
+
+The script's ``__main__`` block does not run: the runner parses the script
+arguments with the script's own parser, constructs ``Example(viewer, args)``,
+steps ``--frames`` frames (default: the script's ``--num-frames``), and then
+evaluates ``--call`` with ``example`` in scope. The report holds the status
+(``ok``, ``error``, ``timeout``, ``crashed``, or ``cancelled``), the exit code,
+the wall time, the frames stepped, the JSON-converted value of ``--call``, any
+exception with its traceback, and the last characters of stdout and stderr.
+When ``--timeout`` expires, the runner records the Python stack of every thread
+and kills the process and everything it started. Runner options may follow the
+script arguments; arguments after ``--`` always go to the script.
+``newton.examples.headless.run_headless()`` does the same from Python.
+
 Asset version pinning
 ---------------------
 

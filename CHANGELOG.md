@@ -6,6 +6,7 @@
 
 - Add experimental `newton.mcp` sessions for live simulation inspection, validated edits, stepping, camera observations, recording, and opt-in trusted Python through an authenticated local MCP bridge.
 - Add a persistent trusted Python workspace to live MCP sessions, with Warp kernel support, bounded result summaries, and explicit error recovery.
+- Add solver introspection to live MCP sessions: `solver_params()` reports the values `SolverMuJoCo` integrates per actuator, joint, geom, body, equality constraint, and option, with the model array and `ModelFlags` behind each; edits to model arrays that no `notify_model_changed()` call covered are detected after each cell and notified with the inferred flags; and `health()` accepts any solver and reports per-world findings and penetrating shape pairs.
 - Add visual feedback to live MCP sessions: inline images from Python via `show()`, auto-framed and multi-view observations, comparison against reference photos, and a `filmstrip` tool that returns frames over time in one image.
 - Add `newton.mcp.WorkerPool` so live MCP sessions can run trusted Python on sibling application sessions in parallel via `workers.broadcast()`, `workers.map()`, and `workers.submit()`.
 

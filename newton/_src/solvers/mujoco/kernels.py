@@ -801,6 +801,7 @@ def convert_mj_coords_to_warp_kernel(
             joint_qd[i] = joint_qd_in[i]
         return
 
+    # Host-side (float64) equivalent: SolverMuJoCo.convert_joint_coords_from_mujoco().
     if type == JointType.FREE:
         # MuJoCo qpos[0:7] holds the body's world pose. Recover Newton's
         # relative transform between the parent and child joint anchors.
@@ -920,6 +921,7 @@ def convert_warp_coords_to_mj_kernel(
     wq_i = joint_q_start[joint_id]
     wqd_i = joint_qd_start[joint_id]
 
+    # Host-side (float64) equivalent: SolverMuJoCo.convert_joint_coords_to_mujoco().
     if jtype == JointType.FREE:
         # MuJoCo qpos[0:7] holds the body's world pose. Compose it from
         # Newton's relative transform between the joint anchors.

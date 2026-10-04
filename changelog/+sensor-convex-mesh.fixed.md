@@ -1,1 +1,1 @@
-Render convex-hull shapes (`GeoType.CONVEX_MESH`) in `SensorTiledCamera`; they were skipped and invisible.
+Render convex-hull shapes (`GeoType.CONVEX_MESH`) in `SensorCamera` and `SensorTiledCamera`; they were skipped and invisible.

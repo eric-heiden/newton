@@ -82,19 +82,26 @@ class RenderContext:
         self._lights_cast_shadow: wp.array[wp.bool] | None = None
         self._lights_position: wp.array[wp.vec3f] | None = None
         self._lights_orientation: wp.array[wp.vec3f] | None = None
+        self._lights_color: wp.array[wp.vec3f] | None = None
+        self._no_triangle_colors: wp.array[wp.vec3f] | None = None
 
-        # Heightfields are triangulated meshes (their wp.Mesh lives in
-        # shape_source_ptr), so the renderer treats them as meshes: it reuses
-        # the MESH ray-intersection path, which keeps heightfield handling out
-        # of the render kernels entirely (no extra shape-type branch, so no
-        # register/occupancy cost). The remapped type array is what the render
-        # kernel dispatches on; model.shape_type (HFIELD) is left untouched for
-        # collision and BVH bounds.
+        self.ambient_sky_color = wp.vec3f(0.2, 0.2, 0.225)
+        """Linear RGB ambient radiance from above (surfaces facing the up axis)."""
+        self.ambient_ground_color = wp.vec3f(0.05, 0.05, 0.06)
+        """Linear RGB ambient radiance from below (surfaces facing away from the up axis)."""
+
+        # Heightfields and convex hulls are triangle meshes (their wp.Mesh lives
+        # in shape_source_ptr), so the renderer treats them as meshes: it reuses
+        # the MESH ray-intersection path, which keeps them out of the render
+        # kernels entirely (no extra shape-type branch, so no register/occupancy
+        # cost). The remapped type array is what the render kernel dispatches on;
+        # model.shape_type is left untouched for collision and BVH bounds.
         if model.shape_type is not None:
             shape_type_np = model.shape_type.numpy()
-            if np.any(shape_type_np == int(GeoType.HFIELD)):
+            as_mesh = np.isin(shape_type_np, (int(GeoType.HFIELD), int(GeoType.CONVEX_MESH)))
+            if np.any(as_mesh):
                 shape_type_np = shape_type_np.copy()
-                shape_type_np[shape_type_np == int(GeoType.HFIELD)] = int(GeoType.MESH)
+                shape_type_np[as_mesh] = int(GeoType.MESH)
                 self._shape_render_type = wp.array(shape_type_np, dtype=wp.int32, device=model.shape_type.device)
 
         if model.particle_q is not None and model.particle_q.shape[0]:
@@ -162,23 +169,49 @@ class RenderContext:
         self,
         enable_shadows: bool = True,
         direction: wp.vec3f | None = None,
+        color: wp.vec3f | None = None,
     ) -> None:
-        """Create a default directional light oriented at ``(-1, 1, -1)``.
+        """Create a default directional light shining down at an angle.
 
         Args:
             enable_shadows: Enable shadow casting for this light.
-            direction: Normalized light direction. If ``None``, defaults to
-                (normalized ``(-1, 1, -1)``).
+            direction: Normalized light direction. If ``None``, shines down at an
+                angle: normalized ``(-1, 1, -1)`` for Z-up, ``(-1, -1, -1)`` for
+                Y-up, and ``(-1, -1, 1)`` for X-up models.
+            color: Linear RGB light intensity. If ``None``, white at unit intensity.
         """
         self._lights_active = wp.array([True], dtype=wp.bool, device=self.device)
         self._lights_type = wp.array([LightType.DIRECTIONAL], dtype=wp.int32, device=self.device)
         self._lights_cast_shadow = wp.array([enable_shadows], dtype=wp.bool, device=self.device)
         self._lights_position = wp.array([wp.vec3f(0.0)], dtype=wp.vec3f, device=self.device)
         self._lights_orientation = wp.array(
-            [direction if direction is not None else wp.vec3f(-0.57735026, 0.57735026, -0.57735026)],
+            [direction if direction is not None else self._default_light_direction()],
             dtype=wp.vec3f,
             device=self.device,
         )
+        self._lights_color = wp.array(
+            [color if color is not None else wp.vec3f(1.0)], dtype=wp.vec3f, device=self.device
+        )
+
+    def _default_light_direction(self) -> wp.vec3f:
+        c = 0.57735026
+        up_axis = int(self.up_axis)
+        if up_axis == 0:
+            return wp.vec3f(-c, -c, c)
+        if up_axis == 1:
+            return wp.vec3f(-c, -c, -c)
+        return wp.vec3f(-c, c, -c)
+
+    def set_ambient_light(self, sky_color: wp.vec3f, ground_color: wp.vec3f | None = None) -> None:
+        """Set the hemispheric ambient light used when ambient lighting is enabled.
+
+        Args:
+            sky_color: Linear RGB ambient radiance from above.
+            ground_color: Linear RGB ambient radiance from below. If ``None``,
+                uses *sky_color* (uniform ambient light).
+        """
+        self.ambient_sky_color = wp.vec3f(sky_color)
+        self.ambient_ground_color = wp.vec3f(sky_color if ground_color is None else ground_color)
 
     def assign_checkerboard_material(
         self,
@@ -418,7 +451,7 @@ class RenderContext:
                     model.bvh_shapes_group_roots,
                     # Shapes
                     model.bvh_shape_enabled,
-                    self._get_shape_render_type(),  # HFIELD remapped to MESH; renderer treats heightfields as meshes
+                    self._get_shape_render_type(),  # HFIELD and CONVEX_MESH remapped to MESH
                     model.shape_scale,
                     model.shape_color,
                     model.bvh_shape_world_transforms,
@@ -436,6 +469,7 @@ class RenderContext:
                     # Triangle Mesh
                     self._triangle_mesh.id if self._triangle_mesh is not None else 0,
                     self._triangle_mesh_group_roots,
+                    self._triangle_colors(),
                     # Meshes
                     self._mesh_data,
                     # Gaussians
@@ -448,6 +482,10 @@ class RenderContext:
                     self._lights_cast_shadow,
                     self._lights_position,
                     self._lights_orientation,
+                    self._light_colors(),
+                    wp.vec3f(self.ambient_sky_color),
+                    wp.vec3f(self.ambient_ground_color),
+                    wp.vec3f(*(float(i == int(self.up_axis)) for i in range(3))),
                     # Outputs
                     color_image,
                     depth_image,
@@ -460,6 +498,24 @@ class RenderContext:
                 device=self.device,
                 block_dim=config.block_dim,
             )
+
+    def _triangle_colors(self) -> wp.array[wp.vec3f]:
+        """Per-triangle display colors (sRGB) of the deformable triangle mesh; empty without ``Model.tri_color``."""
+        colors = getattr(self.model, "tri_color", None)
+        if colors is not None and colors.shape[0] == self.model.tri_count:
+            return colors
+        if self._no_triangle_colors is None:
+            self._no_triangle_colors = wp.zeros(0, dtype=wp.vec3f, device=self.device)
+        return self._no_triangle_colors
+
+    def _light_colors(self) -> wp.array[wp.vec3f] | None:
+        count = self.light_count
+        if self._lights_color is not None and self._lights_color.shape[0] == count:
+            return self._lights_color
+        if count == 0:
+            return None
+        self._lights_color = wp.full(count, wp.vec3f(1.0), dtype=wp.vec3f, device=self.device)
+        return self._lights_color
 
     @property
     def light_count(self) -> int:
@@ -570,7 +626,12 @@ class RenderContext:
 
                         data = MeshData()
                         if shape.uvs is not None:
-                            data.uvs = wp.array(shape.uvs, dtype=wp.vec2f, device=self.device)
+                            uvs = np.asarray(shape.uvs, dtype=np.float32)
+                            transform = np.asarray(shape.texture_transform, dtype=np.float32)
+                            if not np.array_equal(transform, np.eye(2, 3, dtype=np.float32)):
+                                # Mesh.texture_transform maps authored UVs (tiling, offset, rotation).
+                                uvs = uvs @ transform[:, :2].T + transform[:, 2]
+                            data.uvs = wp.array(uvs, dtype=wp.vec2f, device=self.device)
                         if shape.normals is not None:
                             data.normals = wp.array(shape.normals, dtype=wp.vec3f, device=self.device)
                         self._mesh_data_source.append(data)

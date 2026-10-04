@@ -767,8 +767,15 @@ class SensorCamera:
             xform=xform,
         )
 
-    def create_default_light(self, enable_shadows: bool = True, direction: wp.vec3f | None = None) -> None:
+    def create_default_light(
+        self,
+        enable_shadows: bool = True,
+        direction: wp.vec3f | None = None,
+        color: wp.vec3f | None = None,
+    ) -> None:
         """Create a default directional light for the rendered scene.
+
+        Replaces any light created before.
 
         Args:
             enable_shadows: Enable shadow casting for this light. Shadows are
@@ -776,10 +783,30 @@ class SensorCamera:
                 ``enable_shadows=True`` here **and**
                 ``render_config.enable_shadows=True`` (the latter defaults to
                 ``False``); both switches must be set.
-            direction: Normalized light direction. If ``None``, defaults to
-                normalized ``(-1, 1, -1)``.
+            direction: Normalized light direction in world space. If ``None``,
+                the light shines down at an angle relative to the model's up
+                axis: normalized ``(-1, 1, -1)`` for Z-up, ``(-1, -1, -1)`` for
+                Y-up, and ``(-1, -1, 1)`` for X-up.
+            color: Linear RGB light intensity. If ``None``, white at unit
+                intensity.
         """
-        self._render_context.create_default_light(enable_shadows=enable_shadows, direction=direction)
+        self._render_context.create_default_light(enable_shadows=enable_shadows, direction=direction, color=color)
+
+    def set_ambient_light(self, sky_color: wp.vec3f, ground_color: wp.vec3f | None = None) -> None:
+        """Set the hemispheric ambient light used when ambient lighting is enabled.
+
+        Surfaces facing up (along the model's up axis) receive *sky_color*,
+        surfaces facing down receive *ground_color*, and other orientations blend
+        linearly between the two. The defaults are ``(0.2, 0.2, 0.225)`` and
+        ``(0.05, 0.05, 0.06)``. Ambient light is applied only while
+        :attr:`~newton.sensors.SensorCamera.RenderConfig.enable_ambient_lighting` is set.
+
+        Args:
+            sky_color: Linear RGB ambient radiance from above.
+            ground_color: Linear RGB ambient radiance from below. If ``None``,
+                uses *sky_color* (uniform ambient light).
+        """
+        self._render_context.set_ambient_light(sky_color, ground_color)
 
     def assign_checkerboard_material(
         self,

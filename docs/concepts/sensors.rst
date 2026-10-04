@@ -165,6 +165,14 @@ For fisheye cameras, extract the calibration values from your chosen USD attribu
 :meth:`~newton.sensors.SensorCamera.compute_camera_rays_fisheye_kannala_brandt`. Each helper builds a single-camera
 ``(height, width, 2)`` ray bundle.
 
+Camera Lighting
+---------------
+
+:meth:`~newton.sensors.SensorCamera.create_default_light` adds one directional light that shines down at an angle
+relative to the model's up axis; ``direction`` places it and a linear RGB ``color`` sets its intensity and tint.
+:meth:`~newton.sensors.SensorCamera.set_ambient_light` sets the hemispheric ambient light: surfaces facing along the
+up axis receive the sky color, surfaces facing away from it the ground color, and other orientations a linear blend.
+
 Extended Attributes
 -------------------
 

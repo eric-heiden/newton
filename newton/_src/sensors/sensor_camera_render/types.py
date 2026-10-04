@@ -98,7 +98,11 @@ class RenderConfig:
     """
 
     enable_backface_culling: bool = True
-    """Cull back-facing triangles."""
+    """Cull back-facing triangles of mesh shapes.
+
+    Deformable triangle meshes (cloth) are open surfaces and are always
+    intersected from both sides.
+    """
 
     enable_fast_math: bool = True
     """Compile render kernels with CUDA fast math."""

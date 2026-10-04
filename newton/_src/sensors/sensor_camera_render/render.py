@@ -117,6 +117,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
         # Triangle Mesh:
         triangle_mesh_id: wp.uint64,
         triangle_mesh_group_roots: wp.array[wp.int32],
+        triangle_colors: wp.array[wp.vec3f],
         # Meshes
         mesh_data: wp.array[MeshData],
         # Gaussians
@@ -129,6 +130,10 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
         light_cast_shadow: wp.array[wp.bool],
         light_positions: wp.array[wp.vec3f],
         light_orientations: wp.array[wp.vec3f],
+        light_colors: wp.array[wp.vec3f],
+        ambient_sky: wp.vec3f,
+        ambient_ground: wp.vec3f,
+        ambient_up: wp.vec3f,
         # Outputs
         out_color: wp.array[wp.uint32],
         out_depth: wp.array[wp.float32],
@@ -277,6 +282,9 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
             albedo_color = wp.vec3f(1.0)
             if closest_hit.shape_index < raytrace.MAX_SHAPE_ID:
                 albedo_color = srgb_to_linear_wp(shape_colors[closest_hit.shape_index])
+            elif closest_hit.shape_index == raytrace.TRIANGLE_MESH_SHAPE_ID:
+                if closest_hit.face_idx >= 0 and closest_hit.face_idx < triangle_colors.shape[0]:
+                    albedo_color = srgb_to_linear_wp(triangle_colors[closest_hit.face_idx])
 
             if wp.static(config.enable_textures) and closest_hit.shape_index < raytrace.MAX_SHAPE_ID:
                 texture_index = shape_texture_ids[closest_hit.shape_index]
@@ -311,17 +319,13 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
 
         if not is_gaussian:
             if wp.static(config.enable_ambient_lighting):
-                up = wp.vec3f(0.0, 0.0, 1.0)
                 len_n = wp.length(closest_hit.normal)
-                n = closest_hit.normal if len_n > 0.0 else up
+                n = closest_hit.normal if len_n > 0.0 else ambient_up
                 n = wp.normalize(n)
-                hemispheric = 0.5 * (wp.dot(n, up) + 1.0)
-                sky = wp.vec3f(0.4, 0.4, 0.45)
-                ground = wp.vec3f(0.1, 0.1, 0.12)
-                ambient_color = sky * hemispheric + ground * (1.0 - hemispheric)
-                ambient_intensity = 0.5
+                hemispheric = 0.5 * (wp.dot(n, ambient_up) + 1.0)
+                ambient_color = ambient_sky * hemispheric + ambient_ground * (1.0 - hemispheric)
 
-                shaded_color = wp.cw_mul(albedo_color, ambient_color * ambient_intensity)
+                shaded_color = wp.cw_mul(albedo_color, ambient_color)
 
             for light_index in range(light_count):
                 light_contribution = compute_lighting(
@@ -350,7 +354,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                     closest_hit.normal,
                     hit_point,
                 )
-                shaded_color = shaded_color + albedo_color * light_contribution
+                shaded_color = shaded_color + wp.cw_mul(albedo_color, light_colors[light_index]) * light_contribution
 
         if wp.static(state.render_hdr_color):
             out_hdr_color[out_index] = shaded_color

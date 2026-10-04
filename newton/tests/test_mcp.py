@@ -125,8 +125,8 @@ class TestMcp(unittest.TestCase):
         self.assertEqual(model.body_inv_mass.numpy()[0], 0)
         self.assertAlmostEqual(model.body_inv_mass.numpy()[1], 1 / (2 * mass))
 
-    def test_playback_failure_keeps_session_available_for_recovery(self):
-        """Keep serving requests after playback fails so a client can reset and step."""
+    def test_playback_failure_pauses_and_keeps_session_available(self):
+        """Pause playback after a failed step, report it, and keep serving requests."""
         path = Path(self.directory.name) / "playback-session.json"
         completed = threading.Event()
         errors, results, attempts = [], [], []
@@ -152,9 +152,10 @@ class TestMcp(unittest.TestCase):
                 client = SimulationClient(path)
                 client.request("play")
                 status = client.request("describe")
-                while status["valid"]:
+                while not status["last_error"]:
                     status = client.request("describe")
                 self.assertTrue(status["paused"])
+                self.assertTrue(status["valid"])
                 self.assertIn("playback failure", status["last_error"])
                 self.assertLessEqual(len(status["last_error"]), 4096)
                 client.request("reset")
@@ -268,8 +269,8 @@ class TestMcp(unittest.TestCase):
             self.session.dispatch("edit", {"patches": [{"field": "gravity", "values": [[0, 0, 0]]}]})
         notify.assert_called_once_with(int(newton.ModelFlags.MODEL_PROPERTIES))
 
-    def test_checkpoint_and_step_failure_recovery(self):
-        """Restore checkpoint time and recover an interrupted state step through reset."""
+    def test_checkpoint_and_step_failure_rollback(self):
+        """Restore checkpoint time and roll back a step batch that fails partway."""
         self.session.dispatch("step", {"count": 3})
         saved = self.session.state.body_q.numpy().copy()
         self.session.dispatch("checkpoint", {"name": "trial"})
@@ -277,15 +278,25 @@ class TestMcp(unittest.TestCase):
         self.session.dispatch("restore", {"name": "trial"})
         self.assertEqual(self.session.frame, 3)
         np.testing.assert_array_equal(self.session.state.body_q.numpy(), saved)
-        with patch.object(self.session.solver, "step", side_effect=RuntimeError("test failure")):
-            with self.assertRaises(RuntimeError):
-                self.session.dispatch("step")
-        self.assertFalse(self.session.valid)
-        self.session.dispatch("reset")
-        self.assertTrue(self.session.valid)
+        original_step = self.session.solver.step
+        calls = []
 
-    def test_execute_is_opt_in_bounded_and_invalidates_failure(self):
-        """Bound trusted output and require rebuilding after arbitrary execution failure."""
+        def fail_third_step(*args):
+            calls.append(True)
+            if len(calls) == 3:
+                raise RuntimeError("test failure")
+            return original_step(*args)
+
+        with patch.object(self.session.solver, "step", side_effect=fail_third_step):
+            with self.assertRaisesRegex(RuntimeError, "test failure.*rolled back from t=.*frame 5.*frame 3"):
+                self.session.dispatch("step", {"count": 4})
+        self.assertTrue(self.session.valid)
+        self.assertEqual(self.session.frame, 3)
+        np.testing.assert_array_equal(self.session.state.body_q.numpy(), saved)
+        self.assertEqual(self.session.dispatch("step")["frame"], 4)
+
+    def test_execute_is_opt_in_bounded_and_rolls_back_failure(self):
+        """Bound trusted output and undo the mutations of a failed cell."""
         with self.assertRaises(PermissionError):
             self.session.dispatch("execute", {"code": "result = 1"})
         self.session.allow_execute = True
@@ -293,10 +304,11 @@ class TestMcp(unittest.TestCase):
         self.assertEqual(len(result["stdout"]), 16384)
         self.assertTrue(result["truncated"])
         self.assertEqual(result["result"], {"frame": 0})
-        with self.assertRaises(RuntimeError):
+        gravity = self.session.model.gravity.numpy().copy()
+        with self.assertRaisesRegex(RuntimeError, "model \\(gravity\\)"):
             self.session.dispatch("execute", {"code": "model.gravity.zero_(); raise ValueError('broken')"})
-        with self.assertRaisesRegex(RuntimeError, "rebuild"):
-            self.session.dispatch("reset")
+        np.testing.assert_array_equal(self.session.model.gravity.numpy(), gravity)
+        self.assertEqual(self.session.dispatch("reset")["frame"], 0)
 
     def test_result_encoding_failure_preserves_completed_execution(self):
         """Keep completed Python mutations valid when their result exceeds the output budget."""

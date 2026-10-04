@@ -113,9 +113,12 @@ class SimulationServer:
                         server._pending.discard(request)
                 encoded = _encode(response, _MAX_RESPONSE)
             except Exception as error:
-                encoded = _encode(
-                    {"error": {"type": type(error).__name__, "message": str(error)[:32768]}}, _MAX_RESPONSE
-                )
+                message = str(error)[:32768]
+                status = getattr(error, "newton_status", None)
+                if status:
+                    # Session status fields (e.g. active build overrides) accompany errors as well.
+                    message += f"\n{json.dumps(status, separators=(',', ':'))[:4096]}"
+                encoded = _encode({"error": {"type": type(error).__name__, "message": message}}, _MAX_RESPONSE)
             try:
                 self.wfile.write(encoded)
                 self.wfile.flush()

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Exercise persistent trusted Python cells and explicit failure recovery."""
+"""Exercise persistent trusted Python cells and failed-cell rollback."""
 
 import asyncio
 import base64
@@ -117,43 +117,80 @@ class TestMcpExecutor(unittest.TestCase):
         self.assertEqual(status["workspace"]["last_error"]["line"], 2)
         self.assertEqual(self.execute("value")["result"], 8)
 
-    def test_failure_preserves_workspace_and_requires_explicit_recovery(self):
-        """Preserve partial Python work without treating exploration errors as proof of safety."""
-        with self.assertRaisesRegex(RuntimeError, "line 3"):
+    def test_failed_cell_keeps_workspace_and_session_usable(self):
+        """Report an analysis error, keep earlier variables, and leave the scene valid without any recovery step."""
+        with self.assertRaisesRegex(RuntimeError, "line 3.*nothing was restored"):
             self.execute("samples = [1, 2]\nprint('before failure')\nmissing_name")
         status = self.session.dispatch("describe")
-        self.assertFalse(status["valid"])
-        self.assertTrue(status["paused"])
-        self.assertTrue(status["requires_rebuild"])
+        self.assertTrue(status["valid"])
+        self.assertFalse(status["requires_rebuild"])
         self.assertEqual(status["workspace"]["last_error"]["type"], "NameError")
         self.assertIn("samples", status["workspace"]["variables"])
-        with self.assertRaises(RuntimeError):
-            self.execute("samples")
-        inspected = self.execute("samples", recovery="inspect")
-        self.assertEqual(inspected["result"], [1, 2])
-        self.assertFalse(inspected["valid"])
-        self.assertTrue(inspected["requires_rebuild"])
-        with self.assertRaises(RuntimeError):
-            self.session.dispatch("step")
-        recovered = self.execute("samples.append(3)", recovery="acknowledge")
-        self.assertTrue(recovered["valid"])
-        self.assertTrue(recovered["paused"])
-        self.assertFalse(recovered["requires_rebuild"])
-        self.assertEqual(self.execute("samples")["result"], [1, 2, 3])
+        self.assertEqual(self.execute("samples")["result"], [1, 2])
         self.assertEqual(self.session.dispatch("step")["frame"], 1)
 
-    def test_recovery_never_rolls_back_and_failed_acknowledgement_stays_invalid(self):
-        """Keep partial mutations visible and require successful explicit acknowledgement."""
-        with self.assertRaises(RuntimeError):
-            self.execute("model.gravity.zero_()\nraise ValueError('after mutation')")
-        np.testing.assert_array_equal(self.session.model.gravity.numpy(), 0)
-        with self.assertRaises(RuntimeError):
-            self.execute("raise ValueError('repair failed')", recovery="acknowledge")
-        self.assertFalse(self.session.valid)
-        self.assertTrue(self.session.dispatch("describe")["requires_rebuild"])
-        result = self.execute("model.gravity.numpy().tolist()", recovery="inspect")
-        self.assertEqual(result["result"], [[0, 0, 0]])
-        self.assertFalse(result["valid"])
+    def test_failed_cell_rolls_back_the_simulation(self):
+        """Undo state, time, control, and model edits made before an error, and notify the solver."""
+        self.session.dispatch("step", {"count": 2})
+        body_q = self.session.state.body_q.numpy().copy()
+        gravity = self.session.model.gravity.numpy().copy()
+        with self.assertRaises(RuntimeError) as raised:
+            self.execute(
+                "session.dispatch('step', {'count': 3})\n"
+                "model.gravity.zero_()\n"
+                "control.joint_f.fill_(5.0)\n"
+                "after = session.frame\n"
+                "raise ValueError('after mutation')"
+            )
+        message = str(raised.exception)
+        self.assertIn("rolled back from t=", message)
+        self.assertIn("model (gravity)", message)
+        self.assertIn("MODEL_PROPERTIES", message)
+        self.assertEqual(self.session.frame, 2)
+        np.testing.assert_array_equal(self.session.state.body_q.numpy(), body_q)
+        np.testing.assert_array_equal(self.session.model.gravity.numpy(), gravity)
+        np.testing.assert_array_equal(self.session.control.joint_f.numpy(), 0)
+        self.assertTrue(self.session.valid)
+        # Python variables are not rolled back.
+        self.assertEqual(self.execute("after")["result"], 5)
+        # Dynamics continue from the restored state with the restored gravity.
+        reference = SimulationSession(
+            self.session.model, newton.solvers.SolverXPBD(self.session.model), allow_execute=True
+        )
+        self.addCleanup(reference.close)
+        reference.dispatch("step", {"count": 3})
+        self.session.dispatch("step", {"count": 1})
+        np.testing.assert_allclose(self.session.state.body_q.numpy(), reference.state.body_q.numpy(), atol=1e-6)
+
+    def test_rollout_error_rolls_back_and_session_stays_valid(self):
+        """Roll back a rollout whose probe raises halfway, then keep stepping normally."""
+        with self.assertRaisesRegex(RuntimeError, "rolled back from t=.*to t=0 s"):
+            self.execute(
+                "def probe():\n"
+                "    if session.frame == 4:\n"
+                "        raise np.linalg.LinAlgError('SVD did not converge')\n"
+                "    return session.frame\n"
+                "rollout(10, record={'f': probe})"
+            )
+        self.assertEqual(self.session.frame, 0)
+        self.assertTrue(self.session.valid)
+        self.assertEqual(self.execute("rollout(3)['frames']")["result"], 3)
+
+    def test_invalid_scene_keeps_python_and_points_to_rebuild(self):
+        """Allow Python while invalid, refuse stepping with a rebuild instruction, and recover by rebuilding."""
+        model = self.session.model
+        self.session.rebuild_callback = lambda session: {"model": model, "solver": newton.solvers.SolverXPBD(model)}
+        self.execute("kept = 7")
+        self.session._invalidate(requires_rebuild=True)
+        self.session.last_error = "test failure"
+        self.assertEqual(self.execute("kept")["result"], 7)
+        with self.assertRaisesRegex(RuntimeError, "invalid \\(test failure\\).*newton_rebuild"):
+            self.execute("rollout(1)")
+        with self.assertRaisesRegex(RuntimeError, "newton_rebuild"):
+            self.session.dispatch("step")
+        self.session.dispatch("rebuild", {})
+        self.assertTrue(self.session.valid)
+        self.assertEqual(self.execute("rollout(2)['frames'], kept")["result"], [2, 7])
 
     def test_result_budget_does_not_destroy_saved_work(self):
         """Inspect a smaller slice of an already computed result without repeating the computation."""
@@ -314,16 +351,17 @@ values = wp.array([1.0, 2.0, 3.0], dtype=float, device='cpu')
             self.execute("__name__")["result"], other.dispatch("execute", {"code": "__name__"})["result"]
         )
 
-    def test_recovery_arguments_and_execution_permission_are_validated(self):
-        """Reject invalid recovery choices and preserve the trusted-execution opt-in."""
+    def test_execution_arguments_and_permission_are_validated(self):
+        """Reject invalid arguments without running code and preserve the trusted-execution opt-in."""
         revision = self.session.revision
-        for options in ({"recovery": "guess"}, {"recovery": []}, {"reset_namespace": 1}):
-            with self.subTest(options=options), self.assertRaises(ValueError):
-                self.execute("value = 1", **options)
+        with self.assertRaises(ValueError):
+            self.execute("value = 1", reset_namespace=1)
+        with self.assertRaises(TypeError):
+            self.execute("value = 1", recovery="acknowledge")
         self.assertEqual(self.session.revision, revision)
         self.session.allow_execute = False
         with self.assertRaises(PermissionError):
-            self.execute("value = 1", recovery="acknowledge")
+            self.execute("value = 1")
 
     def test_show_returns_inline_images(self):
         """Attach arrays, observations, and figures to the execute response as PNG images."""
@@ -392,8 +430,8 @@ values = wp.array([1.0, 2.0, 3.0], dtype=float, device='cpu')
         self.assertNotIn("images", payload)
 
     @unittest.skipUnless(importlib.util.find_spec("mcp"), "Requires optional MCP SDK for interoperability validation")
-    def test_official_sdk_workspace_and_recovery(self):
-        """Exercise persistent Python cells and explicit recovery through the real stdio MCP bridge."""
+    def test_official_sdk_workspace_and_rollback(self):
+        """Exercise persistent Python cells and failed-cell rollback through the real stdio MCP bridge."""
         from mcp import ClientSession, StdioServerParameters  # noqa: PLC0415
         from mcp.client.stdio import stdio_client  # noqa: PLC0415
 
@@ -409,7 +447,7 @@ values = wp.array([1.0, 2.0, 3.0], dtype=float, device='cpu')
                 await client.initialize()
                 listing = await client.list_tools()
                 tool = next(tool for tool in listing.tools if tool.name == "newton_execute")
-                self.assertEqual(tool.inputSchema["properties"]["recovery"]["enum"], ["none", "inspect", "acknowledge"])
+                self.assertEqual(set(tool.inputSchema["properties"]), {"code", "reset_namespace"})
                 first = await client.call_tool(
                     "newton_execute",
                     {
@@ -435,16 +473,16 @@ values = wp.array([1.0, 2.0, 3.0], dtype=float, device='cpu')
                 )
                 self.assertFalse(launched.isError)
                 self.assertEqual(_payload(launched)["result"], [1, 1])
-                failed = await client.call_tool("newton_execute", {"code": "saved = 19\nmissing_name"})
+                failed = await client.call_tool(
+                    "newton_execute", {"code": "saved = 19\nsession.dispatch('step', {'count': 2})\nmissing_name"}
+                )
                 self.assertTrue(failed.isError)
-                self.assertIn("line 2", failed.content[0].text)
-                inspected = await client.call_tool("newton_execute", {"code": "saved", "recovery": "inspect"})
-                self.assertEqual(_payload(inspected)["result"], 19)
-                self.assertFalse(_payload(inspected)["valid"])
-                acknowledged = await client.call_tool("newton_execute", {"code": "", "recovery": "acknowledge"})
+                self.assertIn("line 3", failed.content[0].text)
+                self.assertIn("rolled back from t=", failed.content[0].text)
+                inspected = await client.call_tool("newton_execute", {"code": "saved, session.frame"})
+                self.assertEqual(_payload(inspected)["result"], [19, 1])
                 # Compact responses omit the flag for valid scenes.
-                self.assertNotIn("valid", _payload(acknowledged))
-                self.assertTrue(self.session.paused)
+                self.assertNotIn("valid", _payload(inspected))
                 cleared = await client.call_tool(
                     "newton_execute", {"code": "'saved' in globals()", "reset_namespace": True}
                 )

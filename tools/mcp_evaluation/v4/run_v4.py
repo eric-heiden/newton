@@ -11,6 +11,7 @@ process after the agent exits.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -51,11 +52,15 @@ REPLAY_DATA = Path(
     os.environ.get("NEWTON_REPLAY_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_replay_task")
 )
 BIN_DATA = Path(os.environ.get("NEWTON_BIN_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_bin_task"))
+SCRATCH_DATA = Path(
+    os.environ.get("NEWTON_SCRATCH_DATA", "/home/horde/artifacts/newton-live-mcp-v4/datasets/abc_scratch_task")
+)
 PRIVATE = Path(os.environ.get("NEWTON_VISUAL_PRIVATE", Path.home() / ".newton-visual-private"))
 # Agent workspaces get opaque names under a neutral root; the labeled run directory keeps the harness
 # records (spec, command, transcript, host log, verification), which agents must not see.
 TRIALS = Path(os.environ.get("NEWTON_TRIAL_ROOT", Path.home() / "trials"))
 SANDBOX = os.environ.get("NEWTON_TRIAL_SANDBOX", "1") == "1"
+VERIFY_LOCKS = Path(os.environ.get("NEWTON_VERIFY_LOCKS", Path.home() / ".cache" / "newton-verify-locks"))
 START = "__START_UTC__"
 # Claude -p waits this long for background shell jobs after the agent's last turn; set explicitly so it does
 # not depend on the launcher's environment (v4 trials inherited 30 min from the operator session).
@@ -118,6 +123,40 @@ Constraints (checked): keep one cube per world with the measured size, mass, and
 
 Goal: set up a controller that follows both wave.csv and high5.csv without falling. Verification runs the script in a fresh process on wave.csv, on high5.csv, and on an unseen slower (0.9x) playback of high5.csv: the root must stay upright (height above 0.6 m), root position RMSE at most 4 cm, and joint-angle RMSE at most 0.05 rad on every run. The same controller code must handle every clip (select the clip only through --motion).
 Constraints (checked): do not change the robot model (bodies, masses, armature, torque limits), the timestep, or the motion input and playback, and apply no forces or torques to the floating base. The controller (gains, targets, feedforward, feedback, estimation, anything in the step logic, and additional Python packages already installed) may change. Keep the file runnable as a Newton example (`python g1_track.py --motion high5.csv --viewer null`).""",
+        },
+        "g1_mpc": {
+            "files": {name: HERE / "g1_mpc" / name for name in ("g1_mpc.py", "walk.csv", "dance.csv", "jumpjack.csv")},
+            "script": "g1_mpc.py",
+            "host_args": ["--motion", "walk.csv"],
+            "verifier": "tools/mcp_evaluation/v4/g1_mpc/verify.py",
+            "seconds": 5400,
+            "private": ["g1_mpc"],
+            # Six clips in fresh processes, each rollout capped at up to 2.5x its idle-machine limit under load.
+            "verify_seconds": 3600,
+            # One g1_mpc verification at a time: concurrent ones would slow each other's timed rollouts.
+            "verify_lock": True,
+            "warmup": [
+                ["g1_mpc.py", "--viewer", "null", "--num-frames", "1", "--motion", "walk.csv"],
+                ["-m", "tools.mcp_evaluation.v4.trial_isolation", "warm", "g1_mpc.py", "--motion", "walk.csv"],
+                # Planning-solver variants agents try (both conditions get the same seed).
+                [
+                    "-m",
+                    "tools.mcp_evaluation.v4.trial_isolation",
+                    "warm-solvers",
+                    "g1_mpc.py",
+                    json.dumps(
+                        [
+                            {"use_mujoco_contacts": True, "integrator": "euler", "njmax": 192, "nconmax": 64},
+                            {"use_mujoco_contacts": True, "cone": "elliptic", "njmax": 192, "nconmax": 64},
+                            {"use_mujoco_contacts": False, "integrator": "implicitfast"},
+                        ]
+                    ),
+                ],
+            ],
+            "goal": """g1_mpc.py simulates a floating-base Unitree G1 humanoid (29 actuated joints, SolverMuJoCo with 2 ms steps) that should track reference motions: walk.csv, dance.csv, and jumpjack.csv (Kimodo clips in MuJoCo qpos format: root position, root quaternion wxyz, and 29 joint angles at 30 fps). A controller runs at 100 Hz: every 10 ms it gets the robot's state and returns one Command for the joint actuators (position and velocity targets, stiffness, damping, and feedforward torque per joint; the actuators clip the torque to the MJCF limits). The script's tracking report prints the metrics below. Problem: the baseline controller only servos the joints toward the reference angles, and the robot falls within about a second.
+
+Goal: develop a controller that makes the robot track the reference motions; investigate model predictive control methods for this. Verification imports the script's Controller and MotionClip and simulates its own copy of the starter's plant (build_model, make_solver, Robot, Command, and TrackingReport) in a fresh process per clip, on the three given clips, on two unseen clips, and on an unseen slower playback of walk.csv (at {slow_low} to {slow_high} times the original speed, drawn at verification): Controller(model, motion) is built once per clip (model is a copy of the robot model posed at the clip's start, for the controller's own use), then compute(t, joint_q, joint_qd) is called every 10 ms. On every clip the robot must stay on its feet for the whole clip (root above {fall_m} m, up axis within 45 degrees of vertical, nothing but the feet touching the floor), with root position RMSE at most {root_cm} cm, root orientation RMSE at most {rot_deg} degrees, joint-angle RMSE at most {joint_rad} rad, and sole position RMSE at most {sole_cm} cm; wrist position errors, foot-lift recall, and jitter are reported as well. Per clip, building the Controller may take at most {setup_s} s and the rollout (all compute() calls and the physics) at most {rollout_s} s of wall time on this machine when it is otherwise idle; verification measures the machine's load (fixed GPU and CPU workloads timed between compute() calls) and allows proportionally more time, at most {load_max}x.
+Constraints (checked): the plant is fixed (robot model, masses, inertias, armature, torque limits, contacts, timestep, and the actuator law), and the controller acts on it only through the Command it returns (gains within the ranges in the script); it may build its own models and solvers, for example for planning, and use the installed Python packages. The controller runs in one Python thread: no threads or subprocesses (GPU and library-internal parallelism are fine), and it may not inspect the verifier (stack frames, garbage collector, raw memory, code objects, trace hooks) or read files outside the workspace. Use only the data in the workspace: do not download motion clips or any other data (the G1 model is already cached). Keep the Controller(model, motion) and compute(t, joint_q, joint_qd) interface and the file runnable (`python g1_mpc.py --motion walk.csv --viewer null` runs the whole clip and prints the tracking report; --num-frames N runs N control periods).""",
         },
         "sdf_grind": {
             "files": {"sdf_grinding.py": HERE / "sdf_grind/sdf_grinding.py"},
@@ -263,6 +302,42 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
 Goal: make the replay physically reproduce the whole episode: the screwdriver grasped, lifted, carried without turning or slipping in the fingers, and placed in the bin the way the real robot did it. Verification imports build_model, make_solver, make_pipeline, and PARAMS and runs its own replay of the full timelines (its own copy of replay_common: Replay, score, and jitter_scene) in fresh processes, on the main episode in 8 copies (2 nominal, 6 with the screwdriver start jittered by up to 4 mm and 5 degrees) and on unseen episodes of the same station, bin, and screwdriver in 4 copies each. Main episode: the screwdriver held through the carry in at least {held} of 8 copies and resting in the bin at the end in at least {placed}; medians over the copies: in-hand rotation during the carry at most {rot}°, slip at most {slip_mm} mm, finger-gap error while holding at most {gap_mm} mm, lift-off error at most {liftoff} state samples, carry-track error at most {track_cm} cm, final tip error at most {final_cm} cm, and movement before the grasp at most {moved_cm} cm; whole-episode joint RMSE at most {arm_rad} rad per arm. Unseen episodes: at least {ho_pct}% of their copies held, placed, and rotated at most {ho_rot}° in the hand (episodes whose real grasp the recorded data cannot reproduce are excluded), and joint RMSE at most {ho_arm_rad} rad per arm (mean over episodes). Two negative controls replay the main episode with the gripper commands forced open (the screwdriver may not rise more than {control_cm} cm) and with the friction of every collision shape set to {control_mu} (the screwdriver may not be held in any copy; a copy whose simulation diverges counts as held). Verification runs twice (a third time if they disagree) and the majority decides.
 Constraints (checked): keep the station's arm kinematics, finger collision geometry (within 0.5 mm), arm bases (within 3 mm of the scene's), table plane, gravity, and the command input; add no shapes, actuators, equality constraints, tendons, or contact pairs to the robot (the finger-mirror equality may be stiffened, not removed). The screwdriver is one free, dynamic body labelled screwdriver with at most 6 collision shapes: 200 to 215 mm long, handle radius within 1.5 mm of the scene's profile at its stations and within 2.5 mm between them, shaft radius 1.5 to 3.5 mm, 40 to 150 g, centre of mass on the axis, within the handle and within 15 mm of the scene's com_local, principal inertias between 0.8x a solid and 1.2x a hollow screwdriver of the scene's shape, starting at the scene's start (within 2 mm and 5 degrees, resting on the table), colliding with the fingers, table, and bin, and with no joint drives, springs, damping, gravity compensation, or applied forces. Tunable: arm joint gains, armature, friction, damping, effort limits (at most 28 N m on joints 1-3 and 10 N m on joints 4-6), and gravity compensation (0 to 1) per link; gripper position gain (100 to 30000 N/m) and pinch force (5 to 80 N per pad; the finger mirror splits the finger actuators' force between the two pads); PARAMS["command_delay"] (0 to 0.2 s) and PARAMS["dt"] (0.25 to 2 ms); the solver (a Newton solver class, not a subclass) and its settings; newton.CollisionPipeline settings or MuJoCo's own contacts; MuJoCo contact and finger-mirror stiffness (solref in standard form with a time constant of at least 2 dt and a damping ratio of 0.5 to 2, refsafe on); materials of every collision shape, finger pads included (friction at most 1.5, torsional at most 0.01 m, rolling at most 0.001 m, restitution at most 0.8, margin at most 2 mm, contact gap at most 0.1 m, no adhesion); and the bin model (at most 12 shapes with walls all around, static or on one dynamic body labelled bin of 0.2 to 0.6 kg, inside the scene's rim outline plus 10 mm, its top within 15 mm of the scene's height). The verification batch (68 worlds) must replay within about 400 s. replay_common.py is fixed (verification uses its own copy). Verification calls build_model, make_solver, and make_pipeline in a copy of the workspace without frames/, arm_logs/, and gt/, and passes only the scenes (geometry, starts, sizes, events; no episode paths, ids, or image measurements), so keep fitted values in the script or in a file next to it. The submission may not inspect the verifier (stack frames, garbage collector, raw memory, code objects, trace hooks), start processes, or read files outside the workspace while it is built. Use only the data in the workspace: do not download recordings or any other data. Keep the file runnable (`python screwdriver_replay.py --viewer null` replays the main episode and prints the metrics; `--episode sib_1`, `--num-worlds 8 --jitter`, and `--seconds` select episodes, ensembles, and shorter runs).""",
         },
+        "abc_scratch": {
+            "files": {
+                **{name: HERE / "abc_scratch" / name for name in ("scene_replay.py", "FORMAT.md")},
+                **{name: SCRATCH_DATA / name for name in ("episode.npz", "photos", "camera.json", "station")},
+                "arm_logs": ARM_DATA / "logs",
+            },
+            "script": "scene_replay.py",
+            "host_args": [],
+            "run_args": "[--seconds <S>] [--num-worlds <N>]",
+            "verifier": "tools/mcp_evaluation/v4/abc_scratch/verify.py",
+            "seconds": 5400,
+            "private": ["abc_scratch"],
+            # One frame of the starter (its main ignores --num-frames and would replay the whole episode).
+            "warmup": [
+                ["scene_replay.py", "--viewer", "null", "--seconds", "0.034"],
+                ["-m", "tools.mcp_evaluation.v4.trial_isolation", "warm", "scene_replay.py"],
+                # Solver variants agents try (both conditions get the same seed).
+                [
+                    "-m",
+                    "tools.mcp_evaluation.v4.trial_isolation",
+                    "warm-solvers",
+                    "scene_replay.py",
+                    json.dumps(
+                        [
+                            {"cone": "elliptic"},
+                            {"use_mujoco_contacts": True},
+                            {"use_mujoco_contacts": True, "cone": "elliptic"},
+                        ]
+                    ),
+                ],
+            ],
+            "goal": """scene_replay.py replays a real robot episode from the ABC-130k dataset (https://abc.bot) in Newton, open loop. At a bimanual station (two 6-DoF YAM arms with parallel grippers, filmed from above and from both wrists), a teleoperator picks up three fake fruits one after another, a pear and an orange with the left arm and a dark round fruit with the right, and puts them into a wedge-shaped wooden tray on the table. photos/ holds {photos} frames of the recording (the top camera at the start, before each grasp, after each release, and at the end; the wrist cameras at each grasp; photos/index.json gives the state sample each one shows); episode.npz the measured joint positions, velocities, and torques (including the gripper motor's effort), the gripper openings, and the logged joint and gripper commands (about 30 Hz); camera.json the calibrated cameras (intrinsics with RealSense distortion, the top camera's pose in the world, and the wrist cameras' mounts); station/ the ABC simulator's MJCF of the station (arms, grippers, table, and enclosure; no objects); and arm_logs/ 64 recorded YAM arm logs (32 episodes of various tasks, both arms; measured joints, velocities, torques, and commands) for calibrating the arms. FORMAT.md describes the files and their frames. scene_replay.py builds the station in identical worlds (build_model(num_worlds)), steps them with make_solver(model) and make_pipeline(model), and drives the arms with the logged commands as joint position targets (its docstring states the command rule). Problem: the scene is empty. Only the station is modeled, with the ABC simulator's arm and gripper defaults; the fruits and the tray are missing.
+
+Goal: recreate the scene and its physics from the photos and the logs (the three fruits with their sizes, masses, start poses, and materials; the tray), so that the replay reproduces the real episode: every fruit grasped, carried, and released into the tray, coming to rest where the real one did. Verification imports build_model, make_solver, make_pipeline, and PARAMS and runs its own replay of the whole episode (the starter's command rule, its own loop) in fresh processes, in 8 copies: 2 nominal, and 6 with every fruit's start moved by up to {jitter_mm} mm and turned by up to {jitter_deg} degrees about the vertical. It takes as the fruits the free bodies that start closest to where the top camera saw the real fruits at the start (within {match_cm} cm). Per fruit, in at least {held} of 8 copies: held through the real carry (from 3 state samples after the real lift-off to 2 before the real release), that is, its centre within the real fruit's half-width plus {hold_mm} mm of the midpoint between the grasping gripper's two finger-pad grasp points (25 mm from each pad's centre toward its tip) for at least {held_pct}% of the carry. Per fruit, in at least {placed} of 8 copies: at rest in the real tray at the end of the episode (inside the tray's outline at the start or the end plus {place_cm} cm, its centre within {height_mm} mm of the height of the real fruit lying on the tray floor, slower than {speed_cm} cm/s over the last {window_s} s), and within {rest_cm} cm of where the real fruit came to rest after its release (its final position, or one it rested at before a later fruit pushed it). Two negative controls replay the episode with the gripper commands forced open and with the friction of every arm and fruit collision shape set to {control_mu}: no fruit may rise more than {control_cm} cm, and a copy whose simulation diverges fails its control (MuJoCo Warp's default pyramidal friction cone can diverge at such low friction). Verification runs twice (a third time if they disagree) and the majority decides.
+Constraints (checked): keep the station's arm kinematics, finger collision geometry (within 0.5 mm), the MJCF's arm bases (within 3 mm), table plane, gravity, and the command input; add no shapes, actuators, equality constraints, tendons, or contact pairs to the robot, and keep its actuators plain servos (no bias force, unit gear). All worlds are identical copies. The fruits are exactly three more free, dynamic bodies (any labels), each starting at rest on the table (its lowest point within 1 mm below to 3 mm above it) within {start_cm} cm of where the top camera saw the real fruit, with {mass_g_low} to {mass_g_high} g, principal inertias between 0.8x a solid and 1.2x a thin-shell ellipsoid of its extents, its centre of mass within 2 cm of the centre of its collision geometry, at most {object_shapes} collision shapes whose extents are within 30% of the real fruit's size range (as tracked in the video), collisions with the finger pads, the table, the tray, and the other fruits, and no joint drives, springs, damping, joint friction, armature, gravity compensation, or applied forces. Everything else you add (the tray) is static or one more body (free or welded to the world) of {tray_kg_low} to {tray_kg_high} kg, with at most {tray_shapes} collision shapes inside the real tray's outline plus {tray_cm} cm and at most {tray_top_cm} cm above the table. Tunable: arm joint gains, armature, friction, damping, effort limits (at most 28 N m on joints 1-3 and 10 N m on joints 4-6), and gravity compensation (0 to 1) per link; gripper position gain (100 to 3000 N/m) and squeeze force (5 to 60 N); PARAMS["command_delay"] (0 to 0.2 s) and PARAMS["dt"] (0.25 to 2 ms); the solver (a Newton solver class, not a subclass) and its settings; newton.CollisionPipeline settings or MuJoCo's own contacts; MuJoCo contact stiffness (solref in standard form with a time constant of at least 2 dt and a damping ratio of 0.5 to 2, refsafe on); materials (friction at most 1.5, torsional at most 0.02 m, rolling at most 0.005 m, restitution at most 0.8, margin at most 2 mm, contact gap at most 0.1 m, no adhesion; robot shapes may keep their MJCF values). The verification batch (12 worlds) must replay within about {runtime_s} s. Verification calls build_model, make_solver, and make_pipeline in a copy of the workspace without photos/ and arm_logs/ (with its own episode.npz, camera.json, and station/; links to files outside the workspace are not allowed), so keep fitted values in the script or in a file next to it. It then re-applies the model to SolverMuJoCo (notify_model_changed with all flags) and requires the solver's own arrays to match the model it compiled, so set solver parameters through the model (including its model.mujoco attributes) and the solver's constructor, not by editing the solver's MuJoCo arrays. The submission may not inspect the verifier (stack frames, garbage collector, raw memory, code objects, trace hooks), start processes, or read files outside the workspace while it is built. Use only the data in the workspace: do not download recordings or any other data. Keep the file runnable (`python scene_replay.py --viewer null` replays the whole episode; `--seconds` and `--num-worlds` select shorter runs and more copies).""",
+        },
     }
     if name == "abc_look":
         # The look task renders with Blender in both conditions (inherited by agents and verifiers).
@@ -329,6 +404,53 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
             ho_arm_rad=f"{t['heldout_arm_rmse_rad_max']:g}",
             control_cm=f"{100 * t['control_rise_m_max']:g}",
             control_mu=f"{CONTROL_MU:g}",
+        )
+    if name == "abc_scratch":
+        from tools.mcp_evaluation.v4.abc_scratch import verify as scratch  # noqa: PLC0415
+
+        t, b, core = scratch.THRESHOLDS, scratch.BOUNDS, scratch.core
+        tasks[name]["goal"] = tasks[name]["goal"].format(
+            photos=len(json.loads((SCRATCH_DATA / "photos" / "index.json").read_text())),
+            jitter_mm=f"{1000 * scratch.JITTER_XY_M:g}",
+            jitter_deg=f"{scratch.JITTER_YAW_DEG:g}",
+            match_cm=f"{100 * b['match_m']:g}",
+            held=t["main_held_min"],
+            hold_mm=f"{1000 * core.HOLD_MARGIN:g}",
+            held_pct=f"{100 * t['held_fraction_min']:g}",
+            placed=t["main_placed_min"],
+            place_cm=f"{100 * core.PLACE_MARGIN:g}",
+            height_mm=f"{1000 * core.REST_HEIGHT_TOLERANCE:g}",
+            speed_cm=f"{100 * core.REST_SPEED:g}",
+            window_s=f"{core.REST_WINDOW:g}",
+            rest_cm=f"{100 * t['rest_xy_err_m_max']:g}",
+            control_mu=f"{scratch.CONTROL_MU:g}",
+            control_cm=f"{100 * t['control_rise_m_max']:g}",
+            start_cm=f"{100 * b['start_xy_m']:g}",
+            mass_g_low=f"{1000 * b['object_mass_kg'][0]:g}",
+            mass_g_high=f"{1000 * b['object_mass_kg'][1]:g}",
+            object_shapes=b["object_shapes_max"],
+            tray_kg_low=f"{b['tray_mass_kg'][0]:g}",
+            tray_kg_high=f"{b['tray_mass_kg'][1]:g}",
+            tray_shapes=b["tray_shapes_max"],
+            tray_cm=f"{100 * b['tray_margin_m']:g}",
+            tray_top_cm=f"{100 * b['tray_top_m']:g}",
+            runtime_s=f"{scratch.RUNTIME_LIMIT_S:g}",
+        )
+    if name == "g1_mpc":
+        from tools.mcp_evaluation.v4.g1_mpc import verify as mpc  # noqa: PLC0415
+
+        t = mpc.THRESHOLDS
+        tasks[name]["goal"] = tasks[name]["goal"].format(
+            fall_m=f"{mpc.plant.FALL_HEIGHT_M:g}",
+            root_cm=f"{100 * t['root_rmse_m']:g}",
+            rot_deg=f"{t['root_rot_rmse_deg']:g}",
+            joint_rad=f"{t['joint_rmse_rad']:g}",
+            sole_cm=f"{100 * t['sole_rmse_m']:g}",
+            setup_s=f"{mpc.SETUP_LIMIT_S:g}",
+            rollout_s=f"{mpc.ROLLOUT_LIMIT_S:g}",
+            load_max=f"{mpc.LOAD_FACTOR_MAX:g}",
+            slow_low=f"{mpc.SCALED['walk_slow'][1][0]:g}",
+            slow_high=f"{mpc.SCALED['walk_slow'][1][1]:g}",
         )
     task = tasks[name]
     # Commands run once on the starter to build the compile-cache seed both conditions start from.
@@ -730,7 +852,20 @@ def _agent_inputs(event: dict) -> list:
 
 
 def verify(workspace: Path, run_dir: Path, task: dict, env: dict, contained=None) -> dict:
-    """Run the task's verifier on the submission, sandboxed with only this task's hidden data readable."""
+    """Run the task's verifier on the submission, sandboxed with only this task's hidden data readable.
+
+    Tasks with ``verify_lock`` verify one submission at a time on this machine (their verifiers time the
+    submission); the wait does not count against the verifier's timeout (``verify_seconds``, default 1800 s).
+    """
+    if not task.get("verify_lock"):
+        return _verify(workspace, run_dir, task, env, contained)
+    VERIFY_LOCKS.mkdir(parents=True, exist_ok=True)
+    with (VERIFY_LOCKS / f"{Path(task['verifier']).parent.name}.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _verify(workspace, run_dir, task, env, contained)
+
+
+def _verify(workspace: Path, run_dir: Path, task: dict, env: dict, contained=None) -> dict:
     sandbox_root = workspace.parent
     output = sandbox_root / "verification.json"
     command = [str(PYTHON), str(ROOT / task["verifier"]), str(workspace / task["script"]), "--output", str(output)]
@@ -754,7 +889,7 @@ def verify(workspace: Path, run_dir: Path, task: dict, env: dict, contained=None
             break
         time.sleep(0.1)
     try:
-        stdout, stderr = process.communicate(timeout=1800)
+        stdout, stderr = process.communicate(timeout=task.get("verify_seconds", 1800))
     except subprocess.TimeoutExpired:
         _stop(process)
         return {"success": False, "error": "verification timed out"}
@@ -786,11 +921,13 @@ def main() -> None:
             "cube_toss",
             "sdf_grind",
             "g1_hard",
+            "g1_mpc",
             "abc_twin",
             "abc_arm",
             "abc_look",
             "abc_replay",
             "abc_bin",
+            "abc_scratch",
         ),
     )
     parser.add_argument("--condition", choices=("mcp", "restart"))

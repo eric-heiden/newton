@@ -444,7 +444,20 @@ def warm_solvers(script: str, variants: list[dict]) -> None:
     host.build()
     example = host.example
     for options in variants:
-        example.solver = newton.solvers.SolverMuJoCo(example.model, **options)
+        solver = newton.solvers.SolverMuJoCo(example.model, **options)
+        try:
+            example.solver = solver
+        except AttributeError:
+            # The example's solver is read-only (owned by a plant object): step the variant on fresh states.
+            model = example.model
+            state_0, state_1, control = model.state(), model.state(), model.control()
+            contacts = None
+            if not options.get("use_mujoco_contacts", True):
+                pipeline = newton.CollisionPipeline(model)
+                contacts = pipeline.contacts()
+                pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, getattr(example, "sim_dt", 1.0e-3))
+            continue
         if options.get("use_mujoco_contacts"):
             example.collision_pipeline = None
         if hasattr(example, "capture"):

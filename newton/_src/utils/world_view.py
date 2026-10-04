@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import difflib
 import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
@@ -16,7 +17,7 @@ from warp.types import is_array
 from ..geometry import GeoType
 from ..geometry.utils import compute_shape_radius
 from ..sim import Control, Model, ModelFlags, State
-from .selection import match_labels
+from .selection import get_name_from_label, match_labels
 
 if TYPE_CHECKING:
     from ..solvers import SolverBase
@@ -136,8 +137,9 @@ class WorldView:
         heights = view.get_attribute("body_q", state_0, labels="*ball")[:, 0, 2]
 
     Rows are selected with the label patterns or model indices described in
-    :ref:`label-matching`. Patterns are matched against full labels;
-    ``"*name"`` also matches a label whose last path component is ``name``.
+    :ref:`label-matching`. As in :meth:`newton.Model.find_bodies`, a pattern
+    matches either the full label or its last path component (the text after
+    the last ``/``), so ``"left_finger"`` selects ``"robot/left_finger"``.
     Rows of joint DOFs and joint coordinates are selected by the labels of
     their joints. Within a world, selected rows keep their model order, which
     is the same in every replicated world.
@@ -444,11 +446,19 @@ class WorldView:
         else:
             if row_labels is None:
                 raise ValueError(f"Rows of frequency {domain} have no labels; pass labels=None or model indices")
-            matched = np.asarray(match_labels(row_labels, labels), dtype=np.int64)
+            # Same matching as Model.find_bodies(): the full label or its last path component.
+            names = [get_name_from_label(label) for label in row_labels]
+            matched = np.union1d(match_labels(row_labels, labels), match_labels(names, labels)).astype(np.int64)
             if matched.size == 0:
+                patterns = labels if isinstance(labels, list) else [labels]
+                close = {
+                    name
+                    for item in patterns
+                    for name in difflib.get_close_matches(str(getattr(item, "pattern", item)), sorted(set(names)), n=3)
+                }
+                hint = f"; closest names: {', '.join(sorted(close))}" if close else ""
                 examples = ", ".join(repr(label) for label in row_labels[:5])
-                raise KeyError(f"No {domain} labels match {labels!r} (labels include {examples})")
-            matched.sort()
+                raise KeyError(f"No {domain} labels match {labels!r} (labels include {examples}){hint}")
         worlds = row_world[matched].astype(np.int64)
         if self.world_count == 1:
             worlds = np.where(worlds < 0, 0, worlds)

@@ -85,8 +85,10 @@ _OBSERVE = {
     },
     "intrinsics": {
         "type": "object",
-        "description": "Calibrated camera instead of fov_y: fx, fy, cx, cy [px], optional image_width/image_height, "
-        "OpenCV distortion k1-k6, p1, p2, s1-s4, or distortion_model='inverse_brown_conrady' with k1-k3, p1, p2.",
+        "description": "Calibrated camera instead of fov_y, with the fields of newton.sensors.SensorCamera.Intrinsics: "
+        "fx, fy, cx, cy [px] (OpenCV image coordinates, integers at pixel centers), optional "
+        "image_width/image_height, OpenCV distortion k1-k6, p1, p2, s1-s4, or "
+        "distortion_model='inverse_brown_conrady' with k1-k3, p1, p2.",
     },
     "world_id": {"type": "integer", "minimum": 0, "default": 0},
     "width": {"type": "integer", "minimum": 1, "maximum": 2048, "default": 640},
@@ -363,7 +365,7 @@ _INSTRUCTIONS_LEAN = (
 """
     + _HELPERS
     + """
-- Images: show(x, label) attaches arrays, matplotlib figures, image paths, and observe/filmstrip results. session.dispatch('observe', {...}) renders the scene (auto-framed; view/views, eye/target or pose, fov_y or intrinsics with distortion, camera_body and camera_offset, world_id, width/height, reference='photo.png' for a comparison panel, overlay for projected points). session.dispatch('filmstrip', {'times': [...], 'reset': True}) steps to each time and returns a grid (references= scores each frame against video frames). render(**observe_options) returns an RGB array<<RTX>>
+- Images: show(x, label) attaches arrays, matplotlib figures, image paths, and observe/filmstrip results. session.dispatch('observe', {...}) renders the scene (auto-framed; view/views, eye/target or pose, fov_y or intrinsics (a dict or newton.sensors.SensorCamera.Intrinsics, with distortion), camera_body and camera_offset, world_id, width/height, reference='photo.png' for a comparison panel, overlay for projected points). session.dispatch('filmstrip', {'times': [...], 'reset': True}) steps to each time and returns a grid (references= scores each frame against video frames). render(**observe_options) returns an RGB array<<RTX>>
 newton_rebuild rebuilds the scene in the same process (a hosted script is read again from disk)."""
 )
 

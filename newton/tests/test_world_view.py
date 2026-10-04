@@ -370,6 +370,24 @@ def test_candidates_match_sequential_runs(test, device):
     test.assertGreater(batched[1], batched[2])
 
 
+def test_labels_match_like_model_find(test, device):
+    model = _replicated(device, 2)
+    view = WorldView(model)
+
+    # A bare name matches the last path component, as Model.find_shapes() does.
+    pads = view.get_indices("shape_material_mu", "pad")
+    np.testing.assert_array_equal(pads.ravel(), model.find_shapes("pad"))
+    np.testing.assert_array_equal(view.get_indices("joint_target_ke", "elbow").ravel(), model.find_joint_dofs("elbow"))
+    np.testing.assert_array_equal(
+        view.get_indices("joint_q", ["shoulder", "elbow"]).ravel(), model.find_joint_coords("arm/*")
+    )
+    np.testing.assert_array_equal(
+        view.get_indices("body_mass", ["base", "arm/tip"]).ravel(), model.find_bodies(["base", "tip"])
+    )
+    with test.assertRaisesRegex(KeyError, "closest names: elbow"):
+        view.get_indices("joint_target_ke", "elbw")
+
+
 class TestWorldView(unittest.TestCase):
     pass
 
@@ -378,6 +396,7 @@ devices = get_test_devices()
 for _name, _func in (
     ("test_indices_per_world", test_indices_per_world),
     ("test_heterogeneous_worlds", test_heterogeneous_worlds),
+    ("test_labels_match_like_model_find", test_labels_match_like_model_find),
     ("test_set_get_attribute", test_set_get_attribute),
     ("test_world_values_and_state", test_world_values_and_state),
     ("test_derived_arrays", test_derived_arrays),

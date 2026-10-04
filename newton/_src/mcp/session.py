@@ -1844,7 +1844,7 @@ class SimulationSession:
         Accepts the camera and rendering options of ``observe`` (``view``, ``eye``/``target``,
         ``pose`` or ``camera_body``/``camera_offset``, ``fov_y`` or ``intrinsics``, ``width``/``height``,
         ``world_id``, ``backend``, ``channel``, ``environment``, ...), which makes it the fast path for
-        fitting loops.
+        fitting loops. ``intrinsics`` may also be a :class:`~newton.sensors.SensorCamera.Intrinsics`.
 
         Args:
             metadata: Also return the observation metadata (camera pose, settings).

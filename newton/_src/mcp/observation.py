@@ -133,11 +133,30 @@ _DISTORTION = ("k1", "k2", "k3", "k4", "k5", "k6", "p1", "p2", "s1", "s2", "s3",
 
 
 def _intrinsics(value, width: int, height: int) -> dict | None:
-    """Validate OpenCV pinhole intrinsics; returns the normalized dictionary reported in metadata."""
+    """Validate OpenCV pinhole intrinsics; returns the normalized dictionary reported in metadata.
+
+    ``value`` is a dictionary or a :class:`SensorCamera.Intrinsics`.
+    """
     if value is None:
         return None
+    if isinstance(value, SensorCamera.Intrinsics):
+        model = SensorCamera.Intrinsics.DistortionModel(value.distortion_model)
+        value = {
+            "fx": value.fx,
+            "fy": value.fy,
+            "cx": value.cx,
+            "cy": value.cy,
+            "image_width": value.width,
+            "image_height": value.height,
+            **{name: getattr(value, name) for name in _DISTORTION if getattr(value, name) != 0.0},
+            **(
+                {}
+                if model == SensorCamera.Intrinsics.DistortionModel.OPENCV
+                else {"distortion_model": model.name.lower()}
+            ),
+        }
     if not isinstance(value, dict):
-        raise ValueError("intrinsics must be an object with fx, fy, cx, cy")
+        raise ValueError("intrinsics must be a newton.sensors.SensorCamera.Intrinsics or an object with fx, fy, cx, cy")
     unknown = set(value) - {"fx", "fy", "cx", "cy", "image_width", "image_height", "distortion_model", *_DISTORTION}
     if unknown:
         raise ValueError(f"Unknown intrinsics keys: {sorted(unknown)}")

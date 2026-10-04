@@ -90,8 +90,8 @@ link filters are matched against the final path component of each label. :meth:`
 :meth:`~newton.Model.find_shapes`, :meth:`~newton.Model.find_joints`, :meth:`~newton.Model.find_joint_dofs`, and
 :meth:`~newton.Model.find_joint_coords` return the model indices a pattern selects, matching full labels and final path
 components, optionally within one world.
-:class:`~newton.selection.WorldView` matches full labels of the rows it selects, and selects joint DOFs and
-coordinates by the labels of their joints.
+:class:`~newton.selection.WorldView` matches labels the same way and selects joint DOFs and coordinates by the labels
+of their joints.
 
 .. code-block:: python
 

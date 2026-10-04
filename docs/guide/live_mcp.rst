@@ -270,7 +270,8 @@ after the comparison metrics are computed, and return their pixel coordinates.
 Calibrated ``intrinsics``, ``pick``, and overlay pixels use the image
 coordinates of :class:`~newton.sensors.SensorCamera.Intrinsics` (x right, y
 down, integer values at pixel centers), which also projects and unprojects
-points outside the MCP.
+points outside the MCP. In Python cells, ``intrinsics`` may also be a
+:class:`~newton.sensors.SensorCamera.Intrinsics`.
 
 Persistent Python workspace
 ---------------------------

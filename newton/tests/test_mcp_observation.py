@@ -581,6 +581,22 @@ class TestMcpObservation(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.renderer.observe(intrinsics={**realsense, "k4": 0.1}, **self.camera)
 
+    def test_intrinsics_accept_sensor_camera_intrinsics(self):
+        """A SensorCamera.Intrinsics renders like the equivalent intrinsics dictionary."""
+        focal = 32.5 / math.tan(math.radians(30.0))
+        values = {"fx": focal, "fy": focal * 1.1, "cx": 30.0, "cy": 33.0, "k1": 0.1, "p2": 0.01}
+        as_dict = self.renderer.observe(channel="depth", raw=True, intrinsics=values, **self.camera)
+        camera = newton.sensors.SensorCamera.Intrinsics(65, 65, **values)
+        as_object = self.renderer.observe(channel="depth", raw=True, intrinsics=camera, **self.camera)
+        self.assertEqual(as_object["camera"]["intrinsics"], as_dict["camera"]["intrinsics"])
+        with np.load(as_dict["raw_artifact"]) as a, np.load(as_object["raw_artifact"]) as b:
+            np.testing.assert_array_equal(a["depth"], b["depth"])
+        realsense = newton.sensors.SensorCamera.Intrinsics(
+            65, 65, focal, focal, 32.0, 32.0, k1=0.2, distortion_model="inverse_brown_conrady"
+        )
+        result = self.renderer.observe(channel="depth", intrinsics=realsense, **self.camera)
+        self.assertEqual(result["camera"]["intrinsics"]["distortion_model"], "inverse_brown_conrady")
+
     @unittest.skipUnless(
         importlib.util.find_spec("ovrtx") is not None and wp.is_cuda_available(), "requires ovrtx and CUDA"
     )

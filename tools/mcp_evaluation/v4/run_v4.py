@@ -555,15 +555,67 @@ def _renderers() -> str:
     )
 
 
-def _newton_tools() -> str:
-    """Newton utilities that serve both conditions (the MCP guide names their live wrappers, so the prompt must)."""
-    return (
-        "Newton utilities: `python -m newton.examples.headless SCRIPT [script args] [--frames N] [--call EXPR] "
-        "[--json OUT] [--timeout S]` runs an example script in a fresh process and reports the outcome as JSON; "
+# Public Newton APIs named in both prompts, one fact line each: (names the line uses, line). The MCP guide
+# names live wrappers of some of them, so both conditions must learn of the underlying API the same way.
+NEWTON_UTILITIES = (
+    (
+        ("newton.examples.headless",),
+        "`python -m newton.examples.headless SCRIPT [script args] [--frames N] [--call EXPR] [--json OUT] "
+        "[--timeout S]` runs an example script in a fresh process and reports the outcome as JSON.",
+    ),
+    (
+        ("newton.utils.report_solver_params", "newton.utils.report_health"),
         "newton.utils.report_solver_params(solver, kind) reports the values a solver integrates and the model arrays "
         "they come from; newton.utils.report_health(model, state, solver) reports non-finite values, full buffers, "
-        "and penetrating shape pairs per world.\n"
-    )
+        "and penetrating shape pairs per world.",
+    ),
+    (
+        (
+            "newton.Model.find_bodies",
+            "newton.Model.find_shapes",
+            "newton.Model.find_joints",
+            "newton.Model.find_joint_dofs",
+            "newton.Model.find_joint_coords",
+        ),
+        "newton.Model.find_bodies, find_shapes, find_joints, find_joint_dofs and find_joint_coords(pattern, "
+        "world=None) return the model indices that label patterns select (full label or last path component); "
+        "SolverMuJoCo.newton_body_to_mjc_body, newton_dof_to_mjc_dof and newton_shape_to_mjc_geom map them to "
+        "compiled MuJoCo ids.",
+    ),
+    (
+        ("newton.selection.WorldView",),
+        "newton.selection.WorldView(model) reads and writes per-world values of model, state and control attributes "
+        "selected by label as [world, row, ...] arrays and copies one world's state into many worlds; with solver= "
+        "it raises for values the solver shares across worlds.",
+    ),
+    (
+        (
+            "newton.solvers.SolverMuJoCo.convert_joint_coords_to_mujoco",
+            "newton.solvers.SolverMuJoCo.convert_joint_coords_from_mujoco",
+        ),
+        "SolverMuJoCo.convert_joint_coords_to_mujoco(joint_q, joint_qd) and convert_joint_coords_from_mujoco(qpos, "
+        "qvel) convert batches between Newton joint coordinates and MuJoCo qpos/qvel; "
+        "docs/concepts/model_based_control.rst lists Newton's kinematics and dynamics functions and the "
+        "Newton-MuJoCo conventions.",
+    ),
+    (
+        (
+            "newton.sensors.SensorCamera.Intrinsics.from_camera_matrix",
+            "newton.sensors.SensorCamera.Intrinsics.project",
+            "newton.sensors.SensorCamera.Intrinsics.unproject",
+            "newton.sensors.SensorCamera.Intrinsics.unproject_to_plane",
+            "newton.sensors.SensorCamera.Intrinsics.compute_camera_rays",
+        ),
+        "newton.sensors.SensorCamera.Intrinsics (from_camera_matrix, project, unproject, unproject_to_plane, "
+        "compute_camera_rays) maps between world points and image pixels of a calibrated camera with OpenCV or "
+        "inverse Brown-Conrady distortion.",
+    ),
+)
+
+
+def _newton_tools() -> str:
+    """Newton utilities that serve both conditions, one line each (see :data:`NEWTON_UTILITIES`)."""
+    return "Newton utilities:\n" + "".join(f"- {line}\n" for _, line in NEWTON_UTILITIES)
 
 
 def _environment(facts: dict) -> str:

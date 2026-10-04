@@ -106,9 +106,9 @@ background calls; ``--max-workers M`` (default ``max(N, 4)``) bounds
 including its ``overrides`` and example arguments.
 
 ``fresh(argv_list, call=..., frames=..., timeout=300, parallel=2, wait=True)``
-runs the script as saved on disk, without the session's live edits, in new
-Python processes through ``python -m newton.examples.headless`` (see
-:doc:`development`). It starts at most ``parallel`` of the session's processes
+runs the script as saved on disk, without the session's live edits or build
+overrides (reported as ``overrides_not_applied``), in new Python processes
+through ``python -m newton.examples.headless`` (see :doc:`development`). It starts at most ``parallel`` of the session's processes
 at once and returns one report per argument list; ``wait=False`` returns a
 handle with ``done()``, ``result()``, and ``cancel()``. Processes still running
 at their timeout or when the session closes are killed together with the
@@ -141,8 +141,8 @@ This adapter implements newline-delimited JSON-RPC initialization and tools,
 following the `MCP stdio transport specification
 <https://modelcontextprotocol.io/specification/2025-11-25/basic/transports>`_.
 Tool results carry a compact JSON text block (default-valued status fields are
-omitted) followed by any images. The server instructions include a short
-workflow guide, followed by application notes passed as
+omitted) followed by any images. The server instructions describe the tools
+and helpers, followed by application notes passed as
 ``SimulationSession(..., guide=...)``.
 
 Its authenticated TCP connection to the embedded session is an internal
@@ -272,8 +272,8 @@ functions, and ``@wp.func`` / ``@wp.kernel`` definitions that can be launched
 in later calls. IPython magics and top-level ``await`` are not implemented.
 
 The reserved names ``session``, ``model``, ``solver``, ``state``, ``state_next``,
-``control``, ``contacts``, ``viewer``, ``wp``, ``np``, and ``show`` refresh before
-each call and after managed state changes. Objects passed as
+``control``, ``contacts``, ``viewer``, ``wp``, ``np``, ``newton``, ``show``, and the
+analysis helpers below refresh before each call and after managed state changes. Objects passed as
 ``SimulationSession(..., namespace={...})`` are also refreshed before each
 call, so applications can expose their own controllers or task objects. Functions that read these globals see the
 current state after an odd number of buffer swaps, including steps initiated
@@ -349,13 +349,25 @@ Trusted cells can use these helpers without imports (``newton``, ``np``, and
 - :meth:`~newton.mcp.SimulationSession.rollout` steps the scene and samples
   named series (callables or workspace expressions such as
   ``"state.body_q.numpy()[3, 2]"``) in one call, optionally resetting or
-  restoring a checkpoint first, stopping on a condition, and plotting the result.
+  restoring a checkpoint first and stopping on a condition.
 - :meth:`~newton.mcp.SimulationSession.solver_contacts` groups the solver's
   active contacts by shape pair and lists the parameters the solver actually
   integrates, such as MuJoCo ``solref``, ``solimp``, and friction after geom
   priority and material mixing, next to the authored shape materials.
-- :meth:`~newton.mcp.SimulationSession.health` flags non-finite state, runaway
-  velocities, deep penetration, and full solver contact or constraint buffers.
+- :meth:`~newton.mcp.SimulationSession.contacts_between` reports the contact
+  count, normal and friction force, slip speed, and penetration between two
+  shape sets; it also works as a ``rollout`` probe.
+- :meth:`~newton.mcp.SimulationSession.solver_params` lists, per actuator,
+  joint, geom, body, equality constraint, or solver option, the value
+  :class:`~newton.solvers.SolverMuJoCo` integrates, the Newton model array and
+  index it comes from, the :class:`~newton.ModelFlags` category that refreshes
+  it, whether it can differ per world, and model values that differ from the
+  compiled ones (``pending``). Other solvers report the Newton model values.
+- :meth:`~newton.mcp.SimulationSession.health` checks any solver and state
+  (default: the session's) for non-finite values, runaway speeds, full contact
+  or constraint buffers, and penetrating shape pairs, naming the worlds
+  involved; ``twins=True`` also reports worlds whose joint state deviates from
+  the others.
 - :meth:`~newton.mcp.SimulationSession.swap_solver` replaces the solver with
   ``factory(model)``: it installs the new solver (a hosted example re-records
   its CUDA graphs), steps a copy of the current state for two frames, runs
@@ -366,6 +378,17 @@ Trusted cells can use these helpers without imports (``newton``, ``np``, and
   scalars that differ from the last build (or from its previous call), keyed by
   entity label with old and new values, plus the
   :class:`~newton.ModelFlags` inferred for the changed fields.
+
+After each cell, and before each ``rollout``, step, or ``filmstrip`` inside a
+cell, the session compares device checksums of the model arrays solvers read
+with their previous values. Changed arrays whose :class:`~newton.ModelFlags`
+category no ``notify_model_changed`` call covered are notified with the inferred
+flags, and the execution result's ``note`` names the changed fields, the flags,
+and edited fields the current solver configuration does not read (for example
+``mujoco.actuator_gainprm`` of actuators driven by ``joint_target_ke``).
+``session.watch.mode = "report"`` reports without notifying and ``"off"``
+disables the checks. Edits made by the application's own ``step()`` are not
+reported.
 
 Writing live results back to the script
 ---------------------------------------

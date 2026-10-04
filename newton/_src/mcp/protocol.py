@@ -201,7 +201,7 @@ TOOLS = [
     _tool("collide", "Recompute collision-pipeline contacts at the current state without advancing time."),
     _tool(
         "step",
-        "Advance a bounded number of physics timesteps. The embedding callback may update control each step; inspect application behavior before editing its control arrays.",
+        "Advance a bounded number of physics timesteps. The embedding callback may update control each step. If a step raises, the simulation is rolled back to its state before the call.",
         {
             "count": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1},
             "dt": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Physics timestep [s]."},
@@ -211,16 +211,16 @@ TOOLS = [
     _tool("pause", "Pause playback while continuing to service queued requests."),
     _tool(
         "reset",
-        "Restore initial state/control/time, reset solver caches and application callback, and clear contact buffers. Use collide or contacts(refresh=True) to regenerate diagnostic contacts. Model parameter edits persist. An invalid model mutation requires rebuilding rather than state reset.",
+        "Restore the initial state, control and time, reset solver caches and the application callback, and clear contact buffers. Model parameter edits persist.",
     ),
     _tool(
         "checkpoint",
-        "Save named public state/control arrays and session time. Hidden solver state is not captured; restore resets caches and does not promise bitwise replay.",
+        "Save named public state/control arrays and session time (at most 8 names). Hidden solver state is not saved; restore resets it.",
         {"name": {"type": "string", "minLength": 1, "maxLength": 64, "default": "default"}},
     ),
     _tool(
         "restore",
-        "Restore a checkpoint's public arrays/time and reset hidden solver caches. Clear diagnostic contacts until collide or contacts(refresh=True). Model edits persist. Application reset callback also runs.",
+        "Restore a checkpoint's public arrays and time, reset hidden solver caches, clear contact buffers, and run the application reset callback. Model edits persist.",
         {"name": {"type": "string", "default": "default"}},
     ),
     _tool(
@@ -294,14 +294,12 @@ TOOLS = [
     ),
     _tool(
         "execute",
-        "Run trusted Python in the live application process. Variables, imports and functions persist across calls "
-        "(and across reset/rebuild). Globals: session, model, state, control, solver, contacts, np, wp, show, plus "
-        "application objects listed in the server instructions. The last expression is returned (large/opaque values "
-        "are summarized; _ keeps the value). show(img, label) returns images inline: numpy arrays, matplotlib figures, "
-        "PNG paths, or observe/filmstrip results. Batch many evaluations per call and print compact numbers. "
-        "session.dispatch(op, args) runs structured operations (observe, filmstrip, step, reset, checkpoint, restore, "
-        "query, edit). If the cell raises, the simulation is rolled back to its state before the cell and the "
-        "error lists what was restored; Python variables are kept. Not a sandbox.",
+        "Run trusted Python in the live application process (not a sandbox). Variables, imports and functions "
+        "persist across calls and across reset/rebuild. The value of the last expression is returned (large or "
+        "opaque values are summarized; _ keeps the value) together with printed output; show(image, label) returns "
+        "images inline. session.dispatch(op, args) runs observe, filmstrip, step, reset, checkpoint, restore, and "
+        "describe. If the cell raises, the simulation is rolled back to its state before the cell and the error "
+        "lists what was restored; Python variables are kept. Preloaded names are listed in the server instructions.",
         {
             "code": {"type": "string", "maxLength": 65536},
             "reset_namespace": {
@@ -314,12 +312,16 @@ TOOLS = [
     ),
     _tool(
         "rebuild",
-        "Invoke the application rebuild callback for topology/solver changes within the same process. Callback arguments are application-specific and new bindings replace the scene, contacts, render caches and checkpoints. Python variables survive unless reset_namespace=true. If the rebuild fails, the previous scene keeps running and the error shows the traceback.",
+        "Rebuild the scene in the same process through the application's rebuild callback (a hosted script is read "
+        "again from disk and its Example constructed again). The new scene replaces contacts, render caches and "
+        "checkpoints; Python variables survive unless reset_namespace=true. If the rebuild fails, the previous scene "
+        "keeps running and the error shows the traceback. arguments are application-specific (hosted scripts: argv, "
+        "overrides, restart).",
         {
             "arguments": {"type": "object"},
             "overrides": {
                 "type": "object",
-                "description": "Hosted scripts: module globals to set after the script loads and before Example() is "
+                "description": "Hosted scripts: module globals set after the script loads and before Example() is "
                 "constructed (a dict merges into a dict global; other values replace it). Active until replaced and "
                 "echoed in every response; {} clears them. Same as arguments.overrides.",
             },
@@ -329,20 +331,27 @@ TOOLS = [
 ]
 
 
-_INSTRUCTIONS = """Live Newton simulation running in another process; its Python state persists between calls.
-Efficient workflow:
-- newton_observe() returns an inline image; omit the camera to auto-frame (view='iso'|'front'|'left'|'right'|'top'). views=[...] gives a multi-view grid in one image. reference='photo.png' renders at the photo's size with the same camera and adds reference and mismatch panels plus pixel statistics.
-- newton_filmstrip(times=[...], reset=true) runs forward and returns labeled grids of frames (paged to fit the displayed size); references=[[...]] compares each frame with reference images. camera_body='label' (optional camera_offset pose in the body frame) mounts a camera on a body, e.g. a wrist camera, and overlay={'name': {'body': 'label'}} marks simulated points on the simulated and reference frames.
-- newton_execute runs Python in the app: batch several parameter candidates in one call, compute numeric comparisons, and call show(image_or_figure, label) to see custom plots or composites inline. Prefer one larger call over many small ones.
-- session.dispatch('checkpoint', {'name': ...}) / ('restore', ...) branches from a saved state instead of re-simulating.
-- Built-in helpers (no import needed; newton, np, wp are preloaded): rollout(frames or seconds=..., record={'name': 'expr' or fn}, start=True|'checkpoint', until='expr', every=k, plot=True) steps and returns NumPy series in one call; solver_contacts() lists active contacts per shape pair with the solver's effective parameters (MuJoCo solref/solimp/friction after priority and mixing) next to the authored materials; solver_params(kind, select=None, world=0) shows what the solver integrates per actuator/joint/geom/body/equality/option, the model array and ModelFlags behind each value, and unapplied edits; health(solver=None, state=None, per_world=True, twins=False) flags NaNs, runaway velocities, deep penetration by shape pair, and solver buffer overflow per world.
-- After each newton_execute cell (and before rollout/step calls inside it) the host checksums the model arrays solvers read; edits no notify_model_changed covered are notified with the inferred ModelFlags and listed in `note` (session.watch.mode = 'report' or 'off').
-If a cell raises, the simulation is rolled back to its state before the cell and the error lists what was restored; Python variables are kept."""
+_HELPERS = """- If a cell raises, the simulation (time, state, control, model arrays) returns to its state before the cell and the error lists what was restored; Python variables are kept.
+- After each cell, and before rollout()/step/filmstrip inside it, the model arrays solvers read are checksummed; changes that no notify_model_changed() call covered are notified with the inferred ModelFlags and listed in `note` (session.watch.mode = 'notify' | 'report' | 'off').
+- rollout(frames or seconds=..., record={'name': 'expr' or fn}, every=k, start=True|'checkpoint', until='expr'): steps and returns NumPy series.
+- session.dispatch('step' | 'reset' | 'checkpoint' | 'restore' | 'describe', {...}): step, return to the initial state, save or restore named states (state, control, time; model edits are kept).
+- health(solver=None, state=None, per_world=True, twins=False): non-finite values, runaway speeds, full solver buffers, and penetrating shape pairs, by world, for any solver.
+- solver_params(kind='actuator'|'joint'|'geom'|'body'|'equality'|'option', select='label*', world=0): values the solver integrates, the model array and ModelFlags behind each, whether they can differ per world, and unapplied edits (`pending`).
+- solver_contacts(): active contacts per shape pair with the parameters the solver integrates and the material that decided them.
+- contacts_between(a, b=None): contact count, normal and friction force, slip speed, and penetration between two shape sets (label substrings); usable as a rollout() probe.
+- diff_model(since='build'|'last'): model values changed since the build, by entity label ([old, new]), with the inferred ModelFlags.
+- swap_solver(factory, frames=2): installs factory(model) as the solver after stepping a copy of the state and running health(); keeps the previous solver if that fails."""
 
+_INSTRUCTIONS = (
+    """Live Newton simulation running in another process. newton_execute runs Python cells in it; variables persist between calls (preloaded: session, model, state, control, solver, contacts, newton, np, wp, show, and the helpers below).
+- newton_observe renders the scene as an inline image (auto-framed unless a camera is given; views=[...] for a grid; reference='photo.png' adds reference and mismatch panels). newton_filmstrip(times=[...], reset=true) steps to each time and returns a grid of frames.
+"""
+    + _HELPERS
+)
 
 _RTX_NOTE = (
-    "; backend='rtx' path-traces a photographic image (about 1 s, first call 5-10 s) for judging appearance, "
-    "the default sensor backend takes about 20 ms."
+    "; backend='rtx' path-traces a photographic image (about 1 s, the first call 5-10 s; the default sensor "
+    "backend takes about 20 ms)."
 )
 
 
@@ -351,15 +360,14 @@ def rtx_available() -> bool:
     return importlib.util.find_spec("ovrtx") is not None
 
 
-_INSTRUCTIONS_LEAN = """Live Newton simulation running in another process; its Python state persists between calls.
-newton_execute runs Python in it (preloaded: session, model, state, control, solver, newton, np, wp, show, rollout, health, solver_contacts, solver_params, render, compare_images, contacts_between, swap_solver, persist, persist_source, diff_model). Batch many evaluations per call and print compact numbers. If a cell raises, the simulation is rolled back to its state before the cell and the error lists what was restored; Python variables are kept.
-- render(**observe_options) returns an RGB numpy image directly (fast path for fitting loops); compare_images(sim, ref, mask=None, panel='edges'|'blend'|'mismatch') returns PSNR, SSIM and edge NCC (geometric alignment) and shows a comparison panel.
-- rollout(frames or seconds=..., record={'name': 'expr' or fn}, start=True|'checkpoint', until='expr', plot=True) steps and returns NumPy series.
-- solver_contacts(): active contacts per shape pair with the parameters the solver integrates and which material decided them. contacts_between(a, b=None): contact count, solver normal/friction force, slip speed, and penetration between two shape sets (label substrings), recordable over time in rollout(record=...). health(solver=None, state=None, per_world=True, twins=False): NaNs, runaway velocities, penetrating shape pairs, full solver buffers, by world, for any solver. solver_params(kind='actuator'|'joint'|'geom'|'body'|'equality'|'option', select='label*', world=0): values the solver integrates, the model array and ModelFlags behind each, and unapplied edits (`pending`).
-- After each cell (and before rollout/step calls inside it) the host checksums the model arrays solvers read; edits no notify_model_changed covered are notified with the inferred ModelFlags and reported in `note` with facts about fields the solver does not read (session.watch.mode = 'report' or 'off').
-- Images: show(session.dispatch('observe', {'view': 'iso'})) or show(session.dispatch('filmstrip', {'times': [0.5, 1.0], 'reset': True})); show() also takes arrays and matplotlib figures. filmstrip compares a rollout with recorded video when given references (image paths, an (N,H,W,3) array, or a directory; one per time), with stride=k, comparison='edges'|'blend', and an optional mask; it returns per-frame PSNR/SSIM/edge NCC and their mean. observe options: views=[...], width/height, eye/target or pose, fov_y or intrinsics={'fx','fy','cx','cy', distortion..., 'distortion_model': 'opencv'|'inverse_brown_conrady' (RealSense)} for calibrated cameras, world_id, reference='photo.png', camera_body='label' with optional camera_offset=[x, y, z, qx, qy, qz, qw] in the body frame for a camera that moves with a body (e.g. a wrist camera), overlay={'name': 'expr', fn, or {'body': label, 'point': [x, y, z]}} to mark projected simulated points on simulated and reference frames and return their pixels<<RTX>>
-- session.dispatch('checkpoint' | 'restore' | 'reset' | 'describe', {...}) manage and inspect the scene.
-newton_rebuild reloads the application (for hosted scripts: re-imports the edited file) in the same process."""
+_INSTRUCTIONS_LEAN = (
+    """Live Newton simulation running in another process. newton_execute runs Python cells in it; variables persist between calls (preloaded: session, model, state, control, solver, contacts, newton, np, wp, show, and the helpers below).
+"""
+    + _HELPERS
+    + """
+- Images: show(x, label) attaches arrays, matplotlib figures, image paths, and observe/filmstrip results. session.dispatch('observe', {...}) renders the scene (auto-framed; view/views, eye/target or pose, fov_y or intrinsics with distortion, camera_body and camera_offset, world_id, width/height, reference='photo.png' for a comparison panel, overlay for projected points). session.dispatch('filmstrip', {'times': [...], 'reset': True}) steps to each time and returns a grid (references= scores each frame against video frames). render(**observe_options) returns an RGB array<<RTX>>
+newton_rebuild rebuilds the scene in the same process (a hosted script is read again from disk)."""
+)
 
 
 def _compact(data: dict, *, full: bool = False) -> dict:

@@ -293,6 +293,24 @@ class TestMcpLaunchedWorkers(unittest.TestCase):
         self.assertEqual(self.execute("workers.resize(1)['count']")["result"], 1)
         self.assertEqual(self.session.dispatch("describe")["capabilities"]["workers"], 1)
 
+    def test_overrides_reach_rebuilt_restarted_and_added_workers(self):
+        """Workers rebuild with the session's overrides, and restarted or added workers start with them."""
+        self.script.write_text("SPEED = 1.0\n" + _SCRIPT.replace("self.speed = 1.0", "self.speed = SPEED"))
+        rebuilt = self.session.dispatch("rebuild", {"overrides": {"SPEED": 5.0}})
+        self.assertEqual(rebuilt["workers_rebuilt"]["rebuilt"], 1)
+        self.assertEqual(rebuilt["overrides"], {"SPEED": 5.0})
+        self.execute("def speed(_):\n    return example.speed")
+        self.assertEqual(self.execute("workers.map(speed, [0])")["result"], [5.0])
+        with self.assertRaisesRegex(RuntimeError, "exited with code 3"):
+            self.execute("import os\nworkers.submit(lambda: os._exit(3)).result()")
+        # The restarted process gets the overrides on its command line, not through a replayed rebuild.
+        self.assertEqual(self.execute("workers.map(speed, [0])")["result"], [5.0])
+        self.execute("workers.resize(2)")
+        self.assertEqual(self.execute("sorted(set(workers.broadcast(speed, 0)))")["result"], [5.0])
+        self.session.dispatch("rebuild", {"overrides": {}})
+        self.assertEqual(self.execute("workers.broadcast(speed, 0)")["result"], [1.0, 1.0])
+        self.assertEqual(self.execute("example.speed")["result"], 1.0)
+
     def test_failed_cuda_context_restarts_the_worker(self):
         """Restart a worker whose device check fails after a call and report it in the next response."""
         pid = self.pool.status()[0]["pid"]
@@ -348,7 +366,7 @@ class TestMcpHostWorkers(unittest.TestCase):
                 result = client.request("execute", code="(workers.map(lambda x: x + 1, [1, 2]), workers.status())")
                 values, status = result["result"]
                 self.assertEqual(values, [2, 3])
-                self.assertIn("workers.resize(n) sets the count (0 to 2)", client.request("guide")["guide"])
+                self.assertIn("workers.resize(n) (0 to 2)", client.request("guide")["guide"])
                 pid = status[0]["pid"]
                 self.assertTrue(_alive(pid))
                 host.send_signal(signal.SIGTERM)

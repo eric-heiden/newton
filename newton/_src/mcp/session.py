@@ -1010,8 +1010,7 @@ class SimulationSession:
             }
         )
 
-    _WORKSPACE_BINDINGS: ClassVar[tuple[str, ...]] = (
-        "session",
+    _SCENE_BINDINGS: ClassVar[tuple[str, ...]] = (
         "model",
         "solver",
         "state",
@@ -1019,70 +1018,35 @@ class SimulationSession:
         "control",
         "contacts",
         "viewer",
-        "np",
-        "wp",
-        "newton",
+    )
+    _HELPERS: ClassVar[tuple[str, ...]] = (
         "show",
         "rollout",
         "health",
         "solver_contacts",
         "solver_params",
         "render",
-        "compare_images",
         "contacts_between",
         "swap_solver",
         "persist",
         "persist_source",
         "diff_model",
     )
+    """Session methods bound under the same name in trusted execution."""
+    _WORKSPACE_BINDINGS: ClassVar[tuple[str, ...]] = ("session", *_SCENE_BINDINGS, "np", "wp", "newton", *_HELPERS)
     _EXPRESSION_RESULT = "__newton_expression_result__"
     _CLASS_HOOK = "__newton_cell_class__"
 
     def _refresh_workspace(self) -> None:
         if self._workspace_module is None or self._closed:
             return
-        self._workspace.update(
-            {
-                name: getattr(self, name)
-                for name in self._WORKSPACE_BINDINGS
-                if name
-                not in (
-                    "session",
-                    "np",
-                    "wp",
-                    "newton",
-                    "show",
-                    "rollout",
-                    "health",
-                    "solver_contacts",
-                    "solver_params",
-                    "render",
-                    "compare_images",
-                    "contacts_between",
-                    "swap_solver",
-                    "persist",
-                    "persist_source",
-                    "diff_model",
-                )
-            }
-        )
+        self._workspace.update({name: getattr(self, name) for name in self._SCENE_BINDINGS})
         self._workspace.update(self.namespace)
         import newton  # noqa: PLC0415
 
+        self._workspace.update({name: getattr(self, name) for name in self._HELPERS})
         self._workspace.update(
             session=self,
-            show=self.show,
-            rollout=self.rollout,
-            health=self.health,
-            solver_contacts=self.solver_contacts,
-            solver_params=self.solver_params,
-            render=self.render,
-            compare_images=self.compare_images,
-            contacts_between=self.contacts_between,
-            swap_solver=self.swap_solver,
-            persist=self.persist,
-            persist_source=self.persist_source,
-            diff_model=self.diff_model,
             np=np,
             wp=wp,
             newton=newton,
@@ -1702,7 +1666,6 @@ class SimulationSession:
         every: int = 1,
         start: bool | str = False,
         until: Callable | str | None = None,
-        plot: bool | list[str] = False,
     ) -> dict:
         """Step the scene and record time series in one call (trusted execution helper).
 
@@ -1719,7 +1682,6 @@ class SimulationSession:
                 checkpoint, ``False`` continues from the current state.
             until: Stop early once this callable/expression is truthy; the
                 reason is reported in ``stopped``.
-            plot: Show a plot of all (or the named) scalar/vector series.
 
         Returns:
             Dictionary with ``t`` [s] and one NumPy array per recorded name
@@ -1796,8 +1758,6 @@ class SimulationSession:
             else:
                 result[name] = np.stack(values)
         result.update(frames=count, stopped=stopped)
-        if plot:
-            self._plot_series(result, plot if isinstance(plot, list) else list(series))
         return result
 
     def _eval_scope(self) -> dict:
@@ -1809,30 +1769,6 @@ class SimulationSession:
             "np": np,
             "wp": wp,
         }
-
-    def _plot_series(self, result: dict, names: list[str]) -> None:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        names = [n for n in names if isinstance(result.get(n), np.ndarray) and result[n].ndim <= 2]
-        if not names:
-            return
-        figure, axes = plt.subplots(len(names), 1, figsize=(6.4, 1.8 * len(names) + 0.4), sharex=True, squeeze=False)
-        for axis, name in zip(axes[:, 0], names, strict=True):
-            values = result[name].reshape(len(result["t"]), -1)
-            for column in range(min(values.shape[1], 8)):
-                axis.plot(result["t"], values[:, column], lw=1.2, label=str(column) if values.shape[1] > 1 else None)
-            axis.set_ylabel(name, fontsize=8)
-            axis.grid(alpha=0.3)
-            if values.shape[1] > 1:
-                axis.legend(fontsize=6, ncol=min(values.shape[1], 8), loc="best")
-        axes[-1, 0].set_xlabel("time [s]")
-        figure.tight_layout()
-        if self._shown_images is not None and len(self._shown_images) < self._MAX_SHOWN_IMAGES:
-            self.show(figure)
-        plt.close(figure)
 
     def health(
         self,
@@ -1982,42 +1918,6 @@ class SimulationSession:
         self._assert_owner()
         image, info = self._renderer_get()._single(**options)
         return (image, info) if metadata else image
-
-    def compare_images(
-        self, simulated, reference, *, mask=None, panel: str | None = None, label: str | None = None
-    ) -> dict:
-        """Compare two images with PSNR [dB], SSIM, and edge NCC (trusted execution helper).
-
-        Args:
-            simulated: Image array, PNG/JPEG path, PIL image, or ``observe`` result.
-            reference: Image of the same size in any of those forms.
-            mask: Optional boolean array selecting the pixels to score.
-            panel: Also show ``simulated | reference | panel`` inline, with ``panel`` one of
-                ``"edges"``, ``"blend"``, or ``"mismatch"``.
-            label: Caption for the shown panel row.
-
-        Returns:
-            Metrics ``psnr_db``, ``ssim``, ``edge_ncc`` (higher is better), and
-            ``mean_abs_difference``.
-        """
-        from .imaging import comparison_panel, image_metrics, tile, to_rgb  # noqa: PLC0415
-
-        def rgb(value):
-            if isinstance(value, dict) and "image_base64" in value:
-                value = base64.b64decode(value["image_base64"])
-            return to_rgb(value)
-
-        a, b = rgb(simulated), rgb(reference)
-        result = image_metrics(a, b, mask)
-        result["mean_abs_difference"] = round(float(np.abs(a.astype(np.int16) - b.astype(np.int16)).mean()), 3)
-        if panel is not None:
-            names = [["simulated", "reference", f"{panel} {label or ''}".strip()]]
-            image = tile([[a, b, comparison_panel(a, b, panel)]], names)
-            if self._shown_images is not None:
-                self.show(image)
-            else:
-                result["panel_image"] = image
-        return result
 
     def contacts_between(self, a, b=None, *, detail: bool = False) -> dict:
         """Contact count, solver normal and friction force, slip speed, and penetration between two shape sets.

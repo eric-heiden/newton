@@ -844,7 +844,7 @@ def persist_source(
 
 
 _DOCUMENTED_FLAGS: dict[str, ModelFlags] = {
-    # Fields listed in the ModelFlags docstrings, beyond the editable ones.
+    # Fields listed in the ModelFlags docstrings that the model-edit checks do not watch.
     **dict.fromkeys(("joint_q", "joint_X_p", "joint_X_c"), ModelFlags.JOINT_PROPERTIES),
     **dict.fromkeys(("body_q", "body_qd", "body_flags"), ModelFlags.BODY_PROPERTIES),
     **dict.fromkeys(
@@ -987,9 +987,10 @@ def _row(value: Any) -> Any:
 
 
 def _flag(name: str) -> ModelFlags | None:
-    from .session import SimulationSession  # noqa: PLC0415
+    from .solverview import FIELD_FLAGS  # noqa: PLC0415
 
-    return SimulationSession._EDIT_FLAGS.get(name, _DOCUMENTED_FLAGS.get(name))
+    # The model-edit checks' table, plus state-like fields the ModelFlags docstrings name.
+    return FIELD_FLAGS.get(name, _DOCUMENTED_FLAGS.get(name))
 
 
 def diff_model(session: Any, since: str = "build", *, limit: int = 16) -> dict:

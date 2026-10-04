@@ -92,12 +92,20 @@ class TestMcpFresh(unittest.TestCase):
         self.assertEqual((report["value"]["moves"], report["value"]["gain"]), (3, 1.0))
         self.assertIn("live edits in this session are not applied", report["source"])
         self.assertFalse(report["script_changed_since_build"])
+        self.assertIsNone(report["overrides_not_applied"])
         self.script.write_text(_SCRIPT.replace("GAIN = 1.0", "GAIN = 2.0"))
         (report,) = self.execute("fresh(['--sleep', '0'], call='example.summary()', frames=5)")
         self.assertEqual((report["value"]["moves"], report["value"]["gain"]), (5, 2.0))
         self.assertTrue(report["script_changed_since_build"])
         # The live example is untouched by fresh runs.
         self.assertEqual(self.execute("(example.gain, example.moves)"), [5.0, 0])
+        # Build overrides apply to the live scene only; fresh runs name the ones they did not apply.
+        self.session.dispatch("rebuild", {"overrides": {"GAIN": 3.0}})
+        self.assertEqual(self.execute("example.gain"), 3.0)
+        (report,) = self.execute("fresh(call='example.summary()')")
+        self.assertEqual(report["value"]["gain"], 2.0)
+        self.assertEqual(report["overrides_not_applied"], {"GAIN": 3.0})
+        self.assertFalse(report["script_changed_since_build"])
 
     def test_queues_runs_beyond_the_parallel_limit(self):
         """Never run more than `parallel` processes at once, in argv order."""

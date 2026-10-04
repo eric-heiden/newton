@@ -585,27 +585,16 @@ def run(example, args):
             )
 
     if perform_test:
-        # generic tests for finiteness of Newton objects
-        if hasattr(example, "state_0"):
-            nan_members = find_nan_members(example.state_0)
+        _test_finite(example)
+
+
+def _test_finite(example) -> None:
+    """Raise if the example's state, model, control, or contacts hold NaN values (test mode)."""
+    for name in ("state_0", "state_1", "model", "control", "contacts"):
+        if hasattr(example, name):
+            nan_members = find_nan_members(getattr(example, name))
             if nan_members:
-                raise ValueError(f"NaN members found in state_0: {nan_members}")
-        if hasattr(example, "state_1"):
-            nan_members = find_nan_members(example.state_1)
-            if nan_members:
-                raise ValueError(f"NaN members found in state_1: {nan_members}")
-        if hasattr(example, "model"):
-            nan_members = find_nan_members(example.model)
-            if nan_members:
-                raise ValueError(f"NaN members found in model: {nan_members}")
-        if hasattr(example, "control"):
-            nan_members = find_nan_members(example.control)
-            if nan_members:
-                raise ValueError(f"NaN members found in control: {nan_members}")
-        if hasattr(example, "contacts"):
-            nan_members = find_nan_members(example.contacts)
-            if nan_members:
-                raise ValueError(f"NaN members found in contacts: {nan_members}")
+                raise ValueError(f"NaN members found in {name}: {nan_members}")
 
 
 def get_examples() -> dict[str, str]:

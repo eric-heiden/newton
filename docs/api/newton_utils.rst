@@ -36,6 +36,8 @@ newton.utils
    plot_graph
    rasterize_mesh_to_heightfield
    remesh_mesh
+   report_health
+   report_solver_params
    run_benchmark
    solidify_mesh
    string_to_warp

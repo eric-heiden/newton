@@ -915,6 +915,177 @@ Caveats
   of imported masks and the warned fallback used when the rules do not fit.
 
 
+.. _mujoco-limits-and-known-behaviors:
+
+Limits and known behaviors
+--------------------------
+
+This section lists what :class:`~newton.solvers.SolverMuJoCo` reads after
+construction, which values all worlds share, and limits of the MuJoCo Warp
+backend.
+
+Runtime updates
+~~~~~~~~~~~~~~~
+
+After construction, the solver reads Newton model arrays again only when
+:meth:`~newton.solvers.SolverBase.notify_model_changed` is called with the
+matching :class:`~newton.ModelFlags` category. Without that call, the solver
+keeps simulating with the old values. The "per world" column says whether the
+MuJoCo field stores one value per world when ``separate_worlds=True``.
+:func:`newton.utils.report_solver_params` lists the compiled values of a
+solver next to the model arrays they come from and names model values that
+differ from them (``pending``); :func:`newton.utils.report_health` checks a
+state and solver for non-finite worlds, full buffers, and penetrating shape
+pairs.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 26 22 18
+
+   * - Newton model field
+     - MuJoCo field
+     - Refreshed by
+     - Per world
+   * - ``joint_target_ke``, ``joint_target_kd``
+     - ``actuator_gainprm``, ``actuator_biasprm`` of joint-target actuators
+     - ``JOINT_DOF_PROPERTIES``
+     - yes
+   * - ``joint_armature``, ``joint_damping``, ``joint_friction``
+     - ``dof_armature``, ``dof_damping``, ``dof_frictionloss``
+     - ``JOINT_DOF_PROPERTIES``
+     - yes
+   * - ``joint_limit_lower``, ``joint_limit_upper``, ``joint_effort_limit``
+     - ``jnt_range``, ``jnt_actfrcrange``
+     - ``JOINT_DOF_PROPERTIES``
+     - yes
+   * - ``joint_limit_ke``, ``joint_limit_kd``, ``mujoco.solreflimit``
+     - ``jnt_solref`` (see `Joint-limit stiffness and damping`_)
+     - ``JOINT_DOF_PROPERTIES``
+     - yes
+   * - ``body_mass``, ``body_com``, ``body_inertia``, ``mujoco.gravcomp``
+     - ``body_mass``, ``body_ipos``, ``body_inertia``, ``body_gravcomp``
+     - ``BODY_INERTIAL_PROPERTIES``
+     - yes
+   * - ``shape_material_mu``, ``shape_material_mu_torsional``,
+       ``shape_material_mu_rolling``
+     - ``geom_friction``
+     - ``SHAPE_PROPERTIES``
+     - yes
+   * - ``shape_material_ke``, ``shape_material_kd``, ``mujoco.solref``
+     - ``geom_solref`` (see `Shape-material contact stiffness and damping`_)
+     - ``SHAPE_PROPERTIES``
+     - yes
+   * - ``shape_margin``, ``shape_gap``, ``mujoco.geom_solimp``,
+       ``mujoco.geom_solmix``
+     - ``geom_margin``, ``geom_gap``, ``geom_solimp``, ``geom_solmix``
+     - ``SHAPE_PROPERTIES``
+     - yes
+   * - ``gravity``
+     - ``opt.gravity``
+     - ``MODEL_PROPERTIES``
+     - yes
+   * - ``mujoco.eq_solref``, ``mujoco.eq_solimp``,
+       ``mujoco.equality_constraint_*``
+     - ``eq_solref``, ``eq_solimp``, ``eq_data``, ``eq_active``
+     - ``CONSTRAINT_PROPERTIES``
+     - yes
+   * - ``mujoco.tendon_*``
+     - ``tendon_*``
+     - ``TENDON_PROPERTIES``
+     - yes
+   * - ``mujoco.actuator_*`` of ``CTRL_DIRECT`` actuators
+     - ``actuator_*``
+     - ``ACTUATOR_PROPERTIES``
+     - yes
+   * - ``mujoco.geom_priority``, ``mujoco.condim``, ``joint_target_mode``,
+       ``mujoco.ctrl_source``, solver options (``model.mujoco.<option>``)
+     - ``geom_priority``, ``geom_condim``, actuator set, ``opt.*``
+     - construction only
+     - no, except the options listed below
+
+``mujoco.gravcomp`` is refreshed by ``BODY_INERTIAL_PROPERTIES``, not by
+``BODY_PROPERTIES``. ``BODY_PROPERTIES`` only rewrites the armature of DOFs
+whose bodies change kinematic state (``body_flags``).
+
+Changing ``mujoco.geom_priority``, ``mujoco.condim``, ``mujoco.ctrl_source``, or
+``model.mujoco.<option>`` after construction has no effect, even with
+``ModelFlags.ALL``. Among the solver options, ``impratio``, ``tolerance``,
+``ls_tolerance``, ``ccd_tolerance``, ``sleep_tolerance``, ``density``,
+``viscosity``, ``gravity``, ``wind``, and ``magnetic`` are stored per world.
+``iterations``, ``ls_iterations``, ``solver``, ``integrator``, ``cone``,
+``jacobian``, and the enable/disable flags are shared by all worlds.
+``opt.timestep`` is overwritten with the ``dt`` passed to
+:meth:`~newton.solvers.SolverMuJoCo.step` on every step.
+
+The solver does not read :attr:`~newton.Model.joint_velocity_limit`,
+:attr:`~newton.Model.shape_material_restitution`,
+:attr:`~newton.Model.body_inv_mass`, or :attr:`~newton.Model.body_inv_inertia`.
+It reads :attr:`~newton.Model.shape_material_kf` only with
+``use_mujoco_contacts=False`` (see :ref:`mujoco-contact-friction-solreffriction`).
+
+Actuator gains and control source
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each MuJoCo actuator has a control source,
+:class:`~newton.solvers.SolverMuJoCo.CtrlSource`, which is fixed at construction:
+
+- ``JOINT_TARGET`` actuators are created from
+  :attr:`~newton.Model.joint_target_mode`. Their ``gainprm`` and ``biasprm``
+  come from :attr:`~newton.Model.joint_target_ke` and
+  :attr:`~newton.Model.joint_target_kd` (``JOINT_DOF_PROPERTIES``); their
+  inputs come from :attr:`~newton.Control.joint_target_q` and
+  :attr:`~newton.Control.joint_target_qd`. ``ACTUATOR_PROPERTIES`` copies only
+  ``mujoco.actuator_ctrlrange`` into these actuators.
+  ``mujoco.actuator_gainprm``, ``actuator_biasprm``, ``actuator_dynprm``,
+  ``actuator_forcerange``, ``actuator_actrange``, ``actuator_gear``, and
+  ``actuator_cranklength`` of their rows are not read. Their force range is
+  set at construction, except that ball-joint actuators without an authored
+  force range take it from :attr:`~newton.Model.joint_effort_limit`.
+- ``CTRL_DIRECT`` actuators take ``gainprm``, ``biasprm``, ``dynprm``,
+  ``ctrlrange``, ``forcerange``, ``actrange``, ``gear``, and ``cranklength``
+  from the ``mujoco.actuator_*`` arrays (``ACTUATOR_PROPERTIES``) and their
+  inputs from ``control.mujoco.ctrl``.
+
+MJCF ``<position>`` and ``<velocity>`` actuators on joints are imported as
+``JOINT_TARGET`` actuators unless ``ctrl_direct=True`` is passed to
+:meth:`~newton.ModelBuilder.add_mjcf`. Other actuator types, such as ``<motor>``,
+are imported as ``CTRL_DIRECT``.
+
+The actuator set is fixed when the solver is constructed. After that,
+``JOINT_DOF_PROPERTIES`` reads :attr:`~newton.Model.joint_target_mode` only to
+decide whether a ``POSITION`` actuator also takes ``joint_target_kd``, and it
+uses the value of world 0 for all worlds.
+
+Contact and constraint buffers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+With MuJoCo Warp, ``nconmax`` contacts per world are allocated as one buffer
+of ``nconmax * world_count`` contacts that all worlds share, while ``njmax``
+limits the constraint rows of each world separately. When the buffers
+overflow, MuJoCo Warp prints a ``broadphase overflow``,
+``narrowphase overflow``, or ``nefc overflow`` message. It also sets the
+matching per-world bit in ``solver.mjw_data.overflow``, which stays set until
+the MuJoCo Warp data is reset. Contacts and constraint rows beyond the
+capacity are not stored.
+
+MuJoCo Warp limits
+~~~~~~~~~~~~~~~~~~
+
+The MuJoCo Warp backend (``use_mujoco_cpu=False``, the default) does not
+implement every MuJoCo feature:
+
+- The noslip solver: ``mujoco_warp.put_model`` raises ``NotImplementedError``
+  for ``noslip_iterations > 0``, and :class:`~newton.solvers.SolverMuJoCo`
+  has no noslip option.
+- The ``PGS`` solver; ``solver`` accepts ``"cg"`` and ``"newton"``.
+- The ``override``, ``fwdinv``, and ``island`` enable flags, and the
+  ``midphase`` and ``autoreset`` disable flags.
+
+With MuJoCo's default ``refsafe`` flag, positive ``solref`` time constants
+below ``2 * dt`` are evaluated as ``2 * dt``. Direct-format negative
+``solref`` values are not clamped (see :ref:`mujoco-contact-solref-conversion`).
+
+
 .. _mujoco-kinematic-links-and-fixed-roots:
 
 Kinematic links and fixed roots

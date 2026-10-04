@@ -68,14 +68,59 @@ Arguments after ``--`` go to the script's own parser. The host
 (:class:`newton.mcp.ExampleHost`) enables trusted execution, exposes the live
 ``example`` and its ``module``, and includes the example's own Warp arrays and
 scalar attributes in checkpoints so controller phases rewind with the physics.
-After a cell rebinds or changes any example attribute (a gain, a shake
-amplitude, a replacement solver), the host re-records the example's CUDA graphs
-before the next step and reports this as ``note`` in the execution result; call
-``recapture()`` after in-place changes it cannot detect. Python errors are
-reported without invalidating the scene. ``newton_rebuild`` reloads the edited
-script from disk in the same process. ``--workers N`` also hosts ``N`` sibling
-copies of the script and exposes them as ``workers`` (see
-:class:`newton.mcp.WorkerPool`) for parallel parameter sweeps.
+
+Before the first step after a cell, the host compares the example's attributes,
+the script's module globals, and the attributes of the objects the example
+holds (solver, model, collision pipeline, the script's own objects such as
+controllers, and their option objects, three levels deep) with their values
+when the example's CUDA graphs were recorded. Scalars and small plain-data containers compare by value, other
+objects by identity. If any of them changed (a gain, ``SUBSTEPS``, a solver
+option, a replacement solver), the host re-records the graphs and reports this
+as ``note`` in the execution result; settings that stepping itself advances,
+such as timers, do not count. ``recapture()`` re-records them explicitly.
+
+``newton_rebuild`` reloads the edited script from disk in the same process,
+together with the modules it imports from its own directory. If loading or
+constructing the example raises, the previous scene (and the previously loaded
+helper modules) keep running and the error shows the traceback of the script
+with ``file:line``. ``newton_rebuild(arguments={"restart": true})`` first loads
+the script with the requested overrides and parses the requested arguments in a
+new process; if that fails, the restart is refused and the current process keeps
+running. If ``Example()`` then fails in the restarted process, it builds with the
+previous arguments and overrides instead and says so in the ``note`` of the next
+execution result. A ``SystemExit`` raised by a cell, a step, or the example's
+argument parser is reported as an error instead of ending the host. Rebuild
+``overrides`` set module globals after the script is loaded and before
+``Example()`` is constructed:
+
+.. code-block:: python
+
+   client.request("rebuild", overrides={"SUBSTEPS": 32, "PARAMS": {"dt": 0.001}})
+
+A dictionary merges into a dictionary global (recursively); other values replace
+the global, keeping a float global a float and a tuple a tuple. Module code that
+already ran while loading, such as a constant computed from the original value
+or a default argument, keeps the original value. The given mapping becomes the
+active set for later rebuilds and restarts; omit ``overrides`` to keep it and
+pass ``{}`` to clear it. Every response, including errors, reports the active
+set as ``overrides``. ``python -m newton.mcp host ... --overrides JSON`` starts
+with an active set.
+
+``--workers N`` also hosts ``N`` sibling copies of the script in separate
+processes and exposes them as ``workers`` (see :class:`newton.mcp.WorkerPool`)
+for parallel parameter sweeps, plus ``jobs`` (:class:`newton.mcp.JobQueue`) for
+background calls; ``--max-workers M`` (default ``max(N, 4)``) bounds
+``workers.resize(n)``. Workers follow every successful ``newton_rebuild``,
+including its ``overrides`` and example arguments.
+
+``fresh(argv_list, call=..., frames=..., timeout=300, parallel=2, wait=True)``
+runs the script as saved on disk, without the session's live edits or build
+overrides (reported as ``overrides_not_applied``), in new Python processes
+through ``python -m newton.examples.headless`` (see :doc:`development`). It starts at most ``parallel`` of the session's processes
+at once and returns one report per argument list; ``wait=False`` returns a
+handle with ``done()``, ``result()``, and ``cancel()``. Processes still running
+at their timeout or when the session closes are killed together with the
+processes they started.
 
 Connect an MCP client
 ---------------------
@@ -97,16 +142,15 @@ images remain available through ``show(session.dispatch("observe", ...))``.
 The profile changes presentation, not permissions:
 trusted execution still requires ``allow_execute=True``. Python can call
 ``session.dispatch(operation, arguments)`` for every structured operation listed
-by ``describe``. Rebuild remains a separate tool because an invalid session
-rejects ordinary Python execution while invalid. Explicit trusted recovery
-modes remain available through ``newton_execute`` as described below.
+by ``describe``. Rebuild remains a separate tool because it is the way out of
+an invalid scene, which refuses stepping and observation.
 
 This adapter implements newline-delimited JSON-RPC initialization and tools,
 following the `MCP stdio transport specification
 <https://modelcontextprotocol.io/specification/2025-11-25/basic/transports>`_.
 Tool results carry a compact JSON text block (default-valued status fields are
-omitted) followed by any images. The server instructions include a short
-workflow guide, followed by application notes passed as
+omitted) followed by any images. The server instructions describe the tools
+and helpers, followed by application notes passed as
 ``SimulationSession(..., guide=...)``.
 
 Its authenticated TCP connection to the embedded session is an internal
@@ -164,14 +208,13 @@ running collision detection. Use ``contacts(refresh=True)`` or ``collide`` to
 regenerate diagnostic contacts, including before an observation with contact
 overlays. The default step path regenerates its contacts before physics;
 application callbacks remain responsible for their own collision workflow.
-A failed physics step pauses and invalidates the session until reset. Playback
-keeps servicing requests and exposes a bounded ``last_error`` in status.
-An arbitrary Python failure or model-notification failure may leave model and
-solver data inconsistent. Rebuilding restores known bindings; an explicitly
-acknowledged Python recovery is also available to callers that can verify or
-repair coherence, as described below. ``replace()`` accepts a
-new model and solver; a registered rebuild callback can expose this through
-MCP without restarting the process.
+A failed ``step`` (or ``filmstrip``) rolls back to the state before the call,
+as described in :ref:`live-mcp-rollback`. Playback pauses after a failed step
+and exposes a bounded ``last_error`` in status. A failed model notification
+during ``edit`` leaves model and solver coherence unknown and invalidates the
+scene until it is rebuilt. ``replace()`` accepts a new model and solver; a
+registered rebuild callback can expose this through MCP without restarting the
+process.
 
 ``contacts`` distinguishes generated collision-pipeline records from coupled
 entry records. It reports counts, capacities, possible overflow, generation
@@ -237,8 +280,8 @@ functions, and ``@wp.func`` / ``@wp.kernel`` definitions that can be launched
 in later calls. IPython magics and top-level ``await`` are not implemented.
 
 The reserved names ``session``, ``model``, ``solver``, ``state``, ``state_next``,
-``control``, ``contacts``, ``viewer``, ``wp``, ``np``, and ``show`` refresh before
-each call and after managed state changes. Objects passed as
+``control``, ``contacts``, ``viewer``, ``wp``, ``np``, ``newton``, ``show``, and the
+analysis helpers below refresh before each call and after managed state changes. Objects passed as
 ``SimulationSession(..., namespace={...})`` are also refreshed before each
 call, so applications can expose their own controllers or task objects. Functions that read these globals see the
 current state after an odd number of buffer swaps, including steps initiated
@@ -293,9 +336,14 @@ and drops its registered definitions. Escaped references, separately named Warp
 modules, and captured CUDA graphs remain application-owned; Warp's ordinary
 module metadata and disk kernel cache are not globally erased.
 
-The source cache retains at most 64 cells of at most 65536 characters each.
-Older Python functions still execute, but source inspection may be unavailable
-after their cell is evicted. ``describe`` and successful execution responses
+The source cache retains the 64 most recent cells of at most 65536 characters
+each, plus older cells that still define a function or class bound in the
+workspace (at most 512 cells in total), so :func:`inspect.getsource` keeps
+working for live definitions. Classes defined at the top level of a cell are
+moved into a per-cell module whose ``__file__`` names the cached cell source,
+which is where :func:`inspect.getsource` looks for a class; they still pickle
+by reference. Older Python functions still execute, but source inspection may
+be unavailable after their cell is evicted. ``describe`` and successful execution responses
 include workspace generation, cell count, a bounded list of variable names,
 and the most recent execution diagnostic. Diagnostics identify the exception,
 cell, source line, and up to eight user-code stack frames.
@@ -309,13 +357,83 @@ Trusted cells can use these helpers without imports (``newton``, ``np``, and
 - :meth:`~newton.mcp.SimulationSession.rollout` steps the scene and samples
   named series (callables or workspace expressions such as
   ``"state.body_q.numpy()[3, 2]"``) in one call, optionally resetting or
-  restoring a checkpoint first, stopping on a condition, and plotting the result.
+  restoring a checkpoint first and stopping on a condition.
 - :meth:`~newton.mcp.SimulationSession.solver_contacts` groups the solver's
   active contacts by shape pair and lists the parameters the solver actually
   integrates, such as MuJoCo ``solref``, ``solimp``, and friction after geom
   priority and material mixing, next to the authored shape materials.
-- :meth:`~newton.mcp.SimulationSession.health` flags non-finite state, runaway
-  velocities, deep penetration, and full solver contact or constraint buffers.
+- :meth:`~newton.mcp.SimulationSession.contacts_between` reports the contact
+  count, normal and friction force, slip speed, and penetration between two
+  shape sets; it also works as a ``rollout`` probe.
+- :meth:`~newton.mcp.SimulationSession.solver_params` lists, per actuator,
+  joint, geom, body, equality constraint, or solver option, the value
+  :class:`~newton.solvers.SolverMuJoCo` integrates, the Newton model array and
+  index it comes from, the :class:`~newton.ModelFlags` category that refreshes
+  it, whether it can differ per world, and model values that differ from the
+  compiled ones (``pending``). Other solvers report the Newton model values.
+  It is :func:`newton.utils.report_solver_params` applied to the session's
+  solver.
+- :meth:`~newton.mcp.SimulationSession.health` checks any solver and state
+  (default: the session's) for non-finite values, runaway speeds, full contact
+  or constraint buffers, and penetrating shape pairs, naming the worlds
+  involved; ``twins=True`` also reports worlds whose joint state deviates from
+  the others. It is :func:`newton.utils.report_health` applied to the session's
+  model, state, solver, and contacts.
+- :meth:`~newton.mcp.SimulationSession.swap_solver` replaces the solver with
+  ``factory(model)``: it installs the new solver (a hosted example re-records
+  its CUDA graphs), steps a copy of the current state for two frames, runs
+  ``health()``, and restores the state. If any of this raises, or ``health()``
+  reports a warning the current state does not already show, the previous
+  solver, graphs, and state are reinstated and the error is raised.
+- :meth:`~newton.mcp.SimulationSession.diff_model` lists the model arrays and
+  scalars that differ from the last build (or from its previous call), keyed by
+  entity label with old and new values, plus the
+  :class:`~newton.ModelFlags` inferred for the changed fields.
+
+After each cell, and before each ``rollout``, step, or ``filmstrip`` inside a
+cell, the session compares device checksums of the model arrays solvers read
+with their previous values. Changed arrays whose :class:`~newton.ModelFlags`
+category no ``notify_model_changed`` call covered are notified with the inferred
+flags, and the execution result's ``note`` names the changed fields, the flags,
+and edited fields the current solver configuration does not read (for example
+``mujoco.actuator_gainprm`` of actuators driven by ``joint_target_ke``).
+A ``notify_model_changed`` call covers a changed array only if it was made on
+the session's solver with the array's category after the array's last change;
+calls on other solver objects, or before the edit, are listed in the note.
+``session.watch.mode = "report"`` reports without notifying and ``"off"``
+disables the checks. Edits made by the application's own ``step()``, also when a
+cell calls ``example.step()``, are not reported. Reading the checksums before a
+step waits for the device work queued before it.
+
+Writing live results back to the script
+---------------------------------------
+
+Values and definitions developed in trusted cells can be written into the
+hosted script (:attr:`~newton.mcp.SimulationSession.source_path`, which
+:class:`~newton.mcp.ExampleHost` sets) instead of being retyped:
+
+- :meth:`~newton.mcp.SimulationSession.persist` replaces the value of a
+  module-level ``NAME = <literal>`` assignment. NumPy and Warp values become
+  plain literals. When the old and new values have the same dictionary keys or
+  sequence lengths, only the differing entries are rewritten, so comments inside
+  the literal remain.
+- :meth:`~newton.mcp.SimulationSession.persist_source` replaces a top-level
+  ``def`` or ``class`` (or a method, with ``target="Class.method"``) with the
+  source of the object defined in a cell, re-indented to fit.
+
+Both refuse a target that is missing, bound more than once at that level, or
+not a literal assignment or definition, and they change nothing else in the
+file. They print a unified diff, save the previous file under
+``<artifact_directory>/persist/``, and then rebuild the scene and any worker
+sessions unless ``rebuild=False``. A ``check`` expression is evaluated before
+writing and again after the rebuild; the result reports both values and
+whether they agree within ``tolerance``.
+
+.. code-block:: python
+
+   module.PARAMS["kp"] = 80.0  # live edit while experimenting
+   persist("PARAMS", check="rollout(seconds=1.0, start=True, record={'x': 'state.body_q.numpy()[0, 0]'})['x'][-1]")
+   persist_source(step, target="Example.step")
 
 Parallel worker sessions
 ------------------------
@@ -323,60 +441,99 @@ Parallel worker sessions
 Every request to one session runs on its owner thread, so candidate
 evaluations issued through one live application run one after another.
 Script-based workflows can instead run several simulator processes at once.
-To recover that parallelism without giving up persistent state, pass the
-connection files of sibling sessions (typically more instances of the same
-application) as ``SimulationSession(..., workers=[...])``. Trusted execution
-then receives a :class:`newton.mcp.WorkerPool` named ``workers``:
+To recover that parallelism without giving up persistent state, a session can
+own a :class:`newton.mcp.WorkerPool` of sibling sessions (typically more
+instances of the same application). ``python -m newton.mcp host ... --workers N``
+launches one with :meth:`~newton.mcp.WorkerPool.launch`; an embedding
+application can also attach existing sessions by passing their connection files
+as ``SimulationSession(..., workers=[...])``. Trusted execution receives the
+pool as ``workers``:
 
 .. code-block:: python
 
-   workers.broadcast("def evaluate(p):\n    task.set_params(p)\n    ...\n    return loss")
-   losses = workers.map("result = evaluate(args)", candidates)
+   def evaluate(stiffness):
+       model.joint_target_ke.fill_(stiffness)
+       solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+       series = rollout(seconds=2.0, start=True, record={"x": "state.body_q.numpy()[0, 0]"})
+       return float(abs(series["x"][-1] - TARGET))
 
-``broadcast`` runs a cell on every worker, ``map`` spreads one cell per
-argument over idle workers and returns results in input order, and ``submit``
-returns a future. Each worker keeps its own scene and Python workspace.
-Worker jobs run with ``recovery="acknowledge"`` so a failed job does not block
-that worker; ``map`` returns ``{"error": ...}`` for the failed item. Rebuild or
-reset a worker whose scene a failed job may have left inconsistent.
+   TARGET = 0.25
+   losses = workers.map(evaluate, np.linspace(100.0, 1000.0, 16))
 
-Explicit recovery after an execution error
-------------------------------------------
+``map`` calls a function once per item on the free workers and returns the
+results in input order, ``submit`` returns a future, and ``broadcast`` runs a
+function or code string once on every worker. Each worker keeps its own scene
+and Python workspace:
 
-A syntax or compilation error runs no Python and leaves scene validity
-unchanged. A runtime exception may occur after partial mutations. It preserves
-Python variables and imports that were created before the error, pauses
-playback, and sets ``valid=False`` and ``requires_rebuild=True``. There is no
-automatic rollback, and the exception type alone is not evidence that model
-and solver data are coherent. A ``NameError`` can occur after a successful
-mutation just as a solver error can.
+* Functions defined in trusted-execution cells, including lambdas and
+  closures, are sent by source. Their cells stay registered in
+  :mod:`linecache`, so :func:`inspect.getsource` and tracebacks also work for
+  them. The cell functions and classes a function uses and the session globals
+  it reads (``TARGET`` above) are sent with it; arguments, those globals, and
+  results are pickled, and Warp arrays travel as NumPy data.
+* Names bound to a session's live objects (``example``, ``model``, ``state``,
+  ``solver``, ``rollout``, ...) are not sent: on a worker they refer to the
+  worker's own scene, which does not have the main session's live edits.
+* ``workers.sync(name=value)`` copies values into every worker's globals once;
+  functions do not resend a synced global while the session still binds the
+  same object.
+* Code strings run as cells on a worker with the item bound to ``args``.
+* A failed call rolls back its worker's simulation like any failed cell, and
+  the error says what was restored; the worker's Python variables are kept. It
+  returns ``{"error": ...}`` from ``map`` (with the worker's cell and line) and
+  raises from ``submit`` and ``broadcast``.
+* Warp kernels sent with a function are defined in a module named after their
+  source, so all workers (and restarted ones) share their kernel-cache entry.
 
-The ``recovery`` argument has three explicit choices:
+A launched pool follows ``newton_rebuild`` with the same arguments. Idle workers
+rebuild before the rebuild returns; a worker that is running a call or still
+starting rebuilds right after it, before any queued call, and is listed as
+``pending``. Each rebuild increments the pool's ``build`` count, which
+``workers.status()`` and every job record report. A worker
+whose process exits or whose CUDA context fails is restarted, and earlier
+``broadcast`` and ``sync`` calls are replayed on it in order;
+``workers.resize(n)`` adds or removes workers the same way. The session lists
+such events under ``workers`` in its next execution response.
 
-* ``"none"`` is the default and rejects execution while the session is invalid.
-* ``"inspect"`` permits trusted Python diagnosis or repair while invalid. It
-  does not automatically restore validity or resume playback. Structured
-  simulation stepping remains blocked until recovery is acknowledged or the
-  scene is rebuilt.
-* ``"acknowledge"`` explicitly accepts the caller's responsibility for checking
-  or repairing model/solver coherence. If the cell completes successfully,
-  it clears invalidation and leaves playback paused. A failed cell remains
-  invalid. This does not reset arrays, notify solvers, clear solver caches,
-  or prove that arbitrary mutations were repaired.
+``jobs.start(fn_or_code, *args, where="worker")`` queues a background call and
+returns a job id at once; nothing runs on the main session's simulation.
+``jobs.wait(timeout=..., any=True)`` returns finished results and the lines
+running jobs printed since the previous wait, with the worker and the ``build``
+its scene had when the job started, and every execution response lists jobs
+that finished since the previous response. Other places to run jobs
+are added with :meth:`~newton.mcp.JobQueue.register_backend`.
 
-For a known analysis-only error, inspect the retained variables and acknowledge
-only after verifying that no simulation mutation needs repair:
+.. _live-mcp-rollback:
 
-.. code-block:: python
+Rollback after a failed call
+----------------------------
 
-   client.request("execute", code="len(samples)", recovery="inspect")
-   client.request("execute", code="", recovery="acknowledge")
+A syntax or compilation error runs no Python. Before a cell runs, the session
+copies the simulation's mutable arrays on their device: state, control, model
+arrays, and arrays the application registers (a hosted example's own Warp
+arrays). A hosted example also remembers its attributes and its script's module
+globals, including the contents of small plain-data lists and dictionaries.
+If the cell raises, also inside ``rollout`` or a step, the session
 
-After an actual model mutation, diagnosis and repair may require restoring
-saved arrays and notifying or rebuilding the solver. Use the application's
-``rebuild`` callback when coherence is uncertain. Trusted recovery remains
-unrestricted Python and requires the same explicit ``allow_execute=True``
-opt-in as ordinary execution; it is not a read-only sandbox.
+* rebinds replaced objects (the solver, state buffers, example attributes, and
+  module globals) and their CUDA graphs,
+* writes back the arrays whose contents changed and notifies the solver about
+  restored model fields with the matching :class:`~newton.ModelFlags`,
+* restores time and frame and, if the state moved, resets solver caches and
+  contacts as ``restore`` does,
+
+and reports what it restored in the error. If nothing changed, it says so and
+leaves hidden solver state alone. Python variables assigned before the error
+are kept. Objects changed in place outside these copies (solver internals,
+meshes, large containers) are not restored. Array groups larger than 256 MiB
+keep their identities but not their contents, and the error lists them. A
+failed ``step`` or ``filmstrip`` request rolls back the same way.
+
+Only a failure of the rollback itself, a failed model notification, or a failed
+``replace`` invalidates the scene. While invalid, Python cells still run (for
+example to save results), and stepping or observing raises an error that points
+to ``rebuild``; ``rebuild`` with ``restart`` starts a fresh process after a CUDA
+error.
 
 Queue waiting has a deadline and expired pending mutations are cancelled.
 Once an operation starts, the client waits for completion because running

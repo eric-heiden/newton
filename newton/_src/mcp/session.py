@@ -9,10 +9,10 @@ import ast
 import base64
 import builtins
 import contextlib
+import functools
 import inspect
 import io
 import json
-import linecache
 import math
 import queue
 import sys
@@ -23,7 +23,7 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import warp as wp
@@ -32,6 +32,12 @@ from ..sim.collide import CollisionPipeline
 from ..sim.contact_kinematics import eval_rigid_contact_kinematics
 from ..sim.enums import JointType, ModelFlags, StateFlags
 from ..sim.model import Model
+from .cells import cell_filename, forget_cell_source, register_cell_source, retain_cell_sources
+
+if TYPE_CHECKING:
+    from .workers import WorkerPool
+
+_OMITTED = object()
 
 
 def _integer(value: Any, name: str, minimum: int, maximum: int) -> int:
@@ -160,6 +166,10 @@ def _result_summary(value: Any) -> str:
     return f"<{name} object; inspect selected attributes of _>"
 
 
+class _HealthWarnings(RuntimeError):
+    """New health() warnings during a solver swap trial."""
+
+
 class SimulationSession:
     """Own the live bindings and serialize simulation operations on one thread.
 
@@ -170,9 +180,9 @@ class SimulationSession:
         Hidden solver state is reset, not checkpointed, so restore does not
         promise bitwise replay. Trusted execution uses a persistent Python
         workspace, not a sandbox. It survives physical resets and is cleared
-        by scene replacement. Explicit recovery acknowledgement accepts the
-        caller's assessment of model/solver coherence; it does not prove safety
-        or roll back mutations.
+        by scene replacement. A failed cell or step rolls the simulation back
+        to its state before the call (Python variables are kept); see
+        :ref:`live-mcp-rollback` for what the rollback covers.
 
     Args:
         model: Finalized model.
@@ -192,8 +202,7 @@ class SimulationSession:
         rebuild_callback: Optional ``callback(session, **arguments)`` returning
             keyword bindings for :meth:`replace`.
         allow_execute: Enable trusted, unrestricted Python execution in a
-            persistent workspace. Runtime failures require rebuilding or
-            explicit inspection and acknowledgement of repaired/verified state.
+            persistent workspace. A cell that raises is rolled back.
         artifact_directory: Directory for observation and recording artifacts.
         namespace: Extra application objects exposed as globals in trusted
             execution, refreshed before every cell.
@@ -205,9 +214,29 @@ class SimulationSession:
         restore_callback: Optional ``callback(session, data)`` restoring what
             ``snapshot_callback`` captured, before ``reset_callback`` runs.
         workers: Connection files of sibling sessions (usually more instances
-            of the same application). Trusted execution receives a ``workers``
-            pool whose ``broadcast``/``map``/``submit`` run cells on them
-            concurrently.
+            of the same application), or a :class:`WorkerPool`. Trusted
+            execution receives it as ``workers``, whose ``map``/``submit``/
+            ``broadcast`` run functions and cells on them concurrently, and a
+            :class:`JobQueue` as ``jobs`` for background calls. Worker sessions
+            follow :meth:`dispatch` ``rebuild``; finished jobs and worker events
+            are added to the next execution response.
+        execute_callback: Optional ``callback(session)`` run after each
+            successful cell; a returned string is added as ``note``.
+        overlay_callback: Optional ``callback(session)`` returning meshes the
+            application draws itself.
+        undo_callback: Optional ``callback(session, copies)`` called before a
+            cell or step. It may register application arrays with
+            ``copies.capture(label, owner)`` and returns a function that
+            restores the application's Python attributes when the call fails
+            and returns the names it restored.
+        solver_callback: Optional ``callback(session, solver)`` that installs a
+            replacement solver in the application for :meth:`swap_solver`
+            (default: rebind ``session.solver``).
+        batch_callback: Optional ``callback(session)`` run after the session
+            itself changed the scene: a batch of consecutive steps (one ``step``
+            call or one :meth:`rollout`) or a rebuild.
+        close_callback: Optional ``callback(session)`` called once on the
+            owning thread when the session closes.
     """
 
     class _Request:
@@ -268,12 +297,16 @@ class SimulationSession:
         artifact_directory: str | Path | None = None,
         namespace: dict[str, Any] | None = None,
         guide: str | None = None,
-        workers: list[str | Path] | None = None,
+        workers: list[str | Path] | WorkerPool | None = None,
         snapshot_callback: Callable | None = None,
         restore_callback: Callable | None = None,
         execute_callback: Callable | None = None,
-        invalidate_on_error: bool = True,
         overlay_callback: Callable | None = None,
+        undo_callback: Callable | None = None,
+        solver_callback: Callable | None = None,
+        batch_callback: Callable | None = None,
+        close_callback: Callable | None = None,
+        sync_callback: Callable | None = None,
     ):
         self._owner = threading.get_ident()
         self._queue = queue.Queue(maxsize=64)
@@ -286,38 +319,71 @@ class SimulationSession:
         self._workspace_module = None
         self._workspace_warp_module = None
         self._workspace_sources = []
+        self._cell_modules = {}
+        self._model_baselines = {}
         self._workspace_generation = 0
         self._cell_count = 0
         self._execution_error = None
         self._shown_images = None
+        self._transaction_depth = 0
+        self._cell_undo = None
+        self._batch_step = 0
+        self._scene_generation = 0
         self.snapshot_callback = snapshot_callback
         self.restore_callback = restore_callback
         self.execute_callback = execute_callback
         """Called as ``execute_callback(session)`` after each successful trusted execution; a returned
         string is added to the execution result as ``note``."""
-        self.invalidate_on_error = invalidate_on_error
         self.overlay_callback = overlay_callback
         """Returns ``[(name, points, indices, color), ...]`` meshes drawn by the application itself,
         which color observations composite over the model's shapes."""
-        """Invalidate the scene when trusted execution raises. ``False`` reports the error and keeps the
-        scene valid; statements before the failing line keep their effects."""
+        self.undo_callback = undo_callback
+        self.solver_callback = solver_callback
+        self.batch_callback = batch_callback
+        self.status_fields: dict[str, Any] = {}
+        """Extra fields included in every status and appended to every error sent to clients
+        (e.g. a hosted script's active build overrides)."""
+        self.close_callback = close_callback
+        """Called once as ``close_callback(session)`` when the session closes, e.g. to stop application
+        subprocesses."""
+        self.sync_callback = sync_callback
+        """Called as ``sync_callback(session)`` before model-edit checks so ``solver``/``state`` bindings are
+        current when application code replaced them."""
+        from .solverview import ModelWatch  # noqa: PLC0415
+
+        self.watch = ModelWatch(self)
+        """Model-edit detection around trusted execution; ``watch.mode`` is ``"notify"``, ``"report"`` or
+        ``"off"``."""
         self.namespace = dict(namespace or {})
         """Extra names available in trusted execution, refreshed before each cell."""
         self.guide = guide
         """Application usage notes appended to the MCP server instructions."""
         self.workers = None
         """Optional :class:`WorkerPool` of sibling sessions, exposed as ``workers`` in trusted execution."""
-        if workers:
+        self._owns_workers = False
+        if workers is not None and not isinstance(workers, list | tuple):
+            self.workers = workers
+        elif workers:
             from .workers import WorkerPool  # noqa: PLC0415
 
-            self.workers = WorkerPool(workers)
+            self.workers = WorkerPool(list(workers))
+            self._owns_workers = True
+        from .jobs import JobQueue  # noqa: PLC0415
+
+        self.jobs = JobQueue(self.workers)
+        """Background jobs, exposed as ``jobs`` in trusted execution."""
+        if self.workers is not None:
+            self.workers.attach(lambda: self._workspace, self._session_names)
             self.namespace.setdefault("workers", self.workers)
+        self.namespace.setdefault("jobs", self.jobs)
         self.artifact_directory = Path(artifact_directory or tempfile.mkdtemp(prefix="newton-mcp-"))
         self.dt = self._timestep(dt)
         self.step_callback = step_callback
         self.reset_callback = reset_callback
         self.rebuild_callback = rebuild_callback
         self.allow_execute = allow_execute
+        self.source_path: Path | None = None
+        """Script that :meth:`persist` and :meth:`persist_source` edit; :class:`ExampleHost` sets it."""
         self.revision = 0
         self.replace(
             model,
@@ -380,6 +446,7 @@ class SimulationSession:
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
+        self._scene_generation += 1
         self.model, self.solver = model, solver
         self.state = state if state is not None else model.state()
         self.state_next = state_next if state_next is not None else model.state()
@@ -395,11 +462,20 @@ class SimulationSession:
         self.revision += 1
         self._checkpoints.clear()
         self._initial = self._snapshot()
+        self._model_baselines = {}
+        if self.allow_execute:
+            from .persist import ModelBaseline  # noqa: PLC0415
+
+            try:
+                self._model_baselines["build"] = ModelBaseline(model)
+            except Exception as error:
+                self._model_baselines["error"] = f"{type(error).__name__}: {str(error)[:200]}"
         self._contact_frame = None
         self._contact_revision = None
         self.last_error: str | None = None
         self._requires_rebuild = False
         self.valid = True
+        self.watch.reset()
         if keep_workspace:
             self._refresh_workspace()
         else:
@@ -438,18 +514,22 @@ class SimulationSession:
             snapshot["application"] = self.snapshot_callback(self)
         return snapshot
 
-    def _restore(self, snapshot: dict) -> dict:
-        self.paused = True
-        for root in ("state", "control"):
-            for field, data in snapshot[root].items():
-                _field(getattr(self, root), field).assign(data)
+    def _resync(self, time: float, frame: int) -> None:
+        """Reset solver history and contacts after the public state arrays were rewritten."""
         # Reset history without overwriting the restored public state with model defaults.
         self.solver.reset(self.state, flags=StateFlags.NONE)
         self.state_next.assign(self.state)
         self.collision_pipeline.reset_contact_matching()
         self.contacts.clear(bump_generation=True)
         self._contact_frame = self._contact_revision = None
-        self.time, self.frame = snapshot["time"], snapshot["frame"]
+        self.time, self.frame = time, frame
+
+    def _restore(self, snapshot: dict) -> dict:
+        self.paused = True
+        for root in ("state", "control"):
+            for field, data in snapshot[root].items():
+                _field(getattr(self, root), field).assign(data)
+        self._resync(snapshot["time"], snapshot["frame"])
         if self.restore_callback is not None and "application" in snapshot:
             self.restore_callback(self, snapshot["application"])
         if self.reset_callback is not None:
@@ -508,7 +588,14 @@ class SimulationSession:
                 request.started = True
             try:
                 request.result = self.dispatch(request.operation, request.arguments)
+            except SystemExit as error:
+                # Application code calling sys.exit() must not end the serving process.
+                request.error = RuntimeError(f"SystemExit({error.code!r}) raised during {request.operation}")
             except Exception as error:
+                if self.status_fields:
+                    # Clients see status fields such as active overrides on errors too (see transport).
+                    with contextlib.suppress(Exception):
+                        error.newton_status = _json(self.status_fields)
                 request.error = error
             finally:
                 request.done.set()
@@ -532,9 +619,9 @@ class SimulationSession:
                     try:
                         self.dispatch("step", {"count": 1})
                     except Exception as error:
+                        # The failed step was rolled back (or the scene is now invalid); stop playback.
+                        self.paused = True
                         self.last_error = str(error)[:4096]
-                        if self.valid:
-                            self._invalidate()
                 else:
                     time.sleep(0.005)
         finally:
@@ -553,11 +640,18 @@ class SimulationSession:
                     break
                 request.error = RuntimeError("Session closed before request execution")
                 request.done.set()
+        if self.close_callback is not None:
+            callback, self.close_callback = self.close_callback, None
+            callback(self)
         if self._renderer is not None:
             self._renderer.close()
+        if self._owns_workers:
+            self.workers.close()
         self._clear_workspace()
-        if self._workspace_module is not None and sys.modules.get(self._workspace_name) is self._workspace_module:
-            del sys.modules[self._workspace_name]
+        if self._workspace_module is not None:
+            # Also the aliases under which definitions shipped from other sessions live (see shipping).
+            for name in [name for name, module in sys.modules.items() if module is self._workspace_module]:
+                del sys.modules[name]
 
     def _status(self) -> dict:
         status = {
@@ -569,6 +663,7 @@ class SimulationSession:
             "closed": self._closed,
             "last_error": self.last_error,
             "requires_rebuild": self._requires_rebuild,
+            **self.status_fields,
         }
         return status
 
@@ -636,6 +731,7 @@ class SimulationSession:
             "capabilities": {
                 "execute": self.allow_execute,
                 "workers": 0 if self.workers is None else self.workers.count,
+                "workers_max": 0 if self.workers is None else self.workers.max_count,
                 "rebuild": self.rebuild_callback is not None,
                 "observation": {"sensor": True, "viewer": self.viewer is not None},
                 "record": True,
@@ -693,18 +789,20 @@ class SimulationSession:
         }
         if operation not in operations:
             raise ValueError(f"Unknown operation {operation!r}")
-        recovery_execution = operation == "execute" and args.get("recovery") in ("inspect", "acknowledge")
-        if (
-            not self.valid
-            and not recovery_execution
-            and operation not in {"describe", "guide", "query", "pause", "reset", "restore", "rebuild"}
-        ):
-            raise RuntimeError(
-                "Session is invalid after a failed mutation; reset or rebuild, or use trusted execute "
-                "with recovery='inspect' to diagnose and recovery='acknowledge' only after verifying coherence"
-            )
+        # Python stays available while invalid, e.g. to save results before a restart.
+        if not self.valid and operation not in {
+            "describe",
+            "guide",
+            "query",
+            "pause",
+            "reset",
+            "restore",
+            "rebuild",
+            "execute",
+        }:
+            raise RuntimeError(self._invalid_message())
         if self._requires_rebuild and operation in {"reset", "restore"}:
-            raise RuntimeError("Model/solver coherence is unknown after a failed mutation; rebuild the scene")
+            raise RuntimeError(self._invalid_message())
         return operations[operation](**args)
 
     def _invalidate(self, *, requires_rebuild: bool = False) -> None:
@@ -713,30 +811,131 @@ class SimulationSession:
         self._requires_rebuild |= requires_rebuild
         self.revision += 1
 
+    def _invalid_message(self) -> str:
+        reason = f" ({self.last_error[:1024]})" if self.last_error else ""
+        return (
+            f"The scene is invalid{reason}. newton_rebuild reloads it in this process and keeps Python variables; "
+            "newton_rebuild(arguments={'restart': true}) restarts the process, e.g. after a CUDA error."
+        )
+
+    def _undo_point(self):
+        """Snapshot for rolling back a top-level operation, or ``None`` if nested or invalid."""
+        if self._transaction_depth or not self.valid:
+            return None
+        from .rollback import UndoPoint  # noqa: PLC0415
+
+        try:
+            return UndoPoint(self)
+        except Exception as error:
+            # E.g. out of device memory for the copies; the operation still runs, without rollback.
+            self.last_error = f"no rollback snapshot: {type(error).__name__}: {error}"[:4096]
+            return None
+
+    def _roll_back(self, undo, *, quiet: bool = False, nested: bool = False) -> str | None:
+        """Undo a failed operation and describe the outcome.
+
+        Args:
+            undo: Undo point taken before the operation, or ``None``.
+            quiet: Return ``None`` instead of a description when nothing changed.
+            nested: The operation ran inside another rolled-back operation.
+        """
+        from .rollback import summarize  # noqa: PLC0415
+
+        if undo is None:
+            if not self.valid:
+                return "The scene was already invalid, so nothing was rolled back."
+            if nested:
+                return "Nothing was rolled back here; the enclosing call rolls back if it fails."
+            return f"Nothing was rolled back ({self.last_error}); statements before the error kept their effects."
+        try:
+            report = undo.rollback()
+        except Exception as error:
+            self._invalidate(requires_rebuild=True)
+            self.last_error = f"rollback failed: {type(error).__name__}: {error}"[:4096]
+            return f"Rolling the simulation back failed ({type(error).__name__}: {str(error)[:1024]}). " + (
+                self._invalid_message()
+            )
+        unchanged = not report.get("replaced") and not (report["restored"] or report["moved"] or report["bindings"])
+        if quiet and unchanged:
+            return None
+        self.paused = True
+        if not report.get("replaced"):
+            self.valid = True
+            self._requires_rebuild = False
+            self.last_error = None
+        self.revision += 1
+        if self._renderer is not None:
+            self._renderer.invalidate()
+        self._refresh_workspace()
+        return summarize(report, undo.uncovered)
+
+    def _roll_back_cell(self) -> str | None:
+        """Roll the simulation back to the start of the running top-level cell, e.g. after a failed worker call.
+
+        Returns:
+            A description of what was restored, or ``None`` if nothing changed or no cell is running.
+        """
+        if self._cell_undo is None:
+            return None
+        outcome = self._roll_back(self._cell_undo, quiet=True)
+        # Later edits in the cell are checked against the restored arrays.
+        self.watch.reset()
+        return outcome
+
+    def _undoable(self, label: str, run: Callable[[], Any]) -> Any:
+        """Run a top-level operation that rolls back when it raises."""
+        undo = self._undo_point()
+        self._transaction_depth += 1
+        try:
+            return run()
+        except (Exception, SystemExit) as error:
+            outcome = self._roll_back(undo, quiet=True) if undo is not None else None
+            if isinstance(error, SystemExit):
+                # sys.exit() in application code must not end the host process.
+                raise RuntimeError(
+                    f"SystemExit({error.code!r}) raised during {label}. {outcome or ''}".strip()
+                ) from error
+            if outcome is None:
+                raise
+            if error.args and isinstance(error.args[0], str):
+                # Keep the exception type (e.g. ValueError for bad arguments) and append the outcome.
+                error.args = (f"{error.args[0][:4096].rstrip('. ')}. {outcome}", *error.args[1:])
+                raise
+            raise RuntimeError(f"{type(error).__name__} during {label}: {str(error)[:4096]}. {outcome}") from error
+        finally:
+            self._transaction_depth -= 1
+
     def _step(self, *, count: int = 1, dt: float | None = None) -> dict:
         _integer(count, "count", 1, 10000)
         dt = self.dt if dt is None else self._timestep(dt)
-        try:
-            for _ in range(count):
-                if self.step_callback is None:
-                    self.state.clear_forces()
-                    self.collision_pipeline.collide(self.state, self.contacts, dt=dt)
-                    self._contact_frame, self._contact_revision = self.frame, self.revision
-                    self.solver.step(self.state, self.state_next, self.control, self.contacts, dt)
-                    self.state, self.state_next = self.state_next, self.state
-                else:
-                    self._contact_frame = self._contact_revision = None
-                    self.step_callback(self, dt)
-                self.time += dt
-                self.frame += 1
-                self.revision += 1
-                self._refresh_workspace()
-                if self._renderer is not None:
-                    self._renderer.after_step()
-        except Exception:
-            self._invalidate()
-            raise
+        # Edits made earlier in the same cell are checked (and notified) before stepping.
+        with self.watch.stepping("step"):
+            self._undoable("step", lambda: self._advance(count, dt))
         return self._status()
+
+    def _advance(self, count: int, dt: float, *, first: bool = True, last: bool = True) -> None:
+        """Step ``count`` times; ``first``/``last`` mark the ends of a batch of consecutive steps."""
+        if not self.valid:
+            raise RuntimeError(self._invalid_message())
+        for index in range(count):
+            self._batch_step = 0 if first and index == 0 else self._batch_step + 1
+            if self.step_callback is None:
+                self.state.clear_forces()
+                self.collision_pipeline.collide(self.state, self.contacts, dt=dt)
+                self._contact_frame, self._contact_revision = self.frame, self.revision
+                self.solver.step(self.state, self.state_next, self.control, self.contacts, dt)
+                self.state, self.state_next = self.state_next, self.state
+            else:
+                self._contact_frame = self._contact_revision = None
+                self.step_callback(self, dt)
+            self.time += dt
+            self.frame += 1
+            self.revision += 1
+            self._refresh_workspace()
+            if self._renderer is not None:
+                self._renderer.after_step()
+        if last and self.batch_callback is not None:
+            self.batch_callback(self)
 
     def _pause(self) -> dict:
         self.paused = True
@@ -750,7 +949,9 @@ class SimulationSession:
         try:
             return self._restore(self._initial)
         except Exception:
-            self._invalidate()
+            # Inside a cell, the cell's rollback repairs the state.
+            if not self._transaction_depth:
+                self._invalidate()
             raise
 
     def _checkpoint(self, *, name: str = "default") -> dict:
@@ -766,7 +967,8 @@ class SimulationSession:
         try:
             return self._restore(snapshot)
         except Exception:
-            self._invalidate()
+            if not self._transaction_depth:
+                self._invalidate()
             raise
 
     def _renderer_get(self):
@@ -783,12 +985,14 @@ class SimulationSession:
         return self._renderer_get().record(**kwargs)
 
     def _filmstrip(self, **kwargs) -> dict:
-        return self._renderer_get().filmstrip(**kwargs)
+        with self.watch.stepping("filmstrip"):
+            return self._undoable("filmstrip", lambda: self._renderer_get().filmstrip(**kwargs))
 
     def _guide(self) -> dict:
         return {"guide": self.guide}
 
     _MAX_SHOWN_IMAGES: ClassVar[int] = 8
+    _MAX_CELL_SOURCES: ClassVar[int] = 512
 
     def show(self, image: Any, label: str | None = None) -> None:
         """Attach an image to the current trusted-execution response.
@@ -831,8 +1035,7 @@ class SimulationSession:
             }
         )
 
-    _WORKSPACE_BINDINGS: ClassVar[tuple[str, ...]] = (
-        "session",
+    _SCENE_BINDINGS: ClassVar[tuple[str, ...]] = (
         "model",
         "solver",
         "state",
@@ -840,54 +1043,35 @@ class SimulationSession:
         "control",
         "contacts",
         "viewer",
-        "np",
-        "wp",
-        "newton",
+    )
+    _HELPERS: ClassVar[tuple[str, ...]] = (
         "show",
         "rollout",
         "health",
         "solver_contacts",
+        "solver_params",
         "render",
-        "compare_images",
         "contacts_between",
+        "swap_solver",
+        "persist",
+        "persist_source",
+        "diff_model",
     )
+    """Session methods bound under the same name in trusted execution."""
+    _WORKSPACE_BINDINGS: ClassVar[tuple[str, ...]] = ("session", *_SCENE_BINDINGS, "np", "wp", "newton", *_HELPERS)
     _EXPRESSION_RESULT = "__newton_expression_result__"
+    _CLASS_HOOK = "__newton_cell_class__"
 
     def _refresh_workspace(self) -> None:
         if self._workspace_module is None or self._closed:
             return
-        self._workspace.update(
-            {
-                name: getattr(self, name)
-                for name in self._WORKSPACE_BINDINGS
-                if name
-                not in (
-                    "session",
-                    "np",
-                    "wp",
-                    "newton",
-                    "show",
-                    "rollout",
-                    "health",
-                    "solver_contacts",
-                    "render",
-                    "compare_images",
-                    "contacts_between",
-                )
-            }
-        )
+        self._workspace.update({name: getattr(self, name) for name in self._SCENE_BINDINGS})
         self._workspace.update(self.namespace)
         import newton  # noqa: PLC0415
 
+        self._workspace.update({name: getattr(self, name) for name in self._HELPERS})
         self._workspace.update(
             session=self,
-            show=self.show,
-            rollout=self.rollout,
-            health=self.health,
-            solver_contacts=self.solver_contacts,
-            render=self.render,
-            compare_images=self.compare_images,
-            contacts_between=self.contacts_between,
             np=np,
             wp=wp,
             newton=newton,
@@ -898,9 +1082,23 @@ class SimulationSession:
             __builtins__=builtins.__dict__,
         )
 
+    def _session_names(self) -> set[str]:
+        """Names bound to this session's own objects, which worker calls resolve in their own session."""
+        return {*self._WORKSPACE_BINDINGS, *self.namespace, "collision_pipeline"}
+
+    def _background_report(self) -> dict:
+        report = {}
+        jobs = self.jobs.report()
+        if jobs:
+            report["jobs"] = jobs
+        events = self.workers.drain_events() if self.workers is not None else []
+        if events:
+            report["workers"] = events
+        return report
+
     def _clear_workspace(self) -> None:
         for filename in self._workspace_sources:
-            linecache.cache.pop(filename, None)
+            self._forget_cell(filename)
         self._workspace_sources.clear()
         self._workspace.clear()
         self._workspace_generation += 1
@@ -932,21 +1130,47 @@ class SimulationSession:
         }
 
     def _cache_cell_source(self, filename: str, code: str) -> None:
-        lines = code.splitlines(keepends=True)
-        if lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
-        linecache.cache[filename] = (len(code), None, lines, filename)
-        self._workspace_sources.append(filename)
-        if len(self._workspace_sources) > 64:
-            linecache.cache.pop(self._workspace_sources.pop(0), None)
+        register_cell_source(filename, code)
+        if filename not in self._workspace_sources:
+            self._workspace_sources.append(filename)
+        # Cells stay cached so inspect.getsource(), tracebacks, persist_source(), and workers.map(fn) keep
+        # working; beyond the limit, the oldest cells no reachable workspace definition comes from go first.
+        self._workspace_sources = retain_cell_sources(
+            self._workspace_sources, self._workspace, maximum=self._MAX_CELL_SOURCES, forget=self._forget_cell
+        )
+
+    def _forget_cell(self, filename: str) -> None:
+        forget_cell_source(filename)
+        module_name = self._cell_modules.pop(filename, None)
+        if module_name is not None:
+            sys.modules.pop(module_name, None)
+
+    def _bind_cell_class(self, cls: Any, *, filename: str, module_name: str) -> None:
+        from .persist import bind_cell_class  # noqa: PLC0415
+
+        # Source lookup is a convenience; it must never fail the cell that defines the class.
+        with contextlib.suppress(Exception):
+            if bind_cell_class(cls, self._workspace, self._workspace_name, filename, module_name):
+                self._cell_modules[filename] = module_name
 
     def _execution_diagnostic(self, error: BaseException, filename: str) -> dict:
+        from .rollback import user_frame  # noqa: PLC0415
+
+        cell_prefix = f"<{self._workspace_name}:"
+        # Cell frames plus frames in user files such as a hosted script, skipping Newton/Warp internals.
         frames = [
-            {"cell": frame.filename, "line": frame.lineno, "function": frame.name, "source": (frame.line or "")[:200]}
+            {
+                "cell" if frame.filename.startswith(cell_prefix) else "file": frame.filename,
+                "line": frame.lineno,
+                "function": frame.name,
+                "source": (frame.line or "")[:200],
+            }
             for frame in traceback.extract_tb(error.__traceback__)
-            if frame.filename.startswith(f"<{self._workspace_name}:")
+            if frame.filename.startswith(cell_prefix)
+            or (user_frame(frame.filename) and not frame.filename.startswith("<"))
         ][-8:]
-        line = getattr(error, "lineno", None) or (frames[-1]["line"] if frames else None)
+        cell_frames = [frame for frame in frames if "cell" in frame]
+        line = getattr(error, "lineno", None) or (cell_frames[-1]["line"] if cell_frames else None)
         return {
             "type": type(error).__name__,
             "message": str(error)[:4096],
@@ -955,17 +1179,15 @@ class SimulationSession:
             "frames": frames,
         }
 
-    def _execute(self, *, code: str, reset_namespace: bool = False, recovery: str = "none") -> dict:
+    def _execute(self, *, code: str, reset_namespace: bool = False) -> dict:
         if not self.allow_execute:
             raise PermissionError("Trusted Python execution was not enabled by the embedding application")
         if not isinstance(code, str) or len(code) > 65536:
             raise ValueError("code must be a string of at most 65536 characters")
         if not isinstance(reset_namespace, bool):
             raise ValueError("reset_namespace must be a boolean")
-        if not isinstance(recovery, str) or recovery not in ("none", "inspect", "acknowledge"):
-            raise ValueError("recovery must be none, inspect, or acknowledge")
         self._cell_count += 1
-        filename = f"<{self._workspace_name}:cell-{self._cell_count}>"
+        filename = cell_filename(self._workspace_name, self._cell_count)
         try:
             tree = ast.parse(code, filename=filename, mode="exec")
             if tree.body and isinstance(tree.body[-1], ast.Expr):
@@ -975,6 +1197,11 @@ class SimulationSession:
                     expression,
                 )
                 ast.fix_missing_locations(tree)
+            defines_classes = any(isinstance(node, ast.ClassDef) for node in tree.body)
+            if defines_classes:
+                from .persist import instrument_cell_classes  # noqa: PLC0415
+
+                instrument_cell_classes(tree, self._CLASS_HOOK)
             compiled = compile(tree, filename, "exec")
         except SyntaxError as error:
             self._execution_error = self._execution_diagnostic(error, filename)
@@ -993,50 +1220,67 @@ class SimulationSession:
         scope = self._workspace
         scope.pop("result", None)
         scope.pop(self._EXPRESSION_RESULT, None)
+        if defines_classes:
+            # Gives cell classes a source file for inspect.getsource() (see persist.bind_cell_class).
+            module_name = f"{self._workspace_name}.cell_{self._cell_count}"
+            scope[self._CLASS_HOOK] = functools.partial(
+                self._bind_cell_class, filename=filename, module_name=module_name
+            )
         output = self._Output(16384)
+        nested = self._transaction_depth > 0
+        undo = self._undo_point()
         self._shown_images = []
+        self._transaction_depth += 1
+        completed = False
+        if not nested:
+            self._cell_undo = undo
+            self.watch.begin()
         try:
-            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-                exec(compiled, scope)
-        except Exception as error:
+            try:
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                    exec(compiled, scope)
+                completed = True
+            finally:
+                scope.pop(self._CLASS_HOOK, None)
+                self._refresh_workspace()
+            # Re-recording CUDA graphs after the cell can fail too; it then rolls back like the cell.
+            note = self.execute_callback(self) if self.execute_callback is not None and self.valid else None
+            if not nested:
+                edits = self.watch.end() if self.valid else self.watch.abort()
+                note = "\n".join(part for part in (note, edits) if part) or None
+        except (Exception, SystemExit) as error:
             self._shown_images = None
             self._execution_error = self._execution_diagnostic(error, filename)
             diagnostic = self._execution_error
-            message = f"Python {diagnostic['type']} at line {diagnostic['line']}: {diagnostic['message']}"[:4096]
-            if not self.invalidate_on_error and self.valid:
-                self.paused = True
-                self.revision += 1
-                if self._renderer is not None:
-                    self._renderer.invalidate()
-                if self.execute_callback is not None:
-                    with contextlib.suppress(Exception):
-                        self.execute_callback(self)
-                raise RuntimeError(
-                    f"{message}. The scene stays valid; statements before the failing line kept their effects "
-                    "(restore a checkpoint to roll back). "
-                    f"frames={json.dumps(diagnostic['frames'])}; stdout={''.join(output.parts)!r}"
-                ) from error
-            self._invalidate(requires_rebuild=True)
-            self.last_error = message
+            if completed:
+                message = f"The cell completed, then updating the application (e.g. re-recording CUDA graphs) raised {diagnostic['type']}: {diagnostic['message']}"
+            elif isinstance(error, SystemExit):
+                message = f"SystemExit({error.code!r}) raised at line {diagnostic['line']}; the session keeps running"
+            else:
+                message = f"Python {diagnostic['type']} at line {diagnostic['line']}: {diagnostic['message']}"
+            message = message[:4096].rstrip(". ")
+            if not nested:
+                # The rollback restores model arrays itself; the next cell starts from a fresh baseline.
+                self.watch.abort()
+            outcome = self._roll_back(undo, nested=nested)
             raise RuntimeError(
-                f"{self.last_error}. Execution may have mutated the scene; paused and invalid, no rollback. "
-                "Workspace variables remain available. Use recovery='inspect' for diagnosis; acknowledge only "
-                "after verifying or repairing model/solver coherence, or rebuild. "
+                f"{message}. {outcome} Python variables assigned before the error are kept. "
                 f"frames={json.dumps(diagnostic['frames'])}; stdout={''.join(output.parts)!r}"
+                f"{self._background_suffix()}"
             ) from error
         finally:
-            self._refresh_workspace()
+            self._transaction_depth -= 1
+            if not nested:
+                self._cell_undo = None
         self.revision += 1
-        if recovery == "acknowledge":
-            self.paused = True
-            self.valid = True
-            self._requires_rebuild = False
+        if not nested:
+            # Nothing touched the model since the check that ended the cell.
+            self.watch.settle()
         if self.valid:
             self.last_error = None
             self._execution_error = None
         if self._renderer is not None:
             self._renderer.invalidate()
-        note = self.execute_callback(self) if self.execute_callback is not None and self.valid else None
         images, self._shown_images = self._shown_images, None
         explicit_result = "result" in scope
         value = scope.get("result") if explicit_result else scope.pop(self._EXPRESSION_RESULT, None)
@@ -1065,21 +1309,48 @@ class SimulationSession:
             "stdout": "".join(output.parts),
             "truncated": output.truncated,
             "workspace": self._workspace_info(),
-            **({"note": str(note)[:1024]} if note else {}),
+            **({"note": str(note)[:4096]} if note else {}),
             **({"images": images} if images else {}),
+            **self._background_report(),
         }
+
+    def _background_suffix(self) -> str:
+        report = self._background_report()
+        return f"; background={json.dumps(_result_json(report))}" if report else ""
 
     def _rebuild(self, *, reset_namespace: bool = False, **kwargs) -> dict:
         if self.rebuild_callback is None:
             raise ValueError("No rebuild callback was registered")
+        from .rollback import describe_exception  # noqa: PLC0415
+
+        started = time.perf_counter()
         try:
             bindings = self.rebuild_callback(self, **kwargs)
             if not isinstance(bindings, dict):
                 raise ValueError("Rebuild callback must return replacement keyword bindings")
+        except (Exception, SystemExit) as error:
+            # Nothing was replaced yet: the previous scene, its checkpoints, and its graphs stay in place.
+            previous = "keeps running unchanged" if self.valid else "is unchanged and still invalid"
+            raise RuntimeError(
+                f"Rebuild failed; the previous scene {previous}.\n{describe_exception(error)}"
+            ) from error
+        try:
             self.replace(**bindings, keep_workspace=not reset_namespace)
+            if self.batch_callback is not None:
+                self.batch_callback(self)
         except Exception:
             self._invalidate(requires_rebuild=True)
             raise
+        workers = None
+        if self.workers is not None and not kwargs.get("restart"):
+            # Workers rebuild after this session succeeded, from the kernels it just compiled; with no
+            # running workers this only records the arguments for workers started later.
+            count = self.workers.count
+            seconds = time.perf_counter() - started
+            workers = self.workers.rebuild(
+                {**kwargs, "reset_namespace": reset_namespace}, timeout=max(30.0, 3.0 * seconds)
+            )
+            workers = workers if count else None
         # Rebuilds repeat often while iterating on a script; the full describe payload (guide,
         # operation list, limits) would be re-sent into the agent's context every time.
         return {
@@ -1090,6 +1361,8 @@ class SimulationSession:
                 for name in ("world_count", "body_count", "shape_count", "joint_count", "joint_dof_count")
             },
             "solver": self._describe_solver(self.solver),
+            **({"workers_rebuilt": workers} if workers is not None else {}),
+            **self._background_report(),
         }
 
     def _query(
@@ -1423,7 +1696,6 @@ class SimulationSession:
         every: int = 1,
         start: bool | str = False,
         until: Callable | str | None = None,
-        plot: bool | list[str] = False,
     ) -> dict:
         """Step the scene and record time series in one call (trusted execution helper).
 
@@ -1440,7 +1712,6 @@ class SimulationSession:
                 checkpoint, ``False`` continues from the current state.
             until: Stop early once this callable/expression is truthy; the
                 reason is reported in ``stopped``.
-            plot: Show a plot of all (or the named) scalar/vector series.
 
         Returns:
             Dictionary with ``t`` [s] and one NumPy array per recorded name
@@ -1453,10 +1724,6 @@ class SimulationSession:
             frames = max(1, round(float(seconds) / self.dt))
         _integer(frames, "frames", 1, 1_000_000)
         _integer(every, "every", 1, 1_000_000)
-        if start is True:
-            self._reset()
-        elif isinstance(start, str):
-            self._restore_named(name=start)
         probes = {}
         for name, probe in (record or {}).items():
             if isinstance(probe, str):
@@ -1483,16 +1750,29 @@ class SimulationSession:
                 else:
                     series[name].append(value.numpy() if isinstance(value, wp.array) else np.asarray(value))
 
-        sample()
-        for index in range(frames):
-            self._step(count=1)
-            last = index == frames - 1
-            done = bool(stop(self)) if stop is not None else False
-            if done or last or (index + 1) % every == 0:
-                sample()
-            if done:
-                stopped = f"until at t={self.time:.4g} s"
-                break
+        def run() -> int:
+            nonlocal stopped
+            if start is True:
+                self._reset()
+            elif isinstance(start, str):
+                self._restore_named(name=start)
+            sample()
+            for index in range(frames):
+                # One batch for the whole rollout: application settings are checked before its first step.
+                self._advance(1, self.dt, first=index == 0, last=False)
+                last = index == frames - 1
+                done = bool(stop(self)) if stop is not None else False
+                if done or last or (index + 1) % every == 0:
+                    sample()
+                if done:
+                    stopped = f"until at t={self.time:.4g} s"
+                    break
+            if self.batch_callback is not None:
+                self.batch_callback(self)
+            return index + 1
+
+        with self.watch.stepping("rollout()"):
+            count = self._undoable("rollout", run)
         result = {"t": np.asarray(times)}
         for name, values in series.items():
             if values and isinstance(values[0], dict):
@@ -1507,9 +1787,7 @@ class SimulationSession:
                 result[name] = nested
             else:
                 result[name] = np.stack(values)
-        result.update(frames=index + 1, stopped=stopped)
-        if plot:
-            self._plot_series(result, plot if isinstance(plot, list) else list(series))
+        result.update(frames=count, stopped=stopped)
         return result
 
     def _eval_scope(self) -> dict:
@@ -1522,35 +1800,136 @@ class SimulationSession:
             "wp": wp,
         }
 
-    def _plot_series(self, result: dict, names: list[str]) -> None:
-        import matplotlib
+    def health(
+        self,
+        solver: Any = None,
+        state: Any = None,
+        *,
+        per_world: bool = True,
+        twins: bool = False,
+        penetration: float = 0.01,
+        twins_tolerance: float = 1e-3,
+    ) -> dict:
+        """Check state and solver for non-finite values, runaway speeds, buffer overflow, and deep penetration.
 
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+        Works on any solver object, including ones built in trusted execution; MuJoCo solvers add
+        per-world checks of their own data, ``njmax``/``nconmax`` buffers, and penetrating shape pairs.
 
-        names = [n for n in names if isinstance(result.get(n), np.ndarray) and result[n].ndim <= 2]
-        if not names:
-            return
-        figure, axes = plt.subplots(len(names), 1, figsize=(6.4, 1.8 * len(names) + 0.4), sharex=True, squeeze=False)
-        for axis, name in zip(axes[:, 0], names, strict=True):
-            values = result[name].reshape(len(result["t"]), -1)
-            for column in range(min(values.shape[1], 8)):
-                axis.plot(result["t"], values[:, column], lw=1.2, label=str(column) if values.shape[1] > 1 else None)
-            axis.set_ylabel(name, fontsize=8)
-            axis.grid(alpha=0.3)
-            if values.shape[1] > 1:
-                axis.legend(fontsize=6, ncol=min(values.shape[1], 8), loc="best")
-        axes[-1, 0].set_xlabel("time [s]")
-        figure.tight_layout()
-        if self._shown_images is not None and len(self._shown_images) < self._MAX_SHOWN_IMAGES:
-            self.show(figure)
-        plt.close(figure)
+        Args:
+            solver: Solver to inspect (default: the session's).
+            state: State to inspect (default: the session's).
+            per_world: Name the worlds behind each finding.
+            twins: Compare the worlds' joint states with each other, for worlds built identical.
+            penetration: Overlap [m] above which contacts are reported by shape pair.
+            twins_tolerance: Deviation [m or rad, and per second for velocities] that counts as disagreement.
 
-    def health(self) -> dict:
-        """Check for non-finite state, runaway velocities, deep penetration, and solver buffer overflow."""
+        Returns:
+            ``{"ok", "warnings", "stats", "checked", ...}`` with ``worlds``, ``penetration`` and
+            ``unsupported`` entries when they apply.
+        """
         from .diagnostics import health  # noqa: PLC0415
 
-        return health(self)
+        self._assert_owner()
+        return health(
+            self,
+            solver,
+            state,
+            per_world=per_world,
+            twins=twins,
+            penetration=penetration,
+            twins_tolerance=twins_tolerance,
+        )
+
+    def solver_params(
+        self, kind: str, select: str | list[str] | None = None, world: int = 0, *, solver: Any = None, limit: int = 64
+    ) -> dict:
+        """What the solver integrates for one kind of entity, where each value comes from, and what refreshes it.
+
+        For :class:`~newton.solvers.SolverMuJoCo` each row holds the compiled MuJoCo value, ``from``
+        (the Newton model array and index it is computed from), and ``pending`` (values whose model
+        array differs from the compiled value, i.e. edits no ``notify_model_changed`` has applied).
+        The result also lists the :class:`~newton.ModelFlags` that refresh each source, whether the
+        MuJoCo field can differ between worlds, and fields that are read only at construction or
+        not at all. Other solvers report the Newton model values and say that compiled values are
+        unavailable.
+
+        Args:
+            kind: ``"actuator"``, ``"joint"``, ``"geom"``, ``"body"``, ``"equality"``, or ``"option"``.
+            select: Label glob(s) matched against full labels or their last path component; a
+                pattern without wildcards also matches as a substring of the last component.
+            world: World whose rows are reported.
+            solver: Solver to inspect (default: the session's); its own ``model`` is used.
+            limit: Maximum number of rows.
+
+        Returns:
+            Dictionary with ``rows`` (``options`` for ``kind="option"``) and the facts above.
+        """
+        from .solverview import solver_params  # noqa: PLC0415
+
+        self._assert_owner()
+        solver = self.solver if solver is None else solver
+        model = getattr(solver, "model", None) or self.model
+        return solver_params(model, solver, kind, select, world=world, limit=limit)
+
+    def swap_solver(self, factory: Callable[[Model], Any], *, frames: int = 2) -> dict:
+        """Replace the live solver with ``factory(model)`` after a trial run (trusted execution helper).
+
+        The new solver is built on the live model and installed in the application, which re-records
+        its CUDA graphs. A scratch copy of the current state is then stepped for ``frames`` frames and
+        checked with :meth:`health`; afterwards state, time, and application timers return to where they
+        were, now with the new solver. If building, installing, stepping, or the health check fails (a
+        warning the current state does not already show), the previous solver, graphs, state, and model
+        arrays are reinstated and the error is raised.
+
+        Args:
+            factory: ``factory(model) -> solver``, e.g. ``lambda m: newton.solvers.SolverXPBD(m, iterations=4)``
+                or a solver class.
+            frames: Trial frames to step before keeping the new solver.
+
+        Returns:
+            ``{"solver", "previous", "frames", "health"}``: solver type names and the trial's health report.
+        """
+        from .diagnostics import health  # noqa: PLC0415
+        from .rollback import UndoPoint, warning_kind  # noqa: PLC0415
+
+        self._assert_owner()
+        _integer(frames, "frames", 1, 1000)
+        if not callable(factory):
+            raise TypeError("factory must be a callable factory(model) -> solver")
+        if not self.valid:
+            raise RuntimeError(self._invalid_message())
+        undo = UndoPoint(self)
+        previous = type(self.solver).__name__
+        baseline = {warning_kind(warning) for warning in health(self)["warnings"]}
+        checkpoint = self._snapshot()
+        stage = "building the new solver"
+        self._transaction_depth += 1
+        try:
+            solver = factory(self.model)
+            stage = "installing the new solver and re-recording CUDA graphs"
+            if self.solver_callback is not None:
+                self.solver_callback(self, solver)
+            else:
+                self.solver = solver
+            self._refresh_workspace()
+            stage = f"stepping {frames} trial frames with the new solver"
+            self._advance(frames, self.dt)
+            stage = f"health() after {frames} trial frames with the new solver"
+            report = health(self)
+            new_warnings = [warning for warning in report["warnings"] if warning_kind(warning) not in baseline]
+            if new_warnings:
+                raise _HealthWarnings("reported " + "; ".join(new_warnings))
+            stage = "restoring the state with the new solver"
+            self._restore(checkpoint)
+        except Exception as error:
+            outcome = self._roll_back(undo, quiet=True)
+            kept = f"kept {previous}" if self.valid else "failed"
+            detail = str(error) if isinstance(error, _HealthWarnings) else f"raised {type(error).__name__}: {error}"
+            detail = detail[:2048].rstrip(". ")
+            raise RuntimeError(f"swap_solver {kept}: {stage} {detail}." + (f" {outcome}" if outcome else "")) from error
+        finally:
+            self._transaction_depth -= 1
+        return {"solver": type(solver).__name__, "previous": previous, "frames": frames, "health": report}
 
     def render(self, *, metadata: bool = False, **options):
         """Render the current state to an RGB array without PNG encoding (trusted execution helper).
@@ -1570,42 +1949,6 @@ class SimulationSession:
         image, info = self._renderer_get()._single(**options)
         return (image, info) if metadata else image
 
-    def compare_images(
-        self, simulated, reference, *, mask=None, panel: str | None = None, label: str | None = None
-    ) -> dict:
-        """Compare two images with PSNR [dB], SSIM, and edge NCC (trusted execution helper).
-
-        Args:
-            simulated: Image array, PNG/JPEG path, PIL image, or ``observe`` result.
-            reference: Image of the same size in any of those forms.
-            mask: Optional boolean array selecting the pixels to score.
-            panel: Also show ``simulated | reference | panel`` inline, with ``panel`` one of
-                ``"edges"``, ``"blend"``, or ``"mismatch"``.
-            label: Caption for the shown panel row.
-
-        Returns:
-            Metrics ``psnr_db``, ``ssim``, ``edge_ncc`` (higher is better), and
-            ``mean_abs_difference``.
-        """
-        from .imaging import comparison_panel, image_metrics, tile, to_rgb  # noqa: PLC0415
-
-        def rgb(value):
-            if isinstance(value, dict) and "image_base64" in value:
-                value = base64.b64decode(value["image_base64"])
-            return to_rgb(value)
-
-        a, b = rgb(simulated), rgb(reference)
-        result = image_metrics(a, b, mask)
-        result["mean_abs_difference"] = round(float(np.abs(a.astype(np.int16) - b.astype(np.int16)).mean()), 3)
-        if panel is not None:
-            names = [["simulated", "reference", f"{panel} {label or ''}".strip()]]
-            image = tile([[a, b, comparison_panel(a, b, panel)]], names)
-            if self._shown_images is not None:
-                self.show(image)
-            else:
-                result["panel_image"] = image
-        return result
-
     def contacts_between(self, a, b=None, *, detail: bool = False) -> dict:
         """Contact count, solver normal and friction force, slip speed, and penetration between two shape sets.
 
@@ -1619,6 +1962,102 @@ class SimulationSession:
 
         self._assert_owner()
         return contacts_between(self, a, b, detail=detail)
+
+    def persist(
+        self,
+        name: str,
+        value: Any = _OMITTED,
+        *,
+        rebuild: bool = True,
+        check: str | Callable | None = None,
+        tolerance: float = 1e-6,
+        path: str | Path | None = None,
+    ) -> dict:
+        """Write a value into the script's module-level ``NAME = <literal>`` assignment (trusted execution helper).
+
+        Only the assignment's value changes; the rest of the file stays byte for byte. When the old and
+        new values are dictionaries with the same keys or sequences of the same length, only the
+        differing entries are rewritten, so comments inside the literal remain. Refuses if ``name`` is
+        not assigned exactly once at module level, or if its current value is not a literal. Prints a
+        unified diff and saves the previous file under ``<artifact_directory>/persist/``.
+
+        Args:
+            name: Module-level variable, such as ``"PARAMS"``.
+            value: New value: dicts, lists, tuples, non-empty sets, numbers, strings, bytes, bools,
+                ``None``, NumPy scalars/arrays and Warp vectors/arrays (converted to plain literals).
+                Omitted: the current value of ``module.<name>`` in the hosted script module.
+            rebuild: Rebuild the scene (and worker sessions) from the edited file.
+            check: Expression (evaluated in the workspace) or callable evaluated before writing and
+                again after the rebuild; both values are reported with ``reproduced``.
+            tolerance: Relative and absolute tolerance of ``reproduced`` for numeric check values.
+            path: File to edit instead of the hosted script, relative to the script's directory.
+
+        Returns:
+            ``path``, ``changed``, ``backup``, the edited ``line``, rebuild timing, and ``check``.
+        """
+        from .persist import MISSING, persist  # noqa: PLC0415
+
+        self._assert_owner()
+        value = MISSING if value is _OMITTED else value
+        return persist(self, name, value, rebuild=rebuild, check=check, tolerance=tolerance, path=path)
+
+    def persist_source(
+        self,
+        obj: Any,
+        *,
+        target: str | None = None,
+        rebuild: bool = True,
+        check: str | Callable | None = None,
+        tolerance: float = 1e-6,
+        path: str | Path | None = None,
+    ) -> dict:
+        """Replace a def or class in the script with the source of one defined in a cell (trusted execution helper).
+
+        The script's single top-level definition with the same name (or ``target``) is replaced, from
+        its first decorator to its last line, by the cell's source re-indented to match; everything else
+        in the file stays byte for byte. Refuses if the target is missing, bound more than once, or not
+        a def/class. Prints a unified diff and saves the previous file under
+        ``<artifact_directory>/persist/``. Global names the new definition reads that the script never
+        binds are listed in ``names_not_defined_in_script``; methods assigned to a class from other cells
+        (not part of its class statement) in ``methods_from_other_cells``.
+
+        Args:
+            obj: Function or class (or its workspace name) defined in a trusted-execution cell.
+            target: Definition to replace: ``"Name"`` or ``"Class.method"``; defaults to the object's
+                qualified name. A different leaf name renames the definition to it.
+            rebuild: Rebuild the scene (and worker sessions) from the edited file.
+            check: Expression or callable evaluated before writing and after the rebuild; both values
+                are reported with ``reproduced``.
+            tolerance: Relative and absolute tolerance of ``reproduced`` for numeric check values.
+            path: File to edit instead of the hosted script, relative to the script's directory.
+
+        Returns:
+            ``path``, ``changed``, ``backup``, the replaced ``lines``, rebuild timing, and ``check``.
+        """
+        from .persist import persist_source  # noqa: PLC0415
+
+        self._assert_owner()
+        return persist_source(self, obj, target=target, rebuild=rebuild, check=check, tolerance=tolerance, path=path)
+
+    def diff_model(self, since: str = "build", *, limit: int = 16) -> dict:
+        """Model arrays and scalars that differ from the last build (trusted execution helper).
+
+        Changed rows are keyed by entity label (``@world`` is appended in multi-world models, ``#row``
+        when labels repeat) with ``[old, new]`` values for at most ``limit`` rows per field, plus
+        ``changed_rows`` and ``rows`` counts. ``replaced`` marks attributes that now refer to a different
+        array object than at the baseline. ``flags`` lists the :class:`~newton.ModelFlags` inferred from
+        the changed fields (the categories ``edit`` uses, plus the fields named in the ModelFlags
+        docstrings); ``fields_without_flag`` lists changed fields with no inferred category.
+
+        Args:
+            since: ``"build"`` compares with the model as built; ``"last"`` with the previous
+                ``diff_model`` call (the build if there was none).
+            limit: Maximum rows listed per field.
+        """
+        from .persist import diff_model  # noqa: PLC0415
+
+        self._assert_owner()
+        return diff_model(self, since, limit=limit)
 
     def solver_contacts(self, limit: int = 20) -> dict:
         """Active solver contacts grouped by shape pair, with the effective solver parameters."""

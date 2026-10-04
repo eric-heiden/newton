@@ -97,7 +97,7 @@ class TestMcpHost(unittest.TestCase):
         host = ExampleHost(self.script)
         session = host.session(artifact_directory=self.directory.name)
         self.addCleanup(session.close)
-        with self.assertRaisesRegex(RuntimeError, "stays valid"):
+        with self.assertRaisesRegex(RuntimeError, "nothing was restored"):
             session.dispatch("execute", {"code": "kept = 3\nmissing_name"})
         self.assertTrue(session.valid)
         self.assertEqual(session.dispatch("execute", {"code": "kept"})["result"], 3)
@@ -243,28 +243,18 @@ class TestMcpHelpers(unittest.TestCase):
         self.session.state.body_q.assign(body_q)
         self.assertFalse(self.session.health()["ok"])
 
-    def test_render_and_compare_images(self):
-        """Render arrays directly and score them against references with image metrics."""
+    def test_render_returns_arrays(self):
+        """Render arrays directly; removed helpers and options are not part of the workspace."""
         camera = {"eye": [1.5, -1.5, 1.0], "target": [0.0, 0.0, 0.3], "width": 64, "height": 48}
         image = self.session.render(**camera)
         self.assertEqual(image.shape, (48, 64, 3))
         self.assertEqual(image.dtype, np.uint8)
-        same = self.session.compare_images(image, image)
-        self.assertEqual(same["psnr_db"], float("inf"))
-        self.assertAlmostEqual(same["ssim"], 1.0, places=4)
-        self.assertAlmostEqual(same["edge_ncc"], 1.0, places=4)
-        shifted = self.session.compare_images(np.roll(image, 6, axis=1), image)
-        self.assertLess(shifted["edge_ncc"], 0.9)
-        self.assertLess(shifted["ssim"], same["ssim"])
-        mask = np.zeros(image.shape[:2], dtype=bool)
-        mask[:, :10] = True
-        self.assertIn("psnr_db", self.session.compare_images(image, image, mask=mask))
         result = self.session.dispatch(
-            "execute",
-            {"code": f"a = render(**{camera!r})\ncompare_images(a, np.flipud(a), panel='edges')['edge_ncc']"},
+            "execute", {"code": f"a = render(**{camera!r})\n(a.shape, 'compare_images' in globals())"}
         )
-        self.assertLess(result["result"], 0.99)
-        self.assertEqual(len(result["images"]), 1)
+        self.assertEqual(result["result"], [[48, 64, 3], False])
+        with self.assertRaisesRegex(TypeError, "unexpected keyword argument 'plot'"):
+            self.session.rollout(1, plot=True)
 
     def test_workspace_preloads_newton_and_helpers(self):
         """Provide newton and the helper functions without imports."""

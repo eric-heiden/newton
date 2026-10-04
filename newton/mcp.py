@@ -19,10 +19,11 @@ this changes tool presentation, not permissions.
 
 from typing import TYPE_CHECKING
 
-__all__ = ["ExampleHost", "SimulationClient", "SimulationServer", "SimulationSession", "WorkerPool"]
+__all__ = ["ExampleHost", "JobQueue", "SimulationClient", "SimulationServer", "SimulationSession", "WorkerPool"]
 
 if TYPE_CHECKING:
     from ._src.mcp.host import ExampleHost
+    from ._src.mcp.jobs import JobQueue
     from ._src.mcp.session import SimulationSession
     from ._src.mcp.transport import SimulationClient, SimulationServer
     from ._src.mcp.workers import WorkerPool
@@ -41,6 +42,10 @@ def __getattr__(name: str):
         from ._src.mcp.host import ExampleHost  # noqa: PLC0415
 
         return ExampleHost
+    if name == "JobQueue":
+        from ._src.mcp.jobs import JobQueue  # noqa: PLC0415
+
+        return JobQueue
     if name == "WorkerPool":
         from ._src.mcp.workers import WorkerPool  # noqa: PLC0415
 

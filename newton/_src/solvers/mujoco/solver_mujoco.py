@@ -61,6 +61,7 @@ from .enums import EqType as _EqType
 from .enums import _ActuatorBiasType, _ActuatorDynamicsType, _ActuatorGainType
 from .equality import MJC_OBJ_BODY, MjcEqualityTargetKind, _register_equality_constraint_attributes
 from .kernels import (
+    MJW_OVERFLOW_KINDS,
     _snapshot_nacon_count,
     apply_mjc_body_f_kernel,
     apply_mjc_control_kernel,
@@ -74,17 +75,20 @@ from .kernels import (
     convert_solref,
     convert_warp_coords_to_mj_kernel,
     copy_qpos_and_detect_tree_change_kernel,
+    count_mjw_overflow_kernel,
     create_convert_mjw_contacts_to_newton_kernel,
     create_inverse_shape_mapping_kernel,
     eval_mujoco_coupling_effective_mass_block_kernel,
     eval_mujoco_coupling_effective_mass_kernel,
     eval_mujoco_coupling_gravity_acceleration_kernel,
+    print_mjw_overflow_kernel,
     recompute_jnt_eq_anchor1_kernel,
     repeat_array_kernel,
     reset_joint_state_kernel,
     reset_sleeping_state_kernel,
     reset_world_buffers_kernel,
     restore_sleeping_state_kernel,
+    stash_mjw_overflow_kernel,
     sync_qpos0_kernel,
     sync_site_xposes_kernel,
     sync_worldbody_geom_xposes_kernel,
@@ -118,6 +122,8 @@ from .kernels import (
 from .utils import solref_invalid_mask
 
 if TYPE_CHECKING:
+    from types import ModuleType
+
     from mujoco import MjData, MjModel
     from mujoco_warp import Data as MjWarpData
     from mujoco_warp import Model as MjWarpModel
@@ -3925,6 +3931,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         ``joint_X_c[world * joints_per_world + jnt % joints_per_world]``.
         Shape ``[nu]``, dtype ``int32``."""
         self._actuator_uses_joint_effort_limit: wp.array[wp.bool] | None = None
+        self._overflow_counts: wp.array[wp.int32] | None = None
+        """Number of (world, step) pairs that raised each MuJoCo Warp overflow bit, shape [overflow bit count]."""
+        self._overflow_kinds: wp.array[wp.int32] | None = None
+        self._overflow_printed: wp.array[wp.int32] | None = None
+        self._overflow_prior: wp.array[wp.int32] | None = None
         self.mjc_eq_to_newton_eq: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, eq] to Newton equality constraint index.
 
@@ -4190,9 +4201,54 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         with self._scoped_deterministic_config():
             yield
 
+    def _init_overflow_counts(self, mujoco_warp: ModuleType, nworld: int) -> None:
+        """Replace MuJoCo Warp's per-world, per-step overflow prints by counts and one print per type."""
+        overflow_type = getattr(mujoco_warp, "OverflowType", None)
+        if overflow_type is None or getattr(self.mjw_data, "overflow", None) is None:
+            return
+        kinds = np.zeros(max(int(flag).bit_length() for flag in overflow_type), dtype=np.int32)
+        for flag in overflow_type:
+            kinds[int(flag).bit_length() - 1] = MJW_OVERFLOW_KINDS.get(flag.name, 0)
+        self.mjw_model.opt.warn_overflow = False
+        self._overflow_kinds = wp.array(kinds, dtype=wp.int32)
+        self._overflow_counts = wp.zeros(len(kinds), dtype=wp.int32)
+        self._overflow_printed = wp.zeros(len(kinds), dtype=wp.int32)
+        self._overflow_prior = wp.zeros(nworld, dtype=wp.int32)
+
     @event_scope
     def _mujoco_warp_step(self):
-        self._mujoco_warp.step(self.mjw_model, self.mjw_data)
+        if self._overflow_counts is None:
+            self._mujoco_warp.step(self.mjw_model, self.mjw_data)
+            return
+        d, opt = self.mjw_data, self.mjw_model.opt
+        wp.launch(stash_mjw_overflow_kernel, dim=d.nworld, inputs=[d.overflow], outputs=[self._overflow_prior])
+        self._mujoco_warp.step(self.mjw_model, d)
+        wp.launch(
+            count_mjw_overflow_kernel,
+            dim=d.nworld,
+            inputs=[],
+            outputs=[d.overflow, self._overflow_prior, self._overflow_counts],
+        )
+        wp.launch(
+            print_mjw_overflow_kernel,
+            dim=1,
+            inputs=[
+                self._overflow_kinds,
+                self._overflow_counts,
+                self._overflow_prior,
+                d.nefc,
+                d.nacon,
+                d.ncollision,
+                int(d.njmax),
+                int(d.njmax_nnz),
+                int(d.naconmax),
+                int(d.naccdmax),
+                int(d.nvmax),
+                int(opt.iterations),
+                int(opt.ls_iterations),
+            ],
+            outputs=[self._overflow_printed],
+        )
 
     @event_scope
     @override
@@ -8094,6 +8150,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 nvmax=nvmax,
             )
             self.nvmax = self.mjw_data.nvmax
+            self._init_overflow_counts(mujoco_warp, nworld)
             if self.enable_sleeping:
                 self._capture_initial_sleeping_state()
                 self._sleep_qpos = wp.empty_like(self.mjw_data.qpos)

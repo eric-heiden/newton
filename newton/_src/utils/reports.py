@@ -96,7 +96,11 @@ def report_health(
     Returns:
         ``ok``, ``warnings``, ``stats``, ``checked`` (what was inspected), and, where they apply,
         ``worlds`` (world indices per finding), ``penetration`` (shape pairs with depth [m]), and
-        ``unsupported`` (checks this solver does not allow).
+        ``unsupported`` (checks this solver does not allow). For
+        :class:`~newton.solvers.SolverMuJoCo` on MuJoCo Warp, ``stats["overflow_counts"]`` maps each
+        MuJoCo Warp overflow type raised since the solver was created (e.g. ``"LS_ITERATIONS"``, the
+        linesearch iteration limit) to the number of (world, step) pairs that raised it; the solver
+        prints each type once instead of once per world and step.
     """
     from ..mcp.diagnostics import health_report  # noqa: PLC0415
 

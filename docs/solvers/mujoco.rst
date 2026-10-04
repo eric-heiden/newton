@@ -1062,11 +1062,20 @@ Contact and constraint buffers
 With MuJoCo Warp, ``nconmax`` contacts per world are allocated as one buffer
 of ``nconmax * world_count`` contacts that all worlds share, while ``njmax``
 limits the constraint rows of each world separately. When the buffers
-overflow, MuJoCo Warp prints a ``broadphase overflow``,
-``narrowphase overflow``, or ``nefc overflow`` message. It also sets the
-matching per-world bit in ``solver.mjw_data.overflow``, which stays set until
-the MuJoCo Warp data is reset. Contacts and constraint rows beyond the
-capacity are not stored.
+overflow, MuJoCo Warp sets the matching per-world bit in
+``solver.mjw_data.overflow``, which stays set until the MuJoCo Warp data is
+reset. Contacts and constraint rows beyond the capacity are not stored. MuJoCo
+Warp sets further bits when a world reaches the solver iteration limit
+(``iterations``) or the linesearch iteration limit (``ls_iterations``).
+
+Instead of MuJoCo Warp's message per world and step,
+:meth:`~newton.solvers.SolverMuJoCo.step` prints one line per overflow type and
+solver, the first time the type occurs (e.g. ``SolverMuJoCo: MuJoCo Warp
+linesearch iteration limit (ls_iterations 30) reached in world 0``), and counts
+the (world, step) pairs that raise each type. :func:`newton.utils.report_health`
+reports the counts as ``stats["overflow_counts"]``. To do so, the solver sets
+``solver.mjw_model.opt.warn_overflow`` to ``False``, so MuJoCo Warp functions
+called directly on ``solver.mjw_model`` set the overflow bits without printing.
 
 MuJoCo Warp limits
 ~~~~~~~~~~~~~~~~~~

@@ -281,6 +281,7 @@ def _mujoco_health(model, solver, report: dict, *, per_world: bool, threshold: f
         overflow = getattr(data, "overflow", None)
         if overflow is not None:
             _overflow_flags(overflow.numpy(), report)
+        _overflow_counts(solver, stats)
         if getattr(data, "solver_niter", None) is not None:
             niter = data.solver_niter.numpy()
             cap = int(solver.mj_model.opt.iterations)
@@ -331,6 +332,19 @@ def _overflow_flags(flags: np.ndarray, report: dict) -> None:
     for name in _ITERATION_FLAGS:
         if name in by_flag:
             report["stats"][f"worlds_flagged_{name.lower()}"] = len(by_flag[name])
+
+
+def _overflow_counts(solver, stats: dict) -> None:
+    """(world, step) pairs per MuJoCo Warp overflow type since the solver was created (``SolverMuJoCo.step``)."""
+    counts = getattr(solver, "_overflow_counts", None)
+    if counts is None:
+        return
+    import mujoco_warp
+
+    names = {int(flag).bit_length() - 1: flag.name for flag in mujoco_warp.OverflowType}
+    raised = {names.get(bit, f"bit {bit}"): int(count) for bit, count in enumerate(counts.numpy()) if count}
+    if raised:
+        stats["overflow_counts"] = raised
 
 
 def _newton_contacts_health(model, state, contacts, report: dict, *, threshold: float) -> None:

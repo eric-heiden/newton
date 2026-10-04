@@ -4,6 +4,7 @@
 """newton.utils.report_solver_params and newton.utils.report_health outside any live session."""
 
 import importlib.util
+import re
 import unittest
 
 import numpy as np
@@ -11,6 +12,7 @@ import warp as wp
 
 import newton
 import newton.utils
+from newton.tests.unittest_utils import StdOutCapture
 
 _HAS_MUJOCO = bool(importlib.util.find_spec("mujoco") and importlib.util.find_spec("mujoco_warp"))
 
@@ -167,6 +169,49 @@ class TestSolverReports(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertEqual(report["worlds"]["nonfinite"], [2])
         self.assertIn("No solver given", report["unsupported"][0])
+
+
+@unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
+class TestMuJoCoWarpOverflowCounts(unittest.TestCase):
+    def test_iteration_limits_print_once_and_are_counted(self):
+        """MuJoCo Warp's per-world, per-step iteration-limit prints become one line per type and a count."""
+        from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+
+        template = newton.ModelBuilder()
+        tilted = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.3)
+        cube = template.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.049), tilted))
+        template.add_shape_box(cube, hx=0.05, hy=0.05, hz=0.05)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        builder.replicate(template, 2)
+        model = builder.finalize(device="cpu")
+        solver = SolverMuJoCo(model, iterations=1, ls_iterations=1)
+        state_0, state_1 = model.state(), model.state()
+        steps = 5
+        capture = StdOutCapture()
+        capture.begin()
+        try:
+            for _ in range(steps):
+                solver.step(state_0, state_1, model.control(), None, 0.002)
+                state_0, state_1 = state_1, state_0
+            wp.synchronize()
+        finally:
+            output = capture.end()
+        lines = [line for line in output.splitlines() if not line.startswith("Module ")]
+        once = " (printed once per solver, newton.utils.report_health() counts every occurrence)"
+        self.assertEqual(
+            sorted(re.sub(r"in world \d+", "in world W", line) for line in lines),
+            [
+                "SolverMuJoCo: MuJoCo Warp linesearch iteration limit (ls_iterations 1) reached in world W" + once,
+                "SolverMuJoCo: MuJoCo Warp solver iteration limit (iterations 1) reached in world W" + once,
+            ],
+            output,
+        )
+        report = newton.utils.report_health(model, state_0, solver)
+        # The contact keeps a one-iteration linesearch from converging in every world and step.
+        self.assertEqual(report["stats"]["overflow_counts"]["LS_ITERATIONS"], steps * model.world_count)
+        self.assertGreater(report["stats"]["overflow_counts"]["ITERATIONS"], 0)
+        self.assertEqual(report["worlds"]["overflow_flags"]["1"], ["ITERATIONS", "LS_ITERATIONS"])
 
 
 if __name__ == "__main__":

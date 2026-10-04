@@ -12,7 +12,7 @@ import warnings
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import warp as wp

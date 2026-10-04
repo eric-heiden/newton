@@ -220,6 +220,29 @@ class TestApi(unittest.TestCase):
                 self.assertEqual(opacity.name, "opacity")
                 self.assertEqual(opacity.kind, inspect.Parameter.KEYWORD_ONLY)
 
+    def test_removed_solver_notify_flags_names_model_flags(self):
+        """Accessing the removed SolverNotifyFlags names its replacement instead of a bare missing attribute."""
+        import newton  # noqa: PLC0415
+
+        with self.assertRaisesRegex(AttributeError, r"removed.*newton\.ModelFlags.*ModelFlags\.ALL"):
+            _ = newton.solvers.SolverNotifyFlags.JOINT_DOF_PROPERTIES
+        self.assertFalse(hasattr(newton.solvers, "SolverNotifyFlags"))
+        with self.assertRaisesRegex(AttributeError, "has no attribute 'SolverNoSuchName'"):
+            _ = newton.solvers.SolverNoSuchName
+
+    def test_model_flags_non_members_name_combination_and_all(self):
+        """ModelFlags(0) (as in ``~ModelFlags(0)``) and combined values name ``|`` and ALL in the error."""
+        import newton  # noqa: PLC0415
+
+        for value in (0, 3):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, r"not a ModelFlags member.*\|.*ModelFlags\.ALL"):
+                    newton.ModelFlags(value)
+        self.assertIs(newton.ModelFlags(2), newton.ModelFlags.JOINT_DOF_PROPERTIES)
+        self.assertIs(newton.ModelFlags(int(newton.ModelFlags.ALL)), newton.ModelFlags.ALL)
+        single = [flag for flag in newton.ModelFlags if flag is not newton.ModelFlags.ALL]
+        self.assertEqual(sum(single), newton.ModelFlags.ALL)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

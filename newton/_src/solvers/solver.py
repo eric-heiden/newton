@@ -614,6 +614,10 @@ class SolverBase:
           properties have changed.
         * ``ModelFlags.ACTUATOR_PROPERTIES``: Actuator gains, biases, limits,
           or force properties have changed.
+        * ``ModelFlags.ALL``: All of the above.
+
+        Combine flags with ``|``, e.g.
+        ``ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.BODY_PROPERTIES``.
 
         Args:
             flags: Bit-mask of :class:`~newton.ModelFlags` or custom ``int``

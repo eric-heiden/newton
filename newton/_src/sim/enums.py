@@ -11,6 +11,12 @@ class ModelFlags(IntEnum):
     These flags are used with :meth:`~newton.solvers.SolverBase.notify_model_changed`
     to specify which properties have changed, allowing the solver to efficiently
     update only the necessary components.
+
+    Combine flags with ``|``, e.g. ``ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.BODY_PROPERTIES``;
+    the result is an ``int`` that :meth:`~newton.solvers.SolverBase.notify_model_changed` accepts.
+    :attr:`ALL` selects every flag. ``ALL`` is itself a member, so iterating over
+    :class:`ModelFlags` yields it after the single flags. Only members convert back to
+    :class:`ModelFlags`: ``ModelFlags(0)`` and ``ModelFlags(3)`` raise :class:`ValueError`.
     """
 
     JOINT_PROPERTIES = 1 << 0
@@ -52,6 +58,16 @@ class ModelFlags(IntEnum):
         | ACTUATOR_PROPERTIES
     )
     """Indicates all property updates."""
+
+    @classmethod
+    def _missing_(cls, value: object):
+        # Combinations are plain ints; name the spellings that work instead of Enum's bare
+        # "is not a valid" message (e.g. for ``~ModelFlags(0)`` meant as "all flags").
+        raise ValueError(
+            f"{value!r} is not a ModelFlags member: members are single flags and ALL. "
+            "Combine flags with | (the result is an int that notify_model_changed() accepts), "
+            "and use ModelFlags.ALL for every flag."
+        )
 
 
 class StateFlags(IntEnum):

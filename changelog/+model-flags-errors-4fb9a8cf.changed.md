@@ -1,0 +1,1 @@
+Name `newton.ModelFlags` in the `AttributeError` raised for the removed `newton.solvers.SolverNotifyFlags`, and name `|` and `ModelFlags.ALL` in the `ValueError` raised for values that are not a single `ModelFlags` member, such as `ModelFlags(0)`; combine flags with `|` and use `ModelFlags.ALL` for every flag.

@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import difflib
 import logging
 import operator
+import re
 import warnings
 from collections.abc import Callable, Iterable, Iterator
 from collections.abc import Set as AbstractSet
@@ -1480,6 +1482,220 @@ class Model:
         index :attr:`joint_target_q` through this regardless of layout.
         """
         return self.joint_q_start if self.use_coord_layout_targets else self.joint_qd_start
+
+    # ----- Label lookup ------------------------------------------------------
+
+    def find_bodies(
+        self,
+        pattern: str | list[str] | re.Pattern[str] | list[int],
+        *,
+        world: int | None = None,
+    ) -> list[int]:
+        """Return the indices of the bodies whose labels match a pattern.
+
+        Patterns follow :ref:`label-matching` and match either the full
+        :attr:`body_label` or its last path component (the text after the
+        last ``/``), so ``"left_link_1"`` finds
+        ``"robot/worldbody/left_link_1"``. Every string pattern must match at
+        least one body. This is a host-side lookup that reads
+        :attr:`body_world` from the device.
+
+        Example:
+
+        .. code-block:: python
+
+            hands = model.find_bodies("*_hand")  # every world
+            (left_hand,) = model.find_bodies("left_hand", world=3)
+            mass = model.body_mass.numpy()[hands]
+
+        Args:
+            pattern: Glob string, list of glob strings, compiled regular
+                expression, or list of body indices (returned as given).
+            world: World whose bodies to search, ``-1`` for global bodies only,
+                or ``None`` for every world. Must be ``None`` for indices.
+
+        Returns:
+            Matching body indices in model order. With ``world=None`` these
+            are the matches of every world, e.g. one index per world for a
+            body of a replicated robot.
+
+        Raises:
+            KeyError: If a string pattern matches no body (in ``world``).
+            ValueError: If ``world`` is out of range or given with indices.
+        """
+        return self._find_labels("body", self.body_label, self.body_world, pattern, world)
+
+    def find_shapes(
+        self,
+        pattern: str | list[str] | re.Pattern[str] | list[int],
+        *,
+        world: int | None = None,
+    ) -> list[int]:
+        """Return the indices of the shapes whose labels match a pattern.
+
+        Matching follows :meth:`find_bodies`, applied to :attr:`shape_label`
+        and :attr:`shape_world`.
+
+        Args:
+            pattern: Glob string, list of glob strings, compiled regular
+                expression, or list of shape indices (returned as given).
+            world: World whose shapes to search, ``-1`` for global shapes only,
+                or ``None`` for every world. Must be ``None`` for indices.
+
+        Returns:
+            Matching shape indices in model order.
+
+        Raises:
+            KeyError: If a string pattern matches no shape (in ``world``).
+            ValueError: If ``world`` is out of range or given with indices.
+        """
+        return self._find_labels("shape", self.shape_label, self.shape_world, pattern, world)
+
+    def find_joints(
+        self,
+        pattern: str | list[str] | re.Pattern[str] | list[int],
+        *,
+        world: int | None = None,
+    ) -> list[int]:
+        """Return the indices of the joints whose labels match a pattern.
+
+        Matching follows :meth:`find_bodies`, applied to :attr:`joint_label`
+        and :attr:`joint_world`. Use :meth:`find_joint_dofs` and
+        :meth:`find_joint_coords` for indices into per-DOF and per-coordinate
+        arrays.
+
+        Args:
+            pattern: Glob string, list of glob strings, compiled regular
+                expression, or list of joint indices (returned as given).
+            world: World whose joints to search, ``-1`` for global joints only,
+                or ``None`` for every world. Must be ``None`` for indices.
+
+        Returns:
+            Matching joint indices in model order.
+
+        Raises:
+            KeyError: If a string pattern matches no joint (in ``world``).
+            ValueError: If ``world`` is out of range or given with indices.
+        """
+        return self._find_labels("joint", self.joint_label, self.joint_world, pattern, world)
+
+    def find_joint_dofs(
+        self,
+        pattern: str | list[str] | re.Pattern[str] | list[int],
+        *,
+        world: int | None = None,
+    ) -> list[int]:
+        """Return the DOF indices of the joints whose labels match a pattern.
+
+        The joints are selected as in :meth:`find_joints`; the result lists
+        every DOF of each joint (e.g. 6 for a free joint, none for a fixed
+        joint), as indices into per-DOF arrays such as
+        :attr:`State.joint_qd`, :attr:`joint_target_ke`, and
+        :attr:`joint_effort_limit` (see :attr:`joint_qd_start`).
+
+        Example:
+
+        .. code-block:: python
+
+            dofs = model.find_joint_dofs("left_joint*", world=0)
+            ke = model.joint_target_ke.numpy()
+            ke[dofs] = 50.0
+            model.joint_target_ke.assign(ke)
+
+        Args:
+            pattern: Glob string, list of glob strings, compiled regular
+                expression, or list of joint indices.
+            world: World whose joints to search, ``-1`` for global joints only,
+                or ``None`` for every world. Must be ``None`` for indices.
+
+        Returns:
+            DOF indices of the matching joints in model order.
+
+        Raises:
+            KeyError: If a string pattern matches no joint (in ``world``).
+            ValueError: If ``world`` is out of range or given with indices.
+        """
+        joints = self.find_joints(pattern, world=world)
+        return self._joint_spans(self.joint_qd_start, joints)
+
+    def find_joint_coords(
+        self,
+        pattern: str | list[str] | re.Pattern[str] | list[int],
+        *,
+        world: int | None = None,
+    ) -> list[int]:
+        """Return the coordinate indices of the joints whose labels match a pattern.
+
+        The joints are selected as in :meth:`find_joints`; the result lists
+        every coordinate of each joint (e.g. 7 for a free joint: position,
+        then quaternion), as indices into per-coordinate arrays such as
+        :attr:`State.joint_q` and :attr:`joint_q` (see :attr:`joint_q_start`).
+        Coordinates and DOFs differ for free, ball, and distance joints.
+
+        Args:
+            pattern: Glob string, list of glob strings, compiled regular
+                expression, or list of joint indices.
+            world: World whose joints to search, ``-1`` for global joints only,
+                or ``None`` for every world. Must be ``None`` for indices.
+
+        Returns:
+            Coordinate indices of the matching joints in model order.
+
+        Raises:
+            KeyError: If a string pattern matches no joint (in ``world``).
+            ValueError: If ``world`` is out of range or given with indices.
+        """
+        joints = self.find_joints(pattern, world=world)
+        return self._joint_spans(self.joint_q_start, joints)
+
+    @staticmethod
+    def _joint_spans(starts: wp.array[wp.int32] | None, joints: list[int]) -> list[int]:
+        if not joints:
+            return []
+        starts_np = starts.numpy()
+        return [index for joint in joints for index in range(int(starts_np[joint]), int(starts_np[joint + 1]))]
+
+    def _find_labels(
+        self,
+        kind: str,
+        labels: list[str],
+        worlds: wp.array[wp.int32] | None,
+        pattern: str | list[str] | re.Pattern[str] | list[int],
+        world: int | None,
+    ) -> list[int]:
+        """Indices of ``labels`` matching ``pattern`` by full label or last path component, in ``world``."""
+        from ..utils.selection import get_name_from_label, match_labels  # noqa: PLC0415
+
+        if world is not None and (
+            isinstance(world, bool) or not isinstance(world, int) or not -1 <= world < self.world_count
+        ):
+            raise ValueError(f"world must be None or an integer in [-1, {self.world_count - 1}], got {world!r}")
+        patterns = pattern if isinstance(pattern, list) else [pattern]
+        if patterns and all(isinstance(item, int) and not isinstance(item, bool) for item in patterns):
+            if world is not None:
+                raise ValueError(f"world must be None when {kind} indices are given; indices are absolute")
+            bad = [index for index in patterns if not 0 <= index < len(labels)]
+            if bad:
+                raise ValueError(f"{kind} indices {bad} are out of range [0, {len(labels)})")
+            return list(dict.fromkeys(patterns))
+        names = [get_name_from_label(label) for label in labels]
+        in_world = None
+        if world is not None:
+            in_world = worlds.numpy() == world if worlds is not None else np.zeros(len(labels), dtype=bool)
+        selected = np.zeros(len(labels), dtype=bool)
+        for item in patterns:
+            hits = np.zeros(len(labels), dtype=bool)
+            hits[match_labels(labels, item)] = True
+            hits[match_labels(names, item)] = True
+            if in_world is not None:
+                hits &= in_world
+            if not hits.any():
+                where = f" in world {world}" if world is not None else ""
+                close = difflib.get_close_matches(str(getattr(item, "pattern", item)), sorted(set(names)), n=3)
+                hint = f"; closest {kind} names: {', '.join(close)}" if close else ""
+                raise KeyError(f"no {kind} label or name matches {item!r}{where}{hint}")
+            selected |= hits
+        return np.flatnonzero(selected).tolist()
 
     def bvh_build_shapes(
         self,

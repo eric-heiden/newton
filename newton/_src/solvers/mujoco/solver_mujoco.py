@@ -61,6 +61,7 @@ from .enums import EqType as _EqType
 from .enums import _ActuatorBiasType, _ActuatorDynamicsType, _ActuatorGainType
 from .equality import MJC_OBJ_BODY, MjcEqualityTargetKind, _register_equality_constraint_attributes
 from .kernels import (
+    MJW_OVERFLOW_KINDS,
     _snapshot_nacon_count,
     apply_mjc_body_f_kernel,
     apply_mjc_control_kernel,
@@ -75,17 +76,20 @@ from .kernels import (
     convert_solref,
     convert_warp_coords_to_mj_kernel,
     copy_qpos_and_detect_tree_change_kernel,
+    count_mjw_overflow_kernel,
     create_convert_mjw_contacts_to_newton_kernel,
     create_inverse_shape_mapping_kernel,
     eval_mujoco_coupling_effective_mass_block_kernel,
     eval_mujoco_coupling_effective_mass_kernel,
     eval_mujoco_coupling_gravity_acceleration_kernel,
+    print_mjw_overflow_kernel,
     recompute_jnt_eq_anchor1_kernel,
     repeat_array_kernel,
     reset_joint_state_kernel,
     reset_sleeping_state_kernel,
     reset_world_buffers_kernel,
     restore_sleeping_state_kernel,
+    stash_mjw_overflow_kernel,
     sync_qpos0_kernel,
     sync_site_xposes_kernel,
     sync_worldbody_geom_xposes_kernel,
@@ -121,6 +125,8 @@ from .kernels import (
 from .utils import solref_invalid_mask
 
 if TYPE_CHECKING:
+    from types import ModuleType
+
     from mujoco import MjData, MjModel
     from mujoco_warp import Data as MjWarpData
     from mujoco_warp import Model as MjWarpModel
@@ -611,6 +617,18 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
     _versions_checked = False
     _convert_mjw_contacts_to_newton_kernel = None
     _generated_kernel_deterministic_options: tuple[wp.DeterministicMode, int] | None = None
+
+    @staticmethod
+    def _invert_world_mapping(mapping: np.ndarray, count: int) -> np.ndarray:
+        """Invert a MuJoCo ``[world, id] -> Newton index`` mapping into ``Newton index -> MuJoCo id``.
+
+        MuJoCo ids are the same in every world; Newton entities without a MuJoCo
+        counterpart map to -1.
+        """
+        inverse = np.full(count, -1, dtype=np.int32)
+        worlds, ids = np.nonzero(mapping >= 0)
+        inverse[mapping[worlds, ids]] = ids
+        return inverse
 
     @staticmethod
     def _tile_world_mapping(template: np.ndarray, nworld: int, stride: int) -> np.ndarray:
@@ -4072,6 +4090,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         ``joint_X_c[world * joints_per_world + jnt % joints_per_world]``.
         Shape ``[nu]``, dtype ``int32``."""
         self._actuator_uses_joint_effort_limit: wp.array[wp.bool] | None = None
+        self._overflow_counts: wp.array[wp.int32] | None = None
+        """Number of (world, step) pairs that raised each MuJoCo Warp overflow bit, shape [overflow bit count]."""
+        self._overflow_kinds: wp.array[wp.int32] | None = None
+        self._overflow_printed: wp.array[wp.int32] | None = None
+        self._overflow_prior: wp.array[wp.int32] | None = None
         self.mjc_eq_to_newton_eq: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, eq] to Newton equality constraint index.
 
@@ -4114,9 +4137,20 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self.body_free_qd_start: wp.array[wp.int32] | None = None
         """Per-body mapping to the free-joint qd_start index (or -1 if not free)."""
 
-        # --- Conditional mappings ---
+        # --- Newton -> MuJoCo mappings (see "Newton and MuJoCo indices" in docs/solvers/mujoco.rst) ---
+        self.newton_body_to_mjc_body: wp.array[wp.int32] | None = None
+        """MuJoCo body id of each Newton body, -1 for bodies without one. Shape [body_count], dtype int32.
+
+        The id is the same in every MuJoCo world; a body of Newton world ``w`` lives in MuJoCo world ``w``."""
+        self.newton_dof_to_mjc_dof: wp.array[wp.int32] | None = None
+        """MuJoCo DOF id of each Newton joint DOF, -1 for DOFs without one. Shape [joint_dof_count], dtype int32.
+
+        The id is the same in every MuJoCo world; ``mj_model.dof_jntid`` gives the MuJoCo joint of a DOF."""
         self.newton_shape_to_mjc_geom: wp.array[wp.int32] | None = None
-        """Inverse mapping from Newton shape index to MuJoCo geom index. Only created when use_mujoco_contacts=False. Shape [nshape], dtype int32."""
+        """MuJoCo geom id of each Newton shape, -1 for shapes without a geom (e.g. sites and skipped
+        visual-only shapes). Shape [shape_count], dtype int32.
+
+        The id is the same in every MuJoCo world; global shapes have a geom in every world."""
 
         # --- Helper arrays for actuator types ---
 
@@ -4307,10 +4341,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 include_sites=include_sites,
                 skip_visual_only_geoms=skip_visual_only_geoms,
             )
-        if not use_mujoco_cpu and not use_mujoco_contacts:
-            # Persistent mappings must be initialized outside step(), which may
-            # first run inside a CUDA graph that is discarded without replay.
+        # Persistent mappings must be initialized outside step(), which may
+        # first run inside a CUDA graph that is discarded without replay.
+        if self.mjc_geom_to_newton_shape is not None:
             self._create_inverse_shape_mapping()
+        if not use_mujoco_cpu and not use_mujoco_contacts:
             self._contact_tid_to_cid = wp.full(self.mjw_data.naconmax, -1, dtype=wp.int32, device=self.device)
         self._initial_model_sync = False
         self.update_data_interval = update_data_interval
@@ -4344,9 +4379,54 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         with self._scoped_deterministic_config():
             yield
 
+    def _init_overflow_counts(self, mujoco_warp: ModuleType, nworld: int) -> None:
+        """Replace MuJoCo Warp's per-world, per-step overflow prints by counts and one print per type."""
+        overflow_type = getattr(mujoco_warp, "OverflowType", None)
+        if overflow_type is None or getattr(self.mjw_data, "overflow", None) is None:
+            return
+        kinds = np.zeros(max(int(flag).bit_length() for flag in overflow_type), dtype=np.int32)
+        for flag in overflow_type:
+            kinds[int(flag).bit_length() - 1] = MJW_OVERFLOW_KINDS.get(flag.name, 0)
+        self.mjw_model.opt.warn_overflow = False
+        self._overflow_kinds = wp.array(kinds, dtype=wp.int32)
+        self._overflow_counts = wp.zeros(len(kinds), dtype=wp.int32)
+        self._overflow_printed = wp.zeros(len(kinds), dtype=wp.int32)
+        self._overflow_prior = wp.zeros(nworld, dtype=wp.int32)
+
     @event_scope
     def _mujoco_warp_step(self):
-        self._mujoco_warp.step(self.mjw_model, self.mjw_data)
+        if self._overflow_counts is None:
+            self._mujoco_warp.step(self.mjw_model, self.mjw_data)
+            return
+        d, opt = self.mjw_data, self.mjw_model.opt
+        wp.launch(stash_mjw_overflow_kernel, dim=d.nworld, inputs=[d.overflow], outputs=[self._overflow_prior])
+        self._mujoco_warp.step(self.mjw_model, d)
+        wp.launch(
+            count_mjw_overflow_kernel,
+            dim=d.nworld,
+            inputs=[],
+            outputs=[d.overflow, self._overflow_prior, self._overflow_counts],
+        )
+        wp.launch(
+            print_mjw_overflow_kernel,
+            dim=1,
+            inputs=[
+                self._overflow_kinds,
+                self._overflow_counts,
+                self._overflow_prior,
+                d.nefc,
+                d.nacon,
+                d.ncollision,
+                int(d.njmax),
+                int(d.njmax_nnz),
+                int(d.naconmax),
+                int(d.naccdmax),
+                int(d.nvmax),
+                int(opt.iterations),
+                int(opt.ls_iterations),
+            ],
+            outputs=[self._overflow_printed],
+        )
 
     @event_scope
     @override
@@ -5170,7 +5250,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         )
 
     def _create_inverse_shape_mapping(self):
-        """Create the Newton shape to MuJoCo geom mapping for external contacts."""
+        """Create :attr:`newton_shape_to_mjc_geom` from :attr:`mjc_geom_to_newton_shape`."""
         nworld = self.mjc_geom_to_newton_shape.shape[0]
         ngeom = self.mjc_geom_to_newton_shape.shape[1]
 
@@ -8048,6 +8128,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             mjc_dof_to_newton_dof_np = self._tile_world_mapping(dof_to_newton_dof_template, nworld, dofs_per_world)
             self.mjc_dof_to_newton_dof = wp.array(mjc_dof_to_newton_dof_np, dtype=wp.int32)
 
+            self.newton_body_to_mjc_body = wp.array(
+                self._invert_world_mapping(mjc_body_to_newton_np, model.body_count), dtype=wp.int32
+            )
+            self.newton_dof_to_mjc_dof = wp.array(
+                self._invert_world_mapping(mjc_dof_to_newton_dof_np, model.joint_dof_count), dtype=wp.int32
+            )
+
             # Create mjc_eq_to_newton_eq: MuJoCo[world, eq] -> Newton equality constraint
             # selected_constraints[idx] is the Newton template constraint index
             neq = self.mj_model.neq
@@ -8235,6 +8322,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 nvmax=nvmax,
             )
             self.nvmax = self.mjw_data.nvmax
+            self._init_overflow_counts(mujoco_warp, nworld)
             if self.enable_sleeping:
                 self._capture_initial_sleeping_state()
                 self._sleep_qpos = wp.empty_like(self.mjw_data.qpos)

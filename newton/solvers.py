@@ -26,8 +26,18 @@ if TYPE_CHECKING:
 
 __all__ = [*_solvers.__all__, "experimental"]  # noqa: PLE0604
 
+# Removed public symbols and their replacements, named in the AttributeError instead of a bare "no attribute".
+_REMOVED_SYMBOLS = {
+    "SolverNotifyFlags": (
+        "newton.solvers.SolverNotifyFlags was removed in Newton 1.5 (deprecated in 1.3); use newton.ModelFlags "
+        "instead, e.g. newton.ModelFlags.JOINT_DOF_PROPERTIES, or newton.ModelFlags.ALL for every flag."
+    ),
+}
+
 
 def __getattr__(name: str):
+    if name in _REMOVED_SYMBOLS:
+        raise AttributeError(_REMOVED_SYMBOLS[name], name=name, obj=sys.modules[__name__])
     if name not in __all__:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 

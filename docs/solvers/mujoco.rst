@@ -696,6 +696,56 @@ a negative world index — assigning any of them to the global world
 raises ``ValueError``. Only shapes may live in the global world (-1);
 they are shared across all worlds without replication.
 
+.. _mujoco-newton-mujoco-indices:
+
+Newton and MuJoCo indices
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The compiled MuJoCo model (``solver.mj_model``, and ``solver.mjw_model`` per
+world) has its own object ids and names. Names are derived from the Newton
+labels: body and joint names replace ``/`` by ``_`` (``robot/arm/elbow``
+becomes ``robot_arm_elbow``, with a suffix if not unique), and geom names append
+the Newton shape index (``robot/arm/box_12``). Look them up through the id
+mappings instead of spelling them by hand:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Newton to MuJoCo
+     - MuJoCo to Newton
+   * - :attr:`~newton.solvers.SolverMuJoCo.newton_body_to_mjc_body`
+     - :attr:`~newton.solvers.SolverMuJoCo.mjc_body_to_newton`
+   * - :attr:`~newton.solvers.SolverMuJoCo.newton_dof_to_mjc_dof`
+     - :attr:`~newton.solvers.SolverMuJoCo.mjc_dof_to_newton_dof`,
+       :attr:`~newton.solvers.SolverMuJoCo.mjc_jnt_to_newton_jnt`,
+       :attr:`~newton.solvers.SolverMuJoCo.mjc_jnt_to_newton_dof`
+   * - :attr:`~newton.solvers.SolverMuJoCo.newton_shape_to_mjc_geom`
+     - :attr:`~newton.solvers.SolverMuJoCo.mjc_geom_to_newton_shape`
+
+The Newton-to-MuJoCo arrays are indexed by Newton body, DOF, or shape and hold
+the MuJoCo id, or -1 for entities without a MuJoCo counterpart (e.g. sites and
+skipped visual-only shapes). The MuJoCo-to-Newton arrays are indexed by
+``[world, id]``. MuJoCo ids are the same in every world: with
+``separate_worlds=True``, a Newton entity of world ``w`` lives in row ``w`` of
+the ``mjw_data`` arrays. The MuJoCo joint of a DOF is ``mj_model.dof_jntid``;
+a Newton joint with several axes (e.g. D6) becomes one MuJoCo slide or hinge
+joint per axis, named with a ``_lin`` or ``_ang`` suffix.
+
+Combined with the label lookups on :class:`~newton.Model` (see
+:meth:`~newton.Model.find_joint_dofs`), this gives the compiled names and
+addresses:
+
+.. code-block:: python
+
+    dofs = model.find_joint_dofs("left_joint1", world=0)
+    mjc_dofs = solver.newton_dof_to_mjc_dof.numpy()[dofs]
+    joint = solver.mj_model.joint(int(solver.mj_model.dof_jntid[mjc_dofs[0]]))
+    print(joint.name, joint.qposadr, joint.dofadr)
+
+    bodies = solver.newton_body_to_mjc_body.numpy()[model.find_bodies("left_hand", world=0)]
+    print([solver.mj_model.body(int(body)).name for body in bodies])
+
 
 Runtime state synchronization
 -----------------------------
@@ -1105,11 +1155,20 @@ Contact and constraint buffers
 With MuJoCo Warp, ``nconmax`` contacts per world are allocated as one buffer
 of ``nconmax * world_count`` contacts that all worlds share, while ``njmax``
 limits the constraint rows of each world separately. When the buffers
-overflow, MuJoCo Warp prints a ``broadphase overflow``,
-``narrowphase overflow``, or ``nefc overflow`` message. It also sets the
-matching per-world bit in ``solver.mjw_data.overflow``, which stays set until
-the MuJoCo Warp data is reset. Contacts and constraint rows beyond the
-capacity are not stored.
+overflow, MuJoCo Warp sets the matching per-world bit in
+``solver.mjw_data.overflow``, which stays set until the MuJoCo Warp data is
+reset. Contacts and constraint rows beyond the capacity are not stored. MuJoCo
+Warp sets further bits when a world reaches the solver iteration limit
+(``iterations``) or the linesearch iteration limit (``ls_iterations``).
+
+Instead of MuJoCo Warp's message per world and step,
+:meth:`~newton.solvers.SolverMuJoCo.step` prints one line per overflow type and
+solver, the first time the type occurs (e.g. ``SolverMuJoCo: MuJoCo Warp
+linesearch iteration limit (ls_iterations 30) reached in world 0``), and counts
+the (world, step) pairs that raise each type. :func:`newton.utils.report_health`
+reports the counts as ``stats["overflow_counts"]``. To do so, the solver sets
+``solver.mjw_model.opt.warn_overflow`` to ``False``, so MuJoCo Warp functions
+called directly on ``solver.mjw_model`` set the overflow bits without printing.
 
 MuJoCo Warp limits
 ~~~~~~~~~~~~~~~~~~
@@ -1167,6 +1226,12 @@ by joint type:
   ``PhysicsJoint``) is treated the same way.
 - **World-attached shapes that are not part of an articulation**
   remain ordinary static MuJoCo geometry rather than mocap bodies.
+
+MuJoCo does not treat mocap bodies as welded to the world, so it detects
+contacts between their geoms and static world geoms (for example, a robot base
+that overlaps a table) unless collision filtering excludes the pair. These
+contacts count toward ``nconmax``; contact forces cannot move either side.
+The penetration check of :func:`newton.utils.report_health` skips them.
 
 If you edit :attr:`~newton.Model.joint_X_p` or :attr:`~newton.Model.joint_X_c`
 for a fixed-root articulation after constructing the solver, call

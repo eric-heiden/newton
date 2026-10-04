@@ -1114,8 +1114,16 @@ class _MuJoCoParams:
             },
             "per_world": {
                 name: self.per_world(name)
-                for name in ("actuator_gainprm", "actuator_biasprm", "actuator_ctrlrange", "actuator_forcerange")
+                for name in (
+                    "actuator_gainprm",
+                    "actuator_biasprm",
+                    "actuator_ctrlrange",
+                    "actuator_forcerange",
+                    "jnt_actfrcrange",
+                )
             },
+            "joint_actfrcrange": "MuJoCo clamps the sum of all actuator forces on a joint to the joint's actfrcrange, "
+            "after clamping each actuator to its own forcerange",
             "construction_only": [
                 "model.joint_target_mode (which JOINT_TARGET actuators exist; POSITION vs POSITION_VELOCITY is read "
                 "from world 0)",
@@ -1144,6 +1152,12 @@ class _MuJoCoParams:
             for f in ("actuator_gainprm", "actuator_biasprm", "actuator_ctrlrange", "actuator_forcerange")
         }
         actuator_labels = getattr(self.mujoco, "actuator_label", None) if self.mujoco is not None else None
+        mj = solver.mj_model
+        trn_type, trn_id = np.asarray(mj.actuator_trntype), np.asarray(mj.actuator_trnid)
+        jnt_type, jnt_force_limited = np.asarray(mj.jnt_type), np.asarray(mj.jnt_actfrclimited).astype(bool)
+        jnt_actfrcrange = self.compiled("jnt_actfrcrange")
+        jnt_dof = solver.mjc_jnt_to_newton_dof.numpy() if solver.mjc_jnt_to_newton_dof is not None else None
+        jnt_dof = jnt_dof[self.world % jnt_dof.shape[0]] if jnt_dof is not None else None
         rows = []
         for actuator in range(len(maps["source"])):
             source, index = int(maps["source"][actuator]), int(maps["newton"][actuator])
@@ -1215,6 +1229,15 @@ class _MuJoCoParams:
             row["biasprm"] = _round(bias[actuator][:3])
             row["ctrlrange"] = _round(ctrlrange[actuator]) if ctrl_limited[actuator] else "unlimited"
             row["forcerange"] = _round(forcerange[actuator]) if force_limited[actuator] else "unlimited"
+            joint = int(trn_id[actuator][0]) if int(trn_type[actuator]) in (0, 1) else -1  # mjTRN_JOINT(INPARENT)
+            if 0 <= joint < len(jnt_force_limited) and jnt_force_limited[joint]:
+                row["joint_actfrcrange"] = _round(jnt_actfrcrange[joint])
+                joint_dof = int(jnt_dof[joint]) if jnt_dof is not None else -1
+                if joint_dof >= 0 and int(jnt_type[joint]) in (2, 3):  # slide, hinge
+                    sources["joint_actfrcrange"] = f"+-model.joint_effort_limit[{joint_dof}]"
+                    checks.append(
+                        ("joint_actfrcrange", jnt_actfrcrange[joint], [-effort[joint_dof], effort[joint_dof]])
+                    )
             checks = [
                 check
                 for check in checks

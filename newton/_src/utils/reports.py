@@ -26,8 +26,11 @@ def report_solver_params(
     model array and index it is computed from), and ``pending`` (values whose model array differs from
     the compiled value, i.e. edits that no ``notify_model_changed()`` call has applied). The report also
     lists the :class:`~newton.ModelFlags` that refresh each source, whether the MuJoCo field can differ
-    between worlds, and fields that are read only at construction or not at all. Other solvers report the
-    model values and state that compiled values are not available.
+    between worlds, and fields that are read only at construction or not at all. Actuator rows on a
+    force-limited joint also list ``joint_actfrcrange``, the joint's ``actfrcrange`` (from
+    :attr:`~newton.Model.joint_effort_limit` for prismatic and revolute axes), which MuJoCo applies to
+    the sum of all actuator forces on the joint. Other solvers report the model values and state that
+    compiled values are not available.
 
     .. note::
         Experimental: the layout of the report may change without a deprecation period.
@@ -67,7 +70,11 @@ def report_health(
 
     :class:`~newton.solvers.SolverMuJoCo` adds per-world checks of its own data, its ``njmax`` and
     contact buffers, and the shape pairs of its deepest contacts; for other solvers, ``contacts`` from
-    the collision pipeline are checked instead.
+    the collision pipeline are checked instead. The penetration check skips contacts between two
+    static shapes (shapes on no body, or on bodies joined to the world only by joints without degrees
+    of freedom) and between shapes the model filters from colliding (explicit filter pairs, shapes on
+    the same body, collision groups or worlds that do not interact, and shapes without
+    :attr:`~newton.ShapeFlags.COLLIDE_SHAPES`); ``stats["penetration_skipped_contacts"]`` counts them.
 
     .. note::
         Experimental: the layout of the report may change without a deprecation period.
@@ -89,7 +96,11 @@ def report_health(
     Returns:
         ``ok``, ``warnings``, ``stats``, ``checked`` (what was inspected), and, where they apply,
         ``worlds`` (world indices per finding), ``penetration`` (shape pairs with depth [m]), and
-        ``unsupported`` (checks this solver does not allow).
+        ``unsupported`` (checks this solver does not allow). For
+        :class:`~newton.solvers.SolverMuJoCo` on MuJoCo Warp, ``stats["overflow_counts"]`` maps each
+        MuJoCo Warp overflow type raised since the solver was created (e.g. ``"LS_ITERATIONS"``, the
+        linesearch iteration limit) to the number of (world, step) pairs that raised it; the solver
+        prints each type once instead of once per world and step.
     """
     from ..mcp.diagnostics import health_report  # noqa: PLC0415
 

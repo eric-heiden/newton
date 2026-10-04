@@ -292,7 +292,7 @@ def eval_mujoco_coupling_effective_mass_kernel(
                 if index < body_world.shape[0]:
                     world = body_world[index]
                 else:
-                    world = int(-1)
+                    world = wp.int32(-1)
             mjc_body = find_mujoco_body_from_newton_body(world, index, mjc_body_to_newton)
             if (
                 world >= 0
@@ -348,7 +348,7 @@ def eval_mujoco_coupling_effective_mass_block_kernel(
                 if index < body_world.shape[0]:
                     world = body_world[index]
                 else:
-                    world = int(-1)
+                    world = wp.int32(-1)
             mjc_body = find_mujoco_body_from_newton_body(world, index, mjc_body_to_newton)
             if (
                 world >= 0
@@ -3521,3 +3521,197 @@ def reset_joint_state_kernel(
     if joint_qd and i < dofs_per_world:
         di = worldid * dofs_per_world + i
         joint_qd[di] = default_joint_qd[di]
+
+
+# MuJoCo Warp overflow types by name, as Newton's own codes for the once-per-solver message below
+# (``mujoco_warp.OverflowType`` bit positions may differ between MuJoCo Warp versions).
+MJW_OVERFLOW_KINDS = {
+    "NEFC": 1,
+    "NJMAX_NNZ": 2,
+    "BROADPHASE": 3,
+    "NARROWPHASE": 4,
+    "CCD": 5,
+    "HFIELD": 6,
+    "CONTACT_MATCH": 7,
+    "NVMAX": 8,
+    "EPA_HORIZON": 9,
+    "ITERATIONS": 10,
+    "LS_ITERATIONS": 11,
+}
+
+
+@wp.func
+def _print_mjw_overflow(
+    kind: int,
+    bit: int,
+    world: int,
+    nefc: int,
+    nacon: int,
+    ncollision: int,
+    njmax: int,
+    njmax_nnz: int,
+    naconmax: int,
+    naccdmax: int,
+    nvmax: int,
+    iterations: int,
+    ls_iterations: int,
+):
+    # One message per overflow type and solver; report_health() has the counts.
+    if kind == 1:
+        wp.printf(
+            "SolverMuJoCo: MuJoCo Warp constraint overflow in world %d: nefc %d > njmax %d; rows beyond njmax are "
+            "dropped (printed once per solver, newton.utils.report_health() counts every occurrence)\n",
+            world,
+            nefc,
+            njmax,
+        )
+    elif kind == 2:
+        wp.printf(
+            "SolverMuJoCo: MuJoCo Warp constraint Jacobian nonzeros exceed njmax_nnz %d in world %d "
+            "(printed once per solver, newton.utils.report_health() counts every occurrence)\n",
+            njmax_nnz,
+            world,
+        )
+    elif kind == 3:
+        wp.printf(
+            "SolverMuJoCo: MuJoCo Warp broadphase overflow: %d collision candidates > naconmax %d "
+            "(printed once per solver, newton.utils.report_health() counts every occurrence)\n",
+            ncollision,
+            naconmax,
+        )
+    elif kind == 4:
+        wp.printf(
+            "SolverMuJoCo: MuJoCo Warp contact overflow: %d contacts > naconmax %d; contacts beyond naconmax are "
+            "dropped (printed once per solver, newton.utils.report_health() counts every occurrence)\n",
+            nacon,
+            naconmax,
+        )
+    elif kind == 5:
+        wp.printf(
+            "SolverMuJoCo: MuJoCo Warp CCD overflow in world %d (naccdmax %d) "
+            "(printed once per solver, newton.utils.report_health() counts every occurrence)\n",
+            world,
+            naccdmax,
+        )
+    elif kind == 6:
+        wp.printf(
+            "SolverMuJoCo: MuJoCo Warp height field collision overflow in world %d "
+            "(printed once per solver, newton.utils.report_health() counts every occurrence)\n",
+            world,
+        )
+    elif kind == 7:
+        wp.printf(
+            "SolverMuJoCo: MuJoCo Warp contact sensor match overflow in world %d (contact_sensor_maxmatch) "
+            "(printed once per solver, newton.utils.report_health() counts every occurrence)\n",
+            world,
+        )
+    elif kind == 8:
+        wp.printf(
+            "SolverMuJoCo: MuJoCo Warp active DOF overflow in world %d (nvmax %d) "
+            "(printed once per solver, newton.utils.report_health() counts every occurrence)\n",
+            world,
+            nvmax,
+        )
+    elif kind == 9:
+        wp.printf(
+            "SolverMuJoCo: MuJoCo Warp EPA horizon buffer too small in world %d "
+            "(printed once per solver, newton.utils.report_health() counts every occurrence)\n",
+            world,
+        )
+    elif kind == 10:
+        wp.printf(
+            "SolverMuJoCo: MuJoCo Warp solver iteration limit (iterations %d) reached in world %d "
+            "(printed once per solver, newton.utils.report_health() counts every occurrence)\n",
+            iterations,
+            world,
+        )
+    elif kind == 11:
+        wp.printf(
+            "SolverMuJoCo: MuJoCo Warp linesearch iteration limit (ls_iterations %d) reached in world %d "
+            "(printed once per solver, newton.utils.report_health() counts every occurrence)\n",
+            ls_iterations,
+            world,
+        )
+    else:
+        wp.printf(
+            "SolverMuJoCo: MuJoCo Warp overflow flag bit %d raised in world %d "
+            "(printed once per solver, newton.utils.report_health() counts every occurrence)\n",
+            bit,
+            world,
+        )
+
+
+@wp.kernel(enable_backward=False)
+def stash_mjw_overflow_kernel(
+    overflow: wp.array[wp.int32],
+    # output
+    prior: wp.array[wp.int32],
+):
+    """Move each world's sticky MuJoCo Warp overflow bits aside so the next step's bits can be counted."""
+    world = wp.tid()
+    prior[world] = overflow[world]
+    overflow[world] = 0
+
+
+@wp.kernel(enable_backward=False)
+def count_mjw_overflow_kernel(
+    # in/out
+    overflow: wp.array[wp.int32],
+    prior: wp.array[wp.int32],
+    counts: wp.array[wp.int32],
+):
+    """Count the overflow bits a MuJoCo Warp step raised per world and restore the sticky bits.
+
+    ``counts[bit]`` is the number of (world, step) pairs that raised overflow bit ``bit``. On return,
+    ``prior`` holds the bits this step raised, for :func:`print_mjw_overflow_kernel`.
+    """
+    world = wp.tid()
+    raised = overflow[world]
+    for bit in range(counts.shape[0]):
+        if raised & (1 << bit):
+            wp.atomic_add(counts, bit, 1)
+    overflow[world] = raised | prior[world]
+    prior[world] = raised
+
+
+@wp.kernel(enable_backward=False)
+def print_mjw_overflow_kernel(
+    kinds: wp.array[wp.int32],
+    counts: wp.array[wp.int32],
+    raised: wp.array[wp.int32],
+    nefc: wp.array[wp.int32],
+    nacon: wp.array[wp.int32],
+    ncollision: wp.array[wp.int32],
+    njmax: int,
+    njmax_nnz: int,
+    naconmax: int,
+    naccdmax: int,
+    nvmax: int,
+    iterations: int,
+    ls_iterations: int,
+    # in/out
+    printed: wp.array[wp.int32],
+):
+    """Print each overflow type the first time it is counted, naming the first world that raised it (one thread)."""
+    for bit in range(counts.shape[0]):
+        if printed[bit] == 0 and counts[bit] > 0:
+            world = wp.int32(-1)
+            for w in range(raised.shape[0]):
+                if world < 0 and (raised[w] & (1 << bit)) != 0:
+                    world = w
+            _print_mjw_overflow(
+                kinds[bit],
+                bit,
+                world,
+                nefc[wp.max(world, 0)],
+                nacon[0],
+                ncollision[0],
+                njmax,
+                njmax_nnz,
+                naconmax,
+                naccdmax,
+                nvmax,
+                iterations,
+                ls_iterations,
+            )
+            printed[bit] = 1

@@ -1,0 +1,1 @@
+Fix `newton.utils.report_solver_params(kind="actuator")` omitting the effort limit that `SolverMuJoCo` applies through the joint's `actfrcrange`: actuator rows on a force-limited joint now list `joint_actfrcrange` and its source, `Model.joint_effort_limit`, next to the actuator's own `forcerange`.

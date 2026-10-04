@@ -1,0 +1,1 @@
+Fix `newton.utils.report_health()` reporting `ok: False` for overlaps between two static shapes (for example a fixed robot base on a table) and between shapes filtered from colliding; its penetration check now skips them and counts them in `stats["penetration_skipped_contacts"]`.

@@ -4,6 +4,7 @@
 """newton.utils.report_solver_params and newton.utils.report_health outside any live session."""
 
 import importlib.util
+import re
 import unittest
 
 import numpy as np
@@ -11,6 +12,7 @@ import warp as wp
 
 import newton
 import newton.utils
+from newton.tests.unittest_utils import StdOutCapture
 
 _HAS_MUJOCO = bool(importlib.util.find_spec("mujoco") and importlib.util.find_spec("mujoco_warp"))
 
@@ -43,6 +45,108 @@ class TestSolverReports(unittest.TestCase):
         self.assertEqual(row["gainprm"][0], 80.0)
         self.assertNotIn("pending", row)
 
+    @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
+    def test_actuator_rows_show_the_joint_effort_limit(self):
+        """An effort limit on the joint's actfrcrange is reported on the joint's actuators, not as unlimited."""
+        from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_mjcf(
+            _MJCF.replace('range="-60 60"', 'range="-60 60" actuatorfrcrange="-12 12"').replace(
+                "</actuator>", '<motor name="torque" joint="hinge"/></actuator>'
+            )
+        )
+        model = builder.finalize(device="cpu")
+        solver = SolverMuJoCo(model)
+        report = newton.utils.report_solver_params(solver, "actuator")
+        self.assertIn("jnt_actfrcrange", report["per_world"])
+        self.assertEqual(len(report["rows"]), 2)
+        for row in report["rows"]:
+            with self.subTest(actuator=row["label"]):
+                self.assertEqual(row["forcerange"], "unlimited")
+                self.assertEqual(row["joint_actfrcrange"], [-12.0, 12.0])
+                self.assertEqual(row["from"]["joint_actfrcrange"], "+-model.joint_effort_limit[0]")
+        model.joint_effort_limit.fill_(5.0)
+        for row in newton.utils.report_solver_params(solver, "actuator")["rows"]:
+            self.assertIn("joint_actfrcrange", row["pending"])
+        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+        for row in newton.utils.report_solver_params(solver, "actuator")["rows"]:
+            self.assertEqual(row["joint_actfrcrange"], [-5.0, 5.0])
+            self.assertNotIn("pending", row)
+
+    @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
+    def test_health_skips_overlap_between_static_shapes(self):
+        """A welded base overlapping the ground does not fail the health check; a penetrating free body does."""
+        from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        base = builder.add_link(label="base")
+        upright = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5 * wp.pi)
+        # 30 mm into the ground; unfiltered, so MuJoCo collides the (mocap) base with the plane.
+        builder.add_shape_capsule(base, xform=wp.transform(wp.vec3(), upright), radius=0.03, half_height=0.1)
+        weld = builder.add_joint_fixed(-1, base, collision_filter_parent=False)
+        arm = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity()), label="arm")
+        builder.add_shape_box(arm, hx=0.1, hy=0.02, hz=0.02)
+        hinge = builder.add_joint_revolute(
+            base, arm, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity()), axis=(0.0, 1.0, 0.0)
+        )
+        builder.add_articulation([weld, hinge])
+        model = builder.finalize(device="cpu")
+        solver = SolverMuJoCo(model)
+        state_0, state_1 = model.state(), model.state()
+        solver.step(state_0, state_1, model.control(), None, 0.002)
+        self.assertGreater(int(solver.mjw_data.nacon.numpy()[0]), 0)
+        report = newton.utils.report_health(model, state_1, solver)
+        self.assertTrue(report["ok"], report)
+        self.assertNotIn("penetration", report)
+        self.assertGreater(report["stats"]["penetration_skipped_contacts"]["static_pairs"], 0)
+        self.assertEqual(report["stats"]["deepest_penetration"], 0.0)
+
+    def test_health_skips_pairs_filtered_from_colliding(self):
+        """Explicit filter pairs, shared bodies, groups, worlds, and non-colliding shapes are skipped; others are kept."""
+        from newton._src.mcp.diagnostics import _skipped_pairs  # noqa: PLC0415
+
+        template = newton.ModelBuilder()
+        body = template.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()))
+        a = template.add_shape_sphere(body, radius=0.1)
+        b = template.add_shape_sphere(body, radius=0.1)
+        other = template.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 1.1), wp.quat_identity()))
+        c = template.add_shape_sphere(other, radius=0.1)
+        d = template.add_shape_sphere(other, radius=0.1, cfg=newton.ModelBuilder.ShapeConfig(collision_group=2))
+        e = template.add_shape_sphere(other, radius=0.1, cfg=newton.ModelBuilder.ShapeConfig(has_shape_collision=False))
+        f = template.add_shape_sphere(other, radius=0.1)
+        template.add_shape_collision_filter_pair(a, f)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        builder.replicate(template, 2)
+        model = builder.finalize(device="cpu")
+        per_world = template.shape_count
+        offset = model.shape_count - 2 * per_world  # the ground plane comes first
+
+        def shape(index, world=0):
+            return offset + world * per_world + index
+
+        pairs = {
+            "kept": (shape(a), shape(c)),
+            "kept_ground": (shape(c), 0),
+            "same_body": (shape(a), shape(b)),
+            "group": (shape(a), shape(d)),
+            "no_collision": (shape(a), shape(e)),
+            "explicit": (shape(a), shape(f)),
+            "other_world": (shape(a), shape(c, world=1)),
+            "unmapped": (-1, shape(c)),
+        }
+        first = np.array([p[0] for p in pairs.values()])
+        second = np.array([p[1] for p in pairs.values()])
+        static, filtered = _skipped_pairs(model, first, second)
+        self.assertFalse(static.any())
+        self.assertEqual(
+            {name for name, skip in zip(pairs, filtered, strict=True) if skip},
+            {"same_body", "group", "no_collision", "explicit", "other_world"},
+        )
+
     def test_health_names_non_finite_worlds_and_diverging_twins(self):
         """Name the world with non-finite state and the world that left its identical twins, with no solver."""
         template = newton.ModelBuilder()
@@ -65,6 +169,49 @@ class TestSolverReports(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertEqual(report["worlds"]["nonfinite"], [2])
         self.assertIn("No solver given", report["unsupported"][0])
+
+
+@unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
+class TestMuJoCoWarpOverflowCounts(unittest.TestCase):
+    def test_iteration_limits_print_once_and_are_counted(self):
+        """MuJoCo Warp's per-world, per-step iteration-limit prints become one line per type and a count."""
+        from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+
+        template = newton.ModelBuilder()
+        tilted = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.3)
+        cube = template.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.049), tilted))
+        template.add_shape_box(cube, hx=0.05, hy=0.05, hz=0.05)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        builder.replicate(template, 2)
+        model = builder.finalize(device="cpu")
+        solver = SolverMuJoCo(model, iterations=1, ls_iterations=1)
+        state_0, state_1 = model.state(), model.state()
+        steps = 5
+        capture = StdOutCapture()
+        capture.begin()
+        try:
+            for _ in range(steps):
+                solver.step(state_0, state_1, model.control(), None, 0.002)
+                state_0, state_1 = state_1, state_0
+            wp.synchronize()
+        finally:
+            output = capture.end()
+        lines = [line for line in output.splitlines() if not line.startswith("Module ")]
+        once = " (printed once per solver, newton.utils.report_health() counts every occurrence)"
+        self.assertEqual(
+            sorted(re.sub(r"in world \d+", "in world W", line) for line in lines),
+            [
+                "SolverMuJoCo: MuJoCo Warp linesearch iteration limit (ls_iterations 1) reached in world W" + once,
+                "SolverMuJoCo: MuJoCo Warp solver iteration limit (iterations 1) reached in world W" + once,
+            ],
+            output,
+        )
+        report = newton.utils.report_health(model, state_0, solver)
+        # The contact keeps a one-iteration linesearch from converging in every world and step.
+        self.assertEqual(report["stats"]["overflow_counts"]["LS_ITERATIONS"], steps * model.world_count)
+        self.assertGreater(report["stats"]["overflow_counts"]["ITERATIONS"], 0)
+        self.assertEqual(report["worlds"]["overflow_flags"]["1"], ["ITERATIONS", "LS_ITERATIONS"])
 
 
 if __name__ == "__main__":

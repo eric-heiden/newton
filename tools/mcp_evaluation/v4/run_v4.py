@@ -480,6 +480,17 @@ def _renderers() -> str:
     )
 
 
+def _newton_tools() -> str:
+    """Newton utilities that serve both conditions (the MCP guide names their live wrappers, so the prompt must)."""
+    return (
+        "Newton utilities: `python -m newton.examples.headless SCRIPT [script args] [--frames N] [--call EXPR] "
+        "[--json OUT] [--timeout S]` runs an example script in a fresh process and reports the outcome as JSON; "
+        "newton.utils.report_solver_params(solver, kind) reports the values a solver integrates and the model arrays "
+        "they come from; newton.utils.report_health(model, state, solver) reports non-finite values, full buffers, "
+        "and penetrating shape pairs per world.\n"
+    )
+
+
 def prompt_for(name: str, condition: str, workspace: Path, seconds: int, guide: str | None) -> str:
     task = _task(name)
     common = f"""You are working on a Newton physics simulation task.
@@ -490,7 +501,7 @@ Newton source tree (read-only reference, including docs and examples): {ROOT}
 {task["goal"]}
 
 Deliverable: the edited {task["script"]} in the workspace, then a brief report. You have {seconds // 60} minutes, starting {START} (check with `date -u`); working efficiently matters. Do not modify files outside the workspace, do not look for other trials or hidden verification data, and do not use subagents.
-{_renderers()}"""
+{_renderers()}{_newton_tools()}"""
     run_args = task.get("run_args", "--num-frames <N>")
     run = f"uv run --no-sync --project {ROOT} python {task['script']} --viewer null {run_args} {' '.join(task['host_args'])}"
     run = run.rstrip()

@@ -422,6 +422,12 @@ def warm(script: str, args: list[str]) -> None:
     host = ExampleHost(script, args)
     host.build()
     host.example.step()
+    # One live cell compiles the session's own kernels (per-cell model-edit checksums) into the shared seed.
+    session = host.session(allow_execute=True)
+    try:
+        session.dispatch("execute", {"code": "example.step()"})
+    finally:
+        session.close()
     sys.path.insert(0, str(Path(script).resolve().parent))
     module = importlib.import_module(Path(script).stem)
     cls = module.Example

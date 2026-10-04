@@ -74,6 +74,8 @@ Joint types
      - *unsupported*
      - Not forwarded to MuJoCo.
 
+.. _mujoco-joint-ref:
+
 Joint reference values (``ref``)
 --------------------------------
 
@@ -372,6 +374,8 @@ The slope is calibrated for the sliding friction rows. With ``condim > 3``, the
 torsional and rolling rows share the same per-contact ``solreffriction`` and
 MuJoCo scales their regularization by the corresponding friction-coefficient
 ratios, so their effective damping deviates from ``kf`` accordingly.
+
+.. _mujoco-actuators:
 
 Actuators
 ---------
@@ -775,6 +779,15 @@ Push, pull, and contact-conversion are implemented by
 and :meth:`~newton.solvers.SolverMuJoCo.update_contacts`, using kernels
 from :github:`newton/_src/solvers/mujoco/kernels.py` — see
 `Code pointers`_ for the full anchor list.
+
+:meth:`~newton.solvers.SolverMuJoCo.convert_joint_coords_to_mujoco` and
+:meth:`~newton.solvers.SolverMuJoCo.convert_joint_coords_from_mujoco` apply the
+push and pull conversion of joint coordinates to arrays of any batch size, in
+float64, without touching the solver's MuJoCo data. They cover the quaternion
+order, the FREE-joint velocity frames, ``ref``, and the coordinate order of
+``solver.mj_model``. :doc:`/concepts/model_based_control` describes these
+conventions, the CPU ``mj_model`` of the solver, and Newton's kinematics and
+dynamics functions.
 
 
 Solver options
@@ -1275,6 +1288,10 @@ API and subject to change.
   ``SolverMuJoCo._update_mjc_data``, and
   ``SolverMuJoCo._update_newton_state`` — per-step control, data, and
   state sync between Newton and MuJoCo.
+- :meth:`~newton.solvers.SolverMuJoCo.convert_joint_coords_to_mujoco` /
+  :meth:`~newton.solvers.SolverMuJoCo.convert_joint_coords_from_mujoco` —
+  host-side (float64) joint coordinate conversion with the same conventions
+  as the per-step sync.
 - :meth:`~newton.solvers.SolverMuJoCo.update_contacts` — explicit pull
   of MuJoCo's resolved contacts into a Newton ``Contacts`` object
   (default per-step path does not pull contacts back).

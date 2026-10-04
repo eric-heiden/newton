@@ -60,6 +60,7 @@ from .constants import (
 from .enums import EqType as _EqType
 from .enums import _ActuatorBiasType, _ActuatorDynamicsType, _ActuatorGainType
 from .equality import MJC_OBJ_BODY, MjcEqualityTargetKind, _register_equality_constraint_attributes
+from .joint_coords import JointCoordinateMap
 from .kernels import (
     MJW_OVERFLOW_KINDS,
     _snapshot_nacon_count,
@@ -553,6 +554,18 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             state_in, state_out = state_out, state_in
 
             solver.render_mujoco_viewer()
+
+    MuJoCo coordinates
+    ------------------
+
+    ``mj_model`` is the compiled MuJoCo model of one world. Its ``qpos`` and
+    ``qvel`` use MuJoCo's conventions (``(w, x, y, z)`` quaternions, FREE-joint
+    velocity at the body origin with angular velocity in the body frame,
+    absolute ``ref`` coordinates), which :meth:`convert_joint_coords_to_mujoco`
+    and :meth:`convert_joint_coords_from_mujoco` convert to and from
+    :attr:`State.joint_q <newton.State.joint_q>` and
+    :attr:`State.joint_qd <newton.State.joint_qd>`. See
+    :doc:`/concepts/model_based_control`.
     """
 
     EqType = _EqType
@@ -4136,6 +4149,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         Shape [nworld, ntendon], dtype int32."""
         self.body_free_qd_start: wp.array[wp.int32] | None = None
         """Per-body mapping to the free-joint qd_start index (or -1 if not free)."""
+        self._joint_coord_map: JointCoordinateMap | None = None
 
         # --- Newton -> MuJoCo mappings (see "Newton and MuJoCo indices" in docs/solvers/mujoco.rst) ---
         self.newton_body_to_mjc_body: wp.array[wp.int32] | None = None
@@ -6073,6 +6087,106 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             device=self.model.device,
         )
         contacts.n_contacts = mj_data.nacon
+
+    def _joint_coordinate_map(self) -> JointCoordinateMap:
+        if self._joint_coord_map is None:
+            self._joint_coord_map = JointCoordinateMap(
+                self.model,
+                self.mj_q_start.numpy(),
+                self.mj_qd_start.numpy(),
+                self.mj_model.nq,
+                self.mj_model.nv,
+                self.mj_model.qpos0,
+            )
+        return self._joint_coord_map
+
+    def convert_joint_coords_to_mujoco(
+        self,
+        joint_q: np.ndarray | wp.array[float],
+        joint_qd: np.ndarray | wp.array[float] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Convert Newton joint coordinates to MuJoCo ``qpos`` and ``qvel``.
+
+        Applies the conversion that :meth:`step` uses when it writes a
+        :class:`~newton.State` into MuJoCo, in float64 on the host, to any
+        batch of states. It reads the model's joint frames, COM offsets, and
+        ``mujoco:dof_ref``, does not use the solver's MuJoCo data, and
+        modifies nothing, so the result can be written into a separate
+        ``mujoco.MjData(solver.mj_model)``.
+
+        Per joint type (see :doc:`/concepts/model_based_control`):
+
+        - FREE: ``qpos`` holds the child body's world position [m] and
+          orientation as a ``(w, x, y, z)`` quaternion; ``joint_q`` holds the
+          pose relative to the joint frames with an ``(x, y, z, w)``
+          quaternion. ``qvel`` holds the linear velocity of the body-frame
+          origin [m/s] in the world frame, then the angular velocity [rad/s]
+          in the body frame; ``joint_qd`` holds the COM linear velocity and
+          the angular velocity, both in the joint's parent frame.
+        - BALL: ``qpos`` is a ``(w, x, y, z)`` quaternion and ``qvel`` the
+          angular velocity in the child body frame; ``joint_q`` is an
+          ``(x, y, z, w)`` quaternion and ``joint_qd`` the angular velocity in
+          the parent anchor frame.
+        - REVOLUTE, PRISMATIC, and each D6 axis: one MuJoCo scalar per axis,
+          ``qpos = joint_q + mujoco:dof_ref`` and ``qvel = joint_qd``.
+
+        Loop-closure joints have no MuJoCo coordinates and are skipped.
+
+        Args:
+            joint_q: Joint coordinates [m or rad] in the layout of
+                :attr:`State.joint_q <newton.State.joint_q>`, shape
+                ``[..., joint_coord_count]``. Leading dimensions are batch
+                dimensions.
+            joint_qd: Joint velocities [m/s or rad/s] in the layout of
+                :attr:`State.joint_qd <newton.State.joint_qd>`, shape
+                ``[..., joint_dof_count]`` with batch dimensions that
+                broadcast against those of ``joint_q``, or ``None`` to convert
+                positions only.
+
+        Returns:
+            ``(qpos, qvel)``, float64 arrays [m or rad] and [m/s or rad/s] of
+            shape ``[..., world_count * nq]`` and ``[..., world_count * nv]``,
+            where ``world_count`` is the model's and ``nq`` and ``nv`` are the
+            sizes of one world (``solver.mj_model.nq`` and ``nv``). World
+            ``w`` occupies entries ``w * nq`` to ``(w + 1) * nq - 1``. For a
+            single-world model this is the layout of ``MjData.qpos`` and
+            ``MjData.qvel``; ``solver.mjw_data.qpos`` has shape
+            ``[world_count, nq]``. ``qvel`` is ``None`` if ``joint_qd`` is
+            ``None``.
+        """
+        return self._joint_coordinate_map().to_mujoco(joint_q, joint_qd)
+
+    def convert_joint_coords_from_mujoco(
+        self,
+        qpos: np.ndarray | wp.array[float],
+        qvel: np.ndarray | wp.array[float] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Convert MuJoCo ``qpos`` and ``qvel`` to Newton joint coordinates.
+
+        Inverse of :meth:`convert_joint_coords_to_mujoco`, with the same
+        conventions; runs in float64 on the host and modifies nothing.
+        Coordinates of loop-closure joints, which have no MuJoCo coordinates,
+        are copied from :attr:`Model.joint_q <newton.Model.joint_q>` and
+        :attr:`Model.joint_qd <newton.Model.joint_qd>`.
+
+        Args:
+            qpos: MuJoCo positions [m or rad], shape
+                ``[..., world_count * nq]`` or ``[..., world_count, nq]`` (the
+                layout of ``solver.mjw_data.qpos``). Leading dimensions are
+                batch dimensions.
+            qvel: MuJoCo velocities [m/s or rad/s], shape
+                ``[..., world_count * nv]`` or ``[..., world_count, nv]`` with
+                batch dimensions that broadcast against those of ``qpos``, or
+                ``None`` to convert positions only.
+
+        Returns:
+            ``(joint_q, joint_qd)``, float64 arrays of shape
+            ``[..., joint_coord_count]`` and ``[..., joint_dof_count]`` in the
+            layout of :attr:`State.joint_q <newton.State.joint_q>` and
+            :attr:`State.joint_qd <newton.State.joint_qd>`. ``joint_qd`` is
+            ``None`` if ``qvel`` is ``None``.
+        """
+        return self._joint_coordinate_map().from_mujoco(qpos, qvel)
 
     def _convert_to_mjc(
         self,

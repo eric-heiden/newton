@@ -270,14 +270,22 @@ values = wp.array([1.0, 2.0, 3.0], dtype=float, device='cpu')
         self.assertEqual(result["result"], [4, 8, 12])
 
     def test_cell_source_cache_is_bounded_and_cleared(self):
-        """Bound cached cell source and remove it when clearing or closing the workspace."""
+        """Bound cached cell source, keep cells of live definitions, and clear it with the workspace."""
         first = self.execute("def first():\n    return 7\nfirst.__code__.co_filename")["result"]
+        dropped = self.execute("def dropped():\n    return 1\ndropped.__code__.co_filename")["result"]
+        self.execute("del dropped")
         self.assertTrue(linecache.getlines(first))
         for index in range(70):
             self.execute(f"counter = {index}")
+        # The 64 most recent cells plus the cell that still defines `first`.
+        self.assertEqual(self.session.dispatch("describe")["workspace"]["source_cells"], 65)
+        self.assertTrue(linecache.getlines(first))
+        self.assertFalse(linecache.getlines(dropped))
+        self.assertEqual(self.execute("first()")["result"], 7)
+        self.execute("first = None")
+        self.execute("counter = 0")
         self.assertEqual(self.session.dispatch("describe")["workspace"]["source_cells"], 64)
         self.assertFalse(linecache.getlines(first))
-        self.assertEqual(self.execute("first()")["result"], 7)
         self.execute("counter = 0", reset_namespace=True)
         self.assertEqual(self.session.dispatch("describe")["workspace"]["source_cells"], 1)
         latest = self.execute("def latest():\n    return 1\nlatest.__code__.co_filename")["result"]

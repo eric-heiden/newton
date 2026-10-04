@@ -9,6 +9,7 @@ import ast
 import base64
 import builtins
 import contextlib
+import functools
 import inspect
 import io
 import json
@@ -32,6 +33,8 @@ from ..sim.collide import CollisionPipeline
 from ..sim.contact_kinematics import eval_rigid_contact_kinematics
 from ..sim.enums import JointType, ModelFlags, StateFlags
 from ..sim.model import Model
+
+_OMITTED = object()
 
 
 def _integer(value: Any, name: str, minimum: int, maximum: int) -> int:
@@ -286,6 +289,8 @@ class SimulationSession:
         self._workspace_module = None
         self._workspace_warp_module = None
         self._workspace_sources = []
+        self._cell_modules = {}
+        self._model_baselines = {}
         self._workspace_generation = 0
         self._cell_count = 0
         self._execution_error = None
@@ -318,6 +323,8 @@ class SimulationSession:
         self.reset_callback = reset_callback
         self.rebuild_callback = rebuild_callback
         self.allow_execute = allow_execute
+        self.source_path: Path | None = None
+        """Script that :meth:`persist` and :meth:`persist_source` edit; :class:`ExampleHost` sets it."""
         self.revision = 0
         self.replace(
             model,
@@ -395,6 +402,14 @@ class SimulationSession:
         self.revision += 1
         self._checkpoints.clear()
         self._initial = self._snapshot()
+        self._model_baselines = {}
+        if self.allow_execute:
+            from .persist import ModelBaseline  # noqa: PLC0415
+
+            try:
+                self._model_baselines["build"] = ModelBaseline(model)
+            except Exception as error:
+                self._model_baselines["error"] = f"{type(error).__name__}: {str(error)[:200]}"
         self._contact_frame = None
         self._contact_revision = None
         self.last_error: str | None = None
@@ -850,8 +865,12 @@ class SimulationSession:
         "render",
         "compare_images",
         "contacts_between",
+        "persist",
+        "persist_source",
+        "diff_model",
     )
     _EXPRESSION_RESULT = "__newton_expression_result__"
+    _CLASS_HOOK = "__newton_cell_class__"
 
     def _refresh_workspace(self) -> None:
         if self._workspace_module is None or self._closed:
@@ -873,6 +892,9 @@ class SimulationSession:
                     "render",
                     "compare_images",
                     "contacts_between",
+                    "persist",
+                    "persist_source",
+                    "diff_model",
                 )
             }
         )
@@ -888,6 +910,9 @@ class SimulationSession:
             render=self.render,
             compare_images=self.compare_images,
             contacts_between=self.contacts_between,
+            persist=self.persist,
+            persist_source=self.persist_source,
+            diff_model=self.diff_model,
             np=np,
             wp=wp,
             newton=newton,
@@ -900,7 +925,7 @@ class SimulationSession:
 
     def _clear_workspace(self) -> None:
         for filename in self._workspace_sources:
-            linecache.cache.pop(filename, None)
+            self._forget_cell(filename)
         self._workspace_sources.clear()
         self._workspace.clear()
         self._workspace_generation += 1
@@ -938,7 +963,31 @@ class SimulationSession:
         linecache.cache[filename] = (len(code), None, lines, filename)
         self._workspace_sources.append(filename)
         if len(self._workspace_sources) > 64:
-            linecache.cache.pop(self._workspace_sources.pop(0), None)
+            from .persist import referenced_cell_files  # noqa: PLC0415
+
+            # Older cells stay cached while a workspace function or class still comes from them, so
+            # inspect.getsource() and persist_source() keep working; at most 512 cells are kept.
+            live = referenced_cell_files(self._workspace)
+            older, recent = self._workspace_sources[:-64], self._workspace_sources[-64:]
+            kept = [filename for filename in older if filename in live][-448:]
+            for filename in older:
+                if filename not in kept:
+                    self._forget_cell(filename)
+            self._workspace_sources = kept + recent
+
+    def _forget_cell(self, filename: str) -> None:
+        linecache.cache.pop(filename, None)
+        module_name = self._cell_modules.pop(filename, None)
+        if module_name is not None:
+            sys.modules.pop(module_name, None)
+
+    def _bind_cell_class(self, cls: Any, *, filename: str, module_name: str) -> None:
+        from .persist import bind_cell_class  # noqa: PLC0415
+
+        # Source lookup is a convenience; it must never fail the cell that defines the class.
+        with contextlib.suppress(Exception):
+            if bind_cell_class(cls, self._workspace, self._workspace_name, filename, module_name):
+                self._cell_modules[filename] = module_name
 
     def _execution_diagnostic(self, error: BaseException, filename: str) -> dict:
         frames = [
@@ -975,6 +1024,11 @@ class SimulationSession:
                     expression,
                 )
                 ast.fix_missing_locations(tree)
+            defines_classes = any(isinstance(node, ast.ClassDef) for node in tree.body)
+            if defines_classes:
+                from .persist import instrument_cell_classes  # noqa: PLC0415
+
+                instrument_cell_classes(tree, self._CLASS_HOOK)
             compiled = compile(tree, filename, "exec")
         except SyntaxError as error:
             self._execution_error = self._execution_diagnostic(error, filename)
@@ -993,6 +1047,12 @@ class SimulationSession:
         scope = self._workspace
         scope.pop("result", None)
         scope.pop(self._EXPRESSION_RESULT, None)
+        if defines_classes:
+            # Gives cell classes a source file for inspect.getsource() (see persist.bind_cell_class).
+            module_name = f"{self._workspace_name}.cell_{self._cell_count}"
+            scope[self._CLASS_HOOK] = functools.partial(
+                self._bind_cell_class, filename=filename, module_name=module_name
+            )
         output = self._Output(16384)
         self._shown_images = []
         try:
@@ -1025,6 +1085,7 @@ class SimulationSession:
                 f"frames={json.dumps(diagnostic['frames'])}; stdout={''.join(output.parts)!r}"
             ) from error
         finally:
+            scope.pop(self._CLASS_HOOK, None)
             self._refresh_workspace()
         self.revision += 1
         if recovery == "acknowledge":
@@ -1619,6 +1680,102 @@ class SimulationSession:
 
         self._assert_owner()
         return contacts_between(self, a, b, detail=detail)
+
+    def persist(
+        self,
+        name: str,
+        value: Any = _OMITTED,
+        *,
+        rebuild: bool = True,
+        check: str | Callable | None = None,
+        tolerance: float = 1e-6,
+        path: str | Path | None = None,
+    ) -> dict:
+        """Write a value into the script's module-level ``NAME = <literal>`` assignment (trusted execution helper).
+
+        Only the assignment's value changes; the rest of the file stays byte for byte. When the old and
+        new values are dictionaries with the same keys or sequences of the same length, only the
+        differing entries are rewritten, so comments inside the literal remain. Refuses if ``name`` is
+        not assigned exactly once at module level, or if its current value is not a literal. Prints a
+        unified diff and saves the previous file under ``<artifact_directory>/persist/``.
+
+        Args:
+            name: Module-level variable, such as ``"PARAMS"``.
+            value: New value: dicts, lists, tuples, non-empty sets, numbers, strings, bytes, bools,
+                ``None``, NumPy scalars/arrays and Warp vectors/arrays (converted to plain literals).
+                Omitted: the current value of ``module.<name>`` in the hosted script module.
+            rebuild: Rebuild the scene (and worker sessions) from the edited file.
+            check: Expression (evaluated in the workspace) or callable evaluated before writing and
+                again after the rebuild; both values are reported with ``reproduced``.
+            tolerance: Relative and absolute tolerance of ``reproduced`` for numeric check values.
+            path: File to edit instead of the hosted script, relative to the script's directory.
+
+        Returns:
+            ``path``, ``changed``, ``backup``, the edited ``line``, rebuild timing, and ``check``.
+        """
+        from .persist import MISSING, persist  # noqa: PLC0415
+
+        self._assert_owner()
+        value = MISSING if value is _OMITTED else value
+        return persist(self, name, value, rebuild=rebuild, check=check, tolerance=tolerance, path=path)
+
+    def persist_source(
+        self,
+        obj: Any,
+        *,
+        target: str | None = None,
+        rebuild: bool = True,
+        check: str | Callable | None = None,
+        tolerance: float = 1e-6,
+        path: str | Path | None = None,
+    ) -> dict:
+        """Replace a def or class in the script with the source of one defined in a cell (trusted execution helper).
+
+        The script's single top-level definition with the same name (or ``target``) is replaced, from
+        its first decorator to its last line, by the cell's source re-indented to match; everything else
+        in the file stays byte for byte. Refuses if the target is missing, bound more than once, or not
+        a def/class. Prints a unified diff and saves the previous file under
+        ``<artifact_directory>/persist/``. Global names the new definition reads that the script never
+        binds are listed in ``names_not_defined_in_script``; methods assigned to a class from other cells
+        (not part of its class statement) in ``methods_from_other_cells``.
+
+        Args:
+            obj: Function or class (or its workspace name) defined in a trusted-execution cell.
+            target: Definition to replace: ``"Name"`` or ``"Class.method"``; defaults to the object's
+                qualified name. A different leaf name renames the definition to it.
+            rebuild: Rebuild the scene (and worker sessions) from the edited file.
+            check: Expression or callable evaluated before writing and after the rebuild; both values
+                are reported with ``reproduced``.
+            tolerance: Relative and absolute tolerance of ``reproduced`` for numeric check values.
+            path: File to edit instead of the hosted script, relative to the script's directory.
+
+        Returns:
+            ``path``, ``changed``, ``backup``, the replaced ``lines``, rebuild timing, and ``check``.
+        """
+        from .persist import persist_source  # noqa: PLC0415
+
+        self._assert_owner()
+        return persist_source(self, obj, target=target, rebuild=rebuild, check=check, tolerance=tolerance, path=path)
+
+    def diff_model(self, since: str = "build", *, limit: int = 16) -> dict:
+        """Model arrays and scalars that differ from the last build (trusted execution helper).
+
+        Changed rows are keyed by entity label (``@world`` is appended in multi-world models, ``#row``
+        when labels repeat) with ``[old, new]`` values for at most ``limit`` rows per field, plus
+        ``changed_rows`` and ``rows`` counts. ``replaced`` marks attributes that now refer to a different
+        array object than at the baseline. ``flags`` lists the :class:`~newton.ModelFlags` inferred from
+        the changed fields (the categories ``edit`` uses, plus the fields named in the ModelFlags
+        docstrings); ``fields_without_flag`` lists changed fields with no inferred category.
+
+        Args:
+            since: ``"build"`` compares with the model as built; ``"last"`` with the previous
+                ``diff_model`` call (the build if there was none).
+            limit: Maximum rows listed per field.
+        """
+        from .persist import diff_model  # noqa: PLC0415
+
+        self._assert_owner()
+        return diff_model(self, since, limit=limit)
 
     def solver_contacts(self, limit: int = 20) -> dict:
         """Active solver contacts grouped by shape pair, with the effective solver parameters."""

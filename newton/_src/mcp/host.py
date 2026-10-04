@@ -278,7 +278,8 @@ class ExampleHost:
 - In models with several worlds, world_id selects the world in observations, and body labels resolve within it.
 - Python errors in a cell are reported but keep the scene valid; statements before the failing line keep their effects.
 - newton_rebuild(arguments={{"restart": true}}) restarts the whole host process (fresh CUDA context, same script and arguments; Python variables are lost, and the next call waits for the new process). Use it only if the process is broken, e.g. after a CUDA error.
-- After editing the script on disk, newton_rebuild reloads and reconstructs it in this process (Python variables survive; pass arguments={{"argv": [...]}} to change example arguments). Rebuild once to confirm the edited script reproduces your live result."""
+- After editing the script on disk, newton_rebuild reloads and reconstructs it in this process (Python variables survive; pass arguments={{"argv": [...]}} to change example arguments). Rebuild once to confirm the edited script reproduces your live result.
+- persist('NAME', value) rewrites the script's module-level literal assignment NAME = ... (dict, list, tuple, number, string, bool, None; NumPy and Warp values become plain literals; without value it writes module.NAME), changing only the differing entries; persist_source(fn_or_class, target='Example.step') replaces the same-named top-level def/class (or the target method) with the definition from a cell. Both refuse when the target is missing, bound more than once, or not a literal/def, print a unified diff, save the previous file under the artifact directory, and then rebuild (rebuild=False skips); check='expr' reports the expression's live and rebuilt values and whether they agree. diff_model(since='build'|'last') lists model arrays changed since the build by entity label ([old, new]) with the ModelFlags inferred for them."""
         if workers:
             text += f"""
 - `workers` holds {workers} sibling live copies of this example (same script and arguments, separate processes and scenes). For a sweep, one call to workers.map(code, [args, ...]) runs a code string once per item in parallel (the item is `args` inside; `example`, `rollout`, ... exist there too) and returns all results in the same response; workers.broadcast(code) defines helpers on all of them. workers.submit(code, args) returns a Future instead; use it only when you will do other work in this call before collecting .result(), since polling costs an extra turn. Workers do not see this session's Python variables or live edits: send the settings to test in `args`, and rebuild them (workers.broadcast("session.dispatch('rebuild', {{}})")) after editing the script."""
@@ -328,6 +329,7 @@ class ExampleHost:
             invalidate_on_error=False,
         )
         session.host = self
+        session.source_path = self.script
         return session
 
 

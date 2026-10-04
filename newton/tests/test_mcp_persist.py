@@ -348,7 +348,8 @@ class TestMcpCellSource(_Base):
         self.assertEqual(inner, "class Inner:\n        pass")
         self.assertIn(module_name, sys.modules)
         self.assertEqual(self.execute("pickle.loads(pickle.dumps(Gains.Inner)) is Gains.Inner")["result"], True)
-        # Sources of live definitions outlast the 64-cell window; unused cells are dropped.
+        # Beyond the cell limit, sources of live definitions are kept and unused cells are dropped.
+        self.session._MAX_CELL_SOURCES = 70
         filename = self.execute("inspect.getsourcefile(Gains)")["result"]
         dropped = self.execute("def dropped():\n    pass\ndropped.__code__.co_filename")["result"]
         self.execute("del dropped")
@@ -467,6 +468,25 @@ class TestMcpPersistHosted(unittest.TestCase):
                     session.dispatch("execute", {"code": code})
                 self.assertIn("raise ValueError('broken')", script.read_text(encoding="utf-8"))
                 self.assertEqual(len(list((Path(directory) / "persist").iterdir())), 3)
+            finally:
+                session.close()
+
+    def test_persist_into_a_helper_module_reaches_the_rebuilt_scene(self):
+        """Rebuild with the helper module that persist(path=...) rewrote, so the check reproduces."""
+        helper = f"persist_helper_{id(self)}"
+        self.addCleanup(sys.modules.pop, helper, None)
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / f"{helper}.py").write_text("GAIN = 1.0\n", encoding="utf-8")
+            script = Path(directory) / "push.py"
+            source = _SCRIPT.replace('self.speed = PARAMS["speed"]', "self.speed = GAIN")
+            script.write_text(f"from {helper} import GAIN\n{source}", encoding="utf-8")
+            session = ExampleHost(script).session(artifact_directory=directory)
+            try:
+                code = f"example.speed = 5.0\npersist('GAIN', 5.0, path='{helper}.py', check='example.speed')['check']"
+                check = session.dispatch("execute", {"code": code})["result"]
+                self.assertEqual((check["live"], check["rebuilt"], check["reproduced"]), (5.0, 5.0, True))
+                self.assertEqual(session.dispatch("execute", {"code": "example.speed"})["result"], 5.0)
+                self.assertEqual(_literal(Path(directory) / f"{helper}.py", "GAIN"), 5.0)
             finally:
                 session.close()
 

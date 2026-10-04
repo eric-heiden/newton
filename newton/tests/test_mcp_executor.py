@@ -309,20 +309,21 @@ values = wp.array([1.0, 2.0, 3.0], dtype=float, device='cpu')
 
     def test_cell_source_cache_is_bounded_and_cleared(self):
         """Bound cached cell source, keep cells of live definitions, and clear it with the workspace."""
+        self.session._MAX_CELL_SOURCES = 66
         first = self.execute("def first():\n    return 7\nfirst.__code__.co_filename")["result"]
         dropped = self.execute("def dropped():\n    return 1\ndropped.__code__.co_filename")["result"]
         self.execute("del dropped")
         self.assertTrue(linecache.getlines(first))
         for index in range(70):
             self.execute(f"counter = {index}")
-        # The 64 most recent cells plus the cell that still defines `first`.
-        self.assertEqual(self.session.dispatch("describe")["workspace"]["source_cells"], 65)
+        # The limit is held; the cell that still defines `first` is kept and older unused cells are dropped.
+        self.assertEqual(self.session.dispatch("describe")["workspace"]["source_cells"], 66)
         self.assertTrue(linecache.getlines(first))
         self.assertFalse(linecache.getlines(dropped))
         self.assertEqual(self.execute("first()")["result"], 7)
         self.execute("first = None")
         self.execute("counter = 0")
-        self.assertEqual(self.session.dispatch("describe")["workspace"]["source_cells"], 64)
+        self.assertEqual(self.session.dispatch("describe")["workspace"]["source_cells"], 66)
         self.assertFalse(linecache.getlines(first))
         self.execute("counter = 0", reset_namespace=True)
         self.assertEqual(self.session.dispatch("describe")["workspace"]["source_cells"], 1)
@@ -332,6 +333,45 @@ values = wp.array([1.0, 2.0, 3.0], dtype=float, device='cpu')
         self.session.close()
         self.assertFalse(linecache.getlines(latest))
         self.assertNotIn(module_name, sys.modules)
+
+    def test_sources_of_definitions_held_in_containers_are_kept(self):
+        """Keep the cells of functions and classes reachable only through containers, partials and instances."""
+        from newton._src.mcp import shipping  # noqa: PLC0415
+
+        self.session._MAX_CELL_SOURCES = 66
+        self.execute(
+            "import functools\n"
+            "def controller(x):\n    return 2 * x\n"
+            "def scaled(x, k):\n    return k * x\n"
+            "class Policy:\n    def act(self, x):\n        return x + 1\n"
+            "CONTROLLERS = {'p': controller, 'scaled': [functools.partial(scaled, k=3)]}\n"
+            "POLICY = Policy()\n"
+            "del controller, scaled, Policy"
+        )
+        unused = self.execute("def unused():\n    pass\nunused.__code__.co_filename")["result"]
+        self.execute("del unused")
+        for index in range(70):
+            self.execute(f"counter = {index}")
+        self.assertFalse(linecache.getlines(unused))
+        result = self.execute(
+            "import inspect\n"
+            "(inspect.getsource(CONTROLLERS['p']).splitlines()[0], "
+            "inspect.getsource(CONTROLLERS['scaled'][0].func).splitlines()[0], "
+            "inspect.getsource(type(POLICY)).splitlines()[0])"
+        )["result"]
+        self.assertEqual(result, ["def controller(x):", "def scaled(x, k):", "class Policy:"])
+        shipment = shipping.prepare(self.session._workspace["CONTROLLERS"]["p"], lambda name, value: False)
+        self.assertEqual(shipment.label, "controller")
+
+    def test_sys_exit_in_a_cell_rolls_back_and_keeps_the_session(self):
+        """Treat SystemExit raised by a cell like any error: roll back and keep serving."""
+        with self.assertRaisesRegex(
+            RuntimeError, r"SystemExit\(0\) raised at line 3; the session keeps running.*rolled back"
+        ):
+            self.execute("import sys\nsession.dispatch('step', {'count': 2})\nsys.exit(0)")
+        self.assertEqual(self.session.frame, 0)
+        self.assertTrue(self.session.valid)
+        self.assertEqual(self.execute("1 + 1")["result"], 2)
 
     def test_namespace_clear_releases_owned_warp_definitions(self):
         """Unload executor-owned Warp definitions when explicitly clearing the namespace."""
@@ -529,7 +569,8 @@ class TestMcpCellSources(unittest.TestCase):
         self.assertIs(linecache.cache[names[0]], entry)
         namespace = {}
         exec(compile("def f1():\n    return 1", names[1], "exec"), namespace)
-        kept = retain_cell_sources(names, namespace, recent=2)
+        self.assertEqual(retain_cell_sources(names, namespace, recent=2, maximum=5), names)
+        kept = retain_cell_sources(names, namespace, recent=2, maximum=3)
         self.assertEqual(kept, [names[1], names[3], names[4]])
         self.assertFalse(linecache.getlines(names[0]))
         self.assertTrue(linecache.getlines(names[1]))

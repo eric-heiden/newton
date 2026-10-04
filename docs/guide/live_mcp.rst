@@ -79,9 +79,17 @@ option, a replacement solver), the host re-records the graphs and reports this
 as ``note`` in the execution result; settings that stepping itself advances,
 such as timers, do not count. ``recapture()`` re-records them explicitly.
 
-``newton_rebuild`` reloads the edited script from disk in the same process. If
-loading or constructing the example raises, the previous scene keeps running and
-the error shows the traceback of the script with ``file:line``. Rebuild
+``newton_rebuild`` reloads the edited script from disk in the same process,
+together with the modules it imports from its own directory. If loading or
+constructing the example raises, the previous scene (and the previously loaded
+helper modules) keep running and the error shows the traceback of the script
+with ``file:line``. ``newton_rebuild(arguments={"restart": true})`` first loads
+the script with the requested overrides and parses the requested arguments in a
+new process; if that fails, the restart is refused and the current process keeps
+running. If ``Example()`` then fails in the restarted process, it builds with the
+previous arguments and overrides instead and says so in the ``note`` of the next
+execution result. A ``SystemExit`` raised by a cell, a step, or the example's
+argument parser is reported as an error instead of ending the host. Rebuild
 ``overrides`` set module globals after the script is loaded and before
 ``Example()`` is constructed:
 
@@ -363,11 +371,14 @@ Trusted cells can use these helpers without imports (``newton``, ``np``, and
   index it comes from, the :class:`~newton.ModelFlags` category that refreshes
   it, whether it can differ per world, and model values that differ from the
   compiled ones (``pending``). Other solvers report the Newton model values.
+  It is :func:`newton.utils.report_solver_params` applied to the session's
+  solver.
 - :meth:`~newton.mcp.SimulationSession.health` checks any solver and state
   (default: the session's) for non-finite values, runaway speeds, full contact
   or constraint buffers, and penetrating shape pairs, naming the worlds
   involved; ``twins=True`` also reports worlds whose joint state deviates from
-  the others.
+  the others. It is :func:`newton.utils.report_health` applied to the session's
+  model, state, solver, and contacts.
 - :meth:`~newton.mcp.SimulationSession.swap_solver` replaces the solver with
   ``factory(model)``: it installs the new solver (a hosted example re-records
   its CUDA graphs), steps a copy of the current state for two frames, runs
@@ -386,9 +397,13 @@ category no ``notify_model_changed`` call covered are notified with the inferred
 flags, and the execution result's ``note`` names the changed fields, the flags,
 and edited fields the current solver configuration does not read (for example
 ``mujoco.actuator_gainprm`` of actuators driven by ``joint_target_ke``).
+A ``notify_model_changed`` call covers a changed array only if it was made on
+the session's solver with the array's category after the array's last change;
+calls on other solver objects, or before the edit, are listed in the note.
 ``session.watch.mode = "report"`` reports without notifying and ``"off"``
-disables the checks. Edits made by the application's own ``step()`` are not
-reported.
+disables the checks. Edits made by the application's own ``step()``, also when a
+cell calls ``example.step()``, are not reported. Reading the checksums before a
+step waits for the device work queued before it.
 
 Writing live results back to the script
 ---------------------------------------
@@ -463,11 +478,18 @@ and Python workspace:
   functions do not resend a synced global while the session still binds the
   same object.
 * Code strings run as cells on a worker with the item bound to ``args``.
-* A failed call rolls back its worker's simulation like any failed cell. It
+* A failed call rolls back its worker's simulation like any failed cell, and
+  the error says what was restored; the worker's Python variables are kept. It
   returns ``{"error": ...}`` from ``map`` (with the worker's cell and line) and
   raises from ``submit`` and ``broadcast``.
+* Warp kernels sent with a function are defined in a module named after their
+  source, so all workers (and restarted ones) share their kernel-cache entry.
 
-A launched pool follows ``newton_rebuild`` with the same arguments. A worker
+A launched pool follows ``newton_rebuild`` with the same arguments. Idle workers
+rebuild before the rebuild returns; a worker that is running a call or still
+starting rebuilds right after it, before any queued call, and is listed as
+``pending``. Each rebuild increments the pool's ``build`` count, which
+``workers.status()`` and every job record report. A worker
 whose process exits or whose CUDA context fails is restarted, and earlier
 ``broadcast`` and ``sync`` calls are replayed on it in order;
 ``workers.resize(n)`` adds or removes workers the same way. The session lists
@@ -476,8 +498,9 @@ such events under ``workers`` in its next execution response.
 ``jobs.start(fn_or_code, *args, where="worker")`` queues a background call and
 returns a job id at once; nothing runs on the main session's simulation.
 ``jobs.wait(timeout=..., any=True)`` returns finished results and the lines
-running jobs printed since the previous wait, and every execution response
-lists jobs that finished since the previous response. Other places to run jobs
+running jobs printed since the previous wait, with the worker and the ``build``
+its scene had when the job started, and every execution response lists jobs
+that finished since the previous response. Other places to run jobs
 are added with :meth:`~newton.mcp.JobQueue.register_backend`.
 
 .. _live-mcp-rollback:

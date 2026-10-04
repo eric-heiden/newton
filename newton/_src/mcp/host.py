@@ -13,14 +13,20 @@ and reload the edited script in the same process.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
+import functools
 import hashlib
+import importlib.util
+import io
 import json
 import linecache
 import os
+import subprocess
 import sys
 import threading
 import time
+import weakref
 from pathlib import Path
 from types import FunctionType, MethodType, ModuleType
 from typing import Any
@@ -49,6 +55,49 @@ def _load_module(path: Path, generation: int, source: bytes):
     finally:
         sys.path.remove(str(path.parent))
     return module
+
+
+def _local_modules(directory: Path) -> dict[str, ModuleType]:
+    """Modules imported from ``directory`` itself (the script's helper modules and packages), by name."""
+    from .rollback import user_frame  # noqa: PLC0415
+
+    try:
+        tops = {
+            entry.stem if entry.suffix == ".py" else entry.name
+            for entry in directory.iterdir()
+            if entry.suffix == ".py" or (entry / "__init__.py").is_file()
+        }
+    except OSError:
+        return {}
+    modules = {}
+    for name, module in list(sys.modules.items()):
+        # Only names that resolve through the directory's own sys.path entry: helper for DIR/helper.py.
+        if name.partition(".")[0] not in tops or name == "__main__":
+            continue
+        path = getattr(module, "__file__", None)
+        if not isinstance(path, str) or not path.endswith(".py"):
+            continue
+        with contextlib.suppress(OSError):
+            resolved = Path(path).resolve()
+            if directory in resolved.parents and user_frame(str(resolved)):
+                modules[name] = module
+    return modules
+
+
+_CHECK = "import json, sys\nfrom newton._src.mcp.host import _check_load\n_check_load(**json.loads(sys.argv[1]))\n"
+
+
+def _check_load(script: str, example_class: str, argv: list[str], overrides: dict) -> None:
+    """Load ``script``, set ``overrides`` and parse ``argv`` as :meth:`ExampleHost.build` does, without ``Example()``."""
+    path = Path(script)
+    sys.argv = [path.name]  # names the script in argument parser errors
+    module = _load_module(path, 0, path.read_bytes())
+    _apply_overrides(module, overrides)
+    cls = getattr(module, example_class)
+    import newton.examples  # noqa: PLC0415
+
+    parser = cls.create_parser() if hasattr(cls, "create_parser") else newton.examples.create_parser()
+    parser.parse_known_args(argv)
 
 
 _SCALARS = (int, float, bool, str, type(None))
@@ -235,7 +284,10 @@ class ExampleHost:
         self._dynamic_scalars: set[str] = set()
         self._dynamic_keys: set[str] = set()
         self._no_solver = _NoSolver()
+        self._session_ref = None
         self.restart_requested = False
+        self.restart_fallback: dict | None = None
+        """Arguments and overrides a restarted host builds with if the requested ones fail."""
         self.source_sha256: str | None = None
         """SHA-256 of the script source the current example was built from."""
         self.fresh = self._fresh_runner()
@@ -269,17 +321,39 @@ class ExampleHost:
         started = time.perf_counter()
         self.generation += 1
         source = self.script.read_bytes()
-        module = _load_module(self.script, self.generation, source)
-        _apply_overrides(module, copy.deepcopy(overrides))
-        cls = getattr(module, self.example_class)
-        import newton.examples  # noqa: PLC0415
+        # Helper modules next to the script are imported again, so edits to them (e.g. by persist(path=...))
+        # take effect; a failed build puts the previous ones back. Warp kernels in an edited helper module
+        # share its Warp module name, so the previous scene would launch their new definitions.
+        local = _local_modules(self.script.parent)
+        for name, module in local.items():
+            del sys.modules[name]
+            # An edit that keeps the file size within the second of the last import would load stale bytecode.
+            with contextlib.suppress(OSError, ValueError):
+                Path(importlib.util.cache_from_source(module.__file__)).unlink(missing_ok=True)
+        try:
+            module = _load_module(self.script, self.generation, source)
+            _apply_overrides(module, copy.deepcopy(overrides))
+            cls = getattr(module, self.example_class)
+            import newton.examples  # noqa: PLC0415
 
-        parser = cls.create_parser() if hasattr(cls, "create_parser") else newton.examples.create_parser()
-        args, _ = parser.parse_known_args(argv)
-        args.viewer = "null"
-        viewer_class = type("RecordingViewerNull", (_RecordingViewer, newton.viewer.ViewerNull), {})
-        viewer = viewer_class(num_frames=1 << 62)
-        example = cls(viewer, args)
+            parser = cls.create_parser() if hasattr(cls, "create_parser") else newton.examples.create_parser()
+            message = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(message):
+                    args, _ = parser.parse_known_args(argv)
+            except SystemExit as error:
+                raise ValueError(
+                    f"The example's argument parser rejected {argv}: {message.getvalue().strip()}"
+                ) from error
+            args.viewer = "null"
+            viewer_class = type("RecordingViewerNull", (_RecordingViewer, newton.viewer.ViewerNull), {})
+            viewer = viewer_class(num_frames=1 << 62)
+            example = cls(viewer, args)
+        except BaseException:
+            for name in _local_modules(self.script.parent):
+                sys.modules.pop(name, None)
+            sys.modules.update(local)
+            raise
         self.argv, self.overrides = argv, overrides
         self.source_sha256 = hashlib.sha256(source).hexdigest()
         self.module, self.example, self.args = module, example, args
@@ -288,6 +362,41 @@ class ExampleHost:
         self.build_seconds = time.perf_counter() - started
         self._fingerprint = self.fingerprint()
         return example
+
+    def check_inputs(self, argv: list[str], overrides: dict, *, timeout: float = 120.0) -> None:
+        """Load the script with ``overrides`` and parse ``argv`` in a new process, as a restarted host would.
+
+        Raises:
+            ValueError: Loading, setting an override, or parsing failed; the message holds the traceback tail.
+        """
+        try:
+            payload = json.dumps(
+                {"script": str(self.script), "example_class": self.example_class, "argv": argv, "overrides": overrides}
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"A restart passes overrides on the command line, so they must be JSON values: {error}"
+            ) from None
+        try:
+            # A new process: the check must not depend on this process's (possibly failed) CUDA context.
+            completed = subprocess.run(
+                [sys.executable, "-c", _CHECK, payload],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise TimeoutError(f"Loading {self.script.name} did not finish within {timeout:g} s") from None
+        if completed.returncode != 0:
+            text = completed.stderr
+            start = text.rfind("Traceback (most recent call last):")
+            lines = [line for line in text[max(start, 0) :].splitlines() if not line.startswith("Module ")]
+            raise ValueError(
+                f"Loading {self.script} with arguments {argv} and overrides {overrides} failed in a new process "
+                f"(exit code {completed.returncode}):\n" + "\n".join(lines[-16:])
+            )
 
     def fingerprint(self, *, deep: bool = True) -> dict:
         """Settings a CUDA graph may have baked in, to detect edits that require re-recording it.
@@ -398,12 +507,7 @@ class ExampleHost:
                     baseline[key] = current[key]
                 else:
                     baseline.pop(key, None)
-        state = getattr(self.example, "state_0", None) or getattr(self.example, "state", None)
-        solver = getattr(self.example, "solver", None) or self._no_solver
-        if session.solver is not solver or session.state is not state:
-            session.solver, session.state = solver, state
-            session.state_next = getattr(self.example, "state_1", None) or session.state_next
-            session.control = getattr(self.example, "control", session.control)
+        self.rebind(session)
         if not any(isinstance(value, wp.Graph) for value in vars(self.example).values()):
             return
         # Timers and phase counters that stepping itself advances do not require a new graph.
@@ -420,6 +524,37 @@ class ExampleHost:
             note = f"CUDA graphs recaptured after changes to {', '.join(names)}"
             if note not in self._notes:
                 self._notes.append(note)
+
+    def rebind(self, session) -> None:
+        """Point the session at the example's current solver, states and control (no settings comparison)."""
+        state = getattr(self.example, "state_0", None) or getattr(self.example, "state", None)
+        solver = getattr(self.example, "solver", None) or self._no_solver
+        if session.solver is not solver or session.state is not state:
+            session.solver, session.state = solver, state
+            session.state_next = getattr(self.example, "state_1", None) or session.state_next
+            session.control = getattr(self.example, "control", session.control)
+
+    def _watch_steps(self) -> None:
+        """Check model edits around ``example.step()`` called from cells, as around a dispatched step.
+
+        Edits the application's own ``step()`` makes are then not attributed to the cell.
+        """
+        cls = type(self.example)
+        original = getattr(cls, "step", None)
+        if not callable(original) or getattr(original, "_newton_mcp_watched", False):
+            return
+        host = self
+
+        @functools.wraps(original)
+        def step(example, *args, **kwargs):
+            session = host._session_ref() if host._session_ref is not None else None
+            if session is None or example is not host.example:
+                return original(example, *args, **kwargs)
+            with session.watch.stepping("example.step()"):
+                return original(example, *args, **kwargs)
+
+        step._newton_mcp_watched = True
+        cls.step = step
 
     def end_batch(self, session) -> None:
         """Refresh the settings baseline after consecutive steps; settings that stepping changed are dynamic."""
@@ -547,15 +682,15 @@ class ExampleHost:
 - reset, checkpoint and restore also rewind the example's Warp arrays and the scalar attributes step() changes (timers, phase counters); assigned settings and model edits are kept, and meshes, SDFs and Python containers are not rewound.
 - Before the first step after a cell, the example's attributes, the module globals, and the settings of the solver, model, their option objects and the script's own objects are compared with their values when the CUDA graphs were recorded; if any changed, the graphs are re-recorded (reported in `note`).
 - Rollback after a failed cell also covers the example's attributes and Warp arrays and the module globals (including in-place edits of small dicts and lists); solver internals, meshes and SDFs are not covered.
-- newton_rebuild reads the script from disk again and constructs Example in this process; Python variables are kept, arguments={{"argv": [...]}} sets the example arguments, and if loading or construction fails the previous scene keeps running and the error shows file:line.
+- newton_rebuild reads the script (and modules imported from its directory) from disk again and constructs Example in this process; Python variables are kept, arguments={{"argv": [...]}} sets the example arguments, and if loading or construction fails the previous scene keeps running and the error shows file:line.
 - newton_rebuild(overrides={{"NAME": value}}) sets module globals after the script loads and before Example() is constructed (a dict merges into a dict global). The set stays active for later rebuilds and restarts, is echoed as `overrides` in every response, and {{}} clears it. Values computed from a global while the module loaded keep the original value.
-- newton_rebuild(arguments={{"restart": true}}) re-executes the host process (new CUDA context; same script, arguments and overrides); Python variables are lost.
+- newton_rebuild(arguments={{"restart": true}}) re-executes the host process (new CUDA context; same script, arguments and overrides); Python variables are lost. It is refused if the script with those overrides and arguments fails to load in a new process; if Example() fails after the restart, the previous arguments and overrides are built and the next `note` says so.
 - persist('NAME', value=module.NAME, rebuild=True, check=None) rewrites the module-level literal assignment NAME = ... in the script, changing only differing entries; persist_source(fn_or_class, target=None) replaces the same-named top-level def or class (or target='Class.method') with the cell's definition. Both refuse targets that are missing, assigned more than once, or not a literal/definition, print a diff, save the previous file under the artifact directory, then rebuild; check='expr' reports its value before writing and after the rebuild.
 - fresh(argv_list=None, call=None, frames=None, timeout=300, parallel=2, wait=True) runs the script file as saved in new processes (python -m newton.examples.headless), without this session's live edits or overrides; per run it returns status, frames, the value of the code string `call` (evaluated with example, module, args), exception, output tails, and the stack at a timeout. wait=False returns a handle with done(), result(), cancel()."""
         if max_workers:
             text += f"""
-- `workers`: {workers} sibling copies of the script in their own processes; workers.resize(n) (0 to {max_workers}), workers.status(). workers.map(fn, items) returns results in input order ({{'error': ...}} for a call that raised), workers.submit(fn, *args) returns a Future, workers.broadcast(fn_or_code) runs on every worker. Cell functions, lambdas and closures are sent by source with the cell definitions and session globals they read; arguments and results are pickled. On a worker, example, model, state and the helpers refer to its own scene, without this session's live edits; workers.sync(name=value) copies values to every worker. Workers follow newton_rebuild, including overrides. A worker whose process exits or whose CUDA context fails is restarted and replays earlier broadcast/sync calls; this is listed under `workers` in the next response.
-- jobs.start(fn_or_code, *args, **kwargs) runs a call on a free worker in the background and returns an id; jobs.wait(timeout=None, any=True) returns finished results and printed lines; jobs.result(id), jobs.cancel(id) (queued jobs), jobs.status(). Jobs that finished are listed under `jobs` in the next response."""
+- `workers`: {workers} sibling copies of the script in their own processes; workers.resize(n) (0 to {max_workers}), workers.status(). workers.map(fn, items) returns results in input order ({{'error': ...}} for a call that raised), workers.submit(fn, *args) returns a Future, workers.broadcast(fn_or_code) runs on every worker. Cell functions, lambdas and closures are sent by source with the cell definitions and session globals they read; arguments and results are pickled. On a worker, example, model, state and the helpers refer to its own scene, without this session's live edits; workers.sync(name=value) copies values to every worker. Workers follow newton_rebuild, including overrides; a busy worker rebuilds after its running call (listed as pending). A call that raises rolls its worker's simulation back. A worker whose process exits or whose CUDA context fails is restarted and replays earlier broadcast/sync calls; this is listed under `workers` in the next response.
+- jobs.start(fn_or_code, *args, **kwargs) runs a call on a free worker in the background and returns an id; jobs.wait(timeout=None, any=True) returns finished results and printed lines, with the worker and its `build` (rebuild count) when the job started; jobs.result(id), jobs.cancel(id) (queued jobs), jobs.status(). Jobs that finished are listed under `jobs` in the next response."""
         return text
 
     def session(self, *, artifact_directory=None, workers=None, allow_execute: bool = True):
@@ -584,13 +719,18 @@ class ExampleHost:
 
         def rebuild(session, argv=None, restart=False, overrides=None):
             if restart:
-                if overrides is not None:
-                    host.overrides = _checked_overrides(overrides)
-                    host.echo(session)
+                new_argv = host.argv if argv is None else list(argv)
+                new_overrides = host.overrides if overrides is None else _checked_overrides(overrides)
+                # Refuse now what the new process could not load; this process keeps running then.
+                host.check_inputs(new_argv, new_overrides)
+                host.restart_fallback = {"argv": host.argv, "overrides": host.overrides}
+                host.argv, host.overrides = new_argv, new_overrides
+                host.echo(session)
                 # The host process re-executes itself once this response has been sent.
                 host.restart_requested = True
                 return host.bindings()
             host.build(argv, overrides)
+            host._watch_steps()
             session.namespace.update(example=host.example, module=host.module)
             session.dt = getattr(host.example, "frame_dt", session.dt)
             host.echo(session)
@@ -623,8 +763,10 @@ class ExampleHost:
             solver_callback=self.install_solver,
             batch_callback=self.end_batch,
             close_callback=lambda _session: self.fresh.close(),
-            sync_callback=self.sync,
+            sync_callback=self.rebind,
         )
+        self._session_ref = weakref.ref(session)
+        self._watch_steps()
         self.echo(session)
         # The session may have adjusted the model (e.g. contact capacity for its collision pipeline).
         self._fingerprint = self.fingerprint()
@@ -664,6 +806,8 @@ def main(argv: list[str] | None = None) -> None:
         help="JSON object of module globals to set before Example() is constructed (as newton_rebuild overrides)",
     )
     parser.add_argument("--parent-pid", type=int, help=argparse.SUPPRESS)
+    # Set by a restart: the previous arguments and overrides, built instead if the requested ones fail.
+    parser.add_argument("--restart-fallback", type=json.loads, help=argparse.SUPPRESS)
     argv = list(sys.argv[1:] if argv is None else argv)
     # Everything after "--" belongs to the example's own argument parser.
     split = argv.index("--") if "--" in argv else len(argv)
@@ -703,9 +847,34 @@ def main(argv: list[str] | None = None) -> None:
     server = None
     try:
         host = ExampleHost(args.script, example_args, example_class=args.example_class, overrides=args.overrides)
-        host.build()
+        restart_note = None
+        try:
+            host.build()
+        except (Exception, SystemExit) as error:
+            fallback = args.restart_fallback
+            if fallback is None:
+                raise
+            from .rollback import describe_exception  # noqa: PLC0415
+
+            restart_note = (
+                f"The restart could not build with arguments {host.argv} and overrides {host.overrides} "
+                f"({describe_exception(error)}); this process was built with the previous arguments "
+                f"{fallback['argv']} and overrides {fallback['overrides']}."
+            )
+            host = ExampleHost(
+                args.script, fallback["argv"], example_class=args.example_class, overrides=fallback["overrides"]
+            )
+            host.build()
+            if pool is not None:
+                # Workers started with the failing arguments; start them again with the ones that built.
+                pool.wait_ready()
+                pool.argv, pool.overrides = list(host.argv), copy.deepcopy(host.overrides)
+                pool.restart(wait=False)
         if pool is not None:
             pool.wait_ready()
+        if restart_note is not None:
+            # Returned as the note of the next newton_execute response.
+            host._notes.append(restart_note[:4096])
         session = host.session(artifact_directory=args.artifacts, workers=pool)
         from .transport import SimulationServer  # noqa: PLC0415
 
@@ -725,22 +894,28 @@ def main(argv: list[str] | None = None) -> None:
     if host.restart_requested:
         marker.unlink(missing_ok=True)
         print("RESTART: re-executing the host process", flush=True)
-        command = _restart_command(argv, host.overrides, host.argv)
+        command = _restart_command(argv, host.overrides, host.argv, fallback=host.restart_fallback)
         os.execv(sys.executable, [sys.executable, "-m", "newton.mcp", "host", *command])
 
 
-def _restart_command(argv: list[str], overrides: dict, example_args: list[str]) -> list[str]:
-    """Host command line ``argv`` with the active ``--overrides`` (dropped if empty) and example arguments."""
+def _restart_command(
+    argv: list[str], overrides: dict, example_args: list[str], *, fallback: dict | None = None
+) -> list[str]:
+    """Host command line ``argv`` with the active ``--overrides`` (dropped if empty), example arguments, and
+    the ``fallback`` arguments and overrides to build with if those fail."""
     split = argv.index("--") if "--" in argv else len(argv)
     head, tail = argv[:split], ["--", *example_args]
+    replaced = ("--overrides", "--restart-fallback")
     kept, skip = [], False
     for item in head:
         if skip:
             skip = False
-        elif item == "--overrides":
+        elif item in replaced:
             skip = True
-        elif not item.startswith("--overrides="):
+        elif not item.startswith(tuple(f"{option}=" for option in replaced)):
             kept.append(item)
     if overrides:
         kept += ["--overrides", json.dumps(overrides)]
+    if fallback is not None:
+        kept += ["--restart-fallback", json.dumps(fallback)]
     return kept + tail

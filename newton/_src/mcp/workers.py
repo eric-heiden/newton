@@ -137,6 +137,7 @@ class _Worker:
         self.thread: threading.Thread | None = None
         self.restarts = 0
         self.can_rebuild = False
+        self.build = 0
         self.ready = threading.Event()
 
 
@@ -152,6 +153,8 @@ class WorkerFuture(Future):
         self._failure: BaseException | None = None
         self.worker: int | None = None
         """Worker that ran (or runs) the call."""
+        self.build: int | None = None
+        """Pool build (see :attr:`WorkerPool.build`) of the worker's scene when the call started."""
 
     def result(self, timeout: float | None = None) -> Any:
         outcome = super().result(timeout)
@@ -228,6 +231,8 @@ class WorkerPool:
         self._closed = False
         self._launch: dict | None = None
         self._rebuild_arguments: dict = {}
+        self.build = 0
+        """Number of :meth:`rebuild` calls; a worker's scene is at this build once it has followed the last one."""
         self._namespace: Callable[[], dict | None] = lambda: None
         self._bound: Callable[[], Iterable[str]] = lambda: _DEFAULT_BOUND
         self._exchange = Path(tempfile.mkdtemp(prefix="newton-mcp-workers-"))
@@ -291,7 +296,8 @@ class WorkerPool:
             return len(self._active())
 
     def status(self) -> list[dict]:
-        """State of every worker: ``worker``, ``state`` (starting/ready/failed), ``pid``, ``restarts``, ``running``."""
+        """State of every worker: ``worker``, ``state`` (starting/ready/failed), ``pid``, ``restarts``, ``running``,
+        and ``build`` (the last :meth:`rebuild` its scene followed; see :attr:`build`)."""
         with self._lock:
             return [
                 {
@@ -300,6 +306,7 @@ class WorkerPool:
                     "pid": worker.process.pid if worker.process is not None else None,
                     "restarts": worker.restarts,
                     "running": worker.task.label if worker.task is not None else None,
+                    "build": worker.build,
                 }
                 for worker in self._workers
                 if not worker.retire
@@ -497,16 +504,20 @@ class WorkerPool:
     def rebuild(self, arguments: dict | None = None, *, timeout: float = 60.0) -> dict:
         """Rebuild every worker's scene with ``arguments`` (as ``newton_rebuild``), waiting up to ``timeout``.
 
-        A busy worker rebuilds after its running call; rebuilds that finish after ``timeout`` are
-        reported by :meth:`drain_events`. Later restarts use the same arguments.
+        Idle workers are waited for. A worker that is running a call or still starting rebuilds after it,
+        before any queued call, and is listed as ``pending`` at once; pending rebuilds and rebuilds that
+        finish after ``timeout`` are reported by :meth:`drain_events`. Later restarts use the same arguments.
+        Each rebuild increments :attr:`build`; calls report the build their worker had (``jobs``).
 
         Returns:
-            ``rebuilt`` count, ``seconds``, ``pending`` workers, and ``errors``.
+            ``build``, ``rebuilt`` count, ``seconds``, ``pending`` workers, and ``errors``.
         """
         arguments = {k: v for k, v in (arguments or {}).items() if k != "restart"}
         started = time.perf_counter()
-        futures = []
+        futures, busy = [], []
         with self._condition:
+            self.build += 1
+            build = self.build
             if arguments.get("argv") is not None:
                 self.argv = list(arguments["argv"])
             if arguments.get("overrides") is not None:
@@ -524,9 +535,13 @@ class WorkerPool:
                     continue
                 future: Future = Future()
                 worker.private.append(
-                    _Task("rebuild", lambda w, a=arguments: self._operation(w, "rebuild", **a), future)
+                    _Task("rebuild", lambda w, a=arguments, b=build: self._rebuild_worker(w, a, b), future)
                 )
-                futures.append((worker.slot, future))
+                # Waiting for a running call (a background job, say) would stall this response.
+                if worker.task is not None or worker.state == "starting":
+                    busy.append((worker.slot, future))
+                else:
+                    futures.append((worker.slot, future))
             self._condition.notify_all()
         rebuilt, errors, pending = 0, [], []
         deadline = time.monotonic() + timeout
@@ -535,16 +550,24 @@ class WorkerPool:
                 future.result(max(0.0, deadline - time.monotonic()))
                 rebuilt += 1
             except TimeoutError:
-                pending.append(slot)
-                future.add_done_callback(lambda f, s=slot: self._late_rebuild(s, f, started))
+                busy.append((slot, future))
             except Exception as error:
                 errors.append(f"worker {slot}: {type(error).__name__}: {str(error)[:500]}")
+        for slot, future in sorted(busy):
+            pending.append(slot)
+            future.add_done_callback(lambda f, s=slot: self._late_rebuild(s, f, started))
         return {
+            "build": build,
             "rebuilt": rebuilt,
             "seconds": round(time.perf_counter() - started, 2),
             **({"pending": pending} if pending else {}),
             **({"errors": errors} if errors else {}),
         }
+
+    def _rebuild_worker(self, worker: _Worker, arguments: dict, build: int) -> dict:
+        result = self._operation(worker, "rebuild", **arguments)
+        worker.build = max(worker.build, build)
+        return result
 
     def drain_events(self) -> list[str]:
         """Worker restarts, start failures, and late rebuilds since the last call."""
@@ -627,13 +650,22 @@ class WorkerPool:
                     return None
                 if worker.state == "starting":
                     return _RESTART
+                # Marked busy under the lock, so rebuild() sees calls that are about to start.
                 if worker.private:
-                    return worker.private.popleft()
+                    worker.task = worker.private.popleft()
+                    return worker.task
                 if self._shared:
-                    return self._shared.popleft()
+                    worker.task = self._shared.popleft()
+                    return worker.task
                 self._condition.wait()
 
     def _execute(self, worker: _Worker, task: _Task) -> None:
+        try:
+            self._run_task(worker, task)
+        finally:
+            worker.task = None
+
+    def _run_task(self, worker: _Worker, task: _Task) -> None:
         setup = task.setup
         if setup is not None and worker.applied >= setup.seq:
             # Already applied while the worker replayed the history after a restart.
@@ -645,6 +677,7 @@ class WorkerPool:
         worker.task = task
         if isinstance(task.future, WorkerFuture):
             task.future.worker = worker.slot
+            task.future.build = worker.build
         try:
             result = task.run(worker)
             if setup is not None:
@@ -659,8 +692,6 @@ class WorkerPool:
             task.future.set_exception(error)
             if self._launch is not None:
                 self._check_device(worker, task)
-        finally:
-            worker.task = None
 
     def _check_device(self, worker: _Worker, task: _Task) -> None:
         try:
@@ -723,6 +754,8 @@ class WorkerPool:
     def _start(self, worker: _Worker) -> None:
         started = time.perf_counter()
         reason, worker.reason = worker.reason, None
+        # Read before the process starts with the current arguments; a later rebuild queues its own task.
+        build = self.build
         try:
             if self._launch is not None:
                 self._spawn(worker)
@@ -731,6 +764,9 @@ class WorkerPool:
             worker.can_rebuild = bool(self._operation(worker, "describe")["capabilities"].get("rebuild"))
             if self._launch is not None and self._rebuild_arguments:
                 self._operation(worker, "rebuild", **self._rebuild_arguments)
+            if self._launch is not None:
+                # Started with the arguments and overrides of the latest rebuild.
+                worker.build = max(worker.build, build)
             replayed, failures = self._replay(worker)
             with self._condition:
                 if worker.state == "starting":
@@ -1078,6 +1114,8 @@ def _error_text(report: dict, slot: int, shipment: shipping.Shipment | None) -> 
             filename = Path(filename).name if not filename.startswith("<") else filename
         frames.append(f"{filename} line {frame.get('line')} in {frame.get('function')}: {frame.get('source', '')}")
     text += f" [worker {slot}" + ("; " + " | ".join(frames) if frames else "") + "]"
+    if report.get("rollback"):
+        text += f" Worker {slot}: {report['rollback']}"
     name = report.get("name")
     if shipment is not None and name in shipment.not_sent:
         text += f"; the session's {name!r} was not sent with the function ({shipment.not_sent[name]})"

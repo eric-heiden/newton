@@ -326,6 +326,7 @@ class SimulationSession:
         self._execution_error = None
         self._shown_images = None
         self._transaction_depth = 0
+        self._cell_undo = None
         self._batch_step = 0
         self._scene_generation = 0
         self.snapshot_callback = snapshot_callback
@@ -587,6 +588,9 @@ class SimulationSession:
                 request.started = True
             try:
                 request.result = self.dispatch(request.operation, request.arguments)
+            except SystemExit as error:
+                # Application code calling sys.exit() must not end the serving process.
+                request.error = RuntimeError(f"SystemExit({error.code!r}) raised during {request.operation}")
             except Exception as error:
                 if self.status_fields:
                     # Clients see status fields such as active overrides on errors too (see transport).
@@ -644,8 +648,10 @@ class SimulationSession:
         if self._owns_workers:
             self.workers.close()
         self._clear_workspace()
-        if self._workspace_module is not None and sys.modules.get(self._workspace_name) is self._workspace_module:
-            del sys.modules[self._workspace_name]
+        if self._workspace_module is not None:
+            # Also the aliases under which definitions shipped from other sessions live (see shipping).
+            for name in [name for name, module in sys.modules.items() if module is self._workspace_module]:
+                del sys.modules[name]
 
     def _status(self) -> dict:
         status = {
@@ -863,14 +869,32 @@ class SimulationSession:
         self._refresh_workspace()
         return summarize(report, undo.uncovered)
 
+    def _roll_back_cell(self) -> str | None:
+        """Roll the simulation back to the start of the running top-level cell, e.g. after a failed worker call.
+
+        Returns:
+            A description of what was restored, or ``None`` if nothing changed or no cell is running.
+        """
+        if self._cell_undo is None:
+            return None
+        outcome = self._roll_back(self._cell_undo, quiet=True)
+        # Later edits in the cell are checked against the restored arrays.
+        self.watch.reset()
+        return outcome
+
     def _undoable(self, label: str, run: Callable[[], Any]) -> Any:
         """Run a top-level operation that rolls back when it raises."""
         undo = self._undo_point()
         self._transaction_depth += 1
         try:
             return run()
-        except Exception as error:
+        except (Exception, SystemExit) as error:
             outcome = self._roll_back(undo, quiet=True) if undo is not None else None
+            if isinstance(error, SystemExit):
+                # sys.exit() in application code must not end the host process.
+                raise RuntimeError(
+                    f"SystemExit({error.code!r}) raised during {label}. {outcome or ''}".strip()
+                ) from error
             if outcome is None:
                 raise
             if error.args and isinstance(error.args[0], str):
@@ -968,6 +992,7 @@ class SimulationSession:
         return {"guide": self.guide}
 
     _MAX_SHOWN_IMAGES: ClassVar[int] = 8
+    _MAX_CELL_SOURCES: ClassVar[int] = 512
 
     def show(self, image: Any, label: str | None = None) -> None:
         """Attach an image to the current trusted-execution response.
@@ -1108,11 +1133,10 @@ class SimulationSession:
         register_cell_source(filename, code)
         if filename not in self._workspace_sources:
             self._workspace_sources.append(filename)
-        # Older cells stay cached while a workspace function or class still comes from them, so
-        # inspect.getsource(), tracebacks, persist_source(), and workers.map(fn) keep working; at most
-        # 512 cells are kept.
+        # Cells stay cached so inspect.getsource(), tracebacks, persist_source(), and workers.map(fn) keep
+        # working; beyond the limit, the oldest cells no reachable workspace definition comes from go first.
         self._workspace_sources = retain_cell_sources(
-            self._workspace_sources, self._workspace, forget=self._forget_cell
+            self._workspace_sources, self._workspace, maximum=self._MAX_CELL_SOURCES, forget=self._forget_cell
         )
 
     def _forget_cell(self, filename: str) -> None:
@@ -1209,6 +1233,7 @@ class SimulationSession:
         self._transaction_depth += 1
         completed = False
         if not nested:
+            self._cell_undo = undo
             self.watch.begin()
         try:
             try:
@@ -1223,12 +1248,14 @@ class SimulationSession:
             if not nested:
                 edits = self.watch.end() if self.valid else self.watch.abort()
                 note = "\n".join(part for part in (note, edits) if part) or None
-        except Exception as error:
+        except (Exception, SystemExit) as error:
             self._shown_images = None
             self._execution_error = self._execution_diagnostic(error, filename)
             diagnostic = self._execution_error
             if completed:
                 message = f"The cell completed, then updating the application (e.g. re-recording CUDA graphs) raised {diagnostic['type']}: {diagnostic['message']}"
+            elif isinstance(error, SystemExit):
+                message = f"SystemExit({error.code!r}) raised at line {diagnostic['line']}; the session keeps running"
             else:
                 message = f"Python {diagnostic['type']} at line {diagnostic['line']}: {diagnostic['message']}"
             message = message[:4096].rstrip(". ")
@@ -1243,7 +1270,12 @@ class SimulationSession:
             ) from error
         finally:
             self._transaction_depth -= 1
+            if not nested:
+                self._cell_undo = None
         self.revision += 1
+        if not nested:
+            # Nothing touched the model since the check that ended the cell.
+            self.watch.settle()
         if self.valid:
             self.last_error = None
             self._execution_error = None
@@ -1296,7 +1328,7 @@ class SimulationSession:
             bindings = self.rebuild_callback(self, **kwargs)
             if not isinstance(bindings, dict):
                 raise ValueError("Rebuild callback must return replacement keyword bindings")
-        except Exception as error:
+        except (Exception, SystemExit) as error:
             # Nothing was replaced yet: the previous scene, its checkpoints, and its graphs stay in place.
             previous = "keeps running unchanged" if self.valid else "is unchanged and still invalid"
             raise RuntimeError(

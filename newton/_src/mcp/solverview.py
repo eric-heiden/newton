@@ -261,25 +261,27 @@ def _rows_text(rows, limit: int = 8) -> str:
 _WATCHES: weakref.WeakSet = weakref.WeakSet()
 
 
-def _record_notify(flags) -> None:
+def _record_notify(solver, flags) -> None:
     try:
         value = int(flags)
     except (TypeError, ValueError):
         return
     for watch in list(_WATCHES):
-        watch.notified |= value
+        watch.record(solver, value)
 
 
 def _wrap_notify(cls) -> None:
-    """Make ``cls.notify_model_changed`` record its flags for active watches (idempotent)."""
+    """Make ``cls.notify_model_changed`` record its solver and flags for active watches (idempotent)."""
     method = getattr(cls, "notify_model_changed", None)
     if method is None or getattr(method, "_newton_mcp_records", False):
         return
 
     @functools.wraps(method)
     def notify_model_changed(self, flags, *args, **kwargs):
-        _record_notify(flags)
-        return method(self, flags, *args, **kwargs)
+        result = method(self, flags, *args, **kwargs)
+        # Recorded after the call: notify_model_changed may rewrite model arrays itself.
+        _record_notify(self, flags)
+        return result
 
     notify_model_changed._newton_mcp_records = True
     cls.notify_model_changed = notify_model_changed
@@ -350,9 +352,11 @@ class ModelWatch:
 
     The session calls :meth:`begin` before a cell runs, wraps stepping operations in
     :meth:`stepping`, and calls :meth:`end` after the cell. Each check compares device-side
-    checksums of the watched arrays with the previous baseline; changed arrays whose
-    :class:`~newton.ModelFlags` category no ``notify_model_changed`` call covered are notified
-    (``mode="notify"``) or only reported (``mode="report"``). ``mode="off"`` disables checks.
+    checksums of the watched arrays with the previous baseline. A changed array counts as
+    applied when ``notify_model_changed`` was called on the session's solver with its
+    :class:`~newton.ModelFlags` category after the array's last change; other changed arrays
+    are notified (``mode="notify"``) or only reported (``mode="report"``). ``mode="off"``
+    disables checks.
 
     Args:
         session: Owning :class:`SimulationSession`.
@@ -366,15 +370,18 @@ class ModelWatch:
         self._session = weakref.ref(session)
         self._mode = "notify"
         self.notified = 0
-        """Flags passed to ``notify_model_changed`` since the last baseline."""
+        """Flags passed to ``notify_model_changed`` of the session's solver since the last baseline."""
         self.timings: list[float] = []
         """Wall time [s] of recent checksum passes (bounded), for overhead measurements."""
         self._model = None
         self._fields: list[tuple[str, wp.array]] = []
         self._segments = None
         self._baseline: dict | None = None
+        self._pending = None
         self._revision = None
         self._copies: dict[str, np.ndarray] = {}
+        self._notifications: list[tuple[Any, int, dict | None]] = []
+        self._notifying = False
         self._depth = 0
         self.active = False
         self._notes: list[str] = []
@@ -391,16 +398,40 @@ class ModelWatch:
             raise ValueError(f"watch mode must be one of {self._MODES}")
         self._mode = value
         self._baseline = None
+        self._pending = None
 
     def reset(self) -> None:
         """Forget the baseline (scene replaced); inside a cell, start a new one so later edits in it are checked."""
         self._model = None
         self._baseline = None
+        self._pending = None
         self._copies.clear()
         self._segments = None
         if self.active:
             # E.g. persist() or a rebuild dispatched from a cell.
             self._guard(self._start)
+
+    def settle(self) -> None:
+        """Keep the baseline valid across a revision change that did not touch the model (the end of a cell)."""
+        session = self._session()
+        if session is not None and self._baseline is not None:
+            self._revision = session.revision
+
+    def record(self, solver, flags: int) -> None:
+        """Remember a ``notify_model_changed(flags)`` call on ``solver`` made while a cell runs."""
+        if not self.active or self._notifying or self._baseline is None:
+            return
+        session = self._session()
+        if session is None:
+            return
+        if solver is session.solver:
+            self.notified |= int(flags)
+        digests = None
+        if solver is session.solver or getattr(solver, "model", None) is session.model:
+            # Checksums at the call: an array edited after it was not covered by it.
+            with contextlib.suppress(Exception):
+                digests = self._digests()
+        self._notifications.append((solver, int(flags), digests))
 
     # -- checksums --------------------------------------------------------------------------------------------------
 
@@ -423,8 +454,9 @@ class ModelWatch:
             current.append((name, id(live), getattr(live, "ptr", None), getattr(live, "capacity", None)))
         return tuple(current)
 
-    def _digests(self) -> dict[str, tuple]:
-        started = time.perf_counter()
+    def _launch(self) -> tuple:
+        """Start a checksum pass over the watched arrays; :meth:`_read` returns its digests."""
+        self._resolve_pending()
         model = self._session().model
         if model is not self._model:
             self._discover(model)
@@ -454,20 +486,42 @@ class ModelWatch:
                 )
             self._segments = (identity, table)
         identity, table = self._segments
-        if table is not None:
-            pointers, counts, item, out = table
-            out.zero_()
-            wp.launch(
-                _hash_segments_kernel,
-                dim=(len(self._fields), 512),
-                inputs=[pointers, counts, item, out],
-                device=out.device,
-            )
-            hashes = [tuple(row) for row in out.numpy().tolist()]
-        else:
-            hashes = [zlib.crc32(np.ascontiguousarray(array.numpy()).view(np.uint8)) for _, array in self._fields]
-        self.timings = [*self.timings[-63:], time.perf_counter() - started]
+        if table is None:
+            return identity, [
+                zlib.crc32(np.ascontiguousarray(array.numpy()).view(np.uint8)) for _, array in self._fields
+            ]
+        pointers, counts, item, out = table
+        out.zero_()
+        wp.launch(
+            _hash_segments_kernel, dim=(len(self._fields), 512), inputs=[pointers, counts, item, out], device=out.device
+        )
+        return identity, out
+
+    @staticmethod
+    def _read(handle: tuple) -> dict[str, tuple]:
+        identity, hashes = handle
+        if isinstance(hashes, wp.array):
+            hashes = [tuple(row) for row in hashes.numpy().tolist()]
         return {name: (key, digest) for (name, *key), digest in zip(identity, hashes, strict=True)}
+
+    def _digests(self) -> dict[str, tuple]:
+        started = time.perf_counter()
+        digests = self._read(self._launch())
+        self.timings = [*self.timings[-63:], time.perf_counter() - started]
+        return digests
+
+    def _resolve_pending(self) -> None:
+        """Make the checksums launched after the last stepping operation the baseline."""
+        if self._pending is None:
+            return
+        handle, self._pending = self._pending, None
+        digests = self._read(handle)
+        if self._baseline is not None:
+            for name, value in digests.items():
+                if self._baseline.get(name) != value:
+                    # The application's own step changed it; its rows are not known for the next report.
+                    self._copies.pop(name, None)
+        self._baseline = digests
 
     def _refresh_copy(self, name: str) -> np.ndarray | None:
         """Changed rows of ``name`` against its host copy, updating the copy (``None`` if unknown)."""
@@ -496,7 +550,11 @@ class ModelWatch:
                 self._refresh_copy(name)
         self._baseline = digests
         self._revision = self._session().revision
+        self._forget_notifications()
+
+    def _forget_notifications(self) -> None:
         self.notified = 0
+        self._notifications.clear()
 
     def _changes(self) -> tuple[dict, list[str]]:
         digests = self._digests()
@@ -512,18 +570,20 @@ class ModelWatch:
         except Exception as error:
             self.active = False
             self._baseline = None
+            self._pending = None
             self._notes.append(f"Model-edit checks stopped for this cell: {type(error).__name__}: {error}")
 
     def _start(self) -> None:
         session = self._session()
         _wrap_solver_classes(session.solver)
+        self._resolve_pending()
         if self._baseline is None or self._model is not session.model:
             self._baseline = None
             self._set_baseline(self._digests())
         elif self._revision != session.revision:
             digests, changed = self._changes()
             self._set_baseline(digests, changed=changed)
-        self.notified = 0
+        self._forget_notifications()
 
     def begin(self) -> None:
         """Start a cell: refresh the baseline if operations since the last cell may have edited the model."""
@@ -540,6 +600,7 @@ class ModelWatch:
             # Nothing else runs before the next cell, so the baseline stays valid across this revision.
             self._revision = self._session().revision
         self.active = False
+        self._notifications.clear()
         notes, self._notes = self._notes, []
         return "\n".join(notes) or None
 
@@ -547,6 +608,8 @@ class ModelWatch:
         """Finish a cell whose failure invalidated the scene; the next cell starts from a fresh baseline."""
         self.active = False
         self._baseline = None
+        self._pending = None
+        self._notifications.clear()
         self._notes = []
 
     @contextlib.contextmanager
@@ -571,29 +634,58 @@ class ModelWatch:
         if self._baseline is None:
             self._start()
             return
-        digests, changed = self._changes()
-        self._set_baseline(digests, changed=changed)
+        # Read at the next check, which waits for the device anyway; this keeps stepping asynchronous.
+        self._pending = self._launch()
+        self._revision = self._session().revision
+        self._forget_notifications()
 
-    def _called(self) -> str:
-        return f" (calls in this interval used {flag_names(self.notified)})" if self.notified else ""
+    def _covered(self, name: str, digest: tuple, solver) -> bool:
+        """Whether a notify_model_changed call on ``solver`` covered ``name`` after its last change."""
+        flag = int(FIELD_FLAGS[name])
+        return any(
+            other is solver and flags & flag and (recorded is None or recorded.get(name) == digest)
+            for other, flags, recorded in self._notifications
+        )
+
+    def _uncounted(self, names: list[str], digests: dict, solver) -> str:
+        """Why notify_model_changed calls with the right flags did not cover ``names``."""
+        reasons = []
+        for name in names:
+            flag = int(FIELD_FLAGS[name])
+            for other, flags, recorded in self._notifications:
+                if not flags & flag:
+                    continue
+                if other is not solver:
+                    reason = f"a call on a {type(other).__name__} that is not the session's solver"
+                elif recorded is not None and recorded.get(name) != digests[name]:
+                    reason = f"a call before the last edit of model.{name}"
+                else:
+                    continue
+                if reason not in reasons:
+                    reasons.append(reason)
+        # The flags used are only news when some missing category was never passed to the session's solver.
+        missing = inferred_flags(names)
+        own = flag_names(self.notified) if self.notified and missing & ~self.notified else None
+        parts = ([f"calls in this interval used {own}"] if own else []) + reasons[:4]
+        return f" ({'; '.join(parts)})" if parts else ""
 
     def _check(self, where: str) -> None:
         session = self._session()
         if session.sync_callback is not None:
             session.sync_callback(session)
-        if self._baseline is None:
+        if self._baseline is None and self._pending is None:
             self._start()
             return
         digests, changed = self._changes()
         if not changed:
-            self.notified = 0
+            self._forget_notifications()
             return
         rows = {name: self._refresh_copy(name) for name in changed}
         solver = session.solver
         mujoco = _is_mujoco(solver)
         flagged = [n for n in changed if n in FIELD_FLAGS and not (mujoco and n in MUJOCO_CONSTRUCTION_ONLY)]
-        required = inferred_flags(flagged)
-        missing = required & ~self.notified
+        uncovered = [name for name in flagged if not self._covered(name, digests[name], solver)]
+        required, missing = inferred_flags(flagged), inferred_flags(uncovered)
         described = []
         for name in changed:
             if self._baseline.get(name, (None,))[0] != digests[name][0]:
@@ -604,14 +696,17 @@ class ModelWatch:
             described.append(f"model.{name} [{size}]" + (f" ({flag.name})" if name in flagged else ""))
         line = f"Model edits {where}: {', '.join(described)}."
         if required and not missing:
-            line += f" Covered by notify_model_changed ({flag_names(self.notified & required)})."
+            line += f" Covered by notify_model_changed ({flag_names(required)})."
         elif missing and self._mode == "notify":
-            line += f" No notify_model_changed call covered {flag_names(missing)}{self._called()}; "
+            line += f" No notify_model_changed call covered {flag_names(missing)}{self._uncounted(uncovered, digests, solver)}; "
+            self._notifying = True
             try:
                 solver.notify_model_changed(missing)
                 line += f"the host called solver.notify_model_changed({flag_expression(missing)})."
             except Exception as error:  # the cell's edits stay; report instead of failing the cell
                 line += f"the host's notify_model_changed raised {type(error).__name__}: {error}"
+            finally:
+                self._notifying = False
             # notify_model_changed may rewrite model arrays itself (e.g. MuJoCo solref modes).
             notified = self._digests()
             for name, value in notified.items():
@@ -620,8 +715,8 @@ class ModelWatch:
             digests = notified
         elif missing:
             line += (
-                f" No notify_model_changed call covered {flag_names(missing)}{self._called()}; the solver keeps "
-                "its previous "
+                f" No notify_model_changed call covered {flag_names(missing)}{self._uncounted(uncovered, digests, solver)}; "
+                "the solver keeps its previous "
                 f"values until notify_model_changed({flag_expression(missing)})."
             )
         if mujoco:
@@ -632,7 +727,7 @@ class ModelWatch:
             self._notes.append(line)
         self._baseline = digests
         self._revision = session.revision
-        self.notified = 0
+        self._forget_notifications()
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -719,7 +814,13 @@ def mujoco_change_facts(model, solver, rows: dict[str, np.ndarray | None]) -> li
             if unmapped:
                 facts.append(f"model.{name} rows {_rows_text(unmapped)} have no MuJoCo actuator.")
     for name in ("joint_target_ke", "joint_target_kd"):
-        if name not in rows or maps is None:
+        if name not in rows:
+            continue
+        if maps is None:
+            facts.append(
+                f"model.{name} rows {_rows_text(all_rows(name))} drive no MuJoCo actuator (this SolverMuJoCo has no "
+                "actuators: joint_target_mode was NONE or EFFORT for every DOF at construction)."
+            )
             continue
         dofs_per_world = model.joint_dof_count // world_count
         driven = set()

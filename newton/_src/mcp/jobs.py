@@ -57,6 +57,11 @@ class _Job:
     def worker(self) -> int | None:
         return getattr(self.future, "worker", None)
 
+    def where_ran(self) -> dict:
+        """``worker`` and, for worker jobs, the pool ``build`` the worker's scene had when the job started."""
+        build = getattr(self.future, "build", None)
+        return {"worker": self.worker(), **({"build": build} if build is not None else {})}
+
     def new_lines(self, limit: int = 20) -> list[str]:
         """Lines the job printed since the previous call (at most ``limit``, the latest ones)."""
         if self.progress is None:
@@ -164,9 +169,10 @@ class JobQueue:
             ids: Jobs to consider (default: all uncollected jobs).
 
         Returns:
-            ``finished``: ``id``, ``status`` (done/failed/cancelled), ``seconds``, ``worker``,
+            ``finished``: ``id``, ``status`` (done/failed/cancelled), ``seconds``, ``worker``, ``build``
+            (the worker pool's rebuild count the worker's scene had when the job started),
             ``result`` or ``error``, and the job's remaining printed ``lines``;
-            ``running``: ``id``, ``status`` (running/queued), ``seconds``, ``worker``, and the
+            ``running``: ``id``, ``status`` (running/queued), ``seconds``, ``worker``, ``build``, and the
             ``lines`` printed since the previous wait.
         """
         with self._lock:
@@ -182,7 +188,7 @@ class JobQueue:
         for job in jobs:
             if job.done():
                 status, value = job.outcome()
-                entry = {"id": job.id, "status": status, "seconds": job.seconds(), "worker": job.worker()}
+                entry = {"id": job.id, "status": status, "seconds": job.seconds(), **job.where_ran()}
                 if status == "done":
                     entry["result"] = value
                 elif status == "failed":
@@ -193,7 +199,7 @@ class JobQueue:
                 finished.append(entry)
             else:
                 status = "running" if job.future.running() else "queued"
-                entry = {"id": job.id, "status": status, "seconds": job.seconds(), "worker": job.worker()}
+                entry = {"id": job.id, "status": status, "seconds": job.seconds(), **job.where_ran()}
                 running.append({**entry, "lines": job.new_lines()})
         return {"finished": finished, "running": running}
 
@@ -211,7 +217,8 @@ class JobQueue:
         return self._job(job_id).future.cancel()
 
     def status(self) -> list[dict]:
-        """``id``, ``label``, ``where``, ``status`` (queued/running/done/failed/cancelled), ``seconds``, ``worker``."""
+        """``id``, ``label``, ``where``, ``status`` (queued/running/done/failed/cancelled), ``seconds``, ``worker``,
+        ``build``."""
         with self._lock:
             jobs = list(self._jobs.values())
         rows = []
@@ -227,7 +234,7 @@ class JobQueue:
                     "where": job.where,
                     "status": status,
                     "seconds": job.seconds(),
-                    "worker": job.worker(),
+                    **job.where_ran(),
                 }
             )
         return rows
@@ -245,7 +252,7 @@ class JobQueue:
                 continue
             job.reported = True
             status, value = job.outcome()
-            entry = {"id": job.id, "status": status, "seconds": job.seconds(), "worker": job.worker()}
+            entry = {"id": job.id, "status": status, "seconds": job.seconds(), **job.where_ran()}
             if status == "done":
                 entry["result"] = _PREVIEW.repr(value)
             elif status == "failed":

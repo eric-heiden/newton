@@ -4,6 +4,9 @@
 """Failed-cell rollback, rebuild overrides, solver swaps, and automatic CUDA-graph recapture."""
 
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import textwrap
 import threading
@@ -291,12 +294,105 @@ class TestMcpRebuild(_HostedTest):
             _restart_command(argv, {}, ["--seed", "4"]),
             ["push.py", "--connection-file", "c.json", "--", "--seed", "4"],
         )
+        fallback = {"argv": ["--seed", "3"], "overrides": {"A": 1}}
+        argv_with_fallback = [*argv[:5], "--restart-fallback", "{}", "--", "--seed", "3"]
+        self.assertEqual(
+            _restart_command(argv_with_fallback, {"B": 2}, ["--seed", "4"], fallback=fallback),
+            [
+                *("push.py", "--connection-file", "c.json", "--overrides", '{"B": 2}'),
+                *("--restart-fallback", json.dumps(fallback), "--", "--seed", "4"),
+            ],
+        )
         host, session = self.host()
-        session.dispatch("rebuild", {"restart": True, "overrides": {"SUBSTEPS": 4}})
+        session.dispatch("rebuild", {"restart": True, "overrides": {"SUBSTEPS": 4}, "argv": ["--seed", "5"]})
         self.assertTrue(host.restart_requested)
         self.assertEqual(host.overrides, {"SUBSTEPS": 4})
+        self.assertEqual(host.argv, ["--seed", "5"])
+        self.assertEqual(host.restart_fallback, {"argv": [], "overrides": {}})
         with self.assertRaisesRegex(RuntimeError, "unexpected keyword argument 'override_set'"):
             session.dispatch("rebuild", {"override_set": {"SUBSTEPS": 4}})
+
+    def test_restart_refuses_inputs_the_new_process_cannot_load(self):
+        """Check overrides, arguments and the script in a new process before the host re-executes itself."""
+        host, session = self.host()
+        with self.assertRaisesRegex(RuntimeError, "(?s)previous scene keeps running.*no module global NOPE"):
+            session.dispatch("rebuild", {"restart": True, "overrides": {"NOPE": 1}})
+        with self.assertRaisesRegex(RuntimeError, "invalid int value: 'abc'"):
+            session.dispatch("rebuild", {"restart": True, "argv": ["--num-frames", "abc"]})
+        self.script.write_text(_SCRIPT.replace("FAIL_AT = -1", "FAIL_AT = (-1"))
+        with self.assertRaisesRegex(RuntimeError, "SyntaxError"):
+            session.dispatch("rebuild", {"restart": True})
+        self.assertFalse(host.restart_requested)
+        self.assertEqual((host.argv, host.overrides), ([], {}))
+        self.assertTrue(session.valid)
+        self.assertEqual(session.dispatch("step")["frame"], 1)
+
+    def test_restarted_host_builds_the_previous_inputs_when_the_new_ones_fail(self):
+        """Build with the fallback arguments when Example() fails with the requested ones, and say so."""
+        connection = Path(self.directory.name) / "restart.json"
+        overrides = {"FAIL_AT": 1, "PARAMS": {"speed": 0}, "DEVICE": "cpu"}
+        script = self.script.with_name("live_edits_restart.py")
+        # The requested overrides make Example() raise; the fallback ones build.
+        script.write_text(_SCRIPT.replace("self.ticks = 0", "self.ticks = 1 / PARAMS['speed']"))
+        command = [
+            *(sys.executable, "-m", "newton.mcp", "host", str(script), "--connection-file", str(connection)),
+            *("--overrides", json.dumps(overrides)),
+            *("--restart-fallback", json.dumps({"argv": [], "overrides": {"DEVICE": "cpu", "SUBSTEPS": 3}})),
+        ]
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(process.wait, 30)
+        self.addCleanup(process.terminate)
+        deadline = time.monotonic() + 120
+        while not connection.with_suffix(".ready").exists():
+            self.assertIsNone(process.poll(), "the host exited instead of building the fallback")
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.1)
+        result = SimulationClient(connection, timeout=60).request("execute", code="module.SUBSTEPS")
+        self.assertEqual(result["result"], 3)
+        self.assertEqual(result["overrides"], {"DEVICE": "cpu", "SUBSTEPS": 3})
+        self.assertIn("The restart could not build", result["note"])
+        self.assertIn("ZeroDivisionError", result["note"])
+
+    def test_argument_errors_and_sys_exit_keep_the_host_running(self):
+        """Report argparse errors and SystemExit from cells and stepping instead of ending the process."""
+        host, session = self.host()
+        example = host.example
+        with self.assertRaisesRegex(RuntimeError, "(?s)previous scene keeps running.*rejected \\['--num-frames'"):
+            session.dispatch("rebuild", {"argv": ["--num-frames", "abc"]})
+        self.assertIs(host.example, example)
+        with self.assertRaisesRegex(RuntimeError, r"SystemExit\(3\) raised at line 2; the session keeps running"):
+            self.execute(session, "rollout(2)\nraise SystemExit(3)")
+        self.assertEqual(session.frame, 0)
+        host.example.step = lambda: sys.exit(4)
+        with self.assertRaisesRegex(RuntimeError, r"SystemExit\(4\)"):
+            session.dispatch("step")
+        del host.example.step
+        self.assertTrue(session.valid)
+        self.assertEqual(session.dispatch("step")["frame"], 1)
+
+    def test_rebuild_imports_edited_helper_modules_again(self):
+        """Reload modules imported from the script's directory, and restore them when the rebuild fails."""
+        helper = f"live_edits_helper_{os.getpid()}_{id(self)}"
+        self.addCleanup(sys.modules.pop, helper, None)
+        directory = Path(self.directory.name)
+        (directory / f"{helper}.py").write_text("GAIN = 1.0\n")
+        script = directory / "uses_helper.py"
+        script.write_text(
+            f"from {helper} import GAIN\n" + _SCRIPT.replace('self.speed = PARAMS["speed"]', "self.speed = GAIN")
+        )
+        host = ExampleHost(script)
+        session = host.session(artifact_directory=self.directory.name)
+        self.addCleanup(session.close)
+        self.assertEqual(host.example.speed, 1.0)
+        (directory / f"{helper}.py").write_text("GAIN = 2.5\n")
+        session.dispatch("rebuild", {})
+        self.assertEqual(host.example.speed, 2.5)
+        loaded = sys.modules[helper]
+        (directory / f"{helper}.py").write_text("GAIN = 4.0\n1 / 0\n")
+        with self.assertRaisesRegex(RuntimeError, "ZeroDivisionError"):
+            session.dispatch("rebuild", {})
+        self.assertIs(sys.modules[helper], loaded)
+        self.assertEqual(host.example.speed, 2.5)
 
     def test_workers_follow_overrides(self):
         """Rebuild hosted workers with the main session's overrides and arguments."""

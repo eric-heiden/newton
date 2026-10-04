@@ -208,6 +208,43 @@ class TestMcpModelWatch(unittest.TestCase):
         self.assertIn("newton.ModelFlags.BODY_INERTIAL_PROPERTIES", note)
         self.assertTrue(all(row["gravcomp"] == 1.0 for row in session.solver_params("body")["rows"]))
 
+    def test_notifications_count_only_on_the_live_solver_after_the_edit(self):
+        """Do not count a notify_model_changed call made before the edit or on another solver as covering it."""
+        session = self.make("cpu")
+        flag = "newton.ModelFlags.JOINT_DOF_PROPERTIES"
+        code = f"solver.notify_model_changed({flag})\nmodel.joint_damping.fill_(5.0)\nrollout(1)"
+        note = session.dispatch("execute", {"code": code})["note"]
+        self.assertIn("a call before the last edit of model.joint_damping", note)
+        self.assertIn(f"the host called solver.notify_model_changed({flag})", note)
+        joints = session.solver_params("joint")["rows"]
+        self.assertTrue(joints and all(row["damping"] == 5.0 and "pending" not in row for row in joints))
+        code = (
+            "scratch = newton.solvers.SolverMuJoCo(model)\nmodel.joint_damping.fill_(7.0)\n"
+            f"scratch.notify_model_changed({flag})\nrollout(1)"
+        )
+        note = session.dispatch("execute", {"code": code})["note"]
+        self.assertIn("a call on a SolverMuJoCo that is not the session's solver", note)
+        self.assertNotIn("Covered by", note)
+        self.assertTrue(all(row["damping"] == 7.0 for row in session.solver_params("joint")["rows"]))
+        code = f"model.joint_damping.fill_(9.0)\nsolver.notify_model_changed({flag})\nrollout(1)"
+        note = session.dispatch("execute", {"code": code})["note"]
+        self.assertIn("Covered by notify_model_changed (JOINT_DOF_PROPERTIES)", note)
+
+    def test_gain_edits_on_a_solver_without_actuators_are_stated(self):
+        """State that joint target gains drive nothing when the MuJoCo model has no actuators."""
+        from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+
+        template = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(template)
+        template.add_mjcf(_MJCF.split("<actuator>", maxsplit=1)[0] + "</mujoco>")
+        model = template.finalize(device="cpu")
+        session = _session(model, SolverMuJoCo(model), self.directory.name)
+        self.addCleanup(session.close)
+        self.assertEqual(session.solver_params("actuator")["rows"], [])
+        note = session.dispatch("execute", {"code": "model.joint_target_ke.fill_(123.0)"})["note"]
+        self.assertIn("model.joint_target_ke rows", note)
+        self.assertIn("drive no MuJoCo actuator (this SolverMuJoCo has no actuators", note)
+
     def test_facts_name_fields_the_solver_does_not_read(self):
         """State that JOINT_TARGET actuators ignore mujoco.actuator_gainprm and non-RAW shapes ignore mujoco.solref."""
         session = self.make("cpu")
@@ -265,8 +302,9 @@ class TestMcpModelWatch(unittest.TestCase):
         self.addCleanup(session.close)
         note = session.dispatch("execute", {"code": "model.shape_material_mu.fill_(0.3)\nr = rollout(1)"})["note"]
         self.assertIn("newton.ModelFlags.SHAPE_PROPERTIES", note)
-        code = "model.body_mass.fill_(2.0)\nother = newton.solvers.SolverSemiImplicit(model)\nother.notify_model_changed(8)"
-        note = session.dispatch("execute", {"code": code})["note"]
+        note = session.dispatch("execute", {"code": "model.body_mass.fill_(2.0)\nsolver.notify_model_changed(8)"})[
+            "note"
+        ]
         self.assertIn("Covered by notify_model_changed (BODY_INERTIAL_PROPERTIES)", note)
 
 
@@ -311,6 +349,72 @@ _HOSTED_SCRIPT = textwrap.dedent(
                 self.simulate()
     """
 )
+
+
+_GRAVITY_SCRIPT = textwrap.dedent(
+    """
+    import newton
+
+
+    class Example:
+        def __init__(self, viewer, args):
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+            builder.add_shape_sphere(builder.add_body(), radius=0.1)
+            self.model = builder.finalize(device="cpu")
+            self.solver = newton.solvers.SolverSemiImplicit(self.model)
+            self.state_0, self.state_1 = self.model.state(), self.model.state()
+            self.control = self.model.control()
+            self.frame_dt = 0.1
+            self.ticks = 0
+
+        def step(self):
+            # The application's own model edit, every frame.
+            self.ticks += 1
+            self.model.gravity.assign([[0.0, 0.0, -9.81 * (self.ticks % 2)]])
+            self.solver.step(self.state_0, self.state_1, self.control, None, self.frame_dt)
+            self.state_0, self.state_1 = self.state_1, self.state_0
+    """
+)
+
+
+class TestMcpHostedStepChecks(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        script = Path(directory.name) / "gravity_steps.py"
+        script.write_text(_GRAVITY_SCRIPT)
+        self.host = ExampleHost(script)
+        self.session = self.host.session(artifact_directory=directory.name)
+        self.addCleanup(self.session.close)
+
+    def execute(self, code: str) -> dict:
+        return self.session.dispatch("execute", {"code": code})
+
+    def test_model_edits_of_the_application_step_are_not_attributed_to_cells(self):
+        """Check around example.step() called from a cell as around a dispatched step."""
+        self.assertNotIn("note", self.execute("for _ in range(3):\n    example.step()"))
+        self.assertNotIn("note", self.execute("session.dispatch('step', {'count': 3})"))
+        note = self.execute("model.body_mass.fill_(2.0)\nexample.step()")["note"]
+        self.assertIn("Model edits before example.step(): model.body_mass", note)
+        self.assertNotIn("gravity", note)
+
+    def test_stepping_checks_skip_settings_comparison_and_leave_checksums_unread(self):
+        """Keep the per-step cost of the checks to a binding refresh and an asynchronous checksum launch."""
+        deep = [0]
+        fingerprint = self.host.fingerprint
+
+        def counted(**kwargs):
+            deep[0] += kwargs.get("deep", True)
+            return fingerprint(**kwargs)
+
+        self.host.fingerprint = counted
+        self.execute(
+            "pending = []\nfor _ in range(10):\n    session.dispatch('step')\n"
+            "    pending.append(session.watch._pending is not None)"
+        )
+        # host.sync (first step of a batch) and end_batch per dispatched step, plus one after the cell.
+        self.assertLessEqual(deep[0], 2 * 10 + 1)
+        self.assertEqual(self.execute("pending")["result"], [True] * 10)
 
 
 @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")

@@ -11,6 +11,7 @@ worker processes read definitions made in earlier cells.
 
 from __future__ import annotations
 
+import functools
 import inspect
 import linecache
 import sys
@@ -87,11 +88,38 @@ def definition_files(value: Any) -> set[str]:
     return files
 
 
+def _definitions(value: Any, seen: set[int], depth: int = 2):
+    """``value`` and the functions and classes it holds: container items, ``functools.partial`` targets, bound
+    methods, and the class of an instance, ``depth`` levels deep; objects in ``seen`` are skipped."""
+    if id(value) in seen:
+        return
+    if inspect.isfunction(value) or isinstance(value, type):
+        seen.add(id(value))
+        yield value
+        return
+    yield value
+    if depth <= 0 or isinstance(value, str | bytes):
+        return
+    if isinstance(value, dict):
+        items = list(value.values())[:1024]
+    elif isinstance(value, list | tuple | set | frozenset):
+        items = list(value)[:1024]
+    elif isinstance(value, functools.partial):
+        items = [value.func, *value.args, *value.keywords.values()]
+    elif inspect.ismethod(value):
+        items = [value.__func__, value.__self__]
+    else:
+        items = [type(value)]
+    for item in items:
+        yield from _definitions(item, seen, depth - 1)
+
+
 def referenced_cell_files(namespace: dict) -> set[str]:
-    """Cells that define the functions and classes currently bound in ``namespace``."""
-    files = set()
+    """Cells that define the functions and classes reachable from ``namespace`` (see :func:`_definitions`)."""
+    files, seen = set(), set()
     for value in list(namespace.values()):
-        files.update(name for name in definition_files(value) if is_cell_filename(name))
+        for item in _definitions(value, seen):
+            files.update(name for name in definition_files(item) if is_cell_filename(name))
     return files
 
 
@@ -103,24 +131,34 @@ def retain_cell_sources(
     maximum: int = 512,
     forget: Callable[[str], None] = forget_cell_source,
 ) -> list[str]:
-    """Forget the source of older cells unless a definition bound in ``namespace`` still comes from them.
+    """Keep up to ``maximum`` cells; beyond that, forget the oldest ones no reachable definition comes from.
 
     Args:
         filenames: Registered cells, oldest first.
-        namespace: Workspace whose bound functions and classes keep their cells.
+        namespace: Workspace whose functions and classes (also inside containers) keep their cells.
         recent: Number of most recent cells that are always kept.
-        maximum: Upper bound on kept cells.
+        maximum: Number of cells kept before any is forgotten.
         forget: Called with each dropped cell (default: :func:`forget_cell_source`).
 
     Returns:
         The cells that remain registered, oldest first.
     """
-    if len(filenames) <= recent:
+    if len(filenames) <= maximum:
         return list(filenames)
-    older, latest = filenames[:-recent], filenames[-recent:]
+    older = filenames[:-recent]
     live = referenced_cell_files(namespace)
-    kept = [name for name in older if name in live][-max(0, maximum - recent) :]
+    excess = len(filenames) - maximum
+    dropped = set()
     for name in older:
-        if name not in kept:
-            forget(name)
-    return kept + latest
+        if len(dropped) == excess:
+            break
+        if name not in live:
+            dropped.add(name)
+    # Still too many: the oldest cells go even if their definitions are still bound.
+    for name in older:
+        if len(dropped) == excess:
+            break
+        dropped.add(name)
+    for name in dropped:
+        forget(name)
+    return [name for name in filenames if name not in dropped]

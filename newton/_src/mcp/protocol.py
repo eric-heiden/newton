@@ -332,7 +332,7 @@ TOOLS = [
 
 
 _HELPERS = """- If a cell raises, the simulation (time, state, control, model arrays) returns to its state before the cell and the error lists what was restored; Python variables are kept.
-- After each cell, and before rollout()/step/filmstrip inside it, the model arrays solvers read are checksummed; changes that no notify_model_changed() call covered are notified with the inferred ModelFlags and listed in `note` (session.watch.mode = 'notify' | 'report' | 'off').
+- After each cell, and before rollout()/step/filmstrip/example.step() inside it, the model arrays solvers read are checksummed; changes that no later notify_model_changed() call on the session's solver covered are notified with the inferred ModelFlags and listed in `note` (session.watch.mode = 'notify' | 'report' | 'off').
 - rollout(frames or seconds=..., record={'name': 'expr' or fn}, every=k, start=True|'checkpoint', until='expr'): steps and returns NumPy series.
 - session.dispatch('step' | 'reset' | 'checkpoint' | 'restore' | 'describe', {...}): step, return to the initial state, save or restore named states (state, control, time; model edits are kept), or list scene counts and solver.
 - health(solver=None, state=None, per_world=True, twins=False): non-finite values, runaway speeds, full solver buffers, and penetrating shape pairs, by world, for any solver.

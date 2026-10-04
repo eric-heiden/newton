@@ -177,6 +177,24 @@ class TestMcpWorkers(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "ZeroDivisionError"):
             self.execute("workers.submit(ratio, 0).result()")
 
+    def test_failed_calls_roll_back_the_worker_scene(self):
+        """Undo the model, state and stepping of a worker call that raises, so later calls start clean."""
+        self.execute(
+            "def bad(_):\n"
+            "    model.body_mass.fill_(123.0)\n"
+            "    state.body_q.assign(np.array([[5, 5, 5, 0, 0, 0, 1]], dtype=np.float32))\n"
+            "    session.dispatch('step', {'count': 3})\n"
+            "    raise ValueError('candidate failed')\n"
+            "def probe(_):\n"
+            "    return float(model.body_mass.numpy()[0]), state.body_q.numpy()[0, :3].tolist(), session.frame"
+        )
+        before = self.execute("workers.broadcast(probe, 0)")["result"]
+        errors = self.execute("workers.map(bad, [0, 1])")["result"]
+        for error in errors:
+            self.assertIn("candidate failed", error["error"])
+            self.assertRegex(error["error"], r"rolled back from t=.* \(frame 3\).*model \(body_mass\)")
+        self.assertEqual(self.execute("workers.broadcast(probe, 0)")["result"], before)
+
     def test_sync_copies_values_once(self):
         """Copy session values into every worker; functions do not resend a synced object."""
         result = self.execute("big = np.arange(1_000_000, dtype=np.float64)\nworkers.sync(big=big)")["result"]
@@ -326,6 +344,22 @@ class TestMcpLaunchedWorkers(unittest.TestCase):
         self.assertRegex(result["workers"][0], r"worker 0 CUDA context failed during broadcast code .*restarted")
         self.assertFalse(_alive(pid))
 
+    def test_rebuild_does_not_wait_for_busy_workers_and_jobs_report_their_build(self):
+        """Return from a rebuild while a job runs, and tag every job with the build its worker had."""
+        self.script.write_text("SPEED = 1.0\n" + _SCRIPT.replace("self.speed = 1.0", "self.speed = SPEED"))
+        self.session.dispatch("rebuild", {})
+        self.execute("import time\ndef job(seconds):\n    time.sleep(seconds)\n    return example.speed")
+        self.execute("first = jobs.start(job, 6.0)\nqueued = jobs.start(job, 0.0)\ntime.sleep(0.5)")
+        started = time.perf_counter()
+        rebuilt = self.session.dispatch("rebuild", {"overrides": {"SPEED": 7.0}})["workers_rebuilt"]
+        self.assertLess(time.perf_counter() - started, 4.0)
+        self.assertEqual((rebuilt["build"], rebuilt["rebuilt"], rebuilt["pending"]), (2, 0, [0]))
+        response = self.execute("jobs.wait(timeout=60, any=False)")
+        finished = response["result"]["finished"]
+        self.assertEqual([(entry["result"], entry["build"]) for entry in finished], [(1.0, 1), (7.0, 2)])
+        self.assertRegex(response["workers"][0], r"worker 0 rebuilt .* after the rebuild request \(it was busy\)")
+        self.assertEqual(self.pool.status()[0]["build"], 2)
+
     def test_job_progress_lines(self):
         """Return the lines a running job printed so far, then its result."""
         self.execute(
@@ -339,6 +373,36 @@ class TestMcpLaunchedWorkers(unittest.TestCase):
         result = self.execute("jobs.wait(timeout=10)")["result"]
         self.assertEqual(result["finished"][0]["result"], 6)
         self.assertEqual(early + result["finished"][0]["lines"], [f"step {i}" for i in range(6)])
+
+
+class TestMcpShipping(unittest.TestCase):
+    def test_shipped_definitions_get_the_same_module_name_in_every_process(self):
+        """Define shipped kernels under a module named after their source, so worker kernel caches agree."""
+        source = "@wp.kernel\ndef triple(a: wp.array[float]):\n    i = wp.tid()\n    a[i] = a[i] * 3.0\n"
+        filename = "<_newton_mcp_sender:cell-1>"
+        from newton._src.mcp.cells import register_cell_source  # noqa: PLC0415
+
+        register_cell_source(filename, source)
+        sender = {"__name__": "_newton_mcp_sender", "wp": wp}
+        exec(compile(source, filename, "exec"), sender)
+        payload = shipping.prepare(sender["triple"], lambda name, value: name == "wp").data
+        names = []
+        for index in range(2):
+            # Two worker processes, i.e. two workspaces with their own module names.
+            module_name = f"_newton_mcp_worker_test_{index}"
+            workspace = type(sys)(module_name)
+            workspace.__dict__["wp"] = wp
+            sys.modules[module_name] = workspace
+            self.addCleanup(sys.modules.pop, module_name, None)
+            kernel = shipping._install(workspace.__dict__, __import__("pickle").loads(payload))[0]
+            self.assertEqual(workspace.__dict__["__name__"], module_name)
+            names.append(kernel.module.name)
+            values = wp.ones(4, dtype=float, device="cpu")
+            wp.launch(kernel, 4, inputs=[values], device="cpu")
+            self.assertEqual(values.numpy().tolist(), [3.0] * 4)
+        self.assertEqual(names[0], names[1])
+        self.assertTrue(names[0].startswith("_newton_mcp_shipped_"))
+        self.addCleanup(sys.modules.pop, names[0], None)
 
 
 class TestMcpHostWorkers(unittest.TestCase):

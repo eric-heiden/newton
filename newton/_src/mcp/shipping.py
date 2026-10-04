@@ -464,17 +464,42 @@ def _apply(namespace: dict, step: tuple, bound: dict[str, Any]) -> None:
         name = record["name"]
         # Separate locals keep a nested function's own name from replacing a worker global of that name.
         scope: dict = {}
-        exec(code, namespace, scope)
-        if record.get("freevars"):
-            function = scope["__newton_closure__"](*loads(record["closure"], namespace))
-        else:
-            function = scope[record["binds"]]
+        with _shipped_module(namespace, record):
+            exec(code, namespace, scope)
+            if record.get("freevars"):
+                function = scope["__newton_closure__"](*loads(record["closure"], namespace))
+            else:
+                function = scope[record["binds"]]
         namespace[name] = function
         if "defaults" in record:
             function.__defaults__, function.__kwdefaults__ = loads(record["defaults"], namespace)
         bound[name] = function
     else:
         raise ValueError(f"Unknown shipment step {kind!r}")
+
+
+@contextlib.contextmanager
+def _shipped_module(namespace: dict, record: dict):
+    """Define a shipped object under a module name derived from its source instead of the workspace's.
+
+    Warp names a kernel's cache entry after its module, and workspace names differ per process; the
+    same name in every worker lets the processes (and restarted ones) share compiled kernels.
+    """
+    digest = hashlib.sha256(f"{record['kind']}\0{record['name']}\0{record['source']}".encode()).hexdigest()[:16]
+    name = f"{_WORKSPACE_PREFIX}shipped_{digest}"
+    workspace = sys.modules.get(str(namespace.get("__name__", "")))
+    if isinstance(workspace, ModuleType):
+        # Pickling by reference looks the definitions up through sys.modules; they live in the workspace.
+        sys.modules[name] = workspace
+    original = namespace.get("__name__", _MISSING)
+    namespace["__name__"] = name
+    try:
+        yield
+    finally:
+        if original is _MISSING:
+            namespace.pop("__name__", None)
+        else:
+            namespace["__name__"] = original
 
 
 def _install(namespace: dict, payload: dict) -> tuple[Any, dict[str, Any]]:
@@ -590,12 +615,23 @@ def serve(namespace: dict, request: dict) -> dict:
 
     Returns:
         ``{"value": reference}`` with the pickled result, or ``{"error": report}``; ``device`` reports
-        a CUDA context that failed during the call.
+        a CUDA context that failed during the call. A call that raised rolls the worker's simulation back
+        to the start of the call, as a failed cell would; the report's ``rollback`` says what was restored.
     """
     response = _serve(namespace, request)
     failure = device_error()
     if failure is not None:
+        # The worker is restarted; its arrays cannot be copied back on a failed context.
         response["device"] = failure
+    elif "error" in response:
+        roll_back = getattr(namespace.get("session"), "_roll_back_cell", None)
+        if roll_back is not None:
+            try:
+                outcome = roll_back()
+            except Exception as error:
+                outcome = f"Rolling the worker back failed: {type(error).__name__}: {str(error)[:300]}"
+            if outcome:
+                response["error"]["rollback"] = outcome
     return response
 
 

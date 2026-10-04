@@ -8,7 +8,8 @@
 - Add a persistent trusted Python workspace to live MCP sessions, with Warp kernel support, bounded result summaries, and rollback of the simulation when a cell or step fails.
 - Add visual feedback to live MCP sessions: inline images from Python via `show()`, auto-framed and multi-view observations, comparison against reference photos, and a `filmstrip` tool that returns frames over time in one image.
 - Add build `overrides` for hosted MCP example scripts, which set module globals before `Example()` is constructed, and `swap_solver()` for replacing a live solver after a trial run.
-- Add `newton.mcp.WorkerPool` so live MCP sessions can run trusted Python on sibling application sessions in parallel via `workers.broadcast()`, `workers.map()`, and `workers.submit()`.
+- Add `newton.mcp.WorkerPool` so live MCP sessions can run trusted Python on sibling application sessions in parallel via `workers.broadcast()`, `workers.map()`, and `workers.submit()`. Functions defined in cells are sent by source with the helpers and globals they use, `workers.sync()` copies session values to every worker, and hosted workers follow rebuilds, restart after a crash or CUDA error, and can be resized at run time.
+- Add `newton.mcp.JobQueue` (`jobs` in live MCP sessions) to start worker calls in the background and collect their results and printed progress later.
 
 <!-- towncrier release notes start -->
 

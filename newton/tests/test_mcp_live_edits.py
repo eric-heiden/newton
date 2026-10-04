@@ -15,7 +15,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.mcp.host import _with_overrides
+from newton._src.mcp.host import _restart_command
 from newton._src.mcp.protocol import _Protocol
 from newton.mcp import ExampleHost, SimulationClient, SimulationServer, SimulationSession
 
@@ -284,10 +284,13 @@ class TestMcpRebuild(_HostedTest):
         """Carry the active overrides into the re-executed host command and its workers."""
         argv = ["push.py", "--connection-file", "c.json", "--overrides", '{"A": 1}', "--", "--seed", "3"]
         self.assertEqual(
-            _with_overrides(argv, {"B": 2}),
+            _restart_command(argv, {"B": 2}, ["--seed", "3"]),
             ["push.py", "--connection-file", "c.json", "--overrides", '{"B": 2}', "--", "--seed", "3"],
         )
-        self.assertEqual(_with_overrides(argv, {}), ["push.py", "--connection-file", "c.json", "--", "--seed", "3"])
+        self.assertEqual(
+            _restart_command(argv, {}, ["--seed", "4"]),
+            ["push.py", "--connection-file", "c.json", "--", "--seed", "4"],
+        )
         host, session = self.host()
         session.dispatch("rebuild", {"restart": True, "overrides": {"SUBSTEPS": 4}})
         self.assertTrue(host.restart_requested)
@@ -335,7 +338,7 @@ class TestMcpRebuild(_HostedTest):
         session = host.session(artifact_directory=self.directory.name, workers=paths)
         self.addCleanup(session.close)
         result = session.dispatch("rebuild", {"overrides": {"SUBSTEPS": 4}})
-        self.assertIn("workers: 1 rebuilt", result["note"])
+        self.assertEqual(result["workers_rebuilt"]["rebuilt"], 1)
         self.assertEqual(self.execute(session, "workers.broadcast('module.SUBSTEPS')")["result"], [4])
         session.dispatch("rebuild", {"overrides": {}})
         self.assertEqual(self.execute(session, "workers.broadcast('module.SUBSTEPS')")["result"], [2])

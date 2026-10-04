@@ -660,6 +660,54 @@ A robust pattern is:
     # Recompute transforms after editing generalized coordinates
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
 
+Find indices by label
+"""""""""""""""""""""
+
+:meth:`~newton.Model.find_bodies`, :meth:`~newton.Model.find_shapes`,
+:meth:`~newton.Model.find_joints`, :meth:`~newton.Model.find_joint_dofs`, and
+:meth:`~newton.Model.find_joint_coords` turn :ref:`label patterns <label-matching>` into model
+indices. A pattern matches either the full label or its last path component, so the prefixes
+that importers and :meth:`~newton.ModelBuilder.add_builder` add need not be spelled out.
+Without ``world``, the result holds the matches of every world in model order, e.g. one index
+per world for a replicated robot; with ``world``, only that world's. A pattern that matches
+nothing raises :class:`KeyError` and names the closest labels.
+
+The DOF and coordinate variants list every DOF or coordinate of the matched joints, as indices
+into ``joint_qd``-layout arrays (velocities, gains, limits, efforts) and ``joint_q``-layout
+arrays (positions). The two layouts differ for free, ball, and distance joints (see
+:attr:`~newton.Model.joint_q_start` and :attr:`~newton.Model.joint_qd_start`).
+
+.. testcode:: articulation-find-by-label
+
+    template = newton.ModelBuilder()
+    base = template.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()), label="robot/base")
+    arm = template.add_link(label="robot/arm")
+    template.add_shape_box(arm, hx=0.05, hy=0.05, hz=0.25, label="robot/arm_box")
+    root = template.add_joint_free(base, label="robot/root")
+    elbow = template.add_joint_revolute(base, arm, axis=wp.vec3(0.0, 1.0, 0.0), label="robot/elbow")
+    template.add_articulation([root, elbow])
+
+    builder = newton.ModelBuilder()
+    builder.replicate(template, 2)
+    model = builder.finalize()
+
+    print(model.find_joints("elbow"))  # one match per world
+    print(model.find_joint_dofs("elbow", world=1))
+    print(model.find_joint_coords("root", world=0))  # position and quaternion
+
+    ke = model.joint_target_ke.numpy()
+    ke[model.find_joint_dofs("elbow")] = 50.0  # every world
+    model.joint_target_ke.assign(ke)
+
+.. testoutput:: articulation-find-by-label
+
+    [1, 3]
+    [13]
+    [0, 1, 2, 3, 4, 5, 6]
+
+For :class:`~newton.solvers.SolverMuJoCo`, see :ref:`mujoco-newton-mujoco-indices` for the
+MuJoCo ids and names of these entities.
+
 ArticulationView: selection interface for RL and batched control
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 

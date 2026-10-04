@@ -510,6 +510,18 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
     _generated_kernel_deterministic_options: tuple[wp.DeterministicMode, int] | None = None
 
     @staticmethod
+    def _invert_world_mapping(mapping: np.ndarray, count: int) -> np.ndarray:
+        """Invert a MuJoCo ``[world, id] -> Newton index`` mapping into ``Newton index -> MuJoCo id``.
+
+        MuJoCo ids are the same in every world; Newton entities without a MuJoCo
+        counterpart map to -1.
+        """
+        inverse = np.full(count, -1, dtype=np.int32)
+        worlds, ids = np.nonzero(mapping >= 0)
+        inverse[mapping[worlds, ids]] = ids
+        return inverse
+
+    @staticmethod
     def _tile_world_mapping(template: np.ndarray, nworld: int, stride: int) -> np.ndarray:
         """Expand a single-world template mapping across all worlds.
 
@@ -3978,9 +3990,20 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self.body_free_qd_start: wp.array[wp.int32] | None = None
         """Per-body mapping to the free-joint qd_start index (or -1 if not free)."""
 
-        # --- Conditional mappings ---
+        # --- Newton -> MuJoCo mappings (see "Newton and MuJoCo indices" in docs/solvers/mujoco.rst) ---
+        self.newton_body_to_mjc_body: wp.array[wp.int32] | None = None
+        """MuJoCo body id of each Newton body, -1 for bodies without one. Shape [body_count], dtype int32.
+
+        The id is the same in every MuJoCo world; a body of Newton world ``w`` lives in MuJoCo world ``w``."""
+        self.newton_dof_to_mjc_dof: wp.array[wp.int32] | None = None
+        """MuJoCo DOF id of each Newton joint DOF, -1 for DOFs without one. Shape [joint_dof_count], dtype int32.
+
+        The id is the same in every MuJoCo world; ``mj_model.dof_jntid`` gives the MuJoCo joint of a DOF."""
         self.newton_shape_to_mjc_geom: wp.array[wp.int32] | None = None
-        """Inverse mapping from Newton shape index to MuJoCo geom index. Only created when use_mujoco_contacts=False. Shape [nshape], dtype int32."""
+        """MuJoCo geom id of each Newton shape, -1 for shapes without a geom (e.g. sites and skipped
+        visual-only shapes). Shape [shape_count], dtype int32.
+
+        The id is the same in every MuJoCo world; global shapes have a geom in every world."""
 
         # --- Helper arrays for actuator types ---
 
@@ -4164,10 +4187,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 include_sites=include_sites,
                 skip_visual_only_geoms=skip_visual_only_geoms,
             )
-        if not use_mujoco_cpu and not use_mujoco_contacts:
-            # Persistent mappings must be initialized outside step(), which may
-            # first run inside a CUDA graph that is discarded without replay.
+        # Persistent mappings must be initialized outside step(), which may
+        # first run inside a CUDA graph that is discarded without replay.
+        if self.mjc_geom_to_newton_shape is not None:
             self._create_inverse_shape_mapping()
+        if not use_mujoco_cpu and not use_mujoco_contacts:
             self._contact_tid_to_cid = wp.full(self.mjw_data.naconmax, -1, dtype=wp.int32, device=self.device)
         self._initial_model_sync = False
         self.update_data_interval = update_data_interval
@@ -5100,7 +5124,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         )
 
     def _create_inverse_shape_mapping(self):
-        """Create the Newton shape to MuJoCo geom mapping for external contacts."""
+        """Create :attr:`newton_shape_to_mjc_geom` from :attr:`mjc_geom_to_newton_shape`."""
         nworld = self.mjc_geom_to_newton_shape.shape[0]
         ngeom = self.mjc_geom_to_newton_shape.shape[1]
 
@@ -7962,6 +7986,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         dof_to_newton_dof_template[mjc_dof] = template_newton_dof
             mjc_dof_to_newton_dof_np = self._tile_world_mapping(dof_to_newton_dof_template, nworld, dofs_per_world)
             self.mjc_dof_to_newton_dof = wp.array(mjc_dof_to_newton_dof_np, dtype=wp.int32)
+
+            self.newton_body_to_mjc_body = wp.array(
+                self._invert_world_mapping(mjc_body_to_newton_np, model.body_count), dtype=wp.int32
+            )
+            self.newton_dof_to_mjc_dof = wp.array(
+                self._invert_world_mapping(mjc_dof_to_newton_dof_np, model.joint_dof_count), dtype=wp.int32
+            )
 
             # Create mjc_eq_to_newton_eq: MuJoCo[world, eq] -> Newton equality constraint
             # selected_constraints[idx] is the Newton template constraint index

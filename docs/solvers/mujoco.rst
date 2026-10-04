@@ -653,6 +653,56 @@ a negative world index — assigning any of them to the global world
 raises ``ValueError``. Only shapes may live in the global world (-1);
 they are shared across all worlds without replication.
 
+.. _mujoco-newton-mujoco-indices:
+
+Newton and MuJoCo indices
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The compiled MuJoCo model (``solver.mj_model``, and ``solver.mjw_model`` per
+world) has its own object ids and names. Names are derived from the Newton
+labels: body and joint names replace ``/`` by ``_`` (``robot/arm/elbow``
+becomes ``robot_arm_elbow``, with a suffix if not unique), and geom names append
+the Newton shape index (``robot/arm/box_12``). Look them up through the id
+mappings instead of spelling them by hand:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Newton to MuJoCo
+     - MuJoCo to Newton
+   * - :attr:`~newton.solvers.SolverMuJoCo.newton_body_to_mjc_body`
+     - :attr:`~newton.solvers.SolverMuJoCo.mjc_body_to_newton`
+   * - :attr:`~newton.solvers.SolverMuJoCo.newton_dof_to_mjc_dof`
+     - :attr:`~newton.solvers.SolverMuJoCo.mjc_dof_to_newton_dof`,
+       :attr:`~newton.solvers.SolverMuJoCo.mjc_jnt_to_newton_jnt`,
+       :attr:`~newton.solvers.SolverMuJoCo.mjc_jnt_to_newton_dof`
+   * - :attr:`~newton.solvers.SolverMuJoCo.newton_shape_to_mjc_geom`
+     - :attr:`~newton.solvers.SolverMuJoCo.mjc_geom_to_newton_shape`
+
+The Newton-to-MuJoCo arrays are indexed by Newton body, DOF, or shape and hold
+the MuJoCo id, or -1 for entities without a MuJoCo counterpart (e.g. sites and
+skipped visual-only shapes). The MuJoCo-to-Newton arrays are indexed by
+``[world, id]``. MuJoCo ids are the same in every world: with
+``separate_worlds=True``, a Newton entity of world ``w`` lives in row ``w`` of
+the ``mjw_data`` arrays. The MuJoCo joint of a DOF is ``mj_model.dof_jntid``;
+a Newton joint with several axes (e.g. D6) becomes one MuJoCo slide or hinge
+joint per axis, named with a ``_lin`` or ``_ang`` suffix.
+
+Combined with the label lookups on :class:`~newton.Model` (see
+:meth:`~newton.Model.find_joint_dofs`), this gives the compiled names and
+addresses:
+
+.. code-block:: python
+
+    dofs = model.find_joint_dofs("left_joint1", world=0)
+    mjc_dofs = solver.newton_dof_to_mjc_dof.numpy()[dofs]
+    joint = solver.mj_model.joint(int(solver.mj_model.dof_jntid[mjc_dofs[0]]))
+    print(joint.name, joint.qposadr, joint.dofadr)
+
+    bodies = solver.newton_body_to_mjc_body.numpy()[model.find_bodies("left_hand", world=0)]
+    print([solver.mj_model.body(int(body)).name for body in bodies])
+
 
 Runtime state synchronization
 -----------------------------

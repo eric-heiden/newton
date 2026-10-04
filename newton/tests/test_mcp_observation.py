@@ -25,7 +25,6 @@ from newton._src.mcp.imaging import encode_png as _encode_png
 from newton._src.mcp.observation import (
     ObservationRenderer,
     _intrinsics,
-    _inverse_brown_conrady_rays,
     _project,
 )
 from newton._src.mcp.protocol import TOOLS
@@ -79,9 +78,9 @@ def _assert_nearly_equal_images(test, a, b, max_pixels=2):
 
 
 def _hit_centroid(image):
-    """Mean pixel-center coordinates [x, y] of the non-black pixels of a shape_index image."""
+    """Mean image coordinates [x, y] (pixel centers at integers) of the non-black pixels of a shape_index image."""
     ys, xs = np.nonzero(np.asarray(image).any(axis=-1))
-    return np.array([xs.mean() + 0.5, ys.mean() + 0.5])
+    return np.array([xs.mean(), ys.mean()])
 
 
 def _has_color(image, color):
@@ -142,7 +141,7 @@ def _corner_centroids(mask):
     result = []
     for x, y in _CORNERS:
         near = (np.abs(xs - 424 - 434 * x) < 60) & (np.abs(ys - 240 - 434 * y) < 60)
-        result.append([xs[near].mean() + 0.5, ys[near].mean() + 0.5])
+        result.append([xs[near].mean(), ys[near].mean()])
     return np.array(result)
 
 
@@ -239,7 +238,7 @@ class TestMcpObservation(unittest.TestCase):
         quad = np.array([[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]], dtype=np.float32)
         self.session.overlay_callback = lambda session: [("quad", quad, np.array([0, 1, 2, 0, 2, 3]), (0, 1, 0))]
         focal = 32.5 / math.tan(math.radians(30.0))
-        ideal = {"fx": focal, "fy": focal, "cx": 32.5, "cy": 32.5}
+        ideal = {"fx": focal, "fy": focal, "cx": 32.0, "cy": 32.0}
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             self.renderer.observe(**self.camera)
@@ -424,7 +423,7 @@ class TestMcpObservation(unittest.TestCase):
         top = {"surface0": [0.0, 0.0, 0.5], "surface1": [0.0, 0.0, 0.5]}
         self.session.contact_data = lambda **kwargs: {"rows": [top], "source": "test"}
         focal = 32.5 / math.tan(math.radians(30.0))
-        shifted = {"fx": focal, "fy": focal, "cx": 22.5, "cy": 32.5}
+        shifted = {"fx": focal, "fy": focal, "cx": 22.0, "cy": 32.0}
         result = self.renderer.observe(contacts=True, contact_depth="always", intrinsics=shifted, **self.camera)
         self.assertEqual(result["contacts"]["drawn"], 1)
         ys, xs = np.nonzero(np.all(_decode_png(result) == (255, 32, 224), axis=-1))
@@ -550,14 +549,14 @@ class TestMcpObservation(unittest.TestCase):
     def test_calibrated_intrinsics_match_pinhole_and_shift_principal_point(self):
         """Render calibrated OpenCV intrinsics; an ideal camera matches the equivalent fov_y render."""
         focal = 32.5 / math.tan(math.radians(30.0))
-        ideal = {"fx": focal, "fy": focal, "cx": 32.5, "cy": 32.5}
+        ideal = {"fx": focal, "fy": focal, "cx": 32.0, "cy": 32.0}
         pinhole = self.renderer.observe(channel="depth", raw=True, fov_y=60.0, **self.camera)
         calibrated = self.renderer.observe(channel="depth", raw=True, intrinsics=ideal, **self.camera)
         self.assertAlmostEqual(calibrated["camera"]["fov_y"], 60.0, places=4)
         with np.load(pinhole["raw_artifact"]) as a, np.load(calibrated["raw_artifact"]) as b:
             np.testing.assert_allclose(a["depth"], b["depth"], atol=1e-4)
         # Moving the principal point shifts the sphere in the image.
-        shifted = self.renderer.observe(channel="depth", raw=True, intrinsics={**ideal, "cx": 22.5}, **self.camera)
+        shifted = self.renderer.observe(channel="depth", raw=True, intrinsics={**ideal, "cx": 22.0}, **self.camera)
         with np.load(shifted["raw_artifact"]) as c:
             hit = np.nonzero(c["depth"][32] > 0)[0]
         self.assertLess(hit.mean(), 32.0 - 5.0)
@@ -567,17 +566,18 @@ class TestMcpObservation(unittest.TestCase):
     def test_inverse_brown_conrady_distortion(self):
         """RealSense distortion maps distorted pixels straight to rays and matches the ideal camera at zero."""
         focal = 32.5 / math.tan(math.radians(30.0))
-        ideal = {"fx": focal, "fy": focal, "cx": 32.5, "cy": 32.5}
+        ideal = {"fx": focal, "fy": focal, "cx": 32.0, "cy": 32.0}
         realsense = {**ideal, "distortion_model": "inverse_brown_conrady", "k1": 0.0}
         pinhole = self.renderer.observe(channel="depth", raw=True, intrinsics=ideal, **self.camera)
         zero = self.renderer.observe(channel="depth", raw=True, intrinsics=realsense, **self.camera)
         with np.load(pinhole["raw_artifact"]) as a, np.load(zero["raw_artifact"]) as b:
             np.testing.assert_allclose(a["depth"], b["depth"], atol=1e-4)
-        rays = _inverse_brown_conrady_rays(4, 2, {**realsense, "k1": 0.2, "image_width": 4.0, "image_height": 2.0})
-        x, y = (0.5 - 32.5) / focal, (0.5 - 32.5) / focal
+        self.renderer.observe(channel="depth", intrinsics={**realsense, "k1": 0.2}, **self.camera)
+        # The top-left pixel is centered at image coordinates (0, 0).
+        x, y = (0.0 - 32.0) / focal, (0.0 - 32.0) / focal
         r2 = x * x + y * y
         expected = np.array([x * (1 + 0.2 * r2), -y * (1 + 0.2 * r2), -1.0])
-        np.testing.assert_allclose(rays[0, 0, 1], expected / np.linalg.norm(expected), atol=1e-6)
+        np.testing.assert_allclose(self.renderer._rays.numpy()[0, 0, 1], expected / np.linalg.norm(expected), atol=1e-6)
         with self.assertRaises(ValueError):
             self.renderer.observe(intrinsics={**realsense, "k4": 0.1}, **self.camera)
 
@@ -747,7 +747,7 @@ class TestMcpObservation(unittest.TestCase):
         opencv = {**calibration, "k1": -0.12, "k2": 0.03, "p1": 0.002, "p2": -0.003, "k4": 0.01, "s1": 0.001}
         realsense = {**calibration, "distortion_model": "inverse_brown_conrady", "k1": 0.1, "k2": -0.02, "p1": 0.002}
         ys, xs = np.mgrid[0:30, 0:40]
-        centers = np.stack([xs.ravel() + 0.5, ys.ravel() + 0.5], axis=-1)
+        centers = np.stack([xs.ravel(), ys.ravel()], axis=-1).astype(np.float64)
         for options in ({}, {"intrinsics": opencv}, {"intrinsics": realsense}):
             with self.subTest(options=options):
                 metadata = self.renderer.observe(channel="depth", **camera, **options)
@@ -793,7 +793,7 @@ class TestMcpObservation(unittest.TestCase):
         _assert_nearly_equal_images(self, _decode_png(mounted), fixed([0.0, -3.0, 0.0]))
         self.assertEqual(mounted["camera"]["mount"]["body"], 1)
         self.assertEqual(mounted["camera"]["mount"]["label"], "scene/mount")
-        np.testing.assert_allclose(_hit_centroid(_decode_png(mounted)), [24.0, 16.0], atol=0.5)
+        np.testing.assert_allclose(_hit_centroid(_decode_png(mounted)), [23.5, 15.5], atol=0.5)
         # camera_offset is a pose in the body frame, whose x axis is world x here.
         offset = self.renderer.observe(camera_body="scene/mount", camera_offset=[0.5, 0, 0, 0, 0, 0, 1], **camera)
         _assert_nearly_equal_images(self, _decode_png(offset), fixed([0.5, -3.0, 0.0]))
@@ -829,7 +829,7 @@ class TestMcpObservation(unittest.TestCase):
         self.assertEqual([m["camera"]["mount"]["body"] for m in mounted], [1, 3])
         # Each world's camera sees its own link centered (shape ids, and so the colors, differ per world).
         for result in mounted:
-            np.testing.assert_allclose(_hit_centroid(_decode_png(result)), [24.0, 16.0], atol=0.5)
+            np.testing.assert_allclose(_hit_centroid(_decode_png(result)), [23.5, 15.5], atol=0.5)
         self.assertEqual(
             self.renderer.observe(camera_body="arm/link", world_id=1, **camera)["camera"]["mount"]["body"], 2
         )
@@ -839,7 +839,7 @@ class TestMcpObservation(unittest.TestCase):
             plain = _decode_png(self.renderer.observe(world_id=world, **fixed))
             marked = self.renderer.observe(world_id=world, overlay={"link": {"body": "link"}}, **fixed)
             np.testing.assert_allclose(marked["overlay"]["link"], _hit_centroid(plain), atol=1.0)
-            self.assertEqual(marked["overlay"]["link"][0] > 24.0, world == 1)
+            self.assertEqual(marked["overlay"]["link"][0] > 23.5, world == 1)
         with self.assertRaisesRegex(ValueError, "matches 2 bodies"):
             self.renderer.observe(camera_body="lin", **camera)
         with self.assertRaisesRegex(ValueError, "belongs to world 0"):
@@ -855,9 +855,9 @@ class TestMcpObservation(unittest.TestCase):
         overlay = {"center": [0.0, 0.0, 0.0], "rim": {"body": 0, "point": [0.5, 0.0, 0.0]}}
         marked = self.renderer.observe(reference=str(reference), overlay=overlay, **camera)
         self.assertEqual(marked["reference"]["mismatch_fraction"], 0.0)
-        self.assertEqual(marked["overlay"]["center"], [32.5, 32.5])
+        self.assertEqual(marked["overlay"]["center"], [32.0, 32.0])
         focal = 32.5 / math.tan(math.radians(30.0))
-        np.testing.assert_allclose(marked["overlay"]["rim"], [32.5 + focal * 0.5 / 3.0, 32.5], atol=0.06)
+        np.testing.assert_allclose(marked["overlay"]["rim"], [32.0 + focal * 0.5 / 3.0, 32.0], atol=0.06)
         image = _decode_png(marked)
         self.assertTrue(_has_color(image[:, :65], _MAGENTA))
         self.assertTrue(_has_color(image[:, 69:134], _MAGENTA))
@@ -935,7 +935,7 @@ class TestMcpObservation(unittest.TestCase):
         )
         tops = [row["pixels"]["top"] for row in evaluated["overlay"]]
         self.assertGreater(tops[2][1], tops[0][1] + 10.0)
-        self.assertEqual([row["pixels"]["fn"] for row in evaluated["overlay"]], [[24.0, 16.0]] * 3)
+        self.assertEqual([row["pixels"]["fn"] for row in evaluated["overlay"]], [[23.5, 15.5]] * 3)
         with self.assertRaisesRegex(ValueError, "camera_offset requires camera_body"):
             session.dispatch(
                 "filmstrip", {"times": [0.0], "reset": True, "camera_offset": [0, 0, 0, 0, 0, 0, 1], **size}
@@ -988,7 +988,7 @@ class TestMcpObservation(unittest.TestCase):
         directions = self.renderer._rays.numpy()[:, :, 1].reshape(-1, 3).astype(np.float64)
         pixels, depth = _project(pose[:3] + 0.5 * directions @ _rotation(pose[3:]).T, pose, 848, 480, 0.0, intrinsics)
         ys, xs = np.mgrid[0:480, 0:848]
-        np.testing.assert_allclose(pixels, np.stack([xs.ravel() + 0.5, ys.ravel() + 0.5], axis=-1), atol=1.0e-3)
+        np.testing.assert_allclose(pixels, np.stack([xs.ravel(), ys.ravel()], axis=-1), atol=1.0e-3)
         self.assertTrue(np.all(depth > 0.0))
         # Overlay rings sit on the rendered spheres, which the same camera without distortion would miss.
         pinhole = _pinhole(intrinsics)
@@ -997,7 +997,7 @@ class TestMcpObservation(unittest.TestCase):
         for i, shape in enumerate(spheres):
             with self.subTest(sphere=i):
                 ys, xs = np.nonzero(shape_index == shape)
-                rendered = np.array([xs.mean() + 0.5, ys.mean() + 0.5])
+                rendered = np.array([xs.mean(), ys.mean()])
                 marked = np.asarray(mounted["overlay"][f"sphere{i}"])
                 np.testing.assert_allclose(marked, rendered, atol=0.35)
                 if _CORNERS[i] != (0.0, 0.0):

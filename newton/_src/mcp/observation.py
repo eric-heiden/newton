@@ -133,7 +133,7 @@ _DISTORTION = ("k1", "k2", "k3", "k4", "k5", "k6", "p1", "p2", "s1", "s2", "s3",
 
 
 def _intrinsics(value, width: int, height: int) -> dict | None:
-    """Validate OpenCV pinhole intrinsics; returns keyword arguments for the sensor ray helper."""
+    """Validate OpenCV pinhole intrinsics; returns the normalized dictionary reported in metadata."""
     if value is None:
         return None
     if not isinstance(value, dict):
@@ -161,94 +161,39 @@ def _intrinsics(value, width: int, height: int) -> dict | None:
         raise ValueError("intrinsics fx and fy must be positive")
     result.setdefault("image_width", float(width))
     result.setdefault("image_height", float(height))
+    try:
+        _calibration(result)
+    except ValueError as error:
+        raise ValueError(f"intrinsics: {error}") from None
     return result
 
 
-def _inverse_brown_conrady_rays(width: int, height: int, intrinsics: dict) -> np.ndarray:
-    """Camera rays for RealSense's inverse Brown-Conrady model, which maps distorted pixels directly to rays.
-
-    Returns ray origins and directions in the sensor's camera frame (x right, y up, looking along -z),
-    shape [height, width, 2, 3].
-    """
-    k = {name: intrinsics.get(name, 0.0) for name in ("k1", "k2", "k3", "p1", "p2")}
-    u = (np.arange(width) + 0.5) / width * intrinsics["image_width"]
-    v = (np.arange(height) + 0.5) / height * intrinsics["image_height"]
-    x, y = np.meshgrid((u - intrinsics["cx"]) / intrinsics["fx"], (v - intrinsics["cy"]) / intrinsics["fy"])
-    r2 = x * x + y * y
-    radial = 1.0 + k["k1"] * r2 + k["k2"] * r2 * r2 + k["k3"] * r2 * r2 * r2
-    ux = x * radial + 2.0 * k["p1"] * x * y + k["p2"] * (r2 + 2.0 * x * x)
-    uy = y * radial + 2.0 * k["p2"] * x * y + k["p1"] * (r2 + 2.0 * y * y)
-    directions = np.stack([ux, -uy, -np.ones_like(ux)], axis=-1)
-    rays = np.zeros((height, width, 2, 3), dtype=np.float32)
-    rays[:, :, 1] = directions / np.linalg.norm(directions, axis=-1, keepdims=True)
-    return rays
-
-
-def _distort_opencv(x: np.ndarray, y: np.ndarray, k: dict) -> tuple[np.ndarray, np.ndarray]:
-    """Apply OpenCV's rational, tangential, and thin-prism distortion to normalized coordinates (y down)."""
-
-    def radial(s):
-        return (1.0 + k["k1"] * s + k["k2"] * s * s + k["k3"] * s**3) / (
-            1.0 + k["k4"] * s + k["k5"] * s * s + k["k6"] * s**3
-        )
-
-    r2 = x * x + y * y
-    xd = x * radial(r2) + 2.0 * k["p1"] * x * y + k["p2"] * (r2 + 2.0 * x * x) + k["s1"] * r2 + k["s2"] * r2 * r2
-    yd = y * radial(r2) + k["p1"] * (r2 + 2.0 * y * y) + 2.0 * k["p2"] * x * y + k["s3"] * r2 + k["s4"] * r2 * r2
-    # Past the radius where r * radial(r^2) stops growing, the polynomial folds points from outside
-    # the calibrated field of view back into the image.
-    radii = np.sqrt(np.nan_to_num(r2, nan=0.0))[:, None] * np.linspace(0.0, 1.0, 65)[None, :]
-    monotonic = (np.diff(radii * radial(radii * radii), axis=1) > 0.0).all(axis=1) | (r2 == 0.0)
-    return np.where(monotonic, xd, np.nan), np.where(monotonic, yd, np.nan)
-
-
-def _distort_inverse_brown_conrady(x: np.ndarray, y: np.ndarray, k: dict) -> tuple[np.ndarray, np.ndarray]:
-    """Distorted coordinates that the inverse Brown-Conrady map of :func:`_inverse_brown_conrady_rays` sends to (x, y)."""
-
-    def undistort(xd, yd):
-        r2 = xd * xd + yd * yd
-        radial = 1.0 + k["k1"] * r2 + k["k2"] * r2 * r2 + k["k3"] * r2**3
-        return (
-            xd * radial + 2.0 * k["p1"] * xd * yd + k["p2"] * (r2 + 2.0 * xd * xd),
-            yd * radial + 2.0 * k["p2"] * xd * yd + k["p1"] * (r2 + 2.0 * yd * yd),
-            radial,
-        )
-
-    xd, yd = x.copy(), y.copy()
-    for _ in range(100):
-        ux, uy, radial = undistort(xd, yd)
-        xd, yd = xd + (x - ux) / radial, yd + (y - uy) / radial
-    ux, uy, _ = undistort(xd, yd)
-    converged = np.hypot(ux - x, uy - y) <= 1.0e-9 * np.maximum(1.0, np.hypot(x, y))
-    return np.where(converged, xd, np.nan), np.where(converged, yd, np.nan)
+def _calibration(intrinsics: dict) -> SensorCamera.Intrinsics:
+    """The :class:`SensorCamera.Intrinsics` of a validated ``intrinsics`` dictionary, at its calibration size."""
+    return SensorCamera.Intrinsics(
+        intrinsics["image_width"],
+        intrinsics["image_height"],
+        intrinsics["fx"],
+        intrinsics["fy"],
+        intrinsics["cx"],
+        intrinsics["cy"],
+        **{name: intrinsics[name] for name in _DISTORTION if name in intrinsics},
+        distortion_model=intrinsics.get("distortion_model", "opencv"),
+    )
 
 
 def _project(points, pose, width: int, height: int, fov_y: float, intrinsics: dict | None):
     """Image coordinates [px] and forward depth [m] of world points seen by an observation camera.
 
-    Coordinates match the renderer's rays: x right, y down, and pixel ``i`` spans ``[i, i + 1)``.
-    Points behind the camera or outside a distortion model's valid range are NaN.
+    Wraps :meth:`SensorCamera.Intrinsics.project` at the output size: OpenCV image coordinates
+    (x right, y down, pixel centers at integers). Points behind the camera or outside a distortion
+    model's valid range are NaN.
     """
-    pose = np.asarray(pose, dtype=np.float64)
-    rotation = np.asarray(wp.quat_to_matrix(wp.quat(*pose[3:7])), dtype=np.float64).reshape(3, 3)
-    local = (np.asarray(points, dtype=np.float64).reshape(-1, 3) - pose[:3]) @ rotation
-    depth = -local[:, 2]
-    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        ahead = depth > 1.0e-9
-        x = np.where(ahead, local[:, 0] / np.where(ahead, depth, 1.0), np.nan)
-        y = np.where(ahead, -local[:, 1] / np.where(ahead, depth, 1.0), np.nan)
-        if intrinsics is None:
-            focal = height / (2.0 * math.tan(math.radians(fov_y) / 2.0))
-            u, v = 0.5 * width + focal * x, 0.5 * height + focal * y
-        else:
-            k = {name: intrinsics.get(name, 0.0) for name in _DISTORTION}
-            if intrinsics.get("distortion_model") == "inverse_brown_conrady":
-                x, y = _distort_inverse_brown_conrady(x, y, k)
-            else:
-                x, y = _distort_opencv(x, y, k)
-            u = (intrinsics["fx"] * x + intrinsics["cx"]) * width / intrinsics["image_width"]
-            v = (intrinsics["fy"] * y + intrinsics["cy"]) * height / intrinsics["image_height"]
-    return np.stack([u, v], axis=-1), depth
+    if intrinsics is None:
+        camera = SensorCamera.Intrinsics.from_fov(width, height, math.radians(fov_y))
+    else:
+        camera = _calibration(intrinsics).resize(width, height)
+    return camera.project(np.reshape(np.asarray(points, dtype=np.float64), (-1, 3)), pose)
 
 
 def _body_index(model, selector, world_id: int) -> int:
@@ -303,17 +248,18 @@ def _draw_markers(image: np.ndarray, markers: list, scale: int = 1) -> np.ndarra
     text_scale = 2 if min(width, height) >= 480 else 1
     for index, (name, pixels, single) in enumerate(markers):
         color = _MARKER_COLORS[index % len(_MARKER_COLORS)]
-        for point, (u, v) in enumerate(pixels / scale):
-            if not (np.isfinite(u) and np.isfinite(v)) or not (0 <= u < width and 0 <= v < height):
+        # Scaling keeps pixel edges in place, so pixel centers (OpenCV coordinates) move by half a pixel.
+        for point, (u, v) in enumerate((pixels + 0.5) / scale - 0.5):
+            if not (np.isfinite(u) and np.isfinite(v)) or not (-0.5 <= u < width - 0.5 and -0.5 <= v < height - 0.5):
                 continue
-            x0, x1 = max(int(u - radius - 3), 0), min(int(u + radius + 3), width)
-            y0, y1 = max(int(v - radius - 3), 0), min(int(v + radius + 3), height)
+            x0, x1 = max(int(u - radius - 3), 0), min(int(u + radius + 4), width)
+            y0, y1 = max(int(v - radius - 3), 0), min(int(v + radius + 4), height)
             ys, xs = np.mgrid[y0:y1, x0:x1]
-            distance = np.abs(np.hypot(xs + 0.5 - u, ys + 0.5 - v) - radius)
+            distance = np.abs(np.hypot(xs - u, ys - v) - radius)
             region = image[y0:y1, x0:x1]
             region[distance <= 2.0] = 0
             region[distance <= 1.0] = color
-            image[int(v), int(u)] = color
+            image[int(math.floor(v + 0.5)), int(math.floor(u + 0.5))] = color
             text = name if single else f"{name}[{point}]"
             text_width = (len(text) * 6 + 2) * text_scale
             left = u + radius + 3 if u + radius + 3 + text_width <= width else u - radius - 3 - text_width
@@ -615,6 +561,9 @@ class ObservationRenderer:
         plus optional distortion ``k1``-``k6``, ``p1``, ``p2``, ``s1``-``s4``.
         ``distortion_model='inverse_brown_conrady'`` (RealSense cameras) reads
         ``k1``, ``k2``, ``k3``, ``p1``, ``p2`` as a distorted-to-undistorted map.
+        Image coordinates (intrinsics, ``pick``, overlay pixels) follow
+        :class:`~newton.sensors.SensorCamera.Intrinsics`: x right, y down, and
+        integer values at pixel centers.
         Color images are supersampled (``antialias``) when the pixel budget
         allows, and ``environment`` adds a sky gradient behind the scene and a
         checker of known cell size on ground planes for scale and motion cues.
@@ -640,8 +589,8 @@ class ObservationRenderer:
             if np.linalg.norm(offset[3:]) < 1.0e-12:
                 raise ValueError("camera_offset quaternion must be nonzero")
             offset = np.concatenate([offset[:3], offset[3:] / np.linalg.norm(offset[3:])])
-            body_pose = self.session.state.body_q.numpy()[body]
-            pose = list(wp.transform_multiply(wp.transform(*body_pose), wp.transform(*offset)))
+            transforms = SensorCamera.compute_camera_transforms_body(self.session.state.body_q, [body], [offset])
+            pose = transforms.numpy()[0].tolist()
             labels = getattr(model, "body_label", None) or []
             mount = {
                 "body": body,
@@ -1285,15 +1234,9 @@ class ObservationRenderer:
                 self._rays = SensorCamera.compute_camera_rays_pinhole(
                     width, height, camera_fov=math.radians(fov_y), device=model.device
                 )
-            elif intrinsics.get("distortion_model") == "inverse_brown_conrady":
-                self._rays = wp.array(
-                    _inverse_brown_conrady_rays(width, height, intrinsics), dtype=wp.vec3f, device=model.device
-                )
             else:
-                # The helper rescales the calibration to the (supersampled) output size.
-                self._rays = SensorCamera.compute_camera_rays_pinhole_opencv(
-                    width, height, **intrinsics, device=model.device
-                )
+                # The rays resample the calibration to the (supersampled) output size.
+                self._rays = _calibration(intrinsics).compute_camera_rays(width, height, device=model.device)
             self._transforms = wp.empty(1, dtype=wp.transformf, device=model.device)
             self._buffer_key = key
         self._transforms.assign(np.asarray(pose, dtype=np.float32).reshape(1, 7))
@@ -1555,7 +1498,7 @@ class ObservationRenderer:
         for (u, v), distance in zip(pixels, distances, strict=True):
             if not (np.isfinite(u) and np.isfinite(v)):
                 continue
-            x, y = int(math.floor(u)), int(math.floor(v))
+            x, y = int(math.floor(u + 0.5)), int(math.floor(v + 0.5))
             if not 0 <= x < width or not 0 <= y < height:
                 continue
             if policy == "visible":

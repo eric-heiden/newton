@@ -267,6 +267,10 @@ Python expression or callable returning a point or an ``(N, 3)`` array.
 ``observe`` and ``filmstrip`` project the points through the same camera,
 including distortion, draw labeled rings on the simulated and reference images
 after the comparison metrics are computed, and return their pixel coordinates.
+Calibrated ``intrinsics``, ``pick``, and overlay pixels use the image
+coordinates of :class:`~newton.sensors.SensorCamera.Intrinsics` (x right, y
+down, integer values at pixel centers), which also projects and unprojects
+points outside the MCP.
 
 Persistent Python workspace
 ---------------------------

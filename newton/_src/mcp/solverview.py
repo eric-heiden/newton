@@ -25,7 +25,7 @@ import warp as wp
 
 from ..sim.enums import BodyFlags, JointTargetMode, ModelFlags
 from ..solvers.mujoco.constants import SOLREF_MODE_FORCE_SPACE, SOLREF_MODE_MJCF_DEFAULT, SOLREF_MODE_RAW
-from ..solvers.mujoco.solver_mujoco import SolverMuJoCo
+from ..solvers.mujoco.solver_mujoco import _MJW_BATCHED_MODEL_FIELDS, _MJW_BATCHED_OPTION_FIELDS, SolverMuJoCo
 
 _F = ModelFlags
 
@@ -1078,7 +1078,7 @@ class _MuJoCoParams:
         return values[self.world % values.shape[0]] if values.ndim >= 2 else values
 
     def per_world(self, name: str) -> bool:
-        return name in SolverMuJoCo._PER_WORLD_MODEL_FIELDS
+        return name in _MJW_BATCHED_MODEL_FIELDS
 
     def attr(self, name: str):
         array = getattr(self.mujoco, name, None) if self.mujoco is not None else None
@@ -1647,7 +1647,7 @@ class _MuJoCoParams:
             },
             "contacts": "MuJoCo collision" if getattr(solver, "_use_mujoco_contacts", True) else "Newton contacts",
             "backend": "mujoco (CPU)" if self.cpu else "mujoco_warp",
-            "per_world": sorted(SolverMuJoCo._PER_WORLD_OPTION_FIELDS),
+            "per_world": sorted(_MJW_BATCHED_OPTION_FIELDS),
             "refreshed_by": {"gravity": "MODEL_PROPERTIES (from model.gravity)"},
             "construction_only": "every other option: constructor argument, else model.mujoco.<option>, else default",
             "model_attributes": model_values,

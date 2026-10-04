@@ -352,13 +352,58 @@ def health(
     twins_tolerance: float = 1e-3,
     limit: int = 8,
 ) -> dict:
-    """Check for non-finite state, runaway velocities, solver buffer overflow, and deep penetration.
+    """:func:`health_report` for a live session: its solver, state, contacts, and initial state by default.
 
     Args:
         session: Live :class:`SimulationSession`.
-        solver: Solver to inspect (default: the session's). Any solver works; MuJoCo solvers add
-            checks of their own data and buffers.
+        solver: Solver to inspect (default: the session's).
         state: State to inspect (default: the session's).
+        per_world: See :func:`health_report`.
+        twins: See :func:`health_report`.
+        penetration: See :func:`health_report`.
+        twins_tolerance: See :func:`health_report`.
+        limit: See :func:`health_report`.
+    """
+    solver = session.solver if solver is None else solver
+    state = session.state if state is None else state
+    return health_report(
+        getattr(solver, "model", None) or session.model,
+        state,
+        solver,
+        contacts=session.contacts if solver is session.solver else None,
+        initial=session._initial.get("state") if state is session.state else None,
+        per_world=per_world,
+        twins=twins,
+        penetration=penetration,
+        twins_tolerance=twins_tolerance,
+        limit=limit,
+    )
+
+
+def health_report(
+    model,
+    state,
+    solver=None,
+    *,
+    contacts=None,
+    initial: dict | None = None,
+    per_world: bool = True,
+    twins: bool = False,
+    penetration: float = 0.01,
+    twins_tolerance: float = 1e-3,
+    limit: int = 8,
+) -> dict:
+    """Check for non-finite state, runaway velocities, solver buffer overflow, and deep penetration.
+
+    Args:
+        model: Model of ``state`` (and of ``solver``).
+        state: State to inspect.
+        solver: Solver to inspect, or ``None``. Any solver works; MuJoCo solvers add checks of
+            their own data and buffers.
+        contacts: Collision-pipeline contacts the solver uses (checked for solvers without their own
+            contact buffers), or ``None``.
+        initial: Joint coordinates at the start (``{"joint_q": array}``), which ``twins`` compares
+            displacements against; without it only velocities are compared.
         per_world: Name the worlds behind each finding.
         twins: Also compare the worlds' joint states with each other, for scenes whose worlds were
             built identical: worlds deviating from the per-coordinate median are listed.
@@ -370,9 +415,6 @@ def health(
         ``{"ok", "warnings", "stats", "checked", "worlds", "penetration", "unsupported"}``; ``checked``
         lists what was inspected and ``unsupported`` what could not be for this solver.
     """
-    solver = session.solver if solver is None else solver
-    state = session.state if state is None else state
-    model = getattr(solver, "model", None) or session.model
     report = {
         "warnings": [],
         "stats": {},
@@ -418,13 +460,11 @@ def health(
     if getattr(solver, "mjw_model", None) is not None and hasattr(solver, "mjc_geom_to_newton_shape"):
         _mujoco_health(model, solver, report, per_world=per_world, threshold=penetration, limit=limit)
     else:
-        name = type(solver).__name__
+        name = type(solver).__name__ if solver is not None else "No solver given"
         report["unsupported"].append(f"{name}: no solver contact or constraint buffers to check")
-        contacts = session.contacts if solver is session.solver else None
         if contacts is not None and getattr(contacts, "rigid_contact_max", 0):
             _newton_contacts_health(model, state, contacts, report, threshold=penetration)
     if twins:
-        initial = session._initial.get("state") if state is session.state else None
         _twins(model, state, initial, report, twins_tolerance)
     pairs = sorted(report.pop("_pairs").values(), key=lambda entry: -entry["depth"])
     if pairs:

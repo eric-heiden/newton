@@ -932,6 +932,11 @@ After construction, the solver reads Newton model arrays again only when
 matching :class:`~newton.ModelFlags` category. Without that call, the solver
 keeps simulating with the old values. The "per world" column says whether the
 MuJoCo field stores one value per world when ``separate_worlds=True``.
+:func:`newton.utils.report_solver_params` lists the compiled values of a
+solver next to the model arrays they come from and names model values that
+differ from them (``pending``); :func:`newton.utils.report_health` checks a
+state and solver for non-finite worlds, full buffers, and penetrating shape
+pairs.
 
 .. list-table::
    :header-rows: 1

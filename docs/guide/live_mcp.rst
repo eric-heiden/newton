@@ -75,7 +75,8 @@ before the next step and reports this as ``note`` in the execution result; call
 reported without invalidating the scene. ``newton_rebuild`` reloads the edited
 script from disk in the same process. ``--workers N`` also hosts ``N`` sibling
 copies of the script in separate processes and exposes them as ``workers`` (see
-:class:`newton.mcp.WorkerPool`) for parallel parameter sweeps; ``--max-workers M``
+:class:`newton.mcp.WorkerPool`) for parallel parameter sweeps, plus ``jobs``
+(:class:`newton.mcp.JobQueue`) for background calls; ``--max-workers M``
 (default ``max(N, 4)``) bounds ``workers.resize(n)``.
 
 Connect an MCP client
@@ -369,6 +370,13 @@ whose process exits or whose CUDA context fails is restarted, and earlier
 ``broadcast`` and ``sync`` calls are replayed on it in order;
 ``workers.resize(n)`` adds or removes workers the same way. The session lists
 such events under ``workers`` in its next execution response.
+
+``jobs.start(fn_or_code, *args, where="worker")`` queues a background call and
+returns a job id at once; nothing runs on the main session's simulation.
+``jobs.wait(timeout=..., any=True)`` returns finished results and the lines
+running jobs printed since the previous wait, and every execution response
+lists jobs that finished since the previous response. Other places to run jobs
+are added with :meth:`~newton.mcp.JobQueue.register_backend`.
 
 Explicit recovery after an execution error
 ------------------------------------------

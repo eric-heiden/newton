@@ -210,9 +210,10 @@ class SimulationSession:
         workers: Connection files of sibling sessions (usually more instances
             of the same application), or a :class:`WorkerPool`. Trusted
             execution receives it as ``workers``, whose ``map``/``submit``/
-            ``broadcast`` run functions and cells on them concurrently. Worker
-            sessions follow :meth:`dispatch` ``rebuild``; worker restarts are
-            added to the next execution response.
+            ``broadcast`` run functions and cells on them concurrently, and a
+            :class:`JobQueue` as ``jobs`` for background calls. Worker sessions
+            follow :meth:`dispatch` ``rebuild``; finished jobs and worker events
+            are added to the next execution response.
     """
 
     class _Request:
@@ -320,9 +321,14 @@ class SimulationSession:
 
             self.workers = WorkerPool(list(workers))
             self._owns_workers = True
+        from .jobs import JobQueue  # noqa: PLC0415
+
+        self.jobs = JobQueue(self.workers)
+        """Background jobs, exposed as ``jobs`` in trusted execution."""
         if self.workers is not None:
             self.workers.attach(lambda: self._workspace, self._session_names)
             self.namespace.setdefault("workers", self.workers)
+        self.namespace.setdefault("jobs", self.jobs)
         self.artifact_directory = Path(artifact_directory or tempfile.mkdtemp(prefix="newton-mcp-"))
         self.dt = self._timestep(dt)
         self.step_callback = step_callback
@@ -918,6 +924,9 @@ class SimulationSession:
 
     def _background_report(self) -> dict:
         report = {}
+        jobs = self.jobs.report()
+        if jobs:
+            report["jobs"] = jobs
         events = self.workers.drain_events() if self.workers is not None else []
         if events:
             report["workers"] = events

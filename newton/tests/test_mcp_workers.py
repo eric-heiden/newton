@@ -195,6 +195,41 @@ class TestMcpWorkers(unittest.TestCase):
         self.assertNotEqual(resent.key, sent.key)
         self.assertEqual(self.execute("workers.map(pick, [5])")["result"], [0.0])
 
+    def test_background_jobs_report_in_the_next_response(self):
+        """Start jobs that return at once, list finished ones in the next response, and collect results."""
+        self.execute("import time\ndef slow(x):\n    time.sleep(0.3)\n    return x * 2")
+        started = time.perf_counter()
+        result = self.execute("[jobs.start(slow, 1), jobs.start(slow, 2), jobs.start('result = 1 / args', 0)]")
+        self.assertLess(time.perf_counter() - started, 0.25)
+        self.assertEqual(result["result"], [1, 2, 3])
+        unfinished = result["jobs"].get("running", []) + result["jobs"].get("queued", [])
+        self.assertEqual(sorted(unfinished), [1, 2, 3])
+        deadline = time.monotonic() + 10
+        report = {}
+        while time.monotonic() < deadline and len(report.get("finished", [])) < 3:
+            time.sleep(0.2)
+            response = self.execute("None")
+            report.setdefault("finished", []).extend(response.get("jobs", {}).get("finished", []))
+        finished = {entry["id"]: entry for entry in report["finished"]}
+        self.assertEqual(finished[1]["result"], "2")
+        self.assertEqual(finished[2]["status"], "done")
+        self.assertEqual(finished[3]["status"], "failed")
+        self.assertIn("ZeroDivisionError", finished[3]["error"])
+        # Reported jobs are not reported again, but wait() still returns their full results once.
+        self.assertNotIn("jobs", self.execute("None"))
+        waited = self.execute("jobs.wait(timeout=5, any=False)")["result"]
+        self.assertEqual([entry["result"] for entry in waited["finished"][:2]], [2, 4])
+        self.assertEqual(self.execute("jobs.wait(timeout=0)")["result"], {"finished": [], "running": []})
+        # A queued job can be cancelled; a running one cannot.
+        result = self.execute(
+            "ids = [jobs.start(slow, i) for i in range(4)]\ntime.sleep(0.1)\n[jobs.cancel(i) for i in ids]"
+        )
+        self.assertEqual(result["result"][:2], [False, False])
+        self.assertEqual(result["result"][2:], [True, True])
+        self.assertEqual(self.execute("jobs.result(ids[1])")["result"], 2)
+        with self.assertRaisesRegex(RuntimeError, "not available"):
+            self.execute("jobs.start(slow, 1, where='fresh')")
+
 
 class TestMcpLaunchedWorkers(unittest.TestCase):
     """Worker processes owned by the pool: rebuilds, restarts, resizing, and progress of jobs."""
@@ -272,6 +307,20 @@ class TestMcpLaunchedWorkers(unittest.TestCase):
         self.assertEqual(result["result"], [2])
         self.assertRegex(result["workers"][0], r"worker 0 CUDA context failed during broadcast code .*restarted")
         self.assertFalse(_alive(pid))
+
+    def test_job_progress_lines(self):
+        """Return the lines a running job printed so far, then its result."""
+        self.execute(
+            "def count(n):\n    for i in range(n):\n        print('step', i, flush=True)\n        time.sleep(0.25)\n"
+            "    return n\nimport time"
+        )
+        result = self.execute("job = jobs.start(count, 6)\ntime.sleep(0.6)\njobs.wait(timeout=0.01)")["result"]
+        self.assertEqual(result["finished"], [])
+        early = result["running"][0]["lines"]
+        self.assertGreaterEqual(len(early), 1)
+        result = self.execute("jobs.wait(timeout=10)")["result"]
+        self.assertEqual(result["finished"][0]["result"], 6)
+        self.assertEqual(early + result["finished"][0]["lines"], [f"step {i}" for i in range(6)])
 
 
 class TestMcpHostWorkers(unittest.TestCase):

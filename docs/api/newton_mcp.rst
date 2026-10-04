@@ -29,6 +29,7 @@ this changes tool presentation, not permissions.
    :nosignatures:
 
    ExampleHost
+   JobQueue
    SimulationClient
    SimulationServer
    SimulationSession

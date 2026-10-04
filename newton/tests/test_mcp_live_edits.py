@@ -163,8 +163,7 @@ class TestMcpRollback(_HostedTest):
     def test_failed_cell_restores_rebound_class_attributes(self):
         """Undo methods a failed cell rebound on a script class, so rerunning the cell wraps the original.
 
-        i15 (g1_mpc): the rollback restored ``example.controller`` but kept ``module.Controller.compute``
-        rebound, so the retried cell wrapped its own patch and recursed.
+        Without this, a retried cell that wraps ``Controller.compute`` wraps its own earlier patch and recurses.
         """
         self.script.write_text(
             _SCRIPT.replace(
@@ -485,7 +484,7 @@ class TestMcpReset(_HostedTest):
         self.script.write_text(timed)
 
     def test_reset_rewinds_scalars_advanced_by_direct_example_steps(self):
-        """Rewind timers that cells advanced through example.step() (i15 g1_mpc: records started at 1.01 s)."""
+        """Rewind timers that cells advanced through example.step(), so records after a reset start at 0 s."""
         host, session = self.host()
         session.dispatch("rebuild", {})
         self.execute(session, "for _ in range(10):\n    example.step()")
@@ -522,7 +521,7 @@ class TestMcpReset(_HostedTest):
 
 class TestMcpRecapture(_HostedTest):
     def test_notes_name_only_the_outermost_changed_settings(self):
-        """Name a replaced object once, not every setting below it (i15: 'example.model, ..., 502 more')."""
+        """Name a replaced object once, not every setting below it."""
         keys = ["example.model", "example.model.actuators", "example.model.mujoco.solref", "example.solver.iterations"]
         self.assertEqual(_outermost(keys), ["example.model", "example.solver.iterations"])
 

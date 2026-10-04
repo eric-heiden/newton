@@ -7,14 +7,17 @@ CPU only; no agents run. ``python -m unittest tools.mcp_evaluation.v4.test_run_v
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import tokenize
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -273,6 +276,46 @@ class TestTrialSnapshots(TemporaryDirectory):
         with mock.patch.object(ti, "live_trials", return_value={"abc123"}):
             with self.assertRaisesRegex(RuntimeError, "between iterations"):
                 run_v4.verify_snapshots(run_dir)
+
+
+class TestAgentVisibleText(unittest.TestCase):
+    """Agents of both conditions can read newton/ and docs/ (the sandbox masks only tools/mcp_evaluation)."""
+
+    ROOT = HERE.parents[2]
+    SUFFIXES = (".py", ".rst", ".md", ".txt", ".toml", ".json", ".yaml", ".yml", ".cfg", ".ini")
+
+    @classmethod
+    def text(cls, path: Path) -> str:
+        """Prose of a file: comments and strings of Python files (not identifiers such as h10), else everything."""
+        source = path.read_text(errors="replace")
+        if path.suffix != ".py":
+            return source
+        try:
+            tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+        except (tokenize.TokenError, SyntaxError):
+            return source
+        return "\n".join(token.string for token in tokens if token.type in (tokenize.COMMENT, tokenize.STRING))
+
+    def test_newton_and_docs_do_not_name_the_study(self):
+        tasks = {d.name for d in HERE.iterdir() if d.is_dir() and "_" in d.name and not d.name.startswith("_")}
+        tasks |= {"grasp_drift", "g1_track", "g1_hard"}
+        patterns = (
+            re.compile(r"\b(" + "|".join(sorted(map(re.escape, tasks))) + r")\b"),
+            re.compile(r"\b[ih]1[0-9]\b"),
+            re.compile(r"\bMCP trials?\b|\bpaired (study|trials?)\b|\bmcp_evaluation\b", re.IGNORECASE),
+        )
+        hits = []
+        for top in ("newton", "docs"):
+            for directory, names, files in os.walk(self.ROOT / top):
+                names[:] = [name for name in names if name not in ("__pycache__", "_build")]
+                for name in files:
+                    path = Path(directory) / name
+                    if path.suffix in self.SUFFIXES:
+                        text = self.text(path)
+                        hits += [
+                            f"{path.relative_to(self.ROOT)}: {m.group(0)}" for p in patterns for m in p.finditer(text)
+                        ]
+        self.assertEqual(hits, [])
 
 
 FACTS = {"gpu": "one MIG 1g.24gb slice (24 GB of GPU memory) of a GPU", "cpu_cores": 4, "cpu_count_reported": 192}

@@ -403,11 +403,7 @@ class TestMcpLazyWorkers(unittest.TestCase):
         return self.session.dispatch("execute", {"code": code})
 
     def test_workers_start_on_first_use_with_the_latest_rebuild(self):
-        """Start no process until a worker is needed; rebuilds before that only record their arguments.
-
-        i15: idle workers of all four MCP trials were started at launch and rebuilt on every
-        newton_rebuild (118.7 s of rebuild time), although no trial used them.
-        """
+        """Start no process until a worker is needed; rebuilds before that only record their arguments."""
         self.assertFalse(self.pool.started)
         self.assertEqual(
             [(row["state"], row["pid"]) for row in self.execute("workers.status()")["result"]],

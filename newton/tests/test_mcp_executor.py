@@ -196,7 +196,7 @@ class TestMcpExecutor(unittest.TestCase):
         self.assertEqual(self.execute("rollout(2)['frames'], kept")["result"], [2, 7])
 
     def test_large_variable_named_result_keeps_the_cell_and_its_value(self):
-        """Keep a large ``result`` variable and the cell's output (i15: the cell failed and the variable vanished)."""
+        """Keep a large ``result`` variable and the cell's output instead of failing the cell."""
         result = self.execute("samples = np.arange(30000)\nresult = samples\nprint('size', result.size)")
         self.assertTrue(result["valid"])
         self.assertIsNone(result["result"])

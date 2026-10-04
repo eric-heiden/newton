@@ -1053,8 +1053,11 @@ def _audit_world(sub: Submission, station: Station, scene: Scene, w: int, truth:
         audit.check("table", ok, f"world {w}: table plane at z {sub.transform[t][2]:.4f}")
 
     # The tray: every added shape inside the real tray's footprint (at the start or the end of the episode, as for
-    # placement) + tray_margin_m, at most tray_top_m high.
+    # placement) + tray_margin_m, at most tray_top_m high. The footprint is a rounded sector fitted to the start and
+    # end photos; the tracker's sharp sector (used for placement) sits up to 1.5 cm inside the visible rim.
     tray = truth["tray"]
+    footprint = truth.get("tray_footprint", tray)
+    corner = float(footprint.get("corner_radius_m", 0.0))
     count = len(roles["tray"])
     audit.check("tray", count <= BOUNDS["tray_shapes_max"], f"world {w}: {count} added tray shapes")
     for s in roles["tray"]:
@@ -1063,7 +1066,7 @@ def _audit_world(sub: Submission, station: Station, scene: Scene, w: int, truth:
             audit.check("tray", False, f"world {w}: unbounded added shape {ix.shape_leaf[s]}")
             continue
         stride = max(1, len(points) // 400)
-        outside = max(core.tray_distance(p[:2], tray) for p in points[::stride])
+        outside = max(max(0.0, core.tray_distance(p[:2], footprint) - corner) for p in points[::stride])
         top = float(points[:, 2].max() - table_z)
         ok = outside <= BOUNDS["tray_margin_m"] and top <= BOUNDS["tray_top_m"]
         message = f"{1000 * outside:.0f} mm outside the tray, top {1000 * top:.0f} mm above the table"

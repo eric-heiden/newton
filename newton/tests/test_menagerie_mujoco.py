@@ -419,6 +419,8 @@ DEFAULT_MODEL_SKIP_FIELDS: set[str] = {
     # Integrator: Newton may select a different integrator than the MJCF default.
     # The solver forces the correct integrator at runtime regardless.
     "opt.integrator",
+    # Overflow warnings: the solver counts MuJoCo Warp buffer overflows and prints each kind once instead.
+    "opt.warn_overflow",
     # Geom ordering: Newton's solver may order geoms differently (e.g. colliders before
     # visuals). Content is verified by compare_geom_fields_unordered() instead.
     "body_geomadr",

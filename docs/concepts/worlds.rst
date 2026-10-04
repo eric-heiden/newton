@@ -381,6 +381,106 @@ updates for world ``0`` therefore continue to affect their global entities.
    Gravity shape: (3,)
 
 
+.. _Per-world values:
+
+Per-World Values and Candidates
+-------------------------------
+
+:class:`newton.selection.WorldView` reads and writes the rows of model, state,
+and control attributes per world. Rows are selected by label pattern (see
+:ref:`label-matching`) in each world, so the same pattern addresses the same
+entity in every replicated world, including static shapes of a world and
+entities of different articulations. Values have shape
+``[world, row, ...]``; the first axis of written values holds one entry per
+world, which broadcasts over the selected rows of that world.
+
+A common use is to evaluate many candidates (parameter sets, initial
+conditions, or control sequences) as the worlds of one model built with
+:meth:`~newton.ModelBuilder.replicate`:
+
+.. testcode::
+
+   import numpy as np
+   import warp as wp
+   import newton
+
+   puck = newton.ModelBuilder()
+   body = puck.add_body(xform=wp.transform((0.0, 0.0, 0.05), wp.quat_identity()), label="puck")
+   puck.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05, label="puck_geom")
+   puck.add_shape_box(-1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()),
+                      hx=1.0, hy=1.0, hz=0.05, label="table")
+
+   scene = newton.ModelBuilder()
+   scene.replicate(puck, world_count=4)
+   model = scene.finalize()
+
+   view = newton.selection.WorldView(model)
+   # One friction coefficient and one mass per world.
+   flags = view.set_attribute("shape_material_mu", model, [0.2, 0.4, 0.6, 0.8], labels=["puck_geom", "table"])
+   flags |= view.set_attribute("body_mass", model, [0.5, 1.0, 1.5, 2.0], labels="puck")
+   print("flags:", newton.ModelFlags(flags & newton.ModelFlags.SHAPE_PROPERTIES).name,
+         newton.ModelFlags(flags & newton.ModelFlags.BODY_INERTIAL_PROPERTIES).name)
+   print("inverse masses:", [round(float(m), 3) for m in model.body_inv_mass.numpy()])
+
+   # Clone world 0's state into every world.
+   state = model.state()
+   view.set_attribute("joint_qd", state, [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]], labels="puck*", worlds=[0])
+   view.copy_state(state, state, src_world=0)
+   print("puck velocities:", view.get_attribute("joint_qd", state, labels="puck*")[:, 0].tolist())
+
+.. testoutput::
+
+   flags: SHAPE_PROPERTIES BODY_INERTIAL_PROPERTIES
+   inverse masses: [2.0, 1.0, 0.667, 0.5]
+   puck velocities: [1.0, 1.0, 1.0, 1.0]
+
+:meth:`~newton.selection.WorldView.set_attribute` returns the
+:class:`~newton.ModelFlags` that cover a model edit (see also
+:meth:`ModelFlags.from_attributes() <newton.ModelFlags.from_attributes>`).
+When a solver is passed, the view first calls
+:meth:`~newton.solvers.SolverBase.check_world_values`, which raises
+:class:`ValueError` if the solver would not use per-world values of the
+selected rows, and then calls
+:meth:`~newton.solvers.SolverBase.notify_model_changed`. Solvers that read the
+model arrays directly accept every attribute. :class:`~newton.solvers.SolverMuJoCo`
+raises for attributes it reads only when it is constructed, such as
+``joint_target_mode``, ``mujoco:condim``, and the solver options
+``model.mujoco.<option>``; for attributes it does not read; and for
+``shape_scale`` of cone, site, and, with ``use_mujoco_contacts=True``, mesh,
+convex-mesh, and heightfield shapes, whose MuJoCo assets come from the first
+world (see :ref:`mujoco-limits-and-known-behaviors`).
+
+Other facts that apply to all worlds of a model:
+
+* Every call to :meth:`~newton.solvers.SolverBase.step` advances all worlds by
+  the same ``dt``.
+* Attributes with frequency :attr:`~newton.Model.AttributeFrequency.ONCE` hold
+  one value for all worlds, and global entities (world ``-1``) are shared by
+  all worlds; :class:`~newton.selection.WorldView` raises for both.
+* The model and solver buffers grow with the number of worlds. To evaluate more
+  candidates than a model has worlds, process them in chunks with the
+  ``worlds`` argument:
+
+.. code-block:: python
+
+   candidates = np.linspace(0.1, 1.0, 1000)
+   scores = np.empty(len(candidates))
+   for first in range(0, len(candidates), model.world_count):
+       chunk = candidates[first : first + model.world_count]
+       worlds = range(len(chunk))
+       view.set_attribute("shape_material_mu", model, chunk, labels="puck_geom", worlds=worlds, solver=solver)
+       view.copy_state(state_0, start_state, src_model=start_model)
+       for _ in range(steps):
+           solver.step(state_0, state_1, control, contacts, dt)
+           state_0, state_1 = state_1, state_0
+       scores[first : first + len(chunk)] = score(view.get_attribute("body_q", state_0, "puck", worlds=worlds))
+
+:meth:`~newton.selection.WorldView.copy_state` also copies the state of a
+single-world model into every world of a model with the same per-world layout,
+for example from a plant into a planning model that rolls out many candidate
+controls.
+
+
 .. _World-entity partitioning:
 
 World-Entity GPU Thread Partitioning

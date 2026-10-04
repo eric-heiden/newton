@@ -668,6 +668,10 @@ of articulations and accessing their joints/links/DOFs with stable tensor shapes
 especially useful in RL pipelines where the same observation/action logic is applied to many
 parallel environments.
 
+To read or write per-world values of rows that are not part of identical articulations, such as
+static shapes of a world or bodies of different articulations, use
+:class:`newton.selection.WorldView` (see :ref:`Per-world values`).
+
 Construct a view by matching articulation keys with a pattern and optional filters:
 
 .. testsetup:: articulation-view

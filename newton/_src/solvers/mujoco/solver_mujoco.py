@@ -9,7 +9,7 @@ import os
 import re
 import sys
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -4805,6 +4805,246 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         else:
             with self._scoped_mujoco_warp_execution():
                 self._notify_model_changed(flags)
+
+    _WORLD_VALUE_ATTRIBUTES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "gravity",
+            "joint_X_p",
+            "joint_X_c",
+            "joint_axis",
+            "joint_target_ke",
+            "joint_target_kd",
+            "joint_armature",
+            "joint_damping",
+            "joint_friction",
+            "joint_effort_limit",
+            "joint_limit_lower",
+            "joint_limit_upper",
+            "joint_limit_ke",
+            "joint_limit_kd",
+            "joint_mimic_coeffs",
+            "constraint_mimic_coef0",
+            "constraint_mimic_coef1",
+            "constraint_mimic_enabled",
+            "body_flags",
+            "body_mass",
+            "body_com",
+            "body_inertia",
+            "shape_transform",
+            "shape_scale",
+            "shape_margin",
+            "shape_gap",
+            "shape_material_mu",
+            "shape_material_mu_torsional",
+            "shape_material_mu_rolling",
+            "shape_material_ke",
+            "shape_material_kd",
+            "shape_material_kf",
+            *(
+                f"mujoco:{name}"
+                for name in (
+                    "solimplimit",
+                    "solreflimit",
+                    "solreflimit_mode",
+                    "limit_margin",
+                    "dof_passive_stiffness",
+                    "solreffriction",
+                    "solimpfriction",
+                    "dof_ref",
+                    "dof_springref",
+                    "gravcomp",
+                    "geom_solimp",
+                    "geom_solmix",
+                    "solref",
+                    "solref_mode",
+                    "pair_solref",
+                    "pair_solreffriction",
+                    "pair_solimp",
+                    "pair_margin",
+                    "pair_gap",
+                    "pair_friction",
+                    "eq_solref",
+                    "eq_solimp",
+                    "equality_constraint_anchor",
+                    "equality_constraint_relpose",
+                    "equality_constraint_polycoef",
+                    "equality_constraint_torquescale",
+                    "equality_constraint_enabled",
+                    "tendon_stiffness",
+                    "tendon_damping",
+                    "tendon_frictionloss",
+                    "tendon_range",
+                    "tendon_margin",
+                    "tendon_solref_limit",
+                    "tendon_solimp_limit",
+                    "tendon_solref_friction",
+                    "tendon_solimp_friction",
+                    "tendon_armature",
+                    "tendon_actuator_force_range",
+                    "actuator_gainprm",
+                    "actuator_biasprm",
+                    "actuator_dynprm",
+                    "actuator_ctrlrange",
+                    "actuator_forcerange",
+                    "actuator_actrange",
+                    "actuator_gear",
+                    "actuator_cranklength",
+                )
+            ),
+        }
+    )
+    """Model attributes that :meth:`notify_model_changed` copies into every world of the MuJoCo model."""
+
+    _CONSTRUCTION_ATTRIBUTES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "joint_target_mode",
+            "joint_type",
+            "joint_dof_dim",
+            "shape_type",
+            "shape_source",
+            "shape_source_ptr",
+            "shape_is_solid",
+            "shape_flags",
+        }
+    )
+    """Model attributes read only when the MuJoCo model is built from the first world."""
+
+    _UNREAD_ATTRIBUTES: ClassVar[dict[str, str]] = {
+        "joint_velocity_limit": "SolverMuJoCo does not read joint_velocity_limit.",
+        "shape_material_restitution": "SolverMuJoCo does not read shape_material_restitution.",
+        "body_inv_mass": "SolverMuJoCo reads body_mass, not body_inv_mass.",
+        "body_inv_inertia": "SolverMuJoCo reads body_inertia, not body_inv_inertia.",
+    }
+
+    _DIRECT_ACTUATOR_ATTRIBUTES: ClassVar[frozenset[str]] = frozenset(
+        f"mujoco:actuator_{name}"
+        for name in ("gainprm", "biasprm", "dynprm", "forcerange", "actrange", "gear", "cranklength")
+    )
+    """Actuator attributes read only for ``CTRL_DIRECT`` actuators."""
+
+    @override
+    def check_world_values(self, name: str, indices: Sequence[int] | None = None) -> None:
+        """Check that this solver uses per-world values of a model attribute.
+
+        Raises for attributes that the solver reads only when it is
+        constructed (for example ``joint_target_mode``, ``mujoco:condim``, and
+        the solver options ``mujoco:<option>``), for attributes it does not
+        read (for example ``shape_material_restitution``), for
+        ``joint_target_ke`` and ``joint_target_kd`` of DOFs that have no
+        joint-target actuator reading them, for actuator parameters of
+        ``JOINT_TARGET`` actuators, and for ``shape_scale`` of
+        cones, of sites in models with several worlds, and, with
+        ``use_mujoco_contacts=True``, of mesh, convex-mesh, and heightfield
+        shapes, whose MuJoCo assets are built from the first world. See
+        :ref:`mujoco-limits-and-known-behaviors`.
+
+        Args:
+            name: Model attribute name, e.g. ``"shape_material_mu"`` or
+                ``"mujoco:gravcomp"``.
+            indices: Model indices of the rows that would change, or ``None``
+                for all rows.
+
+        Raises:
+            ValueError: If per-world values of these rows would not take effect.
+        """
+        name = name.replace(".", ":", 1)
+        model = self.model
+        message = self._UNREAD_ATTRIBUTES.get(name)
+        if message is None and name == "shape_material_kf" and self._use_mujoco_contacts:
+            message = "SolverMuJoCo reads shape_material_kf only with use_mujoco_contacts=False."
+        if message is not None:
+            raise ValueError(message)
+
+        if name in self._CONSTRUCTION_ATTRIBUTES or (
+            name.startswith("mujoco:") and name not in self._WORLD_VALUE_ATTRIBUTES
+        ):
+            try:
+                frequency = model.get_attribute_frequency(name)
+            except KeyError:
+                frequency = None
+            if frequency == Model.AttributeFrequency.WORLD:
+                raise ValueError(
+                    f"SolverMuJoCo reads the solver option {name} only when it is constructed; "
+                    "no ModelFlags refreshes it."
+                )
+            raise ValueError(
+                f"SolverMuJoCo reads {name} only when it is constructed and builds every world from the first "
+                "world's values; no ModelFlags refreshes it."
+            )
+
+        rows = None if indices is None else np.unique(np.asarray(list(indices), dtype=np.int64))
+        if name == "shape_scale" and model.shape_count:
+            self._check_world_shape_scales(np.arange(model.shape_count) if rows is None else rows)
+        elif name in ("joint_target_ke", "joint_target_kd") and model.joint_dof_count:
+            self._check_world_joint_targets(name, np.arange(model.joint_dof_count) if rows is None else rows)
+        elif name in self._DIRECT_ACTUATOR_ATTRIBUTES:
+            ctrl_source = getattr(getattr(model, "mujoco", None), "ctrl_source", None)
+            if ctrl_source is None or ctrl_source.size == 0:
+                return
+            source = ctrl_source.numpy()
+            rows = np.arange(source.shape[0]) if rows is None else rows
+            joint_target = rows[source[rows] == int(SolverMuJoCo.CtrlSource.JOINT_TARGET)]
+            if joint_target.size:
+                labels = getattr(model.mujoco, "actuator_label", None)
+                names = [labels[i] if labels is not None else str(i) for i in joint_target[:5]]
+                raise ValueError(
+                    f"SolverMuJoCo does not read {name} for JOINT_TARGET actuators ({', '.join(names)}"
+                    f"{', ...' if joint_target.size > 5 else ''}); their gains come from joint_target_ke and "
+                    "joint_target_kd, and their force range is set when the solver is constructed."
+                )
+
+    def _check_world_joint_targets(self, name: str, rows: np.ndarray) -> None:
+        """Raise for DOFs without a joint-target actuator that reads ``name``."""
+        model = self.model
+        actuated = np.zeros(model.joint_dof_count // max(model.world_count, 1), dtype=bool)
+        if self.mjc_actuator_to_newton_idx is not None and self.mjc_actuator_ctrl_source is not None:
+            mapping = self.mjc_actuator_to_newton_idx.numpy()
+            mapping = mapping[self.mjc_actuator_ctrl_source.numpy() == int(SolverMuJoCo.CtrlSource.JOINT_TARGET)]
+            # Non-negative entries are position actuators; entries <= -2 are velocity actuators of DOF -(entry + 2).
+            actuated[mapping[mapping >= 0]] = True
+            if name == "joint_target_kd":
+                actuated[-(mapping[mapping <= -2] + 2)] = True
+        missing = rows[~actuated[rows % actuated.shape[0]]] if actuated.shape[0] else rows
+        if missing.size:
+            labels = model.joint_label
+            dof_joint = np.searchsorted(model.joint_qd_start.numpy(), missing, side="right") - 1
+            names = sorted({labels[j] for j in dof_joint[:20]})[:5]
+            kind = "position" if name == "joint_target_ke" else "joint-target"
+            raise ValueError(
+                f"SolverMuJoCo created no {kind} actuator for DOFs of {', '.join(names)}"
+                f"{', ...' if missing.size > 5 else ''} when it was constructed (from joint_target_mode), so it "
+                f"does not read their {name}."
+            )
+
+    def _check_world_shape_scales(self, rows: np.ndarray) -> None:
+        """Raise for shapes whose ``shape_scale`` SolverMuJoCo cannot apply per world."""
+        model = self.model
+        shape_type = model.shape_type.numpy()[rows]
+        problems = []
+        cones = rows[shape_type == int(GeoType.CONE)]
+        if cones.size:
+            problems.append(("SolverMuJoCo compiles cone meshes when it is constructed", cones))
+        if self._use_mujoco_contacts:
+            assets = rows[np.isin(shape_type, (int(GeoType.MESH), int(GeoType.CONVEX_MESH), int(GeoType.HFIELD)))]
+            if assets.size:
+                problems.append(
+                    (
+                        "with use_mujoco_contacts=True, SolverMuJoCo collides every world against mesh, "
+                        "convex-mesh, and heightfield assets built from the first world when it is constructed",
+                        assets,
+                    )
+                )
+        if model.world_count > 1:
+            sites = rows[(model.shape_flags.numpy()[rows] & int(ShapeFlags.SITE)) != 0]
+            if sites.size:
+                problems.append(("SolverMuJoCo uses the first world's size of each site in all worlds", sites))
+        if problems:
+            reason, shapes = problems[0]
+            names = [model.shape_label[i] for i in shapes[:5]]
+            raise ValueError(
+                f"{reason}: shape_scale of {', '.join(names)}{', ...' if shapes.size > 5 else ''} "
+                "does not take per-world values after construction."
+            )
 
     def _notify_model_changed(self, flags: ModelFlags | int) -> None:
         need_const_fixed = False

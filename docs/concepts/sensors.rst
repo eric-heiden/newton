@@ -86,7 +86,8 @@ support label matching accept one of the following:
 Ordinary strings always use glob syntax. Compile a pattern with :func:`re.compile` to opt into regular-expression
 syntax. Callers who want a regular expression to match a substring can add ``.*`` around that substring explicitly.
 For :class:`~newton.selection.ArticulationView`, ``pattern`` is matched against full articulation labels. Joint and
-link filters are matched against the final path component of each label.
+link filters are matched against the final path component of each label. :class:`~newton.selection.WorldView` matches full labels
+of the rows it selects, and selects joint DOFs and coordinates by the labels of their joints.
 
 .. code-block:: python
 

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import IntEnum
 from typing import Any
 
@@ -621,6 +621,29 @@ class SolverBase:
 
         """
         pass
+
+    def check_world_values(self, name: str, indices: Sequence[int] | None = None) -> None:
+        """Check that this solver uses per-world values of a model attribute.
+
+        Raises when values of ``name`` that differ between worlds would not
+        all take effect after :meth:`notify_model_changed`: the solver reads
+        the attribute only when it is constructed, uses one value for all
+        worlds, or does not read it. :meth:`newton.selection.WorldView.set_attribute`
+        calls this before it writes model values for a solver.
+
+        The base implementation accepts every attribute, as solvers that read
+        the :class:`~newton.Model` arrays directly use each row as it is.
+
+        Args:
+            name: Model attribute name, e.g. ``"shape_material_mu"`` or
+                ``"mujoco:gravcomp"``.
+            indices: Model indices of the rows that would change, or ``None``
+                for all rows.
+
+        Raises:
+            ValueError: If per-world values of these rows would not take effect.
+        """
+        del name, indices
 
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
         """

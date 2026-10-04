@@ -27,24 +27,26 @@ class TestMcpWorkers(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.paths = [Path(self.directory.name) / f"worker-{i}.json" for i in range(2)]
         self.stops = []
-        ready = threading.Barrier(3)
 
-        def worker(path):
+        def worker(path, ready):
             model = _scene()
             session = SimulationSession(model, newton.solvers.SolverXPBD(model), allow_execute=True)
             stop = threading.Event()
             self.stops.append(stop)
             with SimulationServer(session, connection_file=path):
-                ready.wait()
+                ready.set()
                 while not stop.is_set():
                     session.pump()
                     time.sleep(0.001)
             session.close()
 
-        self.threads = [threading.Thread(target=worker, args=(path,), daemon=True) for path in self.paths]
-        for thread in self.threads:
-            thread.start()
-        ready.wait(timeout=60)
+        self.threads = []
+        for path in self.paths:
+            ready = threading.Event()
+            self.threads.append(threading.Thread(target=worker, args=(path, ready), daemon=True))
+            self.threads[-1].start()
+            # One at a time: finalizing models in concurrent threads races on Warp's default device.
+            ready.wait(timeout=60)
         model = _scene()
         self.session = SimulationSession(
             model, newton.solvers.SolverXPBD(model), allow_execute=True, workers=self.paths

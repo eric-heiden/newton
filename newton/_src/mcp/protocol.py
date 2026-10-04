@@ -351,7 +351,7 @@ def rtx_available() -> bool:
 
 
 _INSTRUCTIONS_LEAN = """Live Newton simulation running in another process; its Python state persists between calls.
-newton_execute runs Python in it (preloaded: session, model, state, control, solver, newton, np, wp, show, rollout, health, solver_contacts, render, compare_images, contacts_between, swap_solver). Batch many evaluations per call and print compact numbers. If a cell raises, the simulation is rolled back to its state before the cell and the error lists what was restored; Python variables are kept.
+newton_execute runs Python in it (preloaded: session, model, state, control, solver, newton, np, wp, show, rollout, health, solver_contacts, render, compare_images, contacts_between, swap_solver, persist, persist_source, diff_model). Batch many evaluations per call and print compact numbers. If a cell raises, the simulation is rolled back to its state before the cell and the error lists what was restored; Python variables are kept.
 - render(**observe_options) returns an RGB numpy image directly (fast path for fitting loops); compare_images(sim, ref, mask=None, panel='edges'|'blend'|'mismatch') returns PSNR, SSIM and edge NCC (geometric alignment) and shows a comparison panel.
 - rollout(frames or seconds=..., record={'name': 'expr' or fn}, start=True|'checkpoint', until='expr', plot=True) steps and returns NumPy series.
 - solver_contacts(): active contacts per shape pair with the parameters the solver integrates and which material decided them. contacts_between(a, b=None): contact count, solver normal/friction force, slip speed, and penetration between two shape sets (label substrings), recordable over time in rollout(record=...). health(): NaNs, runaway velocities, penetration, full solver buffers.

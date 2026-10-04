@@ -319,9 +319,14 @@ and drops its registered definitions. Escaped references, separately named Warp
 modules, and captured CUDA graphs remain application-owned; Warp's ordinary
 module metadata and disk kernel cache are not globally erased.
 
-The source cache retains at most 64 cells of at most 65536 characters each.
-Older Python functions still execute, but source inspection may be unavailable
-after their cell is evicted. ``describe`` and successful execution responses
+The source cache retains the 64 most recent cells of at most 65536 characters
+each, plus older cells that still define a function or class bound in the
+workspace (at most 512 cells in total), so :func:`inspect.getsource` keeps
+working for live definitions. Classes defined at the top level of a cell are
+moved into a per-cell module whose ``__file__`` names the cached cell source,
+which is where :func:`inspect.getsource` looks for a class; they still pickle
+by reference. Older Python functions still execute, but source inspection may
+be unavailable after their cell is evicted. ``describe`` and successful execution responses
 include workspace generation, cell count, a bounded list of variable names,
 and the most recent execution diagnostic. Diagnostics identify the exception,
 cell, source line, and up to eight user-code stack frames.
@@ -348,6 +353,40 @@ Trusted cells can use these helpers without imports (``newton``, ``np``, and
   ``health()``, and restores the state. If any of this raises, or ``health()``
   reports a warning the current state does not already show, the previous
   solver, graphs, and state are reinstated and the error is raised.
+- :meth:`~newton.mcp.SimulationSession.diff_model` lists the model arrays and
+  scalars that differ from the last build (or from its previous call), keyed by
+  entity label with old and new values, plus the
+  :class:`~newton.ModelFlags` inferred for the changed fields.
+
+Writing live results back to the script
+---------------------------------------
+
+Values and definitions developed in trusted cells can be written into the
+hosted script (:attr:`~newton.mcp.SimulationSession.source_path`, which
+:class:`~newton.mcp.ExampleHost` sets) instead of being retyped:
+
+- :meth:`~newton.mcp.SimulationSession.persist` replaces the value of a
+  module-level ``NAME = <literal>`` assignment. NumPy and Warp values become
+  plain literals. When the old and new values have the same dictionary keys or
+  sequence lengths, only the differing entries are rewritten, so comments inside
+  the literal remain.
+- :meth:`~newton.mcp.SimulationSession.persist_source` replaces a top-level
+  ``def`` or ``class`` (or a method, with ``target="Class.method"``) with the
+  source of the object defined in a cell, re-indented to fit.
+
+Both refuse a target that is missing, bound more than once at that level, or
+not a literal assignment or definition, and they change nothing else in the
+file. They print a unified diff, save the previous file under
+``<artifact_directory>/persist/``, and then rebuild the scene and any worker
+sessions unless ``rebuild=False``. A ``check`` expression is evaluated before
+writing and again after the rebuild; the result reports both values and
+whether they agree within ``tolerance``.
+
+.. code-block:: python
+
+   module.PARAMS["kp"] = 80.0  # live edit while experimenting
+   persist("PARAMS", check="rollout(seconds=1.0, start=True, record={'x': 'state.body_q.numpy()[0, 0]'})['x'][-1]")
+   persist_source(step, target="Example.step")
 
 Parallel worker sessions
 ------------------------

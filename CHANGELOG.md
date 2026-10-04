@@ -6,6 +6,7 @@
 
 - Add experimental `newton.mcp` sessions for live simulation inspection, validated edits, stepping, camera observations, recording, and opt-in trusted Python through an authenticated local MCP bridge.
 - Add a persistent trusted Python workspace to live MCP sessions, with Warp kernel support, bounded result summaries, and rollback of the simulation when a cell or step fails.
+- Add `persist()`, `persist_source()`, and `diff_model()` to live MCP sessions to write values and definitions from trusted cells back into the hosted script (with a diff, a backup, and an optional rebuild check) and to list model edits since the last build by entity label.
 - Add visual feedback to live MCP sessions: inline images from Python via `show()`, auto-framed and multi-view observations, comparison against reference photos, and a `filmstrip` tool that returns frames over time in one image.
 - Add build `overrides` for hosted MCP example scripts, which set module globals before `Example()` is constructed, and `swap_solver()` for replacing a live solver after a trial run.
 - Add `newton.mcp.WorkerPool` so live MCP sessions can run trusted Python on sibling application sessions in parallel via `workers.broadcast()`, `workers.map()`, and `workers.submit()`. Functions defined in cells are sent by source with the helpers and globals they use, `workers.sync()` copies session values to every worker, and hosted workers follow rebuilds, restart after a crash or CUDA error, and can be resized at run time.

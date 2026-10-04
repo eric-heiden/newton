@@ -14,6 +14,7 @@ from __future__ import annotations
 import inspect
 import linecache
 import sys
+from collections.abc import Callable
 from types import FunctionType, ModuleType
 from typing import Any
 
@@ -94,7 +95,14 @@ def referenced_cell_files(namespace: dict) -> set[str]:
     return files
 
 
-def retain_cell_sources(filenames: list[str], namespace: dict, *, recent: int = 64, maximum: int = 512) -> list[str]:
+def retain_cell_sources(
+    filenames: list[str],
+    namespace: dict,
+    *,
+    recent: int = 64,
+    maximum: int = 512,
+    forget: Callable[[str], None] = forget_cell_source,
+) -> list[str]:
     """Forget the source of older cells unless a definition bound in ``namespace`` still comes from them.
 
     Args:
@@ -102,6 +110,7 @@ def retain_cell_sources(filenames: list[str], namespace: dict, *, recent: int = 
         namespace: Workspace whose bound functions and classes keep their cells.
         recent: Number of most recent cells that are always kept.
         maximum: Upper bound on kept cells.
+        forget: Called with each dropped cell (default: :func:`forget_cell_source`).
 
     Returns:
         The cells that remain registered, oldest first.
@@ -113,5 +122,5 @@ def retain_cell_sources(filenames: list[str], namespace: dict, *, recent: int = 
     kept = [name for name in older if name in live][-max(0, maximum - recent) :]
     for name in older:
         if name not in kept:
-            forget_cell_source(name)
+            forget(name)
     return kept + latest

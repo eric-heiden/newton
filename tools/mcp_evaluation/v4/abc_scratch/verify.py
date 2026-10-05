@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import _thread
 import argparse
+import ast
 import builtins
 import copy
 import gc
@@ -494,31 +495,152 @@ def _string_names(value: str) -> set[str]:
     return {text, *text.split(".")}
 
 
-def source_findings(work: Path) -> list[str]:
-    """Introspection in the submitted Python sources."""
-    import ast  # noqa: PLC0415
+# Files Python runs without an import statement (a ``.pth`` line, a ``sitecustomize``/``usercustomize`` module):
+# scanned wherever they sit, outside the import graph, because they would run before scene_replay.py is imported.
+AUTORUN_MODULES = {"sitecustomize.py", "usercustomize.py"}
+# Dynamic code loaders a replay script never needs; one means code the static scan could not otherwise follow.
+CODE_LOADERS = {"import_module", "spec_from_file_location", "module_from_spec", "exec_module", "SourceFileLoader"}
+CODE_LOADERS |= {"run_path", "run_module"}
+READ_CALLS = {"open", "read_text", "read_bytes"}  # reading a .py file as text could feed exec/compile
 
-    findings = []
-    for path in sorted(work.rglob("*.py")):
+
+def _module_dotted(work: Path, path: Path) -> tuple[str, bool]:
+    """A workspace file's dotted module name (relative to the copy root) and whether it is a package ``__init__``."""
+    parts = list(path.relative_to(work).parts)
+    is_init = parts[-1] == "__init__.py"
+    parts = parts[:-1] if is_init else [*parts[:-1], parts[-1][:-3]]
+    return ".".join(parts), is_init
+
+
+def _local_module(work: Path, dotted: str) -> Path | None:
+    """The workspace file a (dotted) module name resolves to (module before package), or ``None`` if not local.
+    Resolved against the copy root, the first entry on the ``sys.path`` the child gives the submission, so the
+    workspace's own modules win over anything of the same name further along the path."""
+    if not dotted:
+        return None
+    base = work.joinpath(*dotted.split("."))
+    for candidate in (base.with_suffix(".py"), base / "__init__.py"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _reach(work: Path, dotted: str, scope: dict, queue: list) -> None:
+    """Add a module and every local parent package that importing it would run to the scan scope."""
+    parts = dotted.split(".")
+    for depth in range(1, len(parts) + 1):
+        found = _local_module(work, ".".join(parts[:depth]))
+        if found is not None and found not in scope:
+            scope[found] = _module_dotted(work, found)
+            queue.append(found)
+
+
+def _literal_str(node) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _file_findings(work: Path, path: Path, tree, out: list) -> None:
+    """The original per-file rules (suspicious modules, names, builtins, and string lookups) for one AST."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [alias.name for alias in node.names]
+            names += [node.module] if isinstance(node, ast.ImportFrom) and node.module else []
+            bad = [name for name in names if name.split(".")[0] in SUSPICIOUS_MODULES]
+        elif isinstance(node, ast.Attribute):
+            bad = [node.attr] if node.attr in SUSPICIOUS_NAMES else []
+        elif isinstance(node, ast.Name):
+            bad = [node.id] if node.id in SUSPICIOUS_NAMES | SUSPICIOUS_BUILTINS else []
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            bad = sorted(_string_names(node.value) & (SUSPICIOUS_NAMES | SUSPICIOUS_BUILTINS))
+        else:
+            bad = []
+        out += [f"{path.relative_to(work)}:{getattr(node, 'lineno', '?')} {name}" for name in bad]
+
+
+def source_findings(work: Path) -> list[str]:
+    """Introspection in the code the submission can execute: ``scene_replay.py`` plus every workspace module it
+    imports, transitively, resolved with the ``sys.path`` the verifier's child gives the submission (the copy
+    root first). Modules outside the workspace (standard library, the virtual environment, Newton, Warp) are
+    trusted and not scanned, so a development helper the submission never imports no longer fails the check.
+
+    The narrowing cannot be used to hide code: a ``.pth`` line or a ``sitecustomize``/``usercustomize`` module
+    runs outside the import graph and is scanned wherever it sits; and in any scanned module a dynamic import of
+    a non-literal name, a code loader (``runpy``, ``spec_from_file_location``, ...), or reading a ``.py`` file as
+    text is itself a finding, because the module it would reach cannot be followed statically. Every rule that
+    applied to a scanned file before still applies to the files that remain in scope.
+    """
+    findings: list[str] = []
+
+    def flag(path: Path, node, message: str) -> None:
+        findings.append(f"{path.relative_to(work)}:{getattr(node, 'lineno', '?')} {message}")
+
+    # Files that run before scene_replay.py is imported, anywhere in the workspace.
+    scope: dict[Path, tuple[str, bool]] = {}
+    for item in sorted(work.rglob("*")):
+        if not item.is_file():
+            continue
+        if item.suffix == ".pth":
+            findings.append(f"{item.relative_to(work)}:1 path-configuration (.pth) file")
+        elif item.name in AUTORUN_MODULES:
+            findings.append(f"{item.relative_to(work)}:1 auto-run module {item.name}")
+            scope[item] = _module_dotted(work, item)
+
+    entry = work / "scene_replay.py"
+    if not entry.is_file():  # Unexpected layout: fall back to scanning every Python file.
+        for path in sorted(work.rglob("*.py")):
+            try:
+                _file_findings(work, path, ast.parse(path.read_text(errors="replace")), findings)
+            except SyntaxError as error:
+                findings.append(f"{path.name}: {error}")
+        return findings[:20]
+
+    scope[entry] = _module_dotted(work, entry)
+    queue = list(scope)
+    while queue:
+        path = queue.pop()
+        dotted, is_init = scope[path]
+        package = dotted.split(".") if is_init else dotted.split(".")[:-1]
         try:
             tree = ast.parse(path.read_text(errors="replace"))
         except SyntaxError as error:
             findings.append(f"{path.name}: {error}")
             continue
+        _file_findings(work, path, tree, findings)
         for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                names = [alias.name for alias in node.names]
-                names += [node.module] if isinstance(node, ast.ImportFrom) and node.module else []
-                bad = [name for name in names if name.split(".")[0] in SUSPICIOUS_MODULES]
-            elif isinstance(node, ast.Attribute):
-                bad = [node.attr] if node.attr in SUSPICIOUS_NAMES else []
-            elif isinstance(node, ast.Name):
-                bad = [node.id] if node.id in SUSPICIOUS_NAMES | SUSPICIOUS_BUILTINS else []
-            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-                bad = sorted(_string_names(node.value) & (SUSPICIOUS_NAMES | SUSPICIOUS_BUILTINS))
-            else:
-                bad = []
-            findings += [f"{path.relative_to(work)}:{getattr(node, 'lineno', '?')} {name}" for name in bad]
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    _reach(work, alias.name, scope, queue)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:  # relative: resolve against this module's package
+                    base = package[: len(package) - (node.level - 1)]
+                    base += node.module.split(".") if node.module else []
+                    base = ".".join(base)
+                else:
+                    base = node.module or ""
+                if base:
+                    _reach(work, base, scope, queue)
+                for alias in node.names:
+                    if alias.name != "*":
+                        _reach(work, f"{base}.{alias.name}" if base else alias.name, scope, queue)
+            elif isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name == "import_module":
+                    literal = _literal_str(node.args[0]) if node.args else None
+                    if literal is None:
+                        flag(path, node, "dynamic import of a non-literal name")
+                    elif literal.startswith("."):  # relative literal, against this module's package
+                        dots = len(literal) - len(literal.lstrip("."))
+                        tail = literal[dots:]
+                        target = package[: len(package) - (dots - 1)] + (tail.split(".") if tail else [])
+                        if target:
+                            _reach(work, ".".join(target), scope, queue)
+                    else:
+                        _reach(work, literal, scope, queue)
+                elif name in CODE_LOADERS:
+                    flag(path, node, f"loads code from a file ({name})")
+                elif name in READ_CALLS and any((_literal_str(arg) or "").endswith(".py") for arg in node.args):
+                    flag(path, node, "reads a .py file as text")
     return findings[:20]
 
 

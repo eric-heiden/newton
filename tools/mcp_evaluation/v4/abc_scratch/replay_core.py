@@ -455,6 +455,22 @@ def object_track(rec: dict, body: int, centre_local: np.ndarray) -> np.ndarray:
     return pose[:, :3] + quat_to_matrix(pose[:, 3:]) @ np.asarray(centre_local, dtype=np.float64)
 
 
+def lowest_rise(rec: dict, body: int, points_local: np.ndarray) -> float:
+    """Highest rise [m] of a body's lowest collision point above its lowest point at the first row.
+
+    ``points_local`` [k, 3] samples the body's collision surfaces in its frame. Independent of where the body
+    frame and the centre of mass sit, and of turning in place: a fruit tipped up while it rests on the table
+    does not rise, a lifted one does. ``inf`` if the body's pose is not finite (a diverged world).
+    """
+    column = int(np.flatnonzero(rec["body_index"] == body)[0])
+    pose = rec["body_q"][:, column]
+    if not np.all(np.isfinite(pose)):
+        return math.inf
+    rotation_z = quat_to_matrix(pose[:, 3:])[:, 2, :]  # world z row of each rotation [n, 3]
+    lowest = (pose[:, 2:3] + rotation_z @ np.asarray(points_local, dtype=np.float64).T).min(axis=1)
+    return float((lowest - lowest[0]).max())
+
+
 def score_object(
     rec: dict, position: np.ndarray, truth: dict, tray: dict, table_z: float, gt_track: np.ndarray | None
 ) -> dict:

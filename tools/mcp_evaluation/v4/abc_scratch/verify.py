@@ -16,7 +16,9 @@ object at the start). It then applies its own perturbations and runs its own rep
   real tray within 5 cm of where the real object rested after its release (its final position, or for the
   pear also where it rested before the later objects pushed it), each in enough copies;
 - two negative controls, 2 copies each: gripper commands forced open, and friction 0.02 on every arm and object
-  shape. No object may rise more than 1 cm; a diverged control copy fails the control.
+  shape. No object's lowest collision point may rise more than 1 cm above its lowest point at the start (an
+  object tipped up while it rests on the table does not rise, a lifted one does); a diverged control copy fails
+  the control.
 
 The copies' order is drawn per run, and the controls' friction is set only after ``make_solver`` and
 ``make_pipeline`` returned, so submitted code cannot single out the controls. SolverMuJoCo keeps its own copy of
@@ -96,7 +98,7 @@ DEFAULT_THRESHOLDS = {
     # [m] final centre to the nearest centre at which the real object rested after its release: its final
     # position, or one it rested at before a later object pushed it (the pear: three rest positions)
     "rest_xy_err_m_max": 0.05,
-    "control_rise_m_max": 0.01,  # [m] highest object rise in either negative control
+    "control_rise_m_max": 0.01,  # [m] highest rise of an object's lowest collision point in either negative control
 }
 
 BOUNDS = {
@@ -853,10 +855,11 @@ class Scene:
         for w in range(model.world_count):
             bodies = ix.bodies(w)
             extra = sorted(b for leaf, found in bodies.items() if leaf not in station.bodies for b in found)
-            centre_local, centre = {}, {}
+            centre_local, centre, points_local = {}, {}, {}
             for b in extra:
                 local = self.local_points(b)
                 if local is not None:
+                    points_local[b] = local  # the controls score the lowest of these points
                     centre_local[b] = _principal(local)[0]
                     centre[b] = _apply(self.body_q[b], centre_local[b][None])[0]
             candidates = sorted(centre)
@@ -878,6 +881,7 @@ class Scene:
                 {
                     "extra": extra,
                     "centre_local": centre_local,
+                    "points_local": points_local,
                     "centre": centre,
                     "objects": objects,
                     "match_distance": distance,
@@ -1802,6 +1806,7 @@ def rollout(
             result["objects"][name] = core.score_object(
                 rec, position, truth["objects"][name], truth["tray"], truth["table_z"], track
             )
+            result["objects"][name]["lowest_rise_m"] = core.lowest_rise(rec, body, info["points_local"][body])
         results.append(result)
     return results
 
@@ -1856,14 +1861,19 @@ def evaluate(worlds: list[dict], results: list[dict], t: dict) -> tuple[dict, di
     metrics["main_final_xy_err_m_max"] = max(o["final_xy_err_m"] for o in objects.values())
     metrics["main_arm_rmse_rad_max"] = max(arm.values())
 
-    # A diverged control world (non-finite state) counts as a failed control.
+    # The controls gate the rise of each object's lowest collision point (``lowest_rise_m``), which does not
+    # depend on the body frame or the centre of mass; the centre's rise is reported. A diverged control world
+    # (non-finite state) counts as a failed control.
     controls = {}
     for control in ("grip_open", "low_mu"):
         rows = [r for spec, r in zip(worlds, results, strict=True) if spec["control"] == control]
-        rises = {name: [r["objects"][name]["max_rise_m"] for r in rows if name in r["objects"]] for name in OBJECTS}
-        controls[control] = {"max_rise_m": rises}
+        rises = {name: [r["objects"][name]["lowest_rise_m"] for r in rows if name in r["objects"]] for name in OBJECTS}
+        centre = {name: [r["objects"][name]["max_rise_m"] for r in rows if name in r["objects"]] for name in OBJECTS}
+        controls[control] = {"lowest_rise_m": rises, "max_rise_m": centre}
         rise = max((v if np.isfinite(v) else math.inf for values in rises.values() for v in values), default=math.inf)
         gate(f"control_{control}_rise_m", rise, t["control_rise_m_max"], "max")
+        values = [v if np.isfinite(v) else math.inf for values in centre.values() for v in values]
+        metrics[f"control_{control}_centre_rise_m"] = max(values, default=math.inf)
     details["controls"] = controls
     metrics["diverged_worlds"] = sum(
         not all(np.isfinite(m["max_rise_m"]) for m in r["objects"].values()) for r in results

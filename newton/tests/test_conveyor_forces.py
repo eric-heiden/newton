@@ -28,8 +28,12 @@ BELT_FRICTION = 0.5
 
 _MODULE_LOAD_OUTPUT_RE = r"^Module .* load on device '[^']*' took [\d.]+ ms\s*\((?:compiled|cached)\)\n?"
 _MUJOCO_LS_ITERATIONS_OUTPUT_RE = (
-    r"^SolverMuJoCo: MuJoCo Warp linesearch iteration limit \(ls_iterations \d+\) reached in world \d+ "
+    # SolverMuJoCo prints each MuJoCo Warp overflow once; MuJoCo Warp's own print is the fallback.
+    r"^(?:SolverMuJoCo: MuJoCo Warp linesearch iteration limit \(ls_iterations \d+\) reached in world \d+ "
     r"\(printed once per solver, newton\.utils\.report_health\(\) counts every occurrence\)\n?"
+    r"|linesearch iterations limit reached - please increase ls_iterations \w+ \d+\n?"
+    r"(?:^To disable the print warning: m\.opt\.warn_overflow &= ~mjw\.OverflowType\.LS_ITERATIONS"
+    r" \(or = 0 for all\)\n?)?)"
 )
 
 

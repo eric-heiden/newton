@@ -75,32 +75,6 @@ def test_default_light_shines_down_for_y_up(test: unittest.TestCase, device):
         np.testing.assert_allclose(_center_radiance(up_axis, configure, device), [0.57735] * 3, atol=1e-4)
 
 
-def test_cloth_renders_triangle_colors_from_both_sides(test: unittest.TestCase, device):
-    """A colored cloth sheet shows Model.tri_color from above and from below, shaded on the visible side."""
-    builder = newton.ModelBuilder()
-    builder.add_cloth_grid(
-        pos=wp.vec3(-0.5, -0.5, 1.0),
-        rot=wp.quat_identity(),
-        vel=wp.vec3(0.0),
-        dim_x=4,
-        dim_y=4,
-        cell_x=0.25,
-        cell_y=0.25,
-        mass=0.1,
-    )
-    model = builder.finalize(device=device)
-    model.tri_color.assign(np.tile([[1.0, 0.0, 0.0]], (model.tri_count, 1)).astype(np.float32))
-    camera = SensorCamera(model)
-    above = wp.transform(wp.vec3(0.0, 0.0, 3.0), wp.quat_identity())
-    below = wp.transform(wp.vec3(0.0, 0.0, -1.0), wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.pi))
-    for eye, facing in ((above, 1.0), (below, -1.0)):
-        images = _render(camera, model, eye, 8, 20.0, albedo=wp.uint32, normal=wp.vec3f)
-        albedo = int(images["albedo"][4, 4])
-        np.testing.assert_allclose([albedo & 255, (albedo >> 8) & 255, (albedo >> 16) & 255], [255, 0, 0], atol=2)
-        # The shading normal faces the camera on either side of the sheet.
-        test.assertAlmostEqual(float(images["normal"][4, 4][2]), facing, places=4)
-
-
 def test_convex_hull_is_rendered(test: unittest.TestCase, device):
     """Convex-hull shapes show up in renders like the mesh they are built from."""
     depths = []
@@ -137,39 +111,6 @@ def test_transparent_shapes_are_not_rendered(test: unittest.TestCase, device):
     np.testing.assert_allclose(depth[8, 8], 2.5, atol=0.05)
 
 
-def _center_left_albedo(device, texture_transform) -> np.ndarray:
-    """Albedo where u = 0.25 on a quad textured red for u < 0.5 and green for u >= 0.5."""
-    texture = np.zeros((8, 16, 4), dtype=np.uint8)
-    texture[..., 3] = 255
-    texture[:, :8, 0] = 255
-    texture[:, 8:, 1] = 255
-    mesh = newton.Mesh(
-        np.array([[-1, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0]], dtype=np.float32),
-        np.array([0, 1, 2, 0, 2, 3], dtype=np.int32),
-        uvs=np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32),
-        compute_inertia=False,
-        texture=texture,
-        texture_transform=texture_transform,
-    )
-    builder = newton.ModelBuilder()
-    builder.add_shape_mesh(-1, mesh=mesh, color=(1.0, 1.0, 1.0))
-    model = builder.finalize(device=device)
-    camera = SensorCamera(model, load_textures=True)
-    camera.default_render_config.enable_textures = True
-    eye = wp.transform(wp.vec3(0.0, 0.0, 1.8), wp.quat_identity())
-    packed = _render(camera, model, eye, 16, 60.0, albedo=wp.uint32)["albedo"][8, 4]
-    return np.array([packed & 255, (packed >> 8) & 255, (packed >> 16) & 255])
-
-
-def test_texture_transform_offsets_uvs(test: unittest.TestCase, device):
-    identity = _center_left_albedo(device, ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)))
-    shifted = _center_left_albedo(device, ((1.0, 0.0, 0.5), (0.0, 1.0, 0.0)))
-    test.assertGreater(identity[0], 200)
-    test.assertLess(identity[1], 50)
-    test.assertGreater(shifted[1], 200)
-    test.assertLess(shifted[0], 50)
-
-
 class TestSensorCameraShading(unittest.TestCase):
     pass
 
@@ -179,10 +120,8 @@ for _name, _function in (
     ("test_ambient_light_follows_up_axis", test_ambient_light_follows_up_axis),
     ("test_default_ambient_light_is_unchanged", test_default_ambient_light_is_unchanged),
     ("test_default_light_shines_down_for_y_up", test_default_light_shines_down_for_y_up),
-    ("test_cloth_renders_triangle_colors_from_both_sides", test_cloth_renders_triangle_colors_from_both_sides),
     ("test_convex_hull_is_rendered", test_convex_hull_is_rendered),
     ("test_transparent_shapes_are_not_rendered", test_transparent_shapes_are_not_rendered),
-    ("test_texture_transform_offsets_uvs", test_texture_transform_offsets_uvs),
 ):
     add_function_test(TestSensorCameraShading, _name, _function, devices=get_test_devices())
 

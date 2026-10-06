@@ -12,6 +12,10 @@ class ModelFlags(IntEnum):
     to specify which properties have changed, allowing the solver to efficiently
     update only the necessary components.
 
+    Categories overlap semantically, but each flag has its own bit. The broad
+    :attr:`JOINT_DOF_PROPERTIES` includes force, inertial, and reference-pose
+    updates. Testing the broad bit alone does not detect a narrower notification.
+
     Combine flags with ``|``, e.g. ``ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.BODY_PROPERTIES``;
     the result is an ``int`` that :meth:`~newton.solvers.SolverBase.notify_model_changed` accepts.
     :attr:`ALL` selects every flag. ``ALL`` is itself a member, so iterating over
@@ -20,10 +24,10 @@ class ModelFlags(IntEnum):
     """
 
     JOINT_PROPERTIES = 1 << 0
-    """Indicates joint property updates: joint_q, joint_X_p, joint_X_c."""
+    """Indicates joint property updates: joint_q, joint_X_p, joint_X_c, joint_axis."""
 
     JOINT_DOF_PROPERTIES = 1 << 1
-    """Indicates joint DOF property updates: joint_target_ke, joint_target_kd, joint_damping, joint_effort_limit, joint_armature, joint_friction, joint_limit_ke, joint_limit_kd, joint_limit_lower, joint_limit_upper."""
+    """Indicates all joint DOF updates, including force, armature, and reference-pose properties: joint_target_ke, joint_target_kd, joint_damping, joint_effort_limit, joint_armature, joint_friction, joint_limit_ke, joint_limit_kd, joint_limit_lower, joint_limit_upper."""
 
     BODY_PROPERTIES = 1 << 2
     """Indicates body property updates: body_q, body_qd, body_flags."""
@@ -46,6 +50,15 @@ class ModelFlags(IntEnum):
     ACTUATOR_PROPERTIES = 1 << 8
     """Indicates actuator property updates: gains, biases, limits, etc."""
 
+    JOINT_DOF_FORCE_PROPERTIES = 1 << 9
+    """Indicates joint force updates: friction, damping, target gains/modes, effort limits, passive stiffness, and limit coefficients/bounds. Excludes armature and reference poses."""
+
+    JOINT_DOF_INERTIAL_PROPERTIES = 1 << 10
+    """Indicates joint_armature updates. MuJoCo recomputes constants; use at reset or for domain randomization rather than every step."""
+
+    JOINT_REFERENCE_POSE_PROPERTIES = 1 << 11
+    """Indicates joint reference-pose and spring-reference updates. Excludes joint transforms, force parameters, and armature. MuJoCo recomputes constants; use at reset or for domain randomization rather than every step."""
+
     ALL = (
         JOINT_PROPERTIES
         | JOINT_DOF_PROPERTIES
@@ -56,6 +69,9 @@ class ModelFlags(IntEnum):
         | CONSTRAINT_PROPERTIES
         | TENDON_PROPERTIES
         | ACTUATOR_PROPERTIES
+        | JOINT_DOF_FORCE_PROPERTIES
+        | JOINT_DOF_INERTIAL_PROPERTIES
+        | JOINT_REFERENCE_POSE_PROPERTIES
     )
     """Indicates all property updates."""
 

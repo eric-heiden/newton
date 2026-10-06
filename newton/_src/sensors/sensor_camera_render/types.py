@@ -98,10 +98,10 @@ class RenderConfig:
     """
 
     enable_backface_culling: bool = True
-    """Cull back-facing triangles of mesh shapes.
+    """Cull back-facing triangles of rigid meshes and deformable surfaces.
 
-    Deformable triangle meshes (cloth) are open surfaces and are always
-    intersected from both sides.
+    When disabled, deformable triangle surfaces render from both sides with
+    normals oriented toward the camera.
     """
 
     enable_fast_math: bool = True

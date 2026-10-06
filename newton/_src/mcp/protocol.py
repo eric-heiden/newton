@@ -10,6 +10,7 @@ endpoint. Device operations occur exclusively in the embedding process.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import importlib.util
 import json
 import sys
@@ -357,7 +358,14 @@ _RTX_NOTE = (
 
 def rtx_available() -> bool:
     """Whether the optional OVRTX renderer behind ``observe(backend='rtx')`` is installed."""
-    return importlib.util.find_spec("ovrtx") is not None
+    if importlib.util.find_spec("ovrtx") is None:
+        return False
+    # ViewerRTX drives OVRTX 0.4 and newer through the separate ovstage package.
+    try:
+        version = tuple(int(part) for part in importlib.metadata.version("ovrtx").split(".")[:2])
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        return True
+    return version < (0, 4) or importlib.util.find_spec("ovstage") is not None
 
 
 _INSTRUCTIONS_LEAN = (

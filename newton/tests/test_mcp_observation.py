@@ -4,7 +4,6 @@
 """Exercise real CPU sensor observations and optional attached OpenGL capture."""
 
 import base64
-import importlib.util
 import json
 import math
 import os
@@ -27,7 +26,7 @@ from newton._src.mcp.observation import (
     _intrinsics,
     _project,
 )
-from newton._src.mcp.protocol import TOOLS
+from newton._src.mcp.protocol import TOOLS, rtx_available
 from newton.mcp import SimulationSession
 from newton.solvers import SolverXPBD
 
@@ -621,9 +620,7 @@ class TestMcpObservation(unittest.TestCase):
         result = self.renderer.observe(channel="depth", intrinsics=realsense, **self.camera)
         self.assertEqual(result["camera"]["intrinsics"]["distortion_model"], "inverse_brown_conrady")
 
-    @unittest.skipUnless(
-        importlib.util.find_spec("ovrtx") is not None and wp.is_cuda_available(), "requires ovrtx and CUDA"
-    )
+    @unittest.skipUnless(rtx_available() and wp.is_cuda_available(), "requires ovrtx and CUDA")
     def test_rtx_backend_renders_selected_world(self):
         """Path-trace one world with the rtx backend and rebuild after a color edit."""
         builder = newton.ModelBuilder()

@@ -6,6 +6,7 @@
 import importlib.util
 import re
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
@@ -74,6 +75,56 @@ class TestSolverReports(unittest.TestCase):
         for row in newton.utils.report_solver_params(solver, "actuator")["rows"]:
             self.assertEqual(row["joint_actfrcrange"], [-5.0, 5.0])
             self.assertNotIn("pending", row)
+
+    @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
+    def test_inactive_torsional_and_rolling_friction(self):
+        """Friction a shape's condim leaves out triggers one warning and is marked on the shape's geom row."""
+        from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_ground_plane()
+        balls = {
+            "default": (None, None, 3),
+            "torsional3": (0.02, None, 3),
+            "rolling4": (None, 0.01, 4),
+            "both6": (0.02, 0.01, 6),
+            "zero3": (0.0, 0.0, 3),
+        }
+        for i, (name, (torsional, rolling, condim)) in enumerate(balls.items()):
+            cfg = newton.ModelBuilder.ShapeConfig()
+            cfg.mu_torsional = cfg.mu_torsional if torsional is None else torsional
+            cfg.mu_rolling = cfg.mu_rolling if rolling is None else rolling
+            body = builder.add_body(xform=wp.transform(wp.vec3(float(i), 0.0, 0.5), wp.quat_identity()))
+            builder.add_shape_sphere(
+                body, radius=0.1, cfg=cfg, label=f"{name}/ball", custom_attributes={"mujoco:condim": condim}
+            )
+        model = builder.finalize(device="cpu")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            solver = SolverMuJoCo(model)
+        messages = [str(w.message) for w in caught if "mu_torsional or mu_rolling" in str(w.message)]
+        self.assertEqual(len(messages), 1, messages)
+        self.assertIn("SolverMuJoCo: 2 shapes", messages[0])
+        self.assertIn("'torsional3/ball' (condim 3", messages[0])
+        self.assertIn("'rolling4/ball' (condim 4", messages[0])
+        self.assertNotIn("default/ball", messages[0])
+        self.assertNotIn("both6/ball", messages[0])
+        report = newton.utils.report_solver_params(solver, "geom", select="*/ball")
+        inactive = {
+            model.shape_label[row["shape"]].split("/")[0]: row.get("friction_inactive") for row in report["rows"]
+        }
+        self.assertEqual(
+            inactive,
+            {
+                "default": ["torsional", "rolling"],
+                "torsional3": ["torsional", "rolling"],
+                "rolling4": ["rolling"],
+                "both6": None,
+                "zero3": None,
+            },
+        )
+        self.assertIn("condim >= 4", report["friction_inactive"])
 
     @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
     def test_health_skips_overlap_between_static_shapes(self):

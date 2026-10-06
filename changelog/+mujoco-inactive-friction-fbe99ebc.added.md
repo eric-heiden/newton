@@ -1,0 +1,1 @@
+Warn once when `SolverMuJoCo` is constructed for shapes whose `mujoco:condim` leaves out the torsional or rolling friction they set (torsional friction needs condim 4 and rolling friction condim 6), and list the left-out components as `friction_inactive` on the `geom` rows of `newton.utils.report_solver_params()`.

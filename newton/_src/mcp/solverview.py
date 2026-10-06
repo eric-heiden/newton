@@ -1450,11 +1450,27 @@ class _MuJoCoParams:
                 checks.append(("solmix", solmix[geom], model_solmix[shape]))
             if shape_gap is not None:
                 checks.append(("gap", gap[geom], shape_gap[shape]))
+            inactive = [
+                name
+                for name, index, needed in (("torsional", 1, 4), ("rolling", 2, 6))
+                if row["condim"] < needed and friction[geom][index] > 0.0
+            ]
+            if inactive:
+                row["friction_inactive"] = inactive
             row["from"] = sources
             self._pending(row, checks)
             rows.append(row)
         rows, truncated = _limited(rows, limit)
+        notes = {}
+        if any("friction_inactive" in row for row in rows):
+            notes["friction_inactive"] = (
+                "friction is (sliding, torsional, rolling); MuJoCo applies torsional friction only in contacts with "
+                "condim >= 4 and rolling friction only with condim 6. A contact takes the condim and friction of its "
+                "higher-priority geom, or at equal priority the larger condim and the element-wise larger friction. "
+                "friction_inactive lists the components the geom's own condim leaves out."
+            )
         return {
+            **notes,
             "flags": {"model.shape_* and model.mujoco geom attributes": "SHAPE_PROPERTIES"},
             "per_world": {name: self.per_world(name) for name in ("geom_friction", "geom_solref", "geom_priority")},
             "not_read": ["model.shape_material_restitution"]

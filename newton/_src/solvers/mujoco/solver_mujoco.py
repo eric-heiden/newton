@@ -282,6 +282,51 @@ def _mesh_scale_key(mesh: Mesh, scale: np.ndarray) -> tuple[int, tuple[float, fl
     return id(mesh), tuple(float(s) for s in scale)
 
 
+def _warn_inactive_friction(
+    shapes: np.ndarray,
+    condim: np.ndarray | None,
+    mu_torsional: np.ndarray,
+    mu_rolling: np.ndarray,
+    labels: Sequence[str] | None,
+) -> None:
+    """Warn once about torsional or rolling friction set on shapes whose ``condim`` excludes it.
+
+    Values equal to the :class:`~newton.ModelBuilder.ShapeConfig` defaults (which are MuJoCo's) are not
+    reported, since they were most likely not set on purpose.
+    """
+    if len(shapes) == 0:
+        return
+    shapes = np.asarray(shapes)
+    dims = np.full(len(shapes), 3, dtype=np.int64) if condim is None else np.asarray(condim)[shapes]
+    torsional, rolling = np.asarray(mu_torsional)[shapes], np.asarray(mu_rolling)[shapes]
+    defaults = ModelBuilder.ShapeConfig()
+    torsional_set = (torsional > 0.0) & ~np.isclose(torsional, defaults.mu_torsional, rtol=1.0e-6, atol=0.0)
+    rolling_set = (rolling > 0.0) & ~np.isclose(rolling, defaults.mu_rolling, rtol=1.0e-6, atol=0.0)
+    inactive = (torsional_set & (dims < 4)) | (rolling_set & (dims < 6))
+    if not inactive.any():
+        return
+    listed = []
+    for i in np.flatnonzero(inactive)[:5]:
+        shape = int(shapes[i])
+        name = labels[shape] if labels and shape < len(labels) and labels[shape] else f"shape {shape}"
+        listed.append(
+            f"{name!r} (condim {int(dims[i])}, mu_torsional {float(torsional[i]):.4g}, "
+            f"mu_rolling {float(rolling[i]):.4g})"
+        )
+    more = f", and {int(inactive.sum()) - len(listed)} more" if inactive.sum() > len(listed) else ""
+    warnings.warn(
+        f"SolverMuJoCo: {int(inactive.sum())} shapes set mu_torsional or mu_rolling (other than the ShapeConfig "
+        f"defaults {defaults.mu_torsional:g} and {defaults.mu_rolling:g}) that their mujoco:condim leaves out: "
+        "MuJoCo applies torsional friction only in contacts with condim >= 4 and rolling friction only with "
+        "condim 6. A contact takes the condim of its higher-priority shape, or the larger condim of the two at "
+        "equal mujoco:geom_priority, so these values act only in contacts with shapes of higher condim. "
+        f"Shapes: {'; '.join(listed)}{more}. The mujoco:condim custom attribute is read at construction; "
+        "newton.utils.report_solver_params(solver, 'geom') lists friction_inactive per geom.",
+        UserWarning,
+        stacklevel=4,
+    )
+
+
 def _mujoco_mesh_vertices_are_planar(
     vertices: np.ndarray, extent_axis: np.ndarray | None = None, eps: float = 1.0e-6
 ) -> bool:
@@ -7034,6 +7079,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # find graph coloring of collision filter pairs
         # filter out shapes that are not colliding with anything
         colliding_shapes = selected_shapes[shape_flags[selected_shapes] & ShapeFlags.COLLIDE_SHAPES != 0]
+        _warn_inactive_friction(colliding_shapes, shape_condim, shape_mu_torsional, shape_mu_rolling, model.shape_label)
 
         # number of shapes we are instantiating in MuJoCo (which will be replicated for the number of envs)
         colliding_shapes_per_world = len(colliding_shapes)

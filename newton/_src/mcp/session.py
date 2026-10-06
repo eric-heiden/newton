@@ -30,7 +30,7 @@ import warp as wp
 
 from ..sim.collide import CollisionPipeline
 from ..sim.contact_kinematics import eval_rigid_contact_kinematics
-from ..sim.enums import JointType, ModelFlags, StateFlags
+from ..sim.enums import JointType, ModelFlags, StateFlags, _covered_model_flags
 from ..sim.model import Model
 from .cells import cell_filename, forget_cell_source, register_cell_source, retain_cell_sources
 
@@ -1516,17 +1516,17 @@ class SimulationSession:
                 "joint_target_ke",
                 "joint_target_kd",
                 "joint_damping",
-                "joint_armature",
                 "joint_friction",
                 "joint_effort_limit",
-                "joint_velocity_limit",
                 "joint_limit_ke",
                 "joint_limit_kd",
                 "joint_limit_lower",
                 "joint_limit_upper",
             ),
-            ModelFlags.JOINT_DOF_PROPERTIES,
+            ModelFlags.JOINT_DOF_FORCE_PROPERTIES,
         ),
+        "joint_armature": ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES,
+        "joint_velocity_limit": ModelFlags.JOINT_DOF_PROPERTIES,
         **dict.fromkeys(
             (
                 "shape_material_mu",
@@ -1631,7 +1631,7 @@ class SimulationSession:
                 requested |= int(ModelFlags[flag])
         elif flags is not None:
             requested = _integer(flags, "flags", 0, int(ModelFlags.ALL))
-        if flags is not None and inferred & requested != inferred:
+        if flags is not None and inferred & _covered_model_flags(requested) != inferred:
             raise ValueError("Explicit flags must include every inferred notification category")
         notification = inferred | requested
         try:

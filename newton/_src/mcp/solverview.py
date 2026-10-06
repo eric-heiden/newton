@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from ..sim.enums import BodyFlags, JointTargetMode, ModelFlags
+from ..sim.enums import BodyFlags, JointTargetMode, ModelFlags, _covered_model_flags
 from ..solvers.mujoco.constants import SOLREF_MODE_FORCE_SPACE, SOLREF_MODE_MJCF_DEFAULT, SOLREF_MODE_RAW
 from ..solvers.mujoco.solver_mujoco import _MJW_BATCHED_MODEL_FIELDS, _MJW_BATCHED_OPTION_FIELDS, SolverMuJoCo
 
@@ -31,16 +31,15 @@ _F = ModelFlags
 
 FIELD_FLAGS: dict[str, ModelFlags] = {
     **dict.fromkeys(("joint_X_p", "joint_X_c", "joint_axis"), _F.JOINT_PROPERTIES),
+    "joint_velocity_limit": _F.JOINT_DOF_PROPERTIES,
     **dict.fromkeys(
         (
             "joint_target_ke",
             "joint_target_kd",
             "joint_target_mode",
             "joint_damping",
-            "joint_armature",
             "joint_friction",
             "joint_effort_limit",
-            "joint_velocity_limit",
             "joint_limit_ke",
             "joint_limit_kd",
             "joint_limit_lower",
@@ -52,11 +51,11 @@ FIELD_FLAGS: dict[str, ModelFlags] = {
             "mujoco.dof_passive_stiffness",
             "mujoco.solreffriction",
             "mujoco.solimpfriction",
-            "mujoco.dof_ref",
-            "mujoco.dof_springref",
         ),
-        _F.JOINT_DOF_PROPERTIES,
+        _F.JOINT_DOF_FORCE_PROPERTIES,
     ),
+    "joint_armature": _F.JOINT_DOF_INERTIAL_PROPERTIES,
+    **dict.fromkeys(("mujoco.dof_ref", "mujoco.dof_springref"), _F.JOINT_REFERENCE_POSE_PROPERTIES),
     "body_flags": _F.BODY_PROPERTIES,
     **dict.fromkeys(
         ("body_mass", "body_inv_mass", "body_com", "body_inertia", "body_inv_inertia", "mujoco.gravcomp"),
@@ -647,7 +646,9 @@ class ModelWatch:
         """Whether a notify_model_changed call on ``solver`` covered ``name`` after its last change."""
         flag = int(FIELD_FLAGS[name])
         return any(
-            other is solver and flags & flag and (recorded is None or recorded.get(name) == digest)
+            other is solver
+            and _covered_model_flags(flags) & flag
+            and (recorded is None or recorded.get(name) == digest)
             for other, flags, recorded in self._notifications
         )
 
@@ -657,7 +658,7 @@ class ModelWatch:
         for name in names:
             flag = int(FIELD_FLAGS[name])
             for other, flags, recorded in self._notifications:
-                if not flags & flag:
+                if not _covered_model_flags(flags) & flag:
                     continue
                 if other is not solver:
                     reason = f"a call on a {type(other).__name__} that is not the session's solver"
@@ -669,7 +670,7 @@ class ModelWatch:
                     reasons.append(reason)
         # The flags used are only news when some missing category was never passed to the session's solver.
         missing = inferred_flags(names)
-        own = flag_names(self.notified) if self.notified and missing & ~self.notified else None
+        own = flag_names(self.notified) if self.notified and missing & ~_covered_model_flags(self.notified) else None
         parts = ([f"calls in this interval used {own}"] if own else []) + reasons[:4]
         return f" ({'; '.join(parts)})" if parts else ""
 
@@ -776,7 +777,7 @@ def mujoco_change_facts(model, solver, rows: dict[str, np.ndarray | None]) -> li
         elif name == "joint_target_mode":
             facts.append(
                 "model.joint_target_mode decides which MuJoCo actuators exist when SolverMuJoCo is constructed; "
-                "afterwards JOINT_DOF_PROPERTIES only reads world 0's mode to decide whether a position actuator "
+                "afterwards JOINT_DOF_FORCE_PROPERTIES only reads world 0's mode to decide whether a position actuator "
                 "also takes joint_target_kd."
             )
         elif name in MUJOCO_CONSTRUCTION_ONLY:
@@ -812,7 +813,7 @@ def mujoco_change_facts(model, solver, rows: dict[str, np.ndarray | None]) -> li
             if joint_target:
                 facts.append(
                     f"model.{name} rows {_rows_text(joint_target)} belong to actuators with ctrl_source JOINT_TARGET, "
-                    "whose gain and bias come from model.joint_target_ke/kd (JOINT_DOF_PROPERTIES); "
+                    "whose gain and bias come from model.joint_target_ke/kd (JOINT_DOF_FORCE_PROPERTIES); "
                     "notify_model_changed copies only actuator_ctrlrange of these rows into MuJoCo."
                 )
             if unmapped:
@@ -1108,8 +1109,8 @@ class _MuJoCoParams:
         maps = _mujoco_actuator_maps(solver)
         result = {
             "flags": {
-                "model.joint_target_ke/kd": "JOINT_DOF_PROPERTIES",
-                "model.joint_effort_limit": "JOINT_DOF_PROPERTIES",
+                "model.joint_target_ke/kd": "JOINT_DOF_FORCE_PROPERTIES",
+                "model.joint_effort_limit": "JOINT_DOF_FORCE_PROPERTIES",
                 "model.mujoco.actuator_*": "ACTUATOR_PROPERTIES",
             },
             "per_world": {
@@ -1363,7 +1364,12 @@ class _MuJoCoParams:
             rows.append(row)
         rows, truncated = _limited(rows, limit)
         return {
-            "flags": {"model.joint_* and model.mujoco joint attributes": "JOINT_DOF_PROPERTIES"},
+            "flags": {
+                "model.joint_armature": "JOINT_DOF_INERTIAL_PROPERTIES",
+                "model.mujoco.dof_ref, dof_springref": "JOINT_REFERENCE_POSE_PROPERTIES",
+                "other model.joint_* DOF and model.mujoco joint attributes": "JOINT_DOF_FORCE_PROPERTIES",
+                "all of these": "JOINT_DOF_PROPERTIES",
+            },
             "per_world": {
                 name: self.per_world(name)
                 for name in ("dof_armature", "dof_damping", "dof_frictionloss", "jnt_range", "jnt_solref")

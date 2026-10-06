@@ -1038,7 +1038,9 @@ Runtime updates
 After construction, the solver reads Newton model arrays again only when
 :meth:`~newton.solvers.SolverBase.notify_model_changed` is called with the
 matching :class:`~newton.ModelFlags` category. Without that call, the solver
-keeps simulating with the old values. The "per world" column says whether the
+keeps simulating with the old values. The broad ``JOINT_DOF_PROPERTIES``
+also refreshes every field listed with a narrower joint DOF category (see
+`Updating joint force properties`_). The "per world" column says whether the
 MuJoCo field stores one value per world when ``separate_worlds=True``.
 :func:`newton.utils.report_solver_params` lists the compiled values of a
 solver next to the model arrays they come from and names model values that
@@ -1056,19 +1058,23 @@ pairs.
      - Per world
    * - ``joint_target_ke``, ``joint_target_kd``
      - ``actuator_gainprm``, ``actuator_biasprm`` of joint-target actuators
-     - ``JOINT_DOF_PROPERTIES``
+     - ``JOINT_DOF_FORCE_PROPERTIES``
      - yes
-   * - ``joint_armature``, ``joint_damping``, ``joint_friction``
-     - ``dof_armature``, ``dof_damping``, ``dof_frictionloss``
-     - ``JOINT_DOF_PROPERTIES``
+   * - ``joint_damping``, ``joint_friction``
+     - ``dof_damping``, ``dof_frictionloss``
+     - ``JOINT_DOF_FORCE_PROPERTIES``
+     - yes
+   * - ``joint_armature``
+     - ``dof_armature``
+     - ``JOINT_DOF_INERTIAL_PROPERTIES``
      - yes
    * - ``joint_limit_lower``, ``joint_limit_upper``, ``joint_effort_limit``
      - ``jnt_range``, ``jnt_actfrcrange``
-     - ``JOINT_DOF_PROPERTIES``
+     - ``JOINT_DOF_FORCE_PROPERTIES``
      - yes
    * - ``joint_limit_ke``, ``joint_limit_kd``, ``mujoco.solreflimit``
      - ``jnt_solref`` (see `Joint-limit stiffness and damping`_)
-     - ``JOINT_DOF_PROPERTIES``
+     - ``JOINT_DOF_FORCE_PROPERTIES``
      - yes
    * - ``body_mass``, ``body_com``, ``body_inertia``, ``mujoco.gravcomp``
      - ``body_mass``, ``body_ipos``, ``body_inertia``, ``body_gravcomp``
@@ -1163,7 +1169,7 @@ Each MuJoCo actuator has a control source,
 - ``JOINT_TARGET`` actuators are created from
   :attr:`~newton.Model.joint_target_mode`. Their ``gainprm`` and ``biasprm``
   come from :attr:`~newton.Model.joint_target_ke` and
-  :attr:`~newton.Model.joint_target_kd` (``JOINT_DOF_PROPERTIES``); their
+  :attr:`~newton.Model.joint_target_kd` (``JOINT_DOF_FORCE_PROPERTIES``); their
   inputs come from :attr:`~newton.Control.joint_target_q` and
   :attr:`~newton.Control.joint_target_qd`. ``ACTUATOR_PROPERTIES`` copies only
   ``mujoco.actuator_ctrlrange`` into these actuators.
@@ -1183,7 +1189,7 @@ MJCF ``<position>`` and ``<velocity>`` actuators on joints are imported as
 are imported as ``CTRL_DIRECT``.
 
 The actuator set is fixed when the solver is constructed. After that,
-``JOINT_DOF_PROPERTIES`` reads :attr:`~newton.Model.joint_target_mode` only to
+``JOINT_DOF_FORCE_PROPERTIES`` reads :attr:`~newton.Model.joint_target_mode` only to
 decide whether a ``POSITION`` actuator also takes ``joint_target_kd``, and it
 uses the value of world 0 for all worlds.
 

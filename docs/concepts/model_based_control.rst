@@ -261,7 +261,7 @@ The MuJoCo model of the solver
   :attr:`Model.joint_target_ke` and :attr:`Model.joint_target_kd` at
   construction and on
   :meth:`~newton.solvers.SolverMuJoCo.notify_model_changed` with
-  :attr:`ModelFlags.JOINT_DOF_PROPERTIES` (see
+  :attr:`ModelFlags.JOINT_DOF_FORCE_PROPERTIES` (see
   :ref:`MuJoCo actuators <mujoco-actuators>`). Entry ``i`` of
   ``solver.mjc_actuator_to_newton_idx`` is the Newton DOF (of world 0) of
   actuator ``i``: ``d >= 0`` for a position actuator, ``-(d + 2)`` for a
@@ -271,7 +271,7 @@ The MuJoCo model of the solver
 - :attr:`Model.joint_effort_limit` of a scalar joint becomes its
   ``jnt_actfrcrange`` and follows
   :meth:`~newton.solvers.SolverMuJoCo.notify_model_changed` with
-  :attr:`ModelFlags.JOINT_DOF_PROPERTIES`; an authored
+  :attr:`ModelFlags.JOINT_DOF_FORCE_PROPERTIES`; an authored
   ``mujoco:actuator_forcerange`` sets the actuator's ``forcerange`` at
   construction.
 - With ``use_mujoco_cpu=True`` and no applied forces, ``mujoco.mj_step`` on

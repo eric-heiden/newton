@@ -111,6 +111,21 @@ class TestMcp(unittest.TestCase):
                 "edit", {"expected_revision": -1, "patches": [{"field": "gravity", "values": [[0, 0, 0]]}]}
             )
 
+    def test_edit_infers_narrow_joint_dof_flags(self):
+        """Notify joint DOF edits with the narrow flags and accept the broad JOINT_DOF_PROPERTIES for them."""
+        flags = newton.ModelFlags
+        session = self.session
+        damping = [{"field": "joint_damping", "indices": [0], "values": [0.5]}]
+        self.assertEqual(session.dispatch("edit", {"patches": damping})["flags"], int(flags.JOINT_DOF_FORCE_PROPERTIES))
+        armature = [{"field": "joint_armature", "indices": [0], "values": [0.01]}]
+        self.assertEqual(
+            session.dispatch("edit", {"patches": armature})["flags"], int(flags.JOINT_DOF_INERTIAL_PROPERTIES)
+        )
+        broad = session.dispatch("edit", {"patches": damping, "flags": ["JOINT_DOF_PROPERTIES"]})
+        self.assertEqual(broad["flags"], int(flags.JOINT_DOF_FORCE_PROPERTIES | flags.JOINT_DOF_PROPERTIES))
+        with self.assertRaises(ValueError):
+            session.dispatch("edit", {"patches": damping, "flags": ["SHAPE_PROPERTIES"]})
+
     def test_mass_edit_preserves_unselected_kinematic_inverses(self):
         """Preserve authored kinematic inverse values when another body's mass changes."""
         builder = newton.ModelBuilder()

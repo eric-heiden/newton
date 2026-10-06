@@ -120,7 +120,8 @@ def test_set_get_attribute(test, device):
     # One value per world and row.
     ke = np.array([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0], [70.0, 80.0]])
     test.assertEqual(
-        view.set_attribute("joint_target_ke", model, ke, labels="arm/*"), int(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+        view.set_attribute("joint_target_ke", model, ke, labels="arm/*"),
+        int(newton.ModelFlags.JOINT_DOF_FORCE_PROPERTIES),
     )
     np.testing.assert_allclose(model.joint_target_ke.numpy().reshape(4, 8)[:, :2], ke)
 
@@ -245,8 +246,17 @@ def test_model_flags_from_attributes(test, device):
     test.assertEqual(flags.from_attributes("mujoco.gravcomp"), int(flags.BODY_INERTIAL_PROPERTIES))
     test.assertEqual(
         flags.from_attributes("joint_target_ke", "shape_material_mu"),
-        int(flags.JOINT_DOF_PROPERTIES | flags.SHAPE_PROPERTIES),
+        int(flags.JOINT_DOF_FORCE_PROPERTIES | flags.SHAPE_PROPERTIES),
     )
+    # Joint DOF attributes map to the narrow categories; the rest keep the full DOF update.
+    test.assertEqual(
+        flags.from_attributes("joint_friction", "mujoco:solreflimit"), int(flags.JOINT_DOF_FORCE_PROPERTIES)
+    )
+    test.assertEqual(flags.from_attributes("joint_armature"), int(flags.JOINT_DOF_INERTIAL_PROPERTIES))
+    test.assertEqual(
+        flags.from_attributes("mujoco.dof_ref", "mujoco:dof_springref"), int(flags.JOINT_REFERENCE_POSE_PROPERTIES)
+    )
+    test.assertEqual(flags.from_attributes("joint_velocity_limit"), int(flags.JOINT_DOF_PROPERTIES))
     test.assertEqual(flags.from_attributes("gravity"), int(flags.MODEL_PROPERTIES))
     test.assertEqual(flags.from_attributes("mujoco:tendon_stiffness"), int(flags.TENDON_PROPERTIES))
     test.assertEqual(flags.from_attributes("unknown_attribute"), int(flags.ALL))

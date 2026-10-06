@@ -174,7 +174,9 @@ class TestMcpModelWatch(unittest.TestCase):
                 result = session.dispatch("execute", {"code": "model.joint_target_ke.fill_(80.0)\nr = rollout(2)"})
                 self.assertIn("before rollout()", result["note"])
                 self.assertIn("model.joint_target_ke", result["note"])
-                self.assertIn("solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)", result["note"])
+                self.assertIn(
+                    "solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_FORCE_PROPERTIES)", result["note"]
+                )
                 self.assertEqual(self.gain(session), 80.0)
                 # Without the check the rollout runs with the compiled gain of 40.
                 session.watch.mode = "off"
@@ -194,6 +196,11 @@ class TestMcpModelWatch(unittest.TestCase):
         result = session.dispatch("execute", {"code": code})
         self.assertNotIn("note", result)
         self.assertEqual(self.gain(session), 60.0)
+        # The narrow force flag covers the gain edit as well.
+        code = "model.joint_target_ke.fill_(50.0)\nsolver.notify_model_changed(newton.ModelFlags.JOINT_DOF_FORCE_PROPERTIES)"
+        result = session.dispatch("execute", {"code": code})
+        self.assertNotIn("note", result)
+        self.assertEqual(self.gain(session), 50.0)
         self.assertNotIn("note", session.dispatch("execute", {"code": "x = 1"}))
 
     def test_wrong_flag_is_reported_and_completed(self):
@@ -215,7 +222,7 @@ class TestMcpModelWatch(unittest.TestCase):
         code = f"solver.notify_model_changed({flag})\nmodel.joint_damping.fill_(5.0)\nrollout(1)"
         note = session.dispatch("execute", {"code": code})["note"]
         self.assertIn("a call before the last edit of model.joint_damping", note)
-        self.assertIn(f"the host called solver.notify_model_changed({flag})", note)
+        self.assertIn("the host called solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_FORCE_PROPERTIES)", note)
         joints = session.solver_params("joint")["rows"]
         self.assertTrue(joints and all(row["damping"] == 5.0 and "pending" not in row for row in joints))
         code = (
@@ -436,7 +443,7 @@ class TestMcpHostedModelWatch(unittest.TestCase):
         result = session.dispatch("execute", {"code": code})
         angles = {float(k): v for k, v in result["result"].items()}
         self.assertGreater(angles[50.0], angles[5.0] + 0.05)
-        self.assertIn("newton.ModelFlags.JOINT_DOF_PROPERTIES", result["note"])
+        self.assertIn("newton.ModelFlags.JOINT_DOF_FORCE_PROPERTIES", result["note"])
 
 
 @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")

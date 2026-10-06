@@ -105,8 +105,10 @@ class ModelFlags(IntEnum):
             names: Model attribute names.
 
         Returns:
-            Bit mask of :class:`ModelFlags`. Attributes without a documented
-            category map to :attr:`ALL`.
+            Bit mask of :class:`ModelFlags`. Each attribute maps to its narrowest
+            category, e.g. ``joint_friction`` to :attr:`JOINT_DOF_FORCE_PROPERTIES`
+            rather than :attr:`JOINT_DOF_PROPERTIES`. Attributes without a
+            documented category map to :attr:`ALL`.
         """
         flags = 0
         for name in names:
@@ -114,23 +116,41 @@ class ModelFlags(IntEnum):
         return flags
 
 
+_JOINT_DOF_SUBCATEGORIES = int(
+    ModelFlags.JOINT_DOF_FORCE_PROPERTIES
+    | ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
+    | ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES
+)
+
+
+def _covered_model_flags(flags: int) -> int:
+    """Categories a ``notify_model_changed(flags)`` call refreshes.
+
+    The broad :attr:`ModelFlags.JOINT_DOF_PROPERTIES` also covers the narrow joint DOF categories.
+    """
+    flags = int(flags)
+    return flags | _JOINT_DOF_SUBCATEGORIES if flags & int(ModelFlags.JOINT_DOF_PROPERTIES) else flags
+
+
 def _model_flags_by_attribute() -> dict[str, ModelFlags]:
     flags = ModelFlags
     categories = {
         flags.JOINT_PROPERTIES: ("joint_q", "joint_X_p", "joint_X_c", "joint_axis"),
+        # DOF attributes outside the narrow categories keep the full joint DOF update.
         flags.JOINT_DOF_PROPERTIES: (
             "joint_qd",
             "joint_f",
             "joint_target_q",
             "joint_target_qd",
+            "joint_velocity_limit",
+        ),
+        flags.JOINT_DOF_FORCE_PROPERTIES: (
             "joint_target_ke",
             "joint_target_kd",
             "joint_target_mode",
             "joint_damping",
-            "joint_armature",
             "joint_friction",
             "joint_effort_limit",
-            "joint_velocity_limit",
             "joint_limit_ke",
             "joint_limit_kd",
             "joint_limit_lower",
@@ -142,9 +162,9 @@ def _model_flags_by_attribute() -> dict[str, ModelFlags]:
             "mujoco:dof_passive_stiffness",
             "mujoco:solreffriction",
             "mujoco:solimpfriction",
-            "mujoco:dof_ref",
-            "mujoco:dof_springref",
         ),
+        flags.JOINT_DOF_INERTIAL_PROPERTIES: ("joint_armature",),
+        flags.JOINT_REFERENCE_POSE_PROPERTIES: ("mujoco:dof_ref", "mujoco:dof_springref"),
         flags.BODY_PROPERTIES: ("body_q", "body_qd", "body_flags"),
         flags.BODY_INERTIAL_PROPERTIES: (
             "body_mass",

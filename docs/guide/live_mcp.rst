@@ -444,7 +444,7 @@ pool as ``workers``:
 
    def evaluate(stiffness):
        model.joint_target_ke.fill_(stiffness)
-       solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+       solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_FORCE_PROPERTIES)
        series = rollout(seconds=2.0, start=True, record={"x": "state.body_q.numpy()[0, 0]"})
        return float(abs(series["x"][-1] - TARGET))
 

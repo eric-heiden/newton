@@ -3,7 +3,10 @@
 
 """Calibrated camera geometry: SensorCamera.Intrinsics and body-mounted camera transforms."""
 
+import json
 import math
+import os
+import tempfile
 import unittest
 
 import numpy as np
@@ -223,6 +226,145 @@ class TestSensorCameraIntrinsics(unittest.TestCase):
             camera.project([0.0, 0.0, -1.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         with self.assertRaisesRegex(ValueError, "plane"):
             camera.unproject_to_plane([1.0, 2.0], plane=(0.0, 0.0, 0.0, 1.0))
+
+    def test_from_dict_reads_calibration_formats(self):
+        """OpenCV camera.json, ROS, and RealSense calibrations give the intrinsics of from_camera_matrix."""
+        expected = Intrinsics.from_camera_matrix(
+            _REALSENSE_K, _REALSENSE_D, width=640, height=480, distortion_model="inverse_brown_conrady"
+        )
+        K3 = np.array(_REALSENSE_K).reshape(3, 3).tolist()
+        fx, cx, fy, cy = _REALSENSE_K[0], _REALSENSE_K[2], _REALSENSE_K[4], _REALSENSE_K[5]
+        top = {
+            "width": 640,
+            "height": 480,
+            "K": _REALSENSE_K,
+            "D": _REALSENSE_D,
+            "distortion_model": "inverse_brown_conrady",
+            "position": [0.0, 0.0, 1.5],
+            "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        }
+        wrist = {**top, "K": K3, "body": "wrist", "body_rotation_xyzw": [1.0, 0.0, 0.0, 0.0]}
+        cameras = {"top": top, "wrist": wrist, "convention": "camera looks along -Z", "time_base": "state clock"}
+        formats = {
+            "camera.json camera": (cameras, "top"),
+            "nested camera matrix": (cameras, "wrist"),
+            "single camera": ({"top": top, "convention": "-Z"}, None),
+            "flat": (top, None),
+            "RealSense rs2_intrinsics": (
+                {
+                    "width": 640,
+                    "height": 480,
+                    "ppx": cx,
+                    "ppy": cy,
+                    "fx": fx,
+                    "fy": fy,
+                    "model": "distortion.inverse_brown_conrady",
+                    "coeffs": _REALSENSE_D,
+                },
+                None,
+            ),
+            "ROS calibration YAML": (
+                {
+                    "image_width": 640,
+                    "image_height": 480,
+                    "camera_name": "top",
+                    "camera_matrix": {"rows": 3, "cols": 3, "data": _REALSENSE_K},
+                    "distortion_model": "Inverse Brown Conrady",
+                    "distortion_coefficients": {"rows": 1, "cols": 5, "data": _REALSENSE_D},
+                },
+                None,
+            ),
+            "separate values": (
+                {
+                    "width": 640,
+                    "height": 480,
+                    "fx": fx,
+                    "fy": fy,
+                    "cx": cx,
+                    "cy": cy,
+                    **dict(zip(("k1", "k2", "p1", "p2", "k3"), _REALSENSE_D, strict=True)),
+                    "K": _REALSENSE_K,
+                    "distortion_model": Intrinsics.DistortionModel.INVERSE_BROWN_CONRADY,
+                },
+                None,
+            ),
+        }
+        for name, (calibration, camera) in formats.items():
+            with self.subTest(format=name):
+                self.assertEqual(Intrinsics.from_dict(calibration, camera), expected)
+
+        # ROS CameraInfo messages (lowercase k and d) and OpenCV model names.
+        ros = {"width": 64, "height": 48, "k": [50.0, 0.0, 31.5, 0.0, 50.0, 23.5, 0.0, 0.0, 1.0]}
+        for model in ("plumb_bob", "rational_polynomial", "OPENCV", "brown_conrady", "radtan"):
+            camera = Intrinsics.from_dict({**ros, "d": _OPENCV_D[:8], "distortion_model": model})
+            self.assertEqual(camera, Intrinsics.from_camera_matrix(ros["k"], _OPENCV_D[:8], width=64, height=48))
+        self.assertEqual(
+            Intrinsics.from_dict({**ros, "d": [0.0] * 5, "distortion_model": "none"}),
+            Intrinsics(64, 48, 50.0, 50.0, 31.5, 23.5),
+        )
+        # The image size from keywords, when the calibration has none.
+        bare = {"fx": 50.0, "fy": 50.0, "cx": 31.5, "cy": 23.5}
+        self.assertEqual(Intrinsics.from_dict(bare, width=64, height=48), Intrinsics(64, 48, 50.0, 50.0, 31.5, 23.5))
+        self.assertEqual(Intrinsics.from_dict(ros, width=64, height=48).width, 64)
+
+        for calibration, arguments, message in (
+            (cameras, {}, r"holds cameras \['top', 'wrist'\]"),
+            (cameras, {"camera": "left"}, "no camera 'left'"),
+            ({"position": [0, 0, 1]}, {}, "no camera matrix"),
+            (bare, {}, "no image width"),
+            ({**bare, "width": 64}, {"height": 48, "width": 32}, "resize"),
+            ({"fx": 50.0, "width": 64, "height": 48}, {}, "lacks fy, cx, cy"),
+            ({**ros, "fx": 51.0}, {}, "disagrees"),
+            ({**ros, "K": _REALSENSE_K}, {}, "'K' and 'k' disagree"),
+            ({**ros, "D": [0.1, 0, 0, 0], "k1": 0.2}, {}, "k1 0.2 disagrees"),
+            ({**ros, "k": _REALSENSE_K[:6]}, {}, "9 values"),
+            ({**ros, "D": [0.1] * 6}, {}, "4, 5, 8, or 12"),
+            ({**ros, "D": "none"}, {}, "must hold numbers"),
+            ({**ros, "distortion_model": "equidistant"}, {}, "fisheye"),
+            ({**ros, "distortion_model": "modified_brown_conrady"}, {}, "not a pinhole distortion model"),
+            ({**ros, "distortion_model": "none", "D": [0.1, 0, 0, 0]}, {}, "nonzero"),
+            ({**ros, "distortion_model": 1.5}, {}, "model name"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                Intrinsics.from_dict(calibration, **arguments)
+        with self.assertRaisesRegex(TypeError, "mapping"):
+            Intrinsics.from_dict([1.0, 2.0])
+
+    def test_from_json_and_pixels_to_plane(self):
+        """A camera.json file maps pixels to points on a table plane and back."""
+        calibration = {
+            "overhead": {
+                "width": 640,
+                "height": 480,
+                "K": _REALSENSE_K,
+                "D": _REALSENSE_D,
+                "distortion_model": "inverse_brown_conrady",
+                "position": _POSE[:3],
+                "rotation_xyzw": _POSE[3:],
+            },
+            "convention": "the camera looks along -Z with +Y up",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "camera.json")
+            with open(path, "w", encoding="utf-8") as file:
+                json.dump(calibration, file)
+            camera = Intrinsics.from_json(path)
+            self.assertEqual(camera, Intrinsics.from_dict(calibration["overhead"]))
+            self.assertEqual(Intrinsics.from_json(path, camera="overhead"), camera)
+            with self.assertRaisesRegex(ValueError, "camera.json: calibration has no camera 'top'"):
+                Intrinsics.from_json(path, camera="top")
+        entry = calibration["overhead"]
+        pose = wp.transform(wp.vec3(*entry["position"]), wp.quat(*entry["rotation_xyzw"]))
+        # The centroid of a mask region: columns are image x and rows image y.
+        mask = np.zeros((480, 640), dtype=bool)
+        mask[200:260, 300:380] = True
+        rows, columns = np.nonzero(mask)
+        pixels = np.array([[columns.mean(), rows.mean()], [10.0, 20.0], [630.0, 470.0]])
+        on_table = camera.unproject_to_plane(pixels, pose, plane=(0.0, 0.0, 1.0, -0.75))
+        np.testing.assert_allclose(on_table[:, 2], 0.75, atol=1.0e-12)
+        back, forward_depth = camera.project(on_table, pose)
+        np.testing.assert_allclose(back, pixels, atol=1.0e-6)
+        self.assertTrue((forward_depth > 0.0).all())
 
 
 def test_rays_match_pinhole_helper(test, device):

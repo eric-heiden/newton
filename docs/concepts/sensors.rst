@@ -179,6 +179,11 @@ image size, focal lengths, principal point, and either OpenCV distortion (radial
 (distorted) pixels to rays. It converts between world points and image coordinates on the host in float64 NumPy and
 builds the ray bundle that renders through the same lens:
 
+* :meth:`~newton.sensors.SensorCamera.Intrinsics.from_camera_matrix`,
+  :meth:`~newton.sensors.SensorCamera.Intrinsics.from_dict`, and
+  :meth:`~newton.sensors.SensorCamera.Intrinsics.from_json` -- intrinsics from a camera matrix and coefficients, or
+  from a calibration dictionary or JSON file (OpenCV-style ``K``, ``D``, and ``distortion_model``, ROS
+  ``CameraInfo`` and calibration files, RealSense ``rs2_intrinsics``);
 * :meth:`~newton.sensors.SensorCamera.Intrinsics.project` -- world points [m] to image coordinates [px] and forward
   depth [m];
 * :meth:`~newton.sensors.SensorCamera.Intrinsics.unproject` -- image coordinates to world-space unit ray directions
@@ -233,6 +238,59 @@ state with the camera pose in the body frame:
 :meth:`~newton.sensors.SensorCamera.compute_camera_rays_pinhole_opencv` samples pixel ``(i, j)`` at calibration image
 coordinates ``(i + 0.5, j + 0.5)`` (scaled to the output size), half a pixel from the OpenCV pixel centers that
 :class:`SensorCamera.Intrinsics <newton.sensors.SensorCamera.Intrinsics>` uses.
+
+From pixels in a photo to points on a plane
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:meth:`~newton.sensors.SensorCamera.Intrinsics.from_dict` and
+:meth:`~newton.sensors.SensorCamera.Intrinsics.from_json` read the intrinsics of one camera from a calibration file
+and ignore other keys, such as the camera pose. This example reads a calibration with an inverse Brown-Conrady lens,
+places the camera from the pose stored next to its intrinsics, finds where the rays through pixels of a photo meet a
+table top, and projects those points back to the same pixels:
+
+.. testcode:: calibration-file
+
+   import json
+
+   import numpy as np
+   import warp as wp
+
+   from newton.sensors import SensorCamera
+
+   # A calibration file with one entry per camera; "overhead" looks down at a table.
+   calibration = json.loads("""
+   {"overhead": {"width": 640, "height": 480,
+                 "K": [600.0, 0.0, 319.5, 0.0, 600.0, 239.5, 0.0, 0.0, 1.0],
+                 "D": [0.05, -0.02, 0.001, -0.0005, 0.0],
+                 "distortion_model": "inverse_brown_conrady",
+                 "position": [0.1, 0.0, 1.6], "rotation_xyzw": [0.0, 0.0, 0.0, 1.0]}}
+   """)
+   intrinsics = SensorCamera.Intrinsics.from_dict(calibration, camera="overhead")
+   # From the file itself: SensorCamera.Intrinsics.from_json("camera.json", camera="overhead")
+
+   # The pose of the camera frame in the world (-Z forward, +Y up). For an OpenCV optical
+   # frame (+Z forward, +Y down), multiply its rotation by wp.quat(1.0, 0.0, 0.0, 0.0).
+   entry = calibration["overhead"]
+   pose = wp.transform(wp.vec3(*entry["position"]), wp.quat(*entry["rotation_xyzw"]))
+
+   # Pixels of an object in a photo, e.g. the centroid of a segmentation mask: columns are x, rows are y.
+   mask = np.zeros((480, 640), dtype=bool)
+   mask[200:260, 300:380] = True
+   rows, columns = np.nonzero(mask)
+   pixels = np.array([[columns.mean(), rows.mean()], [40.0, 30.0]])
+
+   # The points [m] where the rays through these pixels meet the table top z = 0.75 m.
+   on_table = intrinsics.unproject_to_plane(pixels, pose, plane=(0.0, 0.0, 1.0, -0.75))
+   print(on_table.round(3).tolist())
+
+   # Projecting the points gives the pixels again.
+   back, forward_depth = intrinsics.project(on_table, pose)
+   print(np.allclose(back, pixels, atol=1e-6))
+
+.. testoutput:: calibration-file
+
+   [[0.128, 0.014, 0.75], [-0.302, 0.301, 0.75]]
+   True
 
 Camera Lighting
 ---------------

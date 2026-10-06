@@ -280,6 +280,30 @@ class TestMcpObservation(unittest.TestCase):
         dressed = _decode_png(self.renderer.observe(environment=True, antialias=False, **camera))
         np.testing.assert_array_equal(dressed[12:20, 12:20], plain[12:20, 12:20])
 
+    def test_cloth_is_visible_from_both_sides(self):
+        """Render cloth seen from below, as the viewers do, although SensorCamera culls back faces by default."""
+        builder = newton.ModelBuilder()
+        builder.add_cloth_grid(
+            pos=wp.vec3(-1.0, -1.0, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=8,
+            dim_y=8,
+            cell_x=0.25,
+            cell_y=0.25,
+            mass=0.1,
+        )
+        self.session.model = builder.finalize(device="cpu")
+        self.session.state = self.session.model.state()
+        counts = []
+        for eye in ([0.0, 0.0, 4.0], [0.0, 0.0, -3.0]):
+            camera = {"eye": eye, "target": [0.0, 0.0, 0.5], "up": [0.0, 1.0, 0.0], "width": 16, "height": 16}
+            counts.append(
+                self.renderer.observe(channel="depth", antialias=False, **camera)["depth_stats"]["valid_count"]
+            )
+        self.assertGreater(counts[0], 0)
+        self.assertEqual(counts[0], counts[1])
+
     def test_albedo_normal_and_fixed_depth_range(self):
         """Return known albedo, world normals, and explicitly normalized depth."""
         albedo = self.renderer.observe(channel="albedo", **self.camera)

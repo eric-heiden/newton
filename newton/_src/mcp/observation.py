@@ -1285,7 +1285,10 @@ class ObservationRenderer:
             self._visibility_signature = signature
         model.bvh_refit_shapes(state)
         model.bvh_refit_particles(state)
-        config = SensorCamera.RenderConfig(enable_shadows=shadows, enable_textures=textures)
+        # Cloth is an open surface that the viewers draw from both sides; SensorCamera culls its back faces by default.
+        config = SensorCamera.RenderConfig(
+            enable_shadows=shadows, enable_textures=textures, enable_backface_culling=model.tri_count == 0
+        )
         self._sensor.update(
             state,
             self._transforms,

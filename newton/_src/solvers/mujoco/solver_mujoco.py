@@ -5536,6 +5536,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 joint_target = self.mjc_actuator_ctrl_source.numpy() == 0
                 self.mj_model.actuator_gainprm[joint_target] = self.mjw_model.actuator_gainprm.numpy()[0, joint_target]
                 self.mj_model.actuator_biasprm[joint_target] = self.mjw_model.actuator_biasprm.numpy()[0, joint_target]
+                # Ball-axis drives take their force range from joint_effort_limit.
+                self.mj_model.actuator_forcerange[joint_target] = self.mjw_model.actuator_forcerange.numpy()[
+                    0, joint_target
+                ]
             if update_force:
                 self.mj_model.dof_frictionloss[:] = self.mjw_model.dof_frictionloss.numpy()[0]
                 self.mj_model.dof_damping[:] = self.mjw_model.dof_damping.numpy()[0]
@@ -5551,12 +5555,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.mj_model.jnt_margin[:] = self.mjw_model.jnt_margin.numpy()[0]
                 self.mj_model.jnt_range[:] = self.mjw_model.jnt_range.numpy()[0]
                 self.mj_model.jnt_actfrcrange[:] = self.mjw_model.jnt_actfrcrange.numpy()[0]
-            if flags & (ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.ACTUATOR_PROPERTIES):
-                self.mj_model.actuator_gainprm[:] = self.mjw_model.actuator_gainprm.numpy()[0]
-                self.mj_model.actuator_biasprm[:] = self.mjw_model.actuator_biasprm.numpy()[0]
-                self.mj_model.actuator_forcerange[:] = self.mjw_model.actuator_forcerange.numpy()[0]
             if flags & ModelFlags.ACTUATOR_PROPERTIES:
                 for name in (
+                    "actuator_gainprm",
+                    "actuator_biasprm",
+                    "actuator_forcerange",
                     "actuator_dynprm",
                     "actuator_ctrlrange",
                     "actuator_actrange",

@@ -6,6 +6,7 @@
 import asyncio
 import base64
 import importlib.util
+import itertools
 import json
 import socket
 import sys
@@ -24,6 +25,9 @@ from newton._src.mcp.protocol import _Protocol
 from newton.mcp import SimulationClient, SimulationServer, SimulationSession
 from newton.solvers import SolverMuJoCo, SolverXPBD
 from newton.solvers.experimental.coupled import SolverCoupled
+
+_JOINT_DOF_FORCE_FLAGS = (newton.ModelFlags.JOINT_DOF_PROPERTIES, newton.ModelFlags.JOINT_DOF_FORCE_PROPERTIES)
+"""The broad and the narrow notification of joint gain and effort-limit edits."""
 
 
 def _payload(result) -> dict:
@@ -576,61 +580,62 @@ class TestMcpMuJoCoNotification(unittest.TestCase):
 
     def test_cpu_live_drive_update_matches_fresh_solver(self):
         """Make live CPU drive gain edits match a fresh solver's force response."""
-        model, solver = self.scene()
-        model.joint_target_ke.fill_(50)
-        model.joint_target_kd.fill_(4)
-        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
-        fresh = SolverMuJoCo(model, use_mujoco_cpu=True, disable_contacts=True)
-        np.testing.assert_allclose(solver.mj_model.actuator_gainprm, fresh.mj_model.actuator_gainprm)
-        np.testing.assert_allclose(solver.mj_model.actuator_biasprm, fresh.mj_model.actuator_biasprm)
-        control = model.control()
-        control.joint_target_q.fill_(0.5)
-        state, output = model.state(), model.state()
-        fresh_state, fresh_output = model.state(), model.state()
-        solver.step(state, output, control, None, 0.01)
-        fresh.step(fresh_state, fresh_output, control, None, 0.01)
-        np.testing.assert_allclose(output.joint_qd.numpy(), fresh_output.joint_qd.numpy(), atol=1e-6)
-        self.assertGreater(abs(output.joint_qd.numpy()[0]), 0)
+        for flag in _JOINT_DOF_FORCE_FLAGS:
+            with self.subTest(flag=flag.name):
+                model, solver = self.scene()
+                model.joint_target_ke.fill_(50)
+                model.joint_target_kd.fill_(4)
+                solver.notify_model_changed(flag)
+                fresh = SolverMuJoCo(model, use_mujoco_cpu=True, disable_contacts=True)
+                np.testing.assert_allclose(solver.mj_model.actuator_gainprm, fresh.mj_model.actuator_gainprm)
+                np.testing.assert_allclose(solver.mj_model.actuator_biasprm, fresh.mj_model.actuator_biasprm)
+                control = model.control()
+                control.joint_target_q.fill_(0.5)
+                state, output = model.state(), model.state()
+                fresh_state, fresh_output = model.state(), model.state()
+                solver.step(state, output, control, None, 0.01)
+                fresh.step(fresh_state, fresh_output, control, None, 0.01)
+                np.testing.assert_allclose(output.joint_qd.numpy(), fresh_output.joint_qd.numpy(), atol=1e-6)
+                self.assertGreater(abs(output.joint_qd.numpy()[0]), 0)
 
     def test_ball_effort_edit_matches_fresh_solver(self):
         """Update ball-joint axis force limits and preserve authored actuator ranges."""
-        for use_mujoco_cpu in (True, False):
-            for authored_limit in (False, True):
-                with self.subTest(use_mujoco_cpu=use_mujoco_cpu, authored_limit=authored_limit):
-                    builder = newton.ModelBuilder(gravity=(0, 0, 0))
-                    actuator = (
-                        '<actuator><position joint="ball" kp="8" forcerange="-0.3 0.4"/></actuator>'
-                        if authored_limit
-                        else ""
-                    )
-                    builder.add_mjcf(
-                        '<mujoco><option gravity="0 0 0"/><worldbody><body>'
-                        '<joint name="ball" type="ball"/><geom type="sphere" size="0.1" mass="1"/>'
-                        f"</body></worldbody>{actuator}</mujoco>"
-                    )
-                    builder.joint_target_mode[:] = [int(newton.JointTargetMode.POSITION)] * 3
-                    builder.joint_target_ke[:] = [8.0] * 3
-                    builder.joint_effort_limit[:] = [0.8] * 3
-                    device = "cuda:0" if not use_mujoco_cpu and wp.is_cuda_available() else "cpu"
-                    model = builder.finalize(device=device)
-                    solver = SolverMuJoCo(model, use_mujoco_cpu=use_mujoco_cpu, disable_contacts=True)
-                    model.joint_effort_limit.assign(np.asarray([0.2, 0.4, 0.6], dtype=np.float32))
-                    solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
-                    fresh = SolverMuJoCo(model, use_mujoco_cpu=use_mujoco_cpu, disable_contacts=True)
-                    np.testing.assert_allclose(
-                        solver.mjw_model.actuator_forcerange.numpy(), fresh.mjw_model.actuator_forcerange.numpy()
-                    )
-                    if use_mujoco_cpu:
-                        np.testing.assert_allclose(
-                            solver.mj_model.actuator_forcerange, fresh.mj_model.actuator_forcerange
-                        )
-                        control = model.control()
-                        control.joint_target_q.assign(np.asarray([0.3, 0.4, 0.1, np.sqrt(0.74)], dtype=np.float32))
-                        state, output = model.state(), model.state()
-                        fresh_state, fresh_output = model.state(), model.state()
-                        solver.step(state, output, control, None, 0.01)
-                        fresh.step(fresh_state, fresh_output, control, None, 0.01)
-                        np.testing.assert_allclose(output.joint_qd.numpy(), fresh_output.joint_qd.numpy(), atol=1e-6)
+        for use_mujoco_cpu, authored_limit, flag in itertools.product(
+            (True, False), (False, True), _JOINT_DOF_FORCE_FLAGS
+        ):
+            with self.subTest(use_mujoco_cpu=use_mujoco_cpu, authored_limit=authored_limit, flag=flag.name):
+                builder = newton.ModelBuilder(gravity=(0, 0, 0))
+                actuator = (
+                    '<actuator><position joint="ball" kp="8" forcerange="-0.3 0.4"/></actuator>'
+                    if authored_limit
+                    else ""
+                )
+                builder.add_mjcf(
+                    '<mujoco><option gravity="0 0 0"/><worldbody><body>'
+                    '<joint name="ball" type="ball"/><geom type="sphere" size="0.1" mass="1"/>'
+                    f"</body></worldbody>{actuator}</mujoco>"
+                )
+                builder.joint_target_mode[:] = [int(newton.JointTargetMode.POSITION)] * 3
+                builder.joint_target_ke[:] = [8.0] * 3
+                builder.joint_effort_limit[:] = [0.8] * 3
+                device = "cuda:0" if not use_mujoco_cpu and wp.is_cuda_available() else "cpu"
+                model = builder.finalize(device=device)
+                solver = SolverMuJoCo(model, use_mujoco_cpu=use_mujoco_cpu, disable_contacts=True)
+                model.joint_effort_limit.assign(np.asarray([0.2, 0.4, 0.6], dtype=np.float32))
+                solver.notify_model_changed(flag)
+                fresh = SolverMuJoCo(model, use_mujoco_cpu=use_mujoco_cpu, disable_contacts=True)
+                np.testing.assert_allclose(
+                    solver.mjw_model.actuator_forcerange.numpy(), fresh.mjw_model.actuator_forcerange.numpy()
+                )
+                if use_mujoco_cpu:
+                    np.testing.assert_allclose(solver.mj_model.actuator_forcerange, fresh.mj_model.actuator_forcerange)
+                    control = model.control()
+                    control.joint_target_q.assign(np.asarray([0.3, 0.4, 0.1, np.sqrt(0.74)], dtype=np.float32))
+                    state, output = model.state(), model.state()
+                    fresh_state, fresh_output = model.state(), model.state()
+                    solver.step(state, output, control, None, 0.01)
+                    fresh.step(fresh_state, fresh_output, control, None, 0.01)
+                    np.testing.assert_allclose(output.joint_qd.numpy(), fresh_output.joint_qd.numpy(), atol=1e-6)
 
     def test_ball_velocity_effort_edit_matches_fresh_solver(self):
         """Update effort limits on both ball position and velocity sub-actuators."""
@@ -644,12 +649,15 @@ class TestMcpMuJoCoNotification(unittest.TestCase):
         builder.joint_target_kd[:] = [1.0] * 3
         builder.joint_effort_limit[:] = [0.8] * 3
         model = builder.finalize(device="cpu")
-        solver = SolverMuJoCo(model, use_mujoco_cpu=True, disable_contacts=True)
-        model.joint_effort_limit.assign(np.asarray([0.2, 0.4, 0.6], dtype=np.float32))
-        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
-        fresh = SolverMuJoCo(model, use_mujoco_cpu=True, disable_contacts=True)
-        self.assertEqual(solver.mj_model.nu, 6)
-        np.testing.assert_allclose(solver.mj_model.actuator_forcerange, fresh.mj_model.actuator_forcerange)
+        for flag in _JOINT_DOF_FORCE_FLAGS:
+            with self.subTest(flag=flag.name):
+                model.joint_effort_limit.fill_(0.8)
+                solver = SolverMuJoCo(model, use_mujoco_cpu=True, disable_contacts=True)
+                model.joint_effort_limit.assign(np.asarray([0.2, 0.4, 0.6], dtype=np.float32))
+                solver.notify_model_changed(flag)
+                fresh = SolverMuJoCo(model, use_mujoco_cpu=True, disable_contacts=True)
+                self.assertEqual(solver.mj_model.nu, 6)
+                np.testing.assert_allclose(solver.mj_model.actuator_forcerange, fresh.mj_model.actuator_forcerange)
 
     def test_cpu_direct_actuator_parameters_match_fresh_solver(self):
         """Propagate direct actuator gains, biases, gear and force limits into CPU buffers."""

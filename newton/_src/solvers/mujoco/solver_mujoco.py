@@ -8809,6 +8809,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.model.joint_qd_start,
                 self.model.joint_dof_dim,
                 self.model.joint_child,
+                self.model.joint_X_c,
                 self.model.body_q,
                 dof_ref,
                 self.model.joint_rest_q,

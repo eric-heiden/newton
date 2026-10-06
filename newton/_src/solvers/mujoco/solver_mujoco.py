@@ -35,7 +35,7 @@ from ...sim.articulation import eval_fk
 from ...sim.collide import _estimate_rigid_contact_max, _estimate_rigid_contact_max_per_world
 from ...sim.contacts import GENERATION_SENTINEL as _GENERATION_SENTINEL
 from ...sim.graph_coloring import color_graph, plot_graph
-from ...sim.joint_springs import finalize_legacy_joint_spring
+from ...sim.joint_springs import finalize_legacy_joint_spring, warn_unsupported_joint_springs
 from ...utils import topological_sort
 from ...utils.benchmark import event_scope
 from ...utils.import_utils import string_to_warp
@@ -4062,6 +4062,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 ``wp.config.deterministic``.
         """
         super().__init__(model)
+        warn_unsupported_joint_springs(
+            model,
+            type(self).__name__,
+            supported=(JointType.REVOLUTE, JointType.PRISMATIC, JointType.D6, JointType.BALL),
+        )
 
         # Import and cache MuJoCo modules (only happens once per class)
         mujoco, _ = self.import_mujoco()

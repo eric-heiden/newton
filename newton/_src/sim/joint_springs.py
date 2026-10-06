@@ -74,18 +74,27 @@ def finalize_legacy_joint_spring(builder: ModelBuilder, model: Model, attr: Mode
     target.assign(values)
 
 
-def warn_unsupported_joint_springs(model: Model, solver_name: str) -> None:
-    """Report passive springs outside the scalar joint types supported by the native solvers."""
+def warn_unsupported_joint_springs(
+    model: Model,
+    solver_name: str,
+    supported: tuple[JointType, ...] = (JointType.REVOLUTE, JointType.PRISMATIC, JointType.D6),
+) -> None:
+    """Report passive springs on joint types the calling solver ignores."""
     active_dofs = np.flatnonzero(model.joint_stiffness.numpy())
     if active_dofs.size == 0:
         return
     starts = model.joint_qd_start.numpy()
     joints = np.searchsorted(starts, active_dofs, side="right") - 1
     kinds = model.joint_type.numpy()[joints]
-    unsupported = kinds[~np.isin(kinds, (JointType.REVOLUTE, JointType.PRISMATIC, JointType.D6))]
+    unsupported = kinds[~np.isin(kinds, [int(t) for t in supported])]
     if unsupported.size:
+        names = [JointType(int(t)).name for t in supported]
+        scope = (
+            f"only {', '.join(names[:-1])} and {names[-1]} springs are supported"
+            if names
+            else "passive joint springs are not implemented"
+        )
         warnings.warn(
-            f"{solver_name} ignores passive springs on {JointType(int(unsupported[0])).name} joints; "
-            "only REVOLUTE, PRISMATIC and D6 springs are supported.",
+            f"{solver_name} ignores passive springs on {JointType(int(unsupported[0])).name} joints; {scope}.",
             stacklevel=3,
         )

@@ -325,6 +325,46 @@ class TestJointSprings(unittest.TestCase):
             with self.assertWarnsRegex(UserWarning, "ignores passive springs on BALL"):
                 solver_cls(model)
 
+    def test_unsupported_spring_warnings(self):
+        """Warn when a solver ignores nonzero passive stiffness and stay silent where springs apply."""
+        builder = newton.ModelBuilder(gravity=(0, 0, 0))
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_articulation([builder.add_joint_revolute(-1, body, stiffness=5.0)])
+        builder.color()
+        revolute = builder.finalize(device="cpu")
+        for solver_cls, kwargs in (
+            (newton.solvers.SolverXPBD, {}),
+            (newton.solvers.SolverVBD, {"rigid_compliant_alm": True}),
+            (newton.solvers.SolverKamino, {}),
+        ):
+            with self.subTest(solver=solver_cls.__name__):
+                with self.assertWarnsRegex(UserWarning, "ignores passive springs on REVOLUTE"):
+                    solver_cls(revolute, **kwargs)
+        for joint_type in (newton.JointType.FREE, newton.JointType.DISTANCE):
+            with self.subTest(solver="SolverMuJoCo", joint=joint_type.name):
+                builder = newton.ModelBuilder(gravity=(0, 0, 0))
+                body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+                add_joint = (
+                    builder.add_joint_free if joint_type == newton.JointType.FREE else builder.add_joint_distance
+                )
+                builder.add_articulation([add_joint(parent=-1, child=body)])
+                builder.joint_stiffness[:] = [1.0] * 6
+                model = builder.finalize(device="cpu")
+                if joint_type == newton.JointType.FREE:
+                    with self.assertWarnsRegex(UserWarning, "ignores passive springs on FREE"):
+                        SolverMuJoCo(model, use_mujoco_cpu=True)
+                else:
+                    # MuJoCo rejects DISTANCE joints after reporting the spring.
+                    with warnings.catch_warnings(record=True) as caught, self.assertRaises(NotImplementedError):
+                        warnings.simplefilter("always")
+                        SolverMuJoCo(model, use_mujoco_cpu=True)
+                    self.assertIn("ignores passive springs on DISTANCE", "".join(str(w.message) for w in caught))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            SolverFeatherstone(revolute)
+            SolverSemiImplicit(revolute)
+            SolverMuJoCo(revolute, use_mujoco_cpu=True)
+
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA is required for graph capture")
     def test_cuda_graph_runtime_updates(self):
         """Apply core spring updates to already captured solver steps."""

@@ -1003,6 +1003,7 @@ def sync_qpos0_kernel(
     joint_qd_start: wp.array[wp.int32],
     joint_dof_dim: wp.array2d[wp.int32],
     joint_child: wp.array[wp.int32],
+    joint_X_c: wp.array[wp.transform],
     body_q: wp.array[wp.transform],
     dof_ref: wp.array[wp.float32],
     joint_rest_q: wp.array[wp.float32],
@@ -1015,7 +1016,7 @@ def sync_qpos0_kernel(
 
     For hinge/slide: qpos0 = ref, qpos_spring = joint_rest_q + ref.
     For free: qpos0 from body_q (pos + quat in wxyz order).
-    For ball: qpos0 = [1, 0, 0, 0] (identity quaternion in wxyz).
+    For ball: qpos0 = [1, 0, 0, 0] (identity quaternion in wxyz), qpos_spring from joint_rest_q.
     """
     worldid, jntid = wp.tid()
 
@@ -1051,10 +1052,9 @@ def sync_qpos0_kernel(
         qpos0[worldid, q_i + 1] = 0.0
         qpos0[worldid, q_i + 2] = 0.0
         qpos0[worldid, q_i + 3] = 0.0
-        qpos_spring[worldid, q_i + 0] = joint_rest_q[wq_i + 3]
-        qpos_spring[worldid, q_i + 1] = joint_rest_q[wq_i + 0]
-        qpos_spring[worldid, q_i + 2] = joint_rest_q[wq_i + 1]
-        qpos_spring[worldid, q_i + 3] = joint_rest_q[wq_i + 2]
+        rest_wxyz = ball_spring_rest_wxyz(joint_X_c[joints_per_world * worldid + jntid], joint_rest_q, wq_i)
+        for i in range(4):
+            qpos_spring[worldid, q_i + i] = rest_wxyz[i]
     else:
         axis_count = joint_dof_dim[jntid, 0] + joint_dof_dim[jntid, 1]
         for i in range(axis_count):
@@ -1065,6 +1065,37 @@ def sync_qpos0_kernel(
             springref = joint_rest_q[wq_i + i] + ref
             qpos0[worldid, q_i + i] = ref
             qpos_spring[worldid, q_i + i] = springref
+
+
+@wp.kernel
+def sync_ball_qpos_spring_kernel(
+    joints_per_world: int,
+    joint_type: wp.array[wp.int32],
+    joint_q_start: wp.array[wp.int32],
+    joint_X_c: wp.array[wp.transform],
+    joint_rest_q: wp.array[wp.float32],
+    mj_q_start: wp.array[wp.int32],
+    # outputs
+    qpos_spring: wp.array2d[wp.float32],
+):
+    """Refresh BALL qpos_spring after a child joint frame change."""
+    worldid, jntid = wp.tid()
+    q_i = mj_q_start[jntid]
+    if q_i < 0 or joint_type[jntid] != JointType.BALL:
+        return
+    wj = joints_per_world * worldid + jntid
+    rest_wxyz = ball_spring_rest_wxyz(joint_X_c[wj], joint_rest_q, joint_q_start[wj])
+    for i in range(4):
+        qpos_spring[worldid, q_i + i] = rest_wxyz[i]
+
+
+@wp.func
+def ball_spring_rest_wxyz(X_c: wp.transform, joint_rest_q: wp.array[wp.float32], wq_i: int) -> wp.quat:
+    """Express a BALL rest quaternion in MuJoCo's wxyz child-frame coordinates."""
+    # Same child-frame conjugation as convert_warp_coords_to_mj_kernel applies to joint_q.
+    q_cj = X_c.q
+    rest = wp.quat(joint_rest_q[wq_i + 0], joint_rest_q[wq_i + 1], joint_rest_q[wq_i + 2], joint_rest_q[wq_i + 3])
+    return quat_xyzw_to_wxyz(q_cj * rest * wp.quat_inverse(q_cj))
 
 
 @wp.kernel

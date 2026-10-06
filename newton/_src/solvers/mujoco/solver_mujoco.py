@@ -35,7 +35,7 @@ from ...sim.articulation import eval_fk
 from ...sim.collide import _estimate_rigid_contact_max, _estimate_rigid_contact_max_per_world
 from ...sim.contacts import GENERATION_SENTINEL as _GENERATION_SENTINEL
 from ...sim.graph_coloring import color_graph, plot_graph
-from ...sim.joint_springs import finalize_legacy_joint_spring
+from ...sim.joint_springs import finalize_legacy_joint_spring, warn_unsupported_joint_springs
 from ...utils import topological_sort
 from ...utils.benchmark import event_scope
 from ...utils.import_utils import string_to_warp
@@ -87,6 +87,7 @@ from .kernels import (
     reset_sleeping_state_kernel,
     reset_world_buffers_kernel,
     restore_sleeping_state_kernel,
+    sync_ball_qpos_spring_kernel,
     sync_qpos0_kernel,
     sync_site_xposes_kernel,
     sync_worldbody_geom_xposes_kernel,
@@ -4062,6 +4063,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 ``wp.config.deterministic``.
         """
         super().__init__(model)
+        warn_unsupported_joint_springs(
+            model,
+            type(self).__name__,
+            supported=(JointType.REVOLUTE, JointType.PRISMATIC, JointType.D6, JointType.BALL),
+        )
 
         # Import and cache MuJoCo modules (only happens once per class)
         mujoco, _ = self.import_mujoco()
@@ -5112,6 +5118,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.mj_model.dof_solimp[:] = self.mjw_model.dof_solimp.numpy()[0]
                 self.mj_model.dof_solref[:] = self.mjw_model.dof_solref.numpy()[0]
                 self.mj_model.qpos0[:] = self.mjw_model.qpos0.numpy()[0]
+            if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
                 self.mj_model.qpos_spring[:] = self.mjw_model.qpos_spring.numpy()[0]
             if flags & ModelFlags.JOINT_DOF_PROPERTIES:
                 self.mj_model.jnt_solimp[:] = self.mjw_model.jnt_solimp.numpy()[0]
@@ -8804,6 +8811,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.model.joint_qd_start,
                 self.model.joint_dof_dim,
                 self.model.joint_child,
+                self.model.joint_X_c,
                 self.model.body_q,
                 dof_ref,
                 self.model.joint_rest_q,
@@ -8868,6 +8876,24 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 ],
                 device=self.model.device,
             )
+
+        # BALL spring rest is stored in the child joint frame.
+        nworld = self.mjw_model.qpos_spring.shape[0]
+        joints_per_world = self.model.joint_count // nworld
+        wp.launch(
+            sync_ball_qpos_spring_kernel,
+            dim=(nworld, joints_per_world),
+            inputs=[
+                joints_per_world,
+                self.model.joint_type,
+                self.model.joint_q_start,
+                self.model.joint_X_c,
+                self.model.joint_rest_q,
+                self.mj_q_start,
+            ],
+            outputs=[self.mjw_model.qpos_spring],
+            device=self.model.device,
+        )
 
     @staticmethod
     def _build_ref_q(model: Model, ref_q: wp.array | None = None) -> wp.array:

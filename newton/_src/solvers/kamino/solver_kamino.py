@@ -34,6 +34,7 @@ from ...sim.collide import (
     _RIGID_CONTACTS_PER_PRIMITIVE_PAIR,
     _estimate_rigid_contact_max,
 )
+from ...sim.joint_springs import warn_unsupported_joint_springs
 from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
 
@@ -747,6 +748,7 @@ class SolverKamino(SolverBase, CouplingInterface):
         """
         # Initialize the base solver
         super().__init__(model=model)
+        warn_unsupported_joint_springs(model, type(self).__name__, supported=())
 
         # Import all Kamino dependencies and cache them
         # as class variables if not already done

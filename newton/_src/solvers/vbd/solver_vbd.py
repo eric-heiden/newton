@@ -30,6 +30,7 @@ from ...sim import (
 )
 from ...sim.collide import _count_soft_particle_rigid_contact_pairs
 from ...sim.joint_mimic import has_supported_joint_mimics
+from ...sim.joint_springs import warn_unsupported_joint_springs
 from ...utils import is_graph_capture_allocation_enabled
 from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
@@ -792,6 +793,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             collision_frequency=collision_frequency,
             collision_frequency_type=collision_frequency_type,
         )
+        warn_unsupported_joint_springs(model, type(self).__name__, supported=())
         # The solver's warm-start setting is authoritative for an owned pipeline:
         # lambda/penalty restores ride the pipeline's matched contact indices, so
         # history without matching silently cold-starts every refresh (k times per

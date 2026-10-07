@@ -147,6 +147,8 @@ class TestMcpInstructions(unittest.TestCase):
         self.assertNotRegex(self.execute_description, r"\b(query|edit|contacts|collide|record|play|pause)\b")
         advice = r"(?i)\b(prefer|instead of|efficient|use it only|batch many|should|rather than|re-simulat)"
         self.assertIsNone(re.search(advice, text), re.search(advice, text))
+        # Examples name generic workspace paths, not attributes of a particular task's script.
+        self.assertNotIn("controller", text)
 
     def test_hosted_guide_fits_the_instruction_budget(self):
         """Keep the hosted guide and the lean instructions short: agents re-read them on every turn."""

@@ -67,12 +67,11 @@ _OBSERVE = {
     },
     "up": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
     "pose": {
-        "type": ["array", "object"],
+        "type": "array",
         "items": {"type": "number"},
         "minItems": 7,
         "maxItems": 7,
-        "description": "Position xyz [m] and quaternion xyzw, camera-local -Z forward/+Y up, or "
-        "{'position': [...], 'rotation_xyzw': [...]}.",
+        "description": "Position xyz [m] and quaternion xyzw, camera-local -Z forward/+Y up.",
     },
     "camera_body": {
         "type": ["string", "integer"],
@@ -91,8 +90,8 @@ _OBSERVE = {
         "description": "Calibrated camera instead of fov_y: the fields of newton.sensors.SensorCamera.Intrinsics "
         "(fx, fy, cx, cy [px], OpenCV image coordinates; image_width/image_height; distortion k1-k6, p1, p2, s1-s4; "
         "distortion_model 'opencv' or 'inverse_brown_conrady'), or a calibration dictionary with K (3x3), D (OpenCV "
-        "order), width, height and distortion_model, whose position/rotation_xyzw is the pose if no camera is given. "
-        "Renders at the calibration size unless width/height are given.",
+        "order), width, height and distortion_model (read by SensorCamera.Intrinsics.from_dict; other keys are "
+        "ignored). Renders at the calibration size unless width/height are given.",
     },
     "world_id": {"type": "integer", "minimum": 0, "default": 0},
     "width": {"type": "integer", "minimum": 1, "maximum": 2048, "description": "Default 640 (or calibration)."},
@@ -229,7 +228,7 @@ TOOLS = [
             "include": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Workspace names or attribute paths (e.g. example.controller) of Python objects whose "
+                "description": "Workspace names or attribute paths (e.g. 'name' or 'example.attr') of Python objects whose "
                 "arrays, attributes, and list/dict contents are saved too and restored in place.",
             },
         },
@@ -353,7 +352,7 @@ _HELPERS = """- show(image, label) returns an image: an array, figure, path or o
 - rollout(frames or seconds=, record={'name': 'expr' or fn}, every=1, start=False|True|'checkpoint', until=None) steps and returns NumPy series.
 - evaluate(candidates, scenarios, frames=|seconds=, setup=, control=, score=, ...): newton.utils.BatchRollout.evaluate with one world per case on copies of the hosted scene (kept across calls), from the live state or start='initial'|'checkpoint'; example.step() does not run in them.
 - branch(n, setup=fn(world, i), frames=, start=, score=, sequential=False): n variants as such worlds, or one after another through example.step(); the session keeps its state.
-- checkpoint(name, include=['example.controller']) also saves these Python objects; start=name restores them.
+- checkpoint(name, include=['name', 'example.attr']) also saves these Python objects; start=name restores them.
 - session.dispatch('reset'|'restore'|'step'|'observe'|'filmstrip', {...}).
 - health(), solver_params(kind, select), solver_contacts(select), contacts_between(a, b): values the solver integrates, contacts, and problems per world.
 - A cell that raises is rolled back (Python variables stay). Model edits that no notify_model_changed() covered are notified and named in `note`."""

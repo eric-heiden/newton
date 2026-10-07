@@ -11,6 +11,7 @@ import textwrap
 import threading
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import numpy as np
@@ -126,6 +127,74 @@ class TestMcpLongCalls(unittest.TestCase):
         [finished] = replies["second"]["finished_calls"]
         self.assertIn("ValueError", finished["error"])
         self.assertIn("late", finished["error"])
+
+    def test_finished_calls_reach_every_operation(self):
+        """A detached call's result arrives with the next response, whatever its operation."""
+        replies = {}
+
+        def worker(path):
+            client = SimulationClient(path, reply_within=0.5)
+            replies["first"] = client.request("execute", code="import time\ntime.sleep(0.9)\n'late'")
+            replies["describe"] = client.request("describe")
+            replies["step"] = client.request("step", count=1)
+
+        self.serve(worker)
+        self.assertIn("running", replies["first"])
+        [finished] = replies["describe"]["finished_calls"]
+        self.assertEqual(finished["result"], "late")
+        self.assertNotIn("finished_calls", replies["step"])
+
+    def test_finished_images_beyond_the_budget_arrive_later(self):
+        """Images of a finished call that do not fit next to the current call's images come with a later response."""
+        self.session._SHOWN_BUDGET = 300_000
+        replies = {}
+        show = (
+            "rng = np.random.default_rng({seed})\n"
+            "for i in range(6):\n"
+            "    show(rng.integers(0, 255, (100, 100, 3), dtype=np.uint8))\n"
+        )
+
+        def worker(path):
+            client = SimulationClient(path, reply_within=0.5)
+            replies["first"] = client.request(
+                "execute", code="import time\ntime.sleep(0.9)\n" + show.format(seed=1) + "'first'"
+            )
+            replies["second"] = client.request("execute", code=show.format(seed=2) + "'second'")
+            replies["third"] = client.request("execute", code="'third'")
+
+        self.serve(worker)
+        second, third = replies["second"], replies["third"]
+        self.assertEqual(second["result"], "second")
+        [finished] = second["finished_calls"]
+        self.assertEqual(finished["result"], "first")
+        deferred = finished["images_deferred"]
+        self.assertGreater(deferred, 0)
+        size = sum(len(image["image_base64"]) for image in second["images"])
+        self.assertLessEqual(size, self.session._SHOWN_BUDGET)
+        self.assertEqual(len(second["images"]), 12 - deferred)
+        self.assertEqual([entry["call"] for entry in third["finished_calls"]], [finished["call"]])
+        self.assertEqual(len(third["images"]), deferred)
+
+    def test_responses_over_the_transport_limit_drop_images(self):
+        """A response too large for the transport keeps its text and finished results and says what it dropped."""
+        replies = {}
+
+        def worker(path):
+            client = SimulationClient(path)
+            replies["shown"] = client.request(
+                "execute",
+                code="rng = np.random.default_rng(0)\n"
+                "for i in range(5):\n"
+                "    show(rng.integers(0, 255, (100, 100, 3), dtype=np.uint8))\n"
+                "'done'",
+            )
+
+        with unittest.mock.patch("newton._src.mcp.transport._MAX_RESPONSE", 150_000):
+            self.serve(worker)
+        shown = replies["shown"]
+        self.assertEqual(shown["result"], "done")
+        self.assertNotIn("images", shown)
+        self.assertIn("5 image(s) were dropped", shown["note"])
 
     def test_job_waits_end_before_the_reply_limit(self):
         """jobs.result() and jobs.wait() without a timeout return shortly before the running call must reply."""

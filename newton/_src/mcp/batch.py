@@ -35,18 +35,21 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from ..sim import CollisionPipeline, Contacts, Control, Model, ModelBuilder, State, StateFlags, eval_fk
-from ..sim.enums import ModelFlags
+from ..sim import CollisionPipeline, Contacts, Control, Model, ModelBuilder, State, StateFlags, eval_fk, eval_ik
 from ..solvers.solver import SolverBase
 from ..utils.batch_rollout import (
+    _BODY_STATE,
+    _JOINT_STATE,
     BatchRollout,
+    _articulation_mask,
     _build_lock,
     _BuildSource,
-    _is_value_attribute,
     _model_arrays,
+    _row_articulations,
     _split_key,
+    _ValueSync,
 )
-from ..utils.world_view import Frequency, WorldView, _attribute_owner, _row_words
+from ..utils.world_view import WorldView, _attribute_owner
 
 MAX_WORLDS = 256
 """Worlds per batch when ``worlds`` is not given; more cases run in several batches."""
@@ -348,7 +351,7 @@ def _snapshot_into(value: Any) -> bool:
 
 
 class ObjectSnapshot:
-    """In-place copies of Python objects, named by workspace paths such as ``"planner"`` or ``"example.controller"``.
+    """In-place copies of Python objects, named by workspace paths such as ``"name"`` or ``"example.attr"``.
 
     The snapshot keeps every object it saved, the bindings of their attributes
     (and of list items and dictionary entries), and copies of their Warp and
@@ -400,7 +403,7 @@ class ObjectSnapshot:
         parts = path.split(".")
         if not parts or not all(part.isidentifier() for part in parts):
             raise ValueError(
-                f"include names workspace variables or attribute paths, e.g. 'example.controller'; got {path!r}"
+                f"include names workspace variables or attribute paths, e.g. 'name' or 'example.attr'; got {path!r}"
             )
         if parts[0] not in namespace:
             raise KeyError(f"include: the workspace has no variable {parts[0]!r}")
@@ -556,180 +559,97 @@ def _structure_key(model: Model) -> str:
     return digest.hexdigest()
 
 
-def _callable_key(fn: Any) -> tuple:
-    """Identity of a solver or pipeline factory that survives redefining the same function in a later cell."""
+def _value_key(value: Any, depth: int = 0) -> str:
+    """Text that changes when a plain value changes; objects without plain contents are keyed by identity."""
+    if depth > 6:
+        return f"<{type(value).__qualname__} {id(value)}>"
+    if value is None or isinstance(value, (bool, int, float, complex, str, bytes, Enum, np.generic)):
+        return repr(value)
+    if isinstance(value, np.ndarray):
+        digest = hashlib.sha1(np.ascontiguousarray(value).tobytes()).hexdigest()
+        return f"ndarray({value.dtype.str}, {value.shape}, {digest})"
+    if isinstance(value, (list, tuple)):
+        return f"{type(value).__name__}[{', '.join(_value_key(item, depth + 1) for item in value)}]"
+    if isinstance(value, (set, frozenset)):
+        return f"{type(value).__name__}[{', '.join(sorted(_value_key(item, depth + 1) for item in value))}]"
+    if isinstance(value, dict):
+        items = (f"{_value_key(key, depth + 1)}: {_value_key(item, depth + 1)}" for key, item in value.items())
+        return "{" + ", ".join(items) + "}"
+    if isinstance(value, types.ModuleType):
+        return f"<module {value.__name__}>"
+    if isinstance(value, type):
+        return f"<class {value.__module__}.{value.__qualname__} {id(value)}>"
+    if isinstance(value, (types.FunctionType, types.MethodType, functools.partial)):
+        return repr(_callable_key(value, depth + 1))
+    if isinstance(value, (wp.array, Model, State, Control, Contacts, ModelBuilder, SolverBase, CollisionPipeline)):
+        return f"<{type(value).__qualname__} {id(value)}>"
+    if hasattr(value, "__dict__") and not callable(value) and _replayable(value):
+        # Option objects of plain values (e.g. a solver's config dataclass) by their contents.
+        return f"{type(value).__qualname__}{_value_key(vars(value), depth + 1)}"
+    return f"<{type(value).__qualname__} {id(value)}>"
+
+
+def _global_names(code: types.CodeType) -> set[str]:
+    """Global names a function's code (and the functions defined in it) can read."""
+    names, stack = set(), [code]
+    while stack:
+        current = stack.pop()
+        names.update(current.co_names)
+        stack.extend(const for const in current.co_consts if isinstance(const, types.CodeType))
+    return names
+
+
+def _callable_key(fn: Any, depth: int = 0) -> tuple:
+    """Identity of a solver or pipeline factory that survives redefining the same function in a later cell.
+
+    Functions are keyed by their code, closure values, defaults, and the values of the globals they read (plain
+    data by value, functions by their own keys, other objects by identity), so changing a global such as a
+    script's ``PARAMS`` gives a new key.
+    """
     if isinstance(fn, _Call):
         return fn.key()
     if isinstance(fn, type):
         return ("class", fn.__module__, fn.__qualname__, id(fn))
     if isinstance(fn, functools.partial):
-        return ("partial", _callable_key(fn.func), repr(fn.args), repr(sorted(fn.keywords.items())))
+        return (
+            "partial",
+            _callable_key(fn.func, depth + 1),
+            _value_key(fn.args, depth + 1),
+            _value_key(fn.keywords, depth + 1),
+        )
     code = getattr(fn, "__code__", None)
-    if code is None:
+    if code is None or depth > 4:
         return ("object", id(fn))
-    cells = tuple(repr(cell.cell_contents) for cell in (getattr(fn, "__closure__", None) or ()))
-    return ("code", code.co_code, repr(code.co_consts), repr(code.co_names), cells, repr(fn.__defaults__))
+    cells = []
+    for cell in getattr(fn, "__closure__", None) or ():
+        try:
+            cells.append(_value_key(cell.cell_contents, depth + 1))
+        except ValueError:  # an empty cell
+            cells.append("<empty>")
+    namespace = getattr(fn, "__globals__", None) or {}
+    read = [
+        f"{name}={_value_key(namespace[name], depth + 1)}"
+        for name in sorted(_global_names(code))
+        if name in namespace and namespace[name] is not fn
+    ]
+    bound = getattr(fn, "__self__", None)
+    return (
+        "code",
+        code.co_code,
+        repr(code.co_consts),
+        repr(code.co_names),
+        tuple(cells),
+        _value_key(getattr(fn, "__defaults__", None), depth + 1),
+        _value_key(getattr(fn, "__kwdefaults__", None), depth + 1),
+        hashlib.sha1("\n".join(read).encode()).hexdigest(),
+        None if bound is None or isinstance(bound, types.ModuleType) else _value_key(bound, depth + 1),
+    )
 
 
 def _label(fn: Any) -> str:
     if isinstance(fn, _Call):
         return fn.label()
     return getattr(fn, "__qualname__", None) or type(fn).__name__
-
-
-def _control_arrays(control: Control) -> dict[str, wp.array]:
-    return {name: array for name, array in WorldView._state_arrays(control).items() if array.size}
-
-
-def _copy_control(rollout: BatchRollout, control: Control, model: Model) -> None:
-    """Copy the one-world ``control`` of ``model`` into every world of the rollout's control."""
-    view = rollout.view
-    source_view = view._source_view(model)
-    targets = _control_arrays(rollout.control)
-    for name, array in _control_arrays(control).items():
-        destination = targets.get(name)
-        if destination is None:
-            continue
-        try:
-            frequency = view._resolve(name)[1]
-            dst_rows = view._rows(name, frequency, None, None)
-            src_rows = source_view._rows(name, frequency, None, [0])
-        except (KeyError, ValueError):
-            continue
-        if src_rows.shape[1] != dst_rows.shape[1]:
-            continue
-        view._copy_rows(
-            array,
-            view._device_index(np.tile(src_rows[0], dst_rows.shape[0])),
-            destination,
-            view._device_index(dst_rows),
-        )
-
-
-@wp.kernel(enable_backward=False)
-def _differs_u32(
-    a: wp.array2d[wp.uint32],
-    a_rows: wp.array[wp.int32],
-    b: wp.array2d[wp.uint32],
-    b_rows: wp.array[wp.int32],
-    slot: int,
-    flags: wp.array[wp.int32],
-):
-    i, j = wp.tid()
-    if a[a_rows[i], j] != b[b_rows[i], j]:
-        flags[slot] = 1
-
-
-@wp.kernel(enable_backward=False)
-def _differs_u8(
-    a: wp.array2d[wp.uint8],
-    a_rows: wp.array[wp.int32],
-    b: wp.array2d[wp.uint8],
-    b_rows: wp.array[wp.int32],
-    slot: int,
-    flags: wp.array[wp.int32],
-):
-    i, j = wp.tid()
-    if a[a_rows[i], j] != b[b_rows[i], j]:
-        flags[slot] = 1
-
-
-class _ValueSync:
-    """Copies the live model's values into every world of a warm rollout.
-
-    The comparison of the live values with world 0 of the rollout is planned
-    once per pair of models and runs on the device (one flag per attribute,
-    one host read), so a call whose values did not change costs a few kernel
-    launches.
-    """
-
-    def __init__(self, rollout: BatchRollout, live: Model):
-        self.rollout, self.live = rollout, live
-        self.target_view, self.live_view = WorldView(rollout.model), WorldView(live)
-        self.entries: list[tuple] = []
-        self.problem: str | None = None
-        target_arrays = _model_arrays(rollout.model)
-        for name, array in _model_arrays(live).items():
-            destination = target_arrays.get(name)
-            if destination is None or not array.size or not destination.size or destination.dtype != array.dtype:
-                continue
-            try:
-                frequency = Frequency.WORLD if name == "gravity" else live.get_attribute_frequency(name)
-            except (KeyError, AttributeError):
-                continue
-            if frequency == Frequency.ONCE:
-                if destination.shape == array.shape:
-                    rows = np.arange(array.shape[0])
-                    self._add(name, frequency, array, rows, destination, rows)
-                continue
-            if not _is_value_attribute(self.target_view, name, frequency, destination):
-                continue
-            try:
-                live_rows = self.live_view._rows(name, frequency, None, [0])[0]
-                target_rows = self.target_view._rows(name, frequency, None, [0])[0]
-            except (KeyError, ValueError):
-                continue
-            if live_rows.shape != target_rows.shape:
-                self.problem = f"{name} has {live_rows.size} rows in the live scene, {target_rows.size} per world"
-                return
-            self._add(name, frequency, array, live_rows, destination, target_rows)
-        self.flags = wp.zeros(max(len(self.entries), 1), dtype=wp.int32, device=rollout.device)
-
-    def _add(self, name, frequency, live, live_rows, target, target_rows) -> None:
-        live_words, target_words = _row_words(live), _row_words(target)
-        index = self.target_view._device_index
-        self.entries.append(
-            (name, frequency, live, live_words, index(live_rows), live_rows, target, target_words, index(target_rows))
-        )
-
-    def changed(self) -> list[tuple]:
-        """Entries whose live values differ from world 0 of the rollout."""
-        if not self.entries:
-            return []
-        self.flags.zero_()
-        for slot, (_, _, _, live_words, live_index, _, _, target_words, target_index) in enumerate(self.entries):
-            wp.launch(
-                _differs_u32 if live_words.dtype == wp.uint32 else _differs_u8,
-                dim=(live_index.shape[0], live_words.shape[1]),
-                inputs=[live_words, live_index, target_words, target_index, slot],
-                outputs=[self.flags],
-                device=self.rollout.device,
-            )
-        flags = self.flags.numpy()
-        return [entry for entry, flag in zip(self.entries, flags, strict=False) if flag]
-
-    def apply(self) -> tuple[list[str], str | None]:
-        """Copy changed values into every world and notify the solver.
-
-        Returns:
-            The copied attributes, or the reason the rollout must be built
-            again (a changed value that its solver reads only when it is
-            constructed or shares across worlds).
-        """
-        if self.problem is not None:
-            return [], self.problem
-        rollout, target = self.rollout, self.rollout.model
-        unread = getattr(rollout.solver, "_UNREAD_ATTRIBUTES", {})
-        writes = []
-        for name, frequency, live, _, _, live_rows, _, _, _ in self.changed():
-            if frequency == Frequency.ONCE:
-                return [], f"{name} differs (one value for all worlds of a model)"
-            notify = True
-            try:
-                rollout.solver.check_world_values(name, self.target_view.get_indices(name).ravel())
-            except ValueError as error:
-                if name not in unread:
-                    return [], f"{name} differs ({error})"
-                notify = False
-            writes.append((name, live.numpy()[live_rows], notify))
-        flags = 0
-        for name, values, notify in writes:
-            self.target_view.set_attribute(name, target, np.broadcast_to(values, (target.world_count, *values.shape)))
-            if notify:
-                flags |= int(ModelFlags.from_attributes(name))
-        if flags:
-            rollout.solver.notify_model_changed(flags)
-        return [name for name, _, _ in writes], None
 
 
 def _user(fn: Callable | None) -> Callable | None:
@@ -876,13 +796,24 @@ def _facts_text(kind: str, facts: dict[str, Any]) -> str:
         )
     else:
         model = facts["model"]
-        lines.append(
-            f"model: {facts['world_count']} world(s), {model}; solver {facts['solver']}; collision {facts['collision']}"
-        )
-        if facts.get("copied"):
-            names = facts["copied"]
-            shown = ", ".join(names[:8]) + (f", +{len(names) - 8} more" if len(names) > 8 else "")
-            lines.append(f"live model values copied into the worlds: {shown}")
+        if model.startswith("parent"):
+            lines.append(
+                f"models: one per distinct build (build=), up to {facts['batch_worlds']} world(s) each; solver "
+                f"{facts['solver']}; collision {facts['collision']}"
+            )
+        else:
+            lines.append(
+                f"model: {facts['world_count']} world(s), {model}; solver {facts['solver']}; "
+                f"collision {facts['collision']}"
+            )
+        for key, text in (
+            ("copied", "live model values copied into the worlds"),
+            ("separate_copied", "live model values copied into kept separate models"),
+        ):
+            names = facts.get(key)
+            if names:
+                shown = ", ".join(names[:8]) + (f", +{len(names) - 8} more" if len(names) > 8 else "")
+                lines.append(f"{text}: {shown}")
         if facts.get("siblings"):
             lines.append(
                 f"separate models built in this call: {facts['siblings']} ({_seconds(facts['sibling_seconds'])})"
@@ -925,12 +856,21 @@ class _LiveWorld:
         self._view.set_attribute(name, session.model, np.asarray(value)[None], labels=labels, solver=session.solver)
 
     def set_state(self, name: str, value: Any, labels: Any = None) -> None:
+        """Write start-state values; joint coordinates and body states of the written articulations stay consistent
+        (as in :meth:`newton.utils.BatchRollout.set_state`)."""
         session = self._session
-        self._view.set_attribute(name, session.state, np.asarray(value)[None], labels=labels)
-        if name.replace(".", ":", 1) in ("joint_q", "joint_qd") and session.model.joint_count:
-            eval_fk(session.model, session.state.joint_q, session.state.joint_qd, session.state)
-        session.solver.reset(session.state, flags=StateFlags.NONE)
-        session.state_next.assign(session.state)
+        model, state = session.model, session.state
+        self._view.set_attribute(name, state, np.asarray(value)[None], labels=labels)
+        name = name.replace(".", ":", 1)
+        if name in _JOINT_STATE or name in _BODY_STATE:
+            articulations = _row_articulations(model, name, self._view.get_indices(name, labels))
+            if articulations.size:
+                mask = _articulation_mask(model, articulations)
+                if name in _BODY_STATE:
+                    eval_ik(model, state, state.joint_q, state.joint_qd, mask=mask)
+                eval_fk(model, state.joint_q, state.joint_qd, state, mask=mask)
+        session.solver.reset(state, flags=StateFlags.NONE)
+        session.state_next.assign(state)
 
     def set_control(self, name: str, value: Any, labels: Any = None) -> None:
         session = self._session
@@ -996,7 +936,14 @@ class LiveBatches:
             pipeline = None
         return source, solver, pipeline
 
-    def _rollout(self, needed: int, worlds: int | None, solver, pipeline, dt, substeps) -> tuple[BatchRollout, dict]:
+    def _rollout(
+        self, needed: int, worlds: int | None, solver, pipeline, dt, substeps, *, parent_only: bool = False
+    ) -> tuple[BatchRollout, dict]:
+        """The kept N-world model for a call, synchronized with the live values, and facts about it.
+
+        With ``parent_only`` (``build=``, where every case runs in a model of its candidate's build), any kept model
+        of the scene serves as the parent of those models; without one, a one-world model is built.
+        """
         session = self._session()
         source, solver, pipeline = self._source(solver, pipeline)
         dt = float(dt) if dt is not None else source.dt
@@ -1019,7 +966,14 @@ class LiveBatches:
             "solver": _label(solver),
             "collision": _label(pipeline) if pipeline else "none",
             "cuda": live.device.is_cuda,
+            "batch_worlds": world_count,
         }
+        if parent_only:
+            for (cached_key, _), rollout in reversed(self._cache.items()):
+                if cached_key == key:
+                    facts.update(model="parent", world_count=rollout.world_count, copied=[])
+                    return rollout, facts
+            world_count = 1
         candidate = None
         for (cached_key, cached_worlds), rollout in reversed(self._cache.items()):
             if cached_key != key:
@@ -1032,7 +986,7 @@ class LiveBatches:
         if candidate is not None:
             cache_key, rollout = candidate
             sync = self._syncs.get(id(rollout))
-            if sync is None or sync.rollout is not rollout or sync.live is not live:
+            if sync is None or sync.rollout is not rollout or sync.source is not live:
                 sync = self._syncs[id(rollout)] = _ValueSync(rollout, live)
             with session.watch.muted():
                 copied, reason = sync.apply()
@@ -1066,6 +1020,8 @@ class LiveBatches:
         facts.update(
             model=f"built in {_seconds(seconds)} ({reason})", world_count=world_count, copied=rollout.copied_attributes
         )
+        if parent_only:
+            facts["model"] = "parent " + facts["model"]
         return rollout, facts
 
     _KEY_PARTS = (
@@ -1159,6 +1115,8 @@ class LiveBatches:
         facts.update(captures=captures, warmup_seconds=warmup, seconds=time.perf_counter() - started)
         if siblings:
             facts.update(siblings=siblings, sibling_seconds=sibling_seconds)
+        if rollout._stats.get("synced"):
+            facts["separate_copied"] = list(rollout._stats["synced"])
 
     def _run(self, rollout: BatchRollout, call: Callable[[], Any]) -> Any:
         try:
@@ -1197,31 +1155,36 @@ class LiveBatches:
     ) -> LiveEvaluation:
         started = time.perf_counter()
         count = len(candidates) * (1 if scenarios is None else len(scenarios))
-        rollout, facts = self._rollout(count, worlds, solver, pipeline, dt, substeps)
+        parent_only = build is not None
+        rollout, facts = self._rollout(count, worlds, solver, pipeline, dt, substeps, parent_only=parent_only)
         frames = _frames(frames, seconds, rollout.frame_dt)
         state, control_values, label, _, _ = self._start(start)
         session = self._session()
-        _copy_control(rollout, control_values, session.model)
         before = self._stats(rollout)
-        evaluation = self._run(
-            rollout,
-            lambda: rollout.evaluate(
-                candidates,
-                scenarios,
-                frames=frames,
-                score=_user(score),
-                setup=_user(setup),
-                control=control,
-                record=record,
-                every=every,
-                passed=_user(passed),
-                worst=worst,
-                build=_user(build),
-                initial_state=state,
-                initial_model=session.model,
-                initial_world=0,
-            ),
-        )
+        rollout._separate_worlds = facts["batch_worlds"] if parent_only else None
+        try:
+            evaluation = self._run(
+                rollout,
+                lambda: rollout.evaluate(
+                    candidates,
+                    scenarios,
+                    frames=frames,
+                    score=_user(score),
+                    setup=_user(setup),
+                    control=control,
+                    record=record,
+                    every=every,
+                    passed=_user(passed),
+                    worst=worst,
+                    build=_user(build),
+                    initial_state=state,
+                    initial_control=control_values,
+                    initial_model=session.model,
+                    initial_world=0,
+                ),
+            )
+        finally:
+            rollout._separate_worlds = None
         facts.update(start=label, frames=frames, cases=count)
         self._timing(rollout, before, facts, started)
         return LiveEvaluation(evaluation, facts)
@@ -1262,7 +1225,6 @@ class LiveBatches:
         frames = _frames(frames, seconds, rollout.frame_dt)
         state, control_values, label, start_time, _ = self._start(start)
         session = self._session()
-        _copy_control(rollout, control_values, session.model)
         captured: dict[int, dict[str, np.ndarray]] = {}
 
         def keep(records, cases):
@@ -1284,12 +1246,15 @@ class LiveBatches:
                 record=record,
                 every=every,
                 initial_state=state,
+                initial_control=control_values,
                 initial_model=session.model,
                 initial_world=0,
             ),
         )
         records = {name: np.stack([captured[i][name] for i in range(n)], axis=1) for name in (captured[0] if n else {})}
-        times = start_time + rollout.record_time
+        # Variants may run in separate models, so the times follow from the records, not from one rollout.
+        rows = next(iter(records.values())).shape[0] if records else frames // every + 1
+        times = start_time + np.arange(rows) * every * rollout.frame_dt
         facts.update(start=label, frames=frames, cases=n)
         self._timing(rollout, before, facts, started)
         metrics = self._score(score, records, n)

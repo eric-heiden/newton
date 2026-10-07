@@ -64,6 +64,16 @@ class TestMcp(unittest.TestCase):
         result = session.dispatch("observe", {"eye": [0, -3, 1], "target": [0, 0, 1], "width": 32, "height": 32})
         self.assertTrue(base64.b64decode(result["image_base64"]).startswith(b"\x89PNG\r\n\x1a\n"))
 
+    def test_collide_runs_speculative_pipelines(self):
+        """The collide operation passes the session step to a pipeline with speculative contacts."""
+        model = self.session.model
+        pipeline = newton.CollisionPipeline(model, speculative_contact_gap_max=0.01)
+        session = SimulationSession(
+            model, SolverXPBD(model), collision_pipeline=pipeline, artifact_directory=self.directory.name
+        )
+        self.addCleanup(session.close)
+        self.assertEqual(session.dispatch("collide")["source"], "collision_pipeline")
+
     def test_live_edit_affects_dynamics_and_reset(self):
         """Change live gravity in place and restore the state, keeping tuning and control no step wrote."""
         session = self.session

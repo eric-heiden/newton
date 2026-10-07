@@ -579,9 +579,9 @@ NEWTON_DOCS = (
     "docs/concepts/batched_evaluation.rst",
     ("newton.utils.BatchRollout", "newton.utils.compare_trajectories"),
     "Newton docs: docs/concepts/batched_evaluation.rst describes newton.utils.BatchRollout, which runs variants of "
-    "one scene (candidates, scenarios, negative controls, branches from a saved state) as the worlds of one model and "
-    "tabulates per-case metrics, and newton.utils.compare_trajectories, which reports per-signal errors between "
-    "trajectories such as a log and a replay.",
+    "one scene (candidates x scenarios, branches from a saved state) as the worlds of one model and tabulates "
+    "per-case metrics, and newton.utils.compare_trajectories, which reports per-signal errors between named time "
+    "series.",
 )
 
 

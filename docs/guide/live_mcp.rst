@@ -309,11 +309,9 @@ points outside the MCP. In Python cells, ``intrinsics`` may also be a
 such as one camera's entry of a ``camera.json`` file with ``K`` (3x3, row
 major), ``D`` (OpenCV coefficient order), ``width``, ``height`` and
 ``distortion_model``, is read by
-:meth:`~newton.sensors.SensorCamera.Intrinsics.from_dict`;
-its ``position`` and ``rotation_xyzw`` place the camera when no ``eye``,
-``pose``, ``view`` or ``camera_body`` is given. ``pose`` also accepts
-``{"position": [...], "rotation_xyzw": [...]}``. A calibrated camera renders at
-its calibration size unless ``width``/``height`` are given.
+:meth:`~newton.sensors.SensorCamera.Intrinsics.from_dict`, which ignores other
+keys. A calibrated camera renders at its calibration size unless
+``width``/``height`` are given.
 
 Persistent Python workspace
 ---------------------------
@@ -471,15 +469,21 @@ multiplied by the world count. ``solver=``, ``pipeline=``, ``dt=``, and
 
 - Every world starts from ``start``: the live state (default), ``"initial"``
   (the state after the scene was built), or a checkpoint, with the live (or
-  saved) control values. ``example.step()`` does not run in the worlds;
-  ``control`` (schedules and Warp control functions) and per-world setups
-  drive them. The live session does not change.
+  saved) control values, also in separate models. ``example.step()`` does not
+  run in the worlds; ``control`` (schedules and Warp control functions) and
+  per-world setups drive them. The live session does not change.
 - The N-world model, its solver, and its CUDA graphs are kept for later
   calls (two models per session), also across ``newton_rebuild`` when the
   rebuilt scene has the same structure and integer attributes, solver
   arguments, and steps. Before each call the live model's values that differ
-  from the copies are written into every world and notified; a differing value
-  the copies' solver reads only when it is constructed builds a new model.
+  from any world of the copies are written into every world and notified, and
+  kept separate models receive them too (except their own shared values); a
+  differing value the copies' solver reads only when it is constructed builds
+  a new model. A ``solver=`` or ``pipeline=`` function is identified by its
+  code, closure values, defaults, and the values of the globals it reads
+  (plain data by value, other objects by identity). With ``build=``, every
+  case runs in a model of its candidate's build; no N-world copy of the
+  hosted scene is built for such a call.
 - Results are returned with facts: the start, whether the model was reused or
   built (and why), the live values copied, and the wall time with the CUDA
   graph capture and kernel loading of new graphs. A cell whose value is an
@@ -497,7 +501,7 @@ methods of :class:`newton.utils.BatchRollout.WorldSetup` except schedules) or
 Python objects, and its model edits and those of stepping are undone after the
 variant. Records then also accept functions ``fn()`` returning values.
 
-``checkpoint(name, include=["example.controller", ...])`` saves Python
+``checkpoint(name, include=["name", "example.attr", ...])`` saves Python
 objects with the state, for example a controller with its warm start. The
 paths name workspace variables or their attributes. The snapshot copies their
 Warp and NumPy arrays and remembers the bindings of their attributes, list

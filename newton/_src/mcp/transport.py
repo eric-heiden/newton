@@ -30,6 +30,18 @@ def _encode(value: Any, maximum: int) -> bytes:
     return data
 
 
+def _without_images(result: Any) -> Any:
+    """A result with its images dropped and a note saying so, for a response that exceeds the transport limit."""
+    if not isinstance(result, dict):
+        return result
+    result = dict(result)
+    count = len(result.pop("images", None) or []) + int(result.pop("image_base64", None) is not None)
+    result.pop("mime_type", None)
+    note = f"{count} image(s) were dropped: the response exceeded {_MAX_RESPONSE} bytes."
+    result["note"] = f"{result['note']}\n{note}" if result.get("note") else note
+    return result
+
+
 def _read(stream: Any, maximum: int) -> dict:
     line = stream.readline(maximum + 1)
     if not line:
@@ -118,7 +130,11 @@ class SimulationServer:
                 finally:
                     with server._pending_lock:
                         server._pending.discard(request)
-                encoded = _encode(response, _MAX_RESPONSE)
+                try:
+                    encoded = _encode(response, _MAX_RESPONSE)
+                except ValueError:
+                    # The call ran; its text (and finished background results) must still reach the client.
+                    encoded = _encode({"result": _without_images(response["result"])}, _MAX_RESPONSE)
             except Exception as error:
                 message = str(error)[:32768]
                 status = getattr(error, "newton_status", None)

@@ -119,14 +119,42 @@ _HELPERS = textwrap.dedent(
 )
 
 
+# A MuJoCo scene: a puck on a floor and a position-driven hinge arm (the scene of test_batch_rollout).
+_MUJOCO_SCRIPT = textwrap.dedent(
+    """
+    import newton
+    from newton.tests.test_batch_rollout import _puck
+
+    DEVICE = None
+
+
+    class Example:
+        def __init__(self, viewer, args):
+            self.model = _puck(mujoco=True).finalize(device=DEVICE)
+            self.solver = newton.solvers.SolverMuJoCo(self.model)
+            self.state_0, self.state_1 = self.model.state(), self.model.state()
+            self.control = self.model.control()
+            self.contacts = None
+            self.frame_dt = 1.0 / 60.0
+            self.sim_dt = self.frame_dt / 4
+
+        def step(self):
+            for _ in range(4):
+                self.state_0.clear_forces()
+                self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
+                self.state_0, self.state_1 = self.state_1, self.state_0
+    """
+)
+
+
 class _Hosted:
     """A hosted copy of the test script with ``overrides`` (a new directory per instance)."""
 
-    def __init__(self, test, device, overrides=None):
+    def __init__(self, test, device, overrides=None, script=_SCRIPT):
         self.directory = tempfile.TemporaryDirectory()
         test.addCleanup(self.directory.cleanup)
         self.script = Path(self.directory.name) / "puck.py"
-        self.script.write_text(_SCRIPT)
+        self.script.write_text(script)
         self.host = ExampleHost(self.script, overrides={"DEVICE": str(device), **(overrides or {})})
         self.session = self.host.session(artifact_directory=self.directory.name)
         test.addCleanup(self.session.close)
@@ -356,6 +384,126 @@ def test_cells_can_bind_helper_names(test, device):
     test.assertIn("first use", facts["model"])
     hosted.execute("del evaluate")
     test.assertIn("evaluate: 1 case(s)", hosted.value("evaluate([1], None, frames=1, score=score, record=PUCK)"))
+
+
+def test_kept_worlds_start_from_the_live_values(test, device):
+    """Overlapping per-case edits leave no trace, and every world of the kept model is compared with the live one."""
+    hosted = _Hosted(test, device, {"GAIN": 0.0})
+    hosted.execute(
+        "def edit(w, c, s):\n"
+        "    if c == 'puck':\n"
+        "        w.set_model('shape_material_mu', 2.0, labels='puck_geom')\n"
+        "    elif c == 'all':\n"
+        "        w.set_model('shape_material_mu', 0.1)\n"
+        "    w.set_state('joint_qd', [2.0, 0, 0, 0, 0, 0], labels='puck*')\n"
+        "push = lambda w, c, s: w.set_state('joint_qd', [2.0, 0, 0, 0, 0, 0], labels='puck*')\n"
+        "evaluate(['none', 'puck', 'all'], None, frames=20, setup=edit, score=score, record=PUCK)"
+    )
+    same = "[r['slide'] for r in evaluate(['a', 'b', 'c'], None, frames=20, setup=push, score=score, record=PUCK).rows]"
+    slides = hosted.value(same)
+    test.assertAlmostEqual(slides[1], slides[0], places=6)
+    test.assertAlmostEqual(slides[2], slides[0], places=6)
+    # A world of the kept model that differs from the live values (here written directly) is repaired.
+    hosted.execute(
+        "kept = next(reversed(session._batches._cache.values()))\n"
+        "kept.view.set_attribute('shape_material_mu', kept.model, [[2.0]], labels='puck_geom', worlds=[2])"
+    )
+    facts = hosted.value("evaluate(['a', 'b', 'c'], None, frames=20, setup=push, score=score, record=PUCK).facts")
+    test.assertIn("shape_material_mu", facts["copied"])
+    test.assertEqual(hosted.value(same), slides)
+
+
+def test_solver_functions_are_keyed_by_the_globals_they_read(test, device):
+    hosted = _Hosted(test, device, {"GAIN": 0.0})
+    hosted.execute(
+        "ITERATIONS = 1\nSETTINGS = {'iterations': 2}\n"
+        "def make(model):\n    return newton.solvers.SolverXPBD(model, iterations=ITERATIONS)\n"
+        "def make_from_settings(model):\n    return newton.solvers.SolverXPBD(model, **SETTINGS)\n"
+        "one = lambda solver: evaluate([0], None, frames=1, score=lambda r, c: {'n': [0]}, solver=solver)"
+    )
+    for name, change in (("make", "ITERATIONS = 5"), ("make_from_settings", "SETTINGS['iterations'] = 5")):
+        hosted.value(f"one({name}).facts['model']")
+        test.assertEqual(hosted.value(f"one({name}).facts['model']"), "reused")
+        hosted.execute(change)
+        test.assertIn("the solver changed", hosted.value(f"one({name}).facts['model']"))
+        test.assertEqual(hosted.value("next(reversed(session._batches._cache.values())).solver.iterations"), 5)
+
+
+def test_build_runs_without_a_copy_of_the_scene(test, device):
+    hosted = _Hosted(test, device, {"GAIN": 0.0})
+    hosted.execute(
+        "def sized(size):\n"
+        "    b = newton.ModelBuilder()\n"
+        "    b.add_ground_plane(label='floor')\n"
+        "    puck = b.add_body(xform=wp.transform((0.0, 0.0, size), wp.quat_identity()), label='puck')\n"
+        "    b.add_shape_box(puck, hx=size, hy=size, hz=size, label='puck_geom')\n"
+        "    return b\n"
+        "e = evaluate([0.04, 0.06], list(range(6)), frames=2, score=lambda r, c: {'n': [0] * len(c)}, build=sized)"
+    )
+    test.assertEqual(hosted.value("[b['world_count'] for b in e.batches]"), [6, 6])
+    test.assertEqual(hosted.value("[r.world_count for r in session._batches._cache.values()]"), [1])
+    test.assertIn("models: one per distinct build (build=), up to 12 world(s) each", hosted.value("e.format()"))
+    # A kept model of the scene serves later build= calls as it is.
+    hosted.execute("evaluate([0], [1, 2], frames=1, score=score, record=PUCK)")
+    test.assertEqual(
+        hosted.value(
+            "e2 = evaluate([0.04], [0], frames=1, score=lambda r, c: {'n': [0]}, build=sized)\ne2.facts['model']"
+        ),
+        "parent",
+    )
+
+
+def test_separate_models_get_the_live_values_and_control(test, device):
+    """Cases in separate models start with the live control and follow later live edits; branch times fit."""
+    hosted = _Hosted(test, device, script=_MUJOCO_SCRIPT)
+    hosted.execute(
+        "hinge = model.find_joints('hinge')\n"
+        "target = control.joint_target_q.numpy()\n"
+        "target[model.joint_q_start.numpy()[hinge[0]]] = 1.0\n"
+        "control.joint_target_q.assign(target)\n"
+        "def setup(w, c, s):\n"
+        "    w.set_state('joint_qd', [2.0, 0, 0, 0, 0, 0], labels='puck*')\n"
+        "    if c == 'separate':\n"
+        "        w.set_model('mujoco:condim', 4, labels=['puck_geom', 'floor'])\n"
+        "def arm_score(r, c):\n"
+        "    x = r['puck'][:, :, 0, 0]\n"
+        "    return {'arm': r['arm'][-1, :, 0], 'slide': x[-1] - x[0]}\n"
+        "REC = {'arm': ('joint_q', 'hinge'), 'puck': ('body_q', 'puck')}\n"
+        "call = lambda: {r['candidate']: r for r in evaluate({'same': 'same', 'separate': 'separate'}, None, frames=40, "
+        "setup=setup, score=arm_score, record=REC).rows}"
+    )
+    rows = hosted.value("call()")
+    test.assertGreater(rows["same"]["arm"], 0.3)
+    test.assertAlmostEqual(rows["separate"]["arm"], rows["same"]["arm"], places=4)
+    # A live friction edit reaches the kept separate model.
+    result = hosted.value(
+        "model.shape_material_mu.fill_(0.05)\nsolver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)\n"
+        "e = evaluate({'same': 'same', 'separate': 'separate'}, None, frames=40, setup=setup, score=arm_score, record=REC)\ne"
+    )
+    test.assertIn("live model values copied into kept separate models: shape_material_mu", result)
+    slides = hosted.value("{r['candidate']: r['slide'] for r in e.rows}")
+    test.assertGreater(slides["same"], 1.5 * rows["same"]["slide"])
+    test.assertAlmostEqual(slides["separate"], slides["same"], delta=0.01)
+
+    # Branch times follow the records of the model the variants ran in.
+    hosted.execute("b1 = branch(2, frames=10, every=5, record=REC)")
+    times = hosted.value(
+        "b2 = branch(2, lambda w, i: w.set_model('mujoco:condim', 4, labels='puck_geom'), frames=40, every=10, "
+        "record=REC)\nb2.t.tolist()"
+    )
+    test.assertEqual(hosted.value("b2.records['puck'].shape[0]"), len(times))
+    np.testing.assert_allclose(times, np.arange(5) * 10.0 / 60.0, atol=1e-9)
+
+    # Sequential variants: a body pose edit moves the body for the joint-coordinate solver too.
+    x = hosted.value(
+        "def shift(w, i):\n"
+        "    q = w.get_state('body_q', 'puck')\n"
+        "    q[0, 0] += 0.5 * i\n"
+        "    w.set_state('body_q', q, labels='puck')\n"
+        "s = branch(2, shift, frames=3, sequential=True, record={'puck': ('body_q', 'puck')})\n"
+        "s.records['puck'][-1, :, 0, 0].tolist()"
+    )
+    test.assertAlmostEqual(x[1] - x[0], 0.5, places=3)
 
 
 class TestMcpBatch(unittest.TestCase):

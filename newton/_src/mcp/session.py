@@ -505,6 +505,7 @@ class SimulationSession:
         self._call_count = 0
         self._running_request = None
         self._finished_calls: list[dict] = []
+        self._dispatch_depth = 0
         self.cell_assigned: frozenset[str] = frozenset()
         """Attribute names the running cell assigns (``x.name = ...``, ``x.name[i] = ...``), e.g. to skip notes
         about changes the cell made itself."""
@@ -998,7 +999,16 @@ class SimulationSession:
             raise RuntimeError(self._invalid_message())
         if self._requires_rebuild and operation in {"reset", "restore"}:
             raise RuntimeError(self._invalid_message())
-        return operations[operation](**args)
+        self._dispatch_depth += 1
+        try:
+            response = operations[operation](**args)
+        finally:
+            self._dispatch_depth -= 1
+        if operation in ("execute", "rebuild") or self._dispatch_depth:
+            return response
+        # Execute and rebuild add all background work themselves; other operations (not those a cell makes)
+        # carry finished calls.
+        return self._with_finished_calls(response)
 
     def _invalidate(self, *, requires_rebuild: bool = False) -> None:
         self.paused = True
@@ -1564,18 +1574,49 @@ class SimulationSession:
             }
         )
 
-    def _with_background(self, response: dict) -> dict:
-        """Add finished background work to a response; images of finished calls join its ``images``."""
-        report = self._background_report()
+    def _with_background(self, response: dict, report: dict | None = None) -> dict:
+        """Add finished background work to a response; images of finished calls join its ``images``.
+
+        The images of a response stay within :attr:`_SHOWN_BUDGET`, so it fits the transport. Images of finished
+        calls beyond it stay queued for a later response, which lists them under ``finished_calls`` again.
+        """
+        report = self._background_report() if report is None else report
         images = list(response.get("images") or [])
+        if "image_base64" in response:
+            images_room = self._SHOWN_BUDGET - len(response["image_base64"])
+        else:
+            images_room = self._SHOWN_BUDGET
+        room = images_room - sum(len(image.get("image_base64", "")) for image in images)
+        deferred = []
         for entry in report.get("finished_calls", []):
-            images += entry.pop("images", None) or []
+            pending = list(entry.pop("images", None) or [])
             if "image_base64" in entry:
-                images.append({"image_base64": entry.pop("image_base64"), "mime_type": entry.pop("mime_type", "")})
+                pending.append({"image_base64": entry.pop("image_base64"), "mime_type": entry.pop("mime_type", "")})
+            later = []
+            for image in pending:
+                size = len(image.get("image_base64", ""))
+                if not later and size <= room:
+                    images.append(image)
+                    room -= size
+                else:
+                    later.append(image)
+            if later:
+                entry["images_deferred"] = len(later)
+                deferred.append({"call": entry.get("call"), "operation": entry.get("operation"), "images": later})
+        if deferred:
+            self._finished_calls[:0] = deferred
         if images:
             response["images"] = images
         response.update(report)
         return response
+
+    def _with_finished_calls(self, response: dict) -> dict:
+        """Add the results of finished background calls to the response of any operation."""
+        if not self._finished_calls or not isinstance(response, dict):
+            return response
+        report = {"finished_calls": self._finished_calls}
+        self._finished_calls = []
+        return self._with_background(response, report)
 
     def _background_suffix(self) -> str:
         report = self._background_report()
@@ -1964,7 +2005,8 @@ class SimulationSession:
         return {**self._status(), "fields": [f"{root}.{field}" for root, field in prepared], "flags": notification}
 
     def _collide(self) -> dict:
-        self.collision_pipeline.collide(self.state, self.contacts)
+        # Pipelines with speculative contacts need the step they look ahead over.
+        self.collision_pipeline.collide(self.state, self.contacts, dt=self.dt)
         self._contact_frame = self.frame
         self._contact_revision = self.revision
         return {**self._status(), "source": "collision_pipeline"}
@@ -2257,8 +2299,8 @@ class SimulationSession:
         """Save the simulation state under ``name``, optionally with Python objects (trusted execution helper).
 
         The same as ``session.dispatch("checkpoint", ...)``. ``include`` names
-        workspace variables or attribute paths, such as ``"planner"`` or
-        ``"example.controller"``. Their Warp and NumPy arrays are copied, and
+        workspace variables or attribute paths, such as ``"name"`` or
+        ``"example.attr"``. Their Warp and NumPy arrays are copied, and
         their attribute bindings and the contents of their lists and
         dictionaries are remembered, four levels deep into objects of the
         hosted script, its helper modules, and cells (other objects, such as

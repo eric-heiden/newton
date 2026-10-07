@@ -6,18 +6,33 @@
 .. code-block:: console
 
     python -m newton.examples.headless SCRIPT [script args] [--frames N] [--call CODE]
-        [--json OUT] [--timeout S] [--render] [--class NAME] [--tail CHARS] [-- script args]
+        [--set NAME=VALUE ...] [--repeat K] [--json OUT] [--timeout S] [--progress S]
+        [--render] [--class NAME] [--tail CHARS] [-- script args]
 
 ``SCRIPT`` is a Python file that defines an ``Example(viewer, args)`` class, or
 the short name of a bundled example such as ``basic_pendulum``. A new Python
-process loads the script without running its ``__main__`` block, parses the
-script arguments with the script's own parser, constructs the example with a
-null viewer, and steps ``N`` frames (default: the script's ``--num-frames``).
+process loads the script without running its ``__main__`` block, assigns the
+``--set`` overrides, parses the script arguments with the script's own parser,
+constructs the example with a null viewer, and steps ``N`` frames (default: the
+script's ``--num-frames``).
 It then evaluates ``CODE`` (an expression, or statements ending in one) with
 ``example``, ``module``, ``args``, ``newton``, ``np``, and ``wp`` in scope.
 With ``--test`` among the script arguments, ``test_post_step()``,
 ``test_final()``, and the NaN checks run as in ``python -m newton.examples``
 (after ``CODE``). ``--render`` also calls ``example.render()`` after every step.
+
+``--set NAME=VALUE`` (repeatable) assigns a module global of the script after
+it is loaded and before its parser and example are created. ``NAME`` must exist;
+a dotted name such as ``Example.horizon`` or ``PARAMS.gain`` assigns an
+attribute or an existing dictionary key. ``VALUE`` is a Python literal
+(``0.002``, ``True``, ``[1, 2]``, ``'fast'``); any other text is a string. A
+NumPy array global receives an array of its dtype. Values the script computed
+from a global while loading keep the loaded value.
+
+``--repeat K`` runs the script ``K`` times, each in a new process, one after
+another; ``{run}`` in a ``--set`` value becomes the 0-based run index, e.g.
+``--set SEED={run}``. ``--progress S`` prints a progress line to stderr every
+``S`` seconds while a run is going (default 10; 0 turns them off).
 
 Runner options are recognized anywhere after ``SCRIPT``; arguments after ``--``
 always go to the script, for scripts that define options with the same names.
@@ -25,16 +40,21 @@ always go to the script, for scripts that define options with the same names.
 The JSON report (written to ``OUT``, or printed when ``--json`` is omitted)
 contains ``status`` (``ok``, ``error``, ``timeout``, ``crashed``, or
 ``cancelled``), the process ``exit_code`` and terminating ``signal``,
-``wall_seconds``, the last ``phase`` reached (``start``, ``load``, ``build``,
-``step``, ``call``, ``test``, or ``done``), the ``frames`` stepped, per-phase
-host ``seconds``, the example's ``sim_time``, the JSON-converted ``value`` of
-``CODE``, the ``exception`` with its traceback, the Python ``stack`` of every
-thread when a timeout stopped the process, and the last characters of
-``stdout`` and ``stderr``. In ``value``, non-finite floats become ``"nan"``,
+``wall_seconds`` of the process, the last ``phase`` reached (``start``,
+``load``, ``build``, ``step``, ``call``, ``test``, or ``done``), the ``frames``
+stepped, per-phase host ``seconds``, the example's ``sim_time``, the
+``realtime_factor`` (``sim_time`` over the seconds of the step phase), the
+``overrides`` assigned, the JSON-converted ``value`` of ``CODE``, the
+``exception`` with its traceback, the Python ``stack`` of every thread when a
+timeout stopped the process, and the last characters of ``stdout`` and
+``stderr``. With ``--repeat``, the report holds one such report per run in
+``runs``, the ``status`` of the first run that was not ``ok`` (or ``ok``), the
+``status_counts``, each run's ``values``, and the minimum, median, maximum, and
+total ``wall_seconds``. In ``value``, non-finite floats become ``"nan"``,
 ``"inf"``, or ``"-inf"``, and objects without a JSON form become their
 ``repr()``. A timeout kills the process and everything it started. The exit
 status is 0 for ``ok``, 124 for ``timeout``, 130 for ``cancelled``, and
-otherwise nonzero.
+otherwise nonzero; with ``--repeat``, that of the first run that was not ``ok``.
 """
 
 from __future__ import annotations
@@ -42,6 +62,7 @@ from __future__ import annotations
 import argparse
 import ast
 import dataclasses
+import difflib
 import enum
 import faulthandler
 import importlib
@@ -52,12 +73,14 @@ import mmap
 import os
 import re
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import traceback
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -72,6 +95,9 @@ _RUNNER_OPTIONS = {
     "--timeout": True,
     "--class": True,
     "--tail": True,
+    "--set": True,
+    "--repeat": True,
+    "--progress": True,
     "--render": False,
 }
 _PROGRESS_INTERVAL = 1.0
@@ -93,6 +119,8 @@ def run_headless(
     tail: int = 4000,
     echo: bool = False,
     cancel: threading.Event | None = None,
+    overrides: Mapping[str, Any] | None = None,
+    progress: float | None = None,
 ) -> dict[str, Any]:
     """Run an example script in a new Python process with a null viewer and report the outcome.
 
@@ -121,6 +149,13 @@ def run_headless(
         tail: Number of trailing characters of stdout and stderr to report.
         echo: Forward the process's stdout and stderr to this process while it runs.
         cancel: Event that stops the run and kills the process group when set.
+        overrides: Module globals of the script to assign after it is loaded
+            and before its parser and example are created, by name; dotted
+            names assign attributes or dictionary keys. Every name must exist,
+            and values must be Python literals (numbers, strings, booleans,
+            ``None``, and lists, tuples, sets, and dictionaries of them).
+        progress: Seconds between progress lines (phase, frames, ``sim_time``,
+            wall time) printed to stderr while the run is going; ``None`` prints none.
 
     Returns:
         The JSON-compatible report.
@@ -141,6 +176,14 @@ def run_headless(
         raise ValueError("call must be a string of Python code")
     if isinstance(tail, bool) or not isinstance(tail, int) or tail < 0:
         raise ValueError("tail must be a non-negative integer")
+    if progress is not None and (
+        isinstance(progress, bool)
+        or not isinstance(progress, int | float)
+        or not math.isfinite(progress)
+        or progress <= 0
+    ):
+        raise ValueError("progress must be a positive number of seconds or None")
+    assignments = _override_sources(overrides)
     with tempfile.TemporaryDirectory(prefix="newton-headless-") as temporary:
         directory = Path(temporary)
         spec = {
@@ -155,19 +198,60 @@ def run_headless(
             "progress": str(directory / "frames.bin"),
             "deadline": None if timeout is None else float(timeout) + _DEADLINE_GRACE,
             "parent": os.getpid(),
+            "overrides": assignments,
         }
         (directory / "spec.json").write_text(json.dumps(spec))
         (directory / "frames.bin").write_bytes(bytes(8))
         # -u: output written before a kill or crash still reaches the report.
         command = [sys.executable, "-u", "-m", "newton.examples.headless", "--child", str(directory / "spec.json")]
-        outcome = _supervise(command, directory, timeout=timeout, tail=tail, echo=echo, cancel=cancel)
+        outcome = _supervise(
+            command, directory, timeout=timeout, tail=tail, echo=echo, cancel=cancel, progress=progress
+        )
     return {
         "script": target.get("script") or target["module"],
         "argv": argv,
         "call": call,
         "timeout": timeout,
+        "overrides": {name: _to_json(ast.literal_eval(source)) for name, source in assignments},
         **outcome,
     }
+
+
+def _override_sources(overrides: Mapping[str, Any] | None) -> list[list[str]]:
+    """``[name, source]`` pairs whose sources the child evaluates with :func:`ast.literal_eval`."""
+    if overrides is None:
+        return []
+    if not isinstance(overrides, Mapping):
+        raise ValueError("overrides must be a mapping of global names to values")
+    pairs = []
+    for name, value in overrides.items():
+        if not isinstance(name, str) or not all(part.isidentifier() for part in name.split(".")):
+            raise ValueError(f"override name {name!r} must be a global name, optionally dotted (Example.horizon)")
+        source = repr(value)
+        try:
+            same = ast.literal_eval(source) == value
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            same = False
+        if not same:
+            raise ValueError(
+                f"override {name}={source[:200]} must be a Python literal (numbers, strings, booleans, None, "
+                "and lists, tuples, sets, or dictionaries of them)"
+            )
+        pairs.append([name, source])
+    return pairs
+
+
+def _parse_override(text: str, run: int = 0) -> tuple[str, Any]:
+    """``NAME`` and value of a ``--set NAME=VALUE`` option; VALUE is a Python literal, other text a string."""
+    name, separator, value = text.partition("=")
+    name = name.strip()
+    if not separator or not name:
+        raise ValueError(f"--set takes NAME=VALUE, got {text!r}")
+    value = value.replace("{run}", str(run))
+    try:
+        return name, ast.literal_eval(value.strip())
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+        return name, value
 
 
 def _resolve(script: str | os.PathLike) -> dict[str, str]:
@@ -273,7 +357,18 @@ def _read_record(path: Path) -> dict:
     return record if isinstance(record, dict) else {}
 
 
-def _supervise(command, directory: Path, *, timeout, tail, echo, cancel) -> dict:
+def _progress_line(directory: Path, elapsed: float) -> str:
+    record = _read_record(directory / "result.json")
+    frames = int.from_bytes((directory / "frames.bin").read_bytes()[:8], "little")
+    text = f"headless: {elapsed:.0f} s, phase {record.get('phase', 'start')}"
+    if record.get("frames_requested") is not None:
+        text += f", frame {max(frames, record.get('frames', 0))}/{record['frames_requested']}"
+    if isinstance(record.get("sim_time"), int | float):
+        text += f", sim_time {record['sim_time']:.4g} s"
+    return text
+
+
+def _supervise(command, directory: Path, *, timeout, tail, echo, cancel, progress=None) -> dict:
     if os.name == "posix":
         group = {"start_new_session": True}
     else:
@@ -285,8 +380,12 @@ def _supervise(command, directory: Path, *, timeout, tail, echo, cancel) -> dict
     streams = [_Tail(process.stdout, tail, sys.stdout if echo else None)]
     streams.append(_Tail(process.stderr, tail, sys.stderr if echo else None))
     stopped, stack = None, None
+    reported = started
     try:
         while not _exited(process):
+            if progress is not None and time.perf_counter() - reported >= progress:
+                reported = time.perf_counter()
+                print(_progress_line(directory, reported - started), file=sys.stderr, flush=True)
             if timeout is not None and time.perf_counter() - started >= timeout:
                 stopped = "timeout"
                 stack = _dump_stack(process, directory / "stack.txt")
@@ -321,6 +420,11 @@ def _supervise(command, directory: Path, *, timeout, tail, echo, cancel) -> dict
             name = signal.Signals(-returncode).name
         except ValueError:
             name = str(-returncode)
+    seconds = record.get("seconds", {})
+    sim_time, step_seconds = record.get("sim_time"), seconds.get("step")
+    realtime = None
+    if isinstance(sim_time, int | float) and isinstance(step_seconds, int | float) and step_seconds > 0.0:
+        realtime = round(sim_time / step_seconds, 4)
     return {
         "status": status,
         "exit_code": returncode,
@@ -329,9 +433,10 @@ def _supervise(command, directory: Path, *, timeout, tail, echo, cancel) -> dict
         "phase": record.get("phase", "start"),
         "frames": frames,
         "frames_requested": record.get("frames_requested"),
-        "sim_time": record.get("sim_time"),
+        "sim_time": sim_time,
+        "realtime_factor": realtime,
         "device": record.get("device"),
-        "seconds": record.get("seconds", {}),
+        "seconds": seconds,
         "value": record.get("value"),
         "exception": record.get("exception"),
         "stack": stack,
@@ -454,6 +559,40 @@ def _load(spec: dict) -> ModuleType:
     return module
 
 
+def _resolve_override(target: Any, part: str, name: str) -> Any:
+    if isinstance(target, dict):
+        if part in target:
+            return target[part]
+        options = [str(key) for key in target]
+    else:
+        try:
+            return getattr(target, part)
+        except AttributeError:
+            options = [key for key in dir(target) if not key.startswith("__")]
+    close = difflib.get_close_matches(part, options, n=3)
+    hint = f"; did you mean {', '.join(repr(option) for option in close)}?" if close else ""
+    owner = "the script" if isinstance(target, ModuleType) else repr(name.rsplit(".", 1)[0] if "." in name else name)
+    raise AttributeError(f"--set {name}: {owner} has no {'key' if isinstance(target, dict) else 'name'} {part!r}{hint}")
+
+
+def _apply_overrides(module: ModuleType, overrides: list[list[str]]) -> None:
+    """Assign ``--set`` values to the script's globals, attributes, or dictionary keys; each must exist."""
+    for name, source in overrides:
+        value = ast.literal_eval(source)
+        *path, last = name.split(".")
+        target = module
+        for index, part in enumerate(path):
+            target = _resolve_override(target, part, ".".join(path[: index + 1]))
+        current = _resolve_override(target, last, name)
+        numpy = sys.modules.get("numpy")
+        if numpy is not None and isinstance(current, numpy.ndarray):
+            value = numpy.asarray(value, dtype=current.dtype)
+        if isinstance(target, dict):
+            target[last] = value
+        else:
+            setattr(target, last, value)
+
+
 def _evaluate(code: str, scope: dict) -> Any:
     filename = "<call>"
     lines = code.splitlines(keepends=True)
@@ -491,6 +630,7 @@ def _child_run(spec: dict, record: _Record) -> None:
     started = time.perf_counter()
     record.write(phase="load")
     module = _load(spec)
+    _apply_overrides(module, spec.get("overrides", []))
     started = phase("build", started)
     cls = getattr(module, spec["example_class"], None)
     if cls is None:
@@ -605,7 +745,8 @@ def _split(argv: list[str]) -> tuple[list[str], str | None, list[str]]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m newton.examples.headless",
-        usage="%(prog)s SCRIPT [script args] [--frames N] [--call CODE] [--json OUT] [--timeout S] [-- script args]",
+        usage="%(prog)s SCRIPT [script args] [--frames N] [--call CODE] [--set NAME=VALUE ...] [--repeat K] "
+        "[--json OUT] [--timeout S] [--progress S] [-- script args]",
         description="Run an example script in a clean headless process and report the outcome as JSON.",
         allow_abbrev=False,
     )
@@ -617,22 +758,65 @@ def _parser() -> argparse.ArgumentParser:
         help="Python code evaluated after stepping, with example, module, args, newton, np, and wp in scope; "
         "the value of its final expression is reported.",
     )
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Assign an existing module global (or a dotted attribute or dictionary key) of the script before the "
+        "example is created; VALUE is a Python literal, other text a string, and {run} the run index. Repeatable.",
+    )
+    parser.add_argument(
+        "--repeat", type=int, default=1, help="Run the script this many times, each in a new process (default 1)."
+    )
     parser.add_argument("--json", type=Path, default=None, help="Write the report to this file instead of stdout.")
-    parser.add_argument("--timeout", type=float, default=None, help="Kill the run after this many seconds.")
+    parser.add_argument("--timeout", type=float, default=None, help="Kill each run after this many seconds.")
+    parser.add_argument(
+        "--progress",
+        type=float,
+        default=10.0,
+        help="Seconds between progress lines on stderr while a run is going (default 10; 0 for none).",
+    )
     parser.add_argument("--class", dest="example_class", default="Example", help="Example class name in the script.")
     parser.add_argument("--render", action="store_true", help="Also call example.render() after every step.")
     parser.add_argument("--tail", type=int, default=4000, help="Characters of stdout and stderr to report.")
     return parser
 
 
-def _summary(report: dict) -> str:
+def _summary(report: dict, prefix: str = "headless: ") -> str:
     text = (
-        f"headless: {report['status']} after {report['wall_seconds']:.1f} s, phase {report['phase']}, "
+        f"{prefix}{report['status']} after {report['wall_seconds']:.1f} s, phase {report['phase']}, "
         f"{report['frames']} frames, exit code {report['exit_code']}"
     )
     if report.get("exception"):
         text += f"; {report['exception']['type']}: {report['exception']['message'][:300]}"
     return text
+
+
+def _repeat_report(runs: list[dict], repeat: int) -> dict:
+    """One report for runs of ``--repeat``: per-status counts, values, wall-time statistics, and every run."""
+    counts: dict[str, int] = {}
+    for run in runs:
+        counts[run["status"]] = counts.get(run["status"], 0) + 1
+    failed = next((run for run in runs if run["status"] != "ok"), None)
+    if failed is None and len(runs) < repeat:
+        failed = {"status": "cancelled", "exit_code": None}
+    walls = [run["wall_seconds"] for run in runs] or [0.0]
+    return {
+        "status": "ok" if failed is None else failed["status"],
+        "exit_code": 0 if failed is None else failed["exit_code"],
+        "repeat": repeat,
+        "status_counts": counts,
+        "wall_seconds": {
+            "min": min(walls),
+            "median": round(statistics.median(walls), 3),
+            "max": max(walls),
+            "total": round(sum(walls), 3),
+        },
+        "values": [run["value"] for run in runs],
+        "runs": runs,
+    }
 
 
 def _exit_code(report: dict) -> int:
@@ -662,29 +846,49 @@ def main(argv: list[str] | None = None) -> int:
     options = parser.parse_args([*runner, *([] if script is None else [script])])
     if options.frames is not None and options.frames < 0:
         parser.error("--frames must be non-negative")
+    if options.repeat < 1:
+        parser.error("--repeat must be at least 1")
+    if not math.isfinite(options.progress) or options.progress < 0:
+        parser.error("--progress must be a non-negative number of seconds")
+    for text in options.overrides:
+        if "=" not in text or not text.partition("=")[0].strip():
+            parser.error(f"--set takes NAME=VALUE, got {text!r}")
     cancel = threading.Event()
     handlers = {}
     if threading.current_thread() is threading.main_thread():
         for number in (signal.SIGINT, signal.SIGTERM):
             handlers[number] = signal.signal(number, lambda *_: cancel.set())
+    runs = []
     try:
-        report = run_headless(
-            options.script,
-            script_args,
-            frames=options.frames,
-            call=options.call,
-            timeout=options.timeout,
-            example_class=options.example_class,
-            render=options.render,
-            tail=options.tail,
-            echo=True,
-            cancel=cancel,
-        )
+        for run in range(options.repeat):
+            if cancel.is_set():
+                break
+            prefix = f"headless: run {run + 1}/{options.repeat}: " if options.repeat > 1 else "headless: "
+            if options.repeat > 1:
+                print(f"{prefix}starting", file=sys.stderr, flush=True)
+            report = run_headless(
+                options.script,
+                script_args,
+                frames=options.frames,
+                call=options.call,
+                timeout=options.timeout,
+                example_class=options.example_class,
+                render=options.render,
+                tail=options.tail,
+                echo=True,
+                cancel=cancel,
+                overrides=dict(_parse_override(text, run) for text in options.overrides),
+                progress=options.progress or None,
+            )
+            runs.append({"run": run, **report} if options.repeat > 1 else report)
+            if options.repeat > 1:
+                print(_summary(report, prefix), file=sys.stderr, flush=True)
     except (FileNotFoundError, ValueError) as error:
         parser.error(str(error))
     finally:
         for number, handler in handlers.items():
             signal.signal(number, handler)
+    report = runs[0] if options.repeat == 1 else _repeat_report(runs, options.repeat)
     text = json.dumps(report, indent=2)
     if options.json is None:
         print(text, flush=True)
@@ -692,7 +896,17 @@ def main(argv: list[str] | None = None) -> int:
         temporary = options.json.with_name(options.json.name + ".tmp")
         temporary.write_text(text + "\n")
         os.replace(temporary, options.json)
-    print(_summary(report), file=sys.stderr, flush=True)
+    if options.repeat == 1:
+        print(_summary(report), file=sys.stderr, flush=True)
+    else:
+        walls = report["wall_seconds"]
+        counts = ", ".join(f"{count} {status}" for status, count in report["status_counts"].items())
+        print(
+            f"headless: {len(runs)} of {options.repeat} runs: {counts}; wall {walls['min']:.1f}-{walls['max']:.1f} s "
+            f"(median {walls['median']:.1f} s)",
+            file=sys.stderr,
+            flush=True,
+        )
     return _exit_code(report)
 
 

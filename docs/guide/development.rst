@@ -737,6 +737,30 @@ and kills the process and everything it started. Runner options may follow the
 script arguments; arguments after ``--`` always go to the script.
 ``newton.examples.headless.run_headless()`` does the same from Python.
 
+Variants and repeated runs need no edits to the script:
+
+.. code-block:: console
+
+    python -m newton.examples.headless my_scene.py --set HORIZON=40 \
+        --set "PARAMS.gains=[80, 4]" --set SEED={run} --repeat 5 \
+        --call "example.metrics()" --json runs.json
+
+- ``--set NAME=VALUE`` assigns a module global of the script after it is loaded
+  and before its parser and example are created; dotted names assign class
+  attributes or dictionary keys. The name must exist, and ``VALUE`` is a Python
+  literal (other text is a string). Values the script computed from the global
+  while loading keep the loaded value.
+- ``--repeat K`` runs the script ``K`` times, each in a new process, one after
+  another. ``{run}`` in a ``--set`` value is the 0-based run index. The report
+  lists every run, the values of ``--call``, the status counts, and the
+  minimum, median, and maximum wall time.
+- ``--progress S`` prints the phase, frame, and ``sim_time`` of a run to stderr
+  every ``S`` seconds (default 10; 0 turns it off).
+
+Each run reports its ``wall_seconds``, the host ``seconds`` of each phase
+(load, build, step, call, test), and its ``realtime_factor``, the simulated
+time over the seconds of the step phase.
+
 Asset version pinning
 ---------------------
 

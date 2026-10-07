@@ -547,12 +547,15 @@ class TestMcpRecapture(_HostedTest):
         host, session = self.host(overrides={"DEVICE": "cuda:0"})
         self.assertIsNotNone(host.example.graph)
         self.assertEqual(self.advance(session)[1], 2)
+        recaptures = host.recaptures
         with wp.ScopedDevice("cpu"):
-            note = self.execute(session, "module.SUBSTEPS = 4")["note"]
-        self.assertEqual(note, "CUDA graphs recaptured after changes to module.SUBSTEPS")
+            result = self.execute(session, "module.SUBSTEPS = 4")
+        # The cell assigned the global itself, so the recapture is not reported to it.
+        self.assertNotIn("note", result)
         self.assertEqual(self.advance(session)[1], 4)
-        note = self.execute(session, "example.solver.angular_damping = 0.5")["note"]
-        self.assertIn("example.solver.angular_damping", note)
+        self.assertEqual(host.recaptures, recaptures + 1)
+        note = self.execute(session, "vars(example.solver).update(angular_damping=0.5)")["note"]
+        self.assertEqual(note, "CUDA graphs recaptured after changes to example.solver.angular_damping")
         # Rewinding timers and stepping again re-uses the graph.
         result = self.execute(session, "rollout(3, start=True)\nrollout(3, start=True)")
         self.assertNotIn("note", result)

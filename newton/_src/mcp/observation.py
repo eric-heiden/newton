@@ -130,6 +130,116 @@ def _camera_pose(eye, target, up, pose, up_axis: int, frame=None, view=None, fov
 
 
 _DISTORTION = ("k1", "k2", "k3", "k4", "k5", "k6", "p1", "p2", "s1", "s2", "s3", "s4")
+_INTRINSICS_FIELDS = frozenset(
+    {"fx", "fy", "cx", "cy", "image_width", "image_height", "distortion_model", *_DISTORTION}
+)
+_POSE_KEYS = ("position", "rotation_xyzw")
+# OpenCV's distCoeffs order.
+_OPENCV_ORDER = ("k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6", "s1", "s2", "s3", "s4")
+
+
+def _pose_from_dict(value: dict) -> list[float]:
+    """``[x, y, z, qx, qy, qz, qw]`` from ``{"position": [x, y, z], "rotation_xyzw": [qx, qy, qz, qw]}``."""
+    missing = [key for key in _POSE_KEYS if key not in value]
+    if missing:
+        raise ValueError(f"A pose dictionary needs 'position' and 'rotation_xyzw'; missing {missing}")
+    position = _vector("position", value["position"], 3)
+    return [*position.tolist(), *_vector("rotation_xyzw", value["rotation_xyzw"], 4).tolist()]
+
+
+def _calibration_from_dict(value: dict, width: int | None, height: int | None) -> SensorCamera.Intrinsics:
+    """Intrinsics of a calibration dictionary such as a ``camera.json`` entry (``K``, ``D``, ``width``, ...)."""
+    from_dict = getattr(SensorCamera.Intrinsics, "from_dict", None)
+    has_size = (
+        any(key in value for key in ("width", "image_width")),
+        any(key in value for key in ("height", "image_height")),
+    )
+    sizes = {
+        **({} if has_size[0] else {"width": 640 if width is None else width}),
+        **({} if has_size[1] else {"height": 480 if height is None else height}),
+    }
+    if from_dict is not None:
+        return from_dict(value, **sizes)
+    # The same reading as SensorCamera.Intrinsics.from_dict for the common keys.
+    entries = {**value, **sizes}
+
+    def number(*keys):
+        for key in keys:
+            if key in entries:
+                return float(np.asarray(entries[key], dtype=np.float64).reshape(-1)[0])
+        return None
+
+    matrix = next((entries[key] for key in ("K", "k", "camera_matrix") if key in entries), None)
+    if isinstance(matrix, dict):
+        matrix = matrix.get("data")
+    if matrix is not None:
+        matrix = np.asarray(matrix, dtype=np.float64).reshape(-1)
+        if matrix.size != 9:
+            raise ValueError("intrinsics K must hold the 9 values of a 3x3 camera matrix")
+        fx, fy, cx, cy = matrix[[0, 4, 2, 5]].tolist()
+    else:
+        fx, fy, cx, cy = number("fx"), number("fy"), number("cx", "ppx"), number("cy", "ppy")
+        if None in (fx, fy, cx, cy):
+            raise ValueError("intrinsics need a camera matrix K or fx, fy, cx, cy")
+    coefficients = next(
+        (entries[key] for key in ("D", "d", "dist_coeffs", "distortion_coefficients", "coeffs") if key in entries), None
+    )
+    if isinstance(coefficients, dict):
+        coefficients = coefficients.get("data")
+    distortion = {}
+    if coefficients is not None:
+        distortion = dict(
+            zip(_OPENCV_ORDER, np.asarray(coefficients, dtype=np.float64).reshape(-1).tolist(), strict=False)
+        )
+    distortion.update({name: float(entries[name]) for name in _DISTORTION if name in entries})
+    model = (
+        str(entries.get("distortion_model", "opencv")).strip().lower().replace("-", "_").removeprefix("rs2_distortion_")
+    )
+    if model in ("none", "pinhole"):
+        distortion = {}
+        model = "opencv"
+    elif model in ("plumb_bob", "rational_polynomial", "brown_conrady", "radtan"):
+        model = "opencv"
+    if model == "inverse_brown_conrady":
+        distortion = {name: value for name, value in distortion.items() if name in ("k1", "k2", "k3", "p1", "p2")}
+    return SensorCamera.Intrinsics(
+        int(number("width", "image_width")),
+        int(number("height", "image_height")),
+        fx,
+        fy,
+        cx,
+        cy,
+        **{name: value for name, value in distortion.items() if value != 0.0},
+        distortion_model=model,
+    )
+
+
+def _camera_inputs(intrinsics, pose, width: int | None, height: int | None):
+    """Accept calibration dictionaries and pose dictionaries for ``intrinsics`` and ``pose``.
+
+    Returns:
+        ``(intrinsics, pose, pose_from_intrinsics)``: intrinsics as given or as
+        :class:`~newton.sensors.SensorCamera.Intrinsics`, the pose as seven numbers (or ``None``),
+        and the pose an intrinsics dictionary carried in ``position``/``rotation_xyzw`` (or ``None``).
+    """
+    if isinstance(pose, dict):
+        pose = _pose_from_dict(pose)
+    carried = None
+    if isinstance(intrinsics, dict):
+        if all(key in intrinsics for key in _POSE_KEYS):
+            carried = _pose_from_dict(intrinsics)
+        calibration = {key: value for key, value in intrinsics.items() if key not in _POSE_KEYS}
+        if not set(calibration) <= _INTRINSICS_FIELDS:
+            try:
+                intrinsics = _calibration_from_dict(calibration, width, height)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"intrinsics: {error}. Accepted: the fields of newton.sensors.SensorCamera.Intrinsics, or a "
+                    "calibration dictionary with K (3x3), D (OpenCV order), width, height and distortion_model"
+                ) from None
+        else:
+            intrinsics = calibration
+    return intrinsics, pose, carried
 
 
 def _intrinsics(value, width: int, height: int) -> dict | None:
@@ -542,8 +652,8 @@ class ObservationRenderer:
         view: str | None = None,
         backend: str = "sensor",
         channel: str = "color",
-        width: int = 640,
-        height: int = 480,
+        width: int | None = None,
+        height: int | None = None,
         world_id: int = 0,
         eye=None,
         target=None,
@@ -594,6 +704,17 @@ class ObservationRenderer:
         """
         self._check_thread()
         model = self.session.model
+        intrinsics, pose, carried_pose = _camera_inputs(intrinsics, pose, width, height)
+        if carried_pose is not None and all(value is None for value in (pose, eye, target, view, camera_body)):
+            pose = carried_pose
+        else:
+            carried_pose = None
+        if width is None or height is None:
+            # A calibrated camera renders at its calibration size unless a size is given.
+            size = _intrinsics(intrinsics, 640, 480) if intrinsics is not None else None
+            calibrated = (int(size["image_width"]), int(size["image_height"])) if size else (640, 480)
+            width = calibrated[0] if width is None else width
+            height = calibrated[1] if height is None else height
         width = _integer("width", width, 1, 2048)
         height = _integer("height", height, 1, 2048)
         world_id = _integer("world_id", world_id, 0, model.world_count - 1)
@@ -681,6 +802,7 @@ class ObservationRenderer:
                 "fov_y": float(fov_y),
                 **({"intrinsics": intrinsics} if intrinsics is not None else {}),
                 **({"mount": mount} if mount is not None else {}),
+                **({"pose_from": "intrinsics position and rotation_xyzw"} if carried_pose is not None else {}),
                 "convention": "xyzw, -Z forward, +Y up, top-left",
                 "coordinates": "simulation world coordinates [m]",
             },

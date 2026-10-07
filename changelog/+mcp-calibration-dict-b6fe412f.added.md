@@ -1,0 +1,1 @@
+Accept calibration dictionaries such as a `camera.json` entry (`K`, `D`, `width`, `height`, `distortion_model`, `position`, `rotation_xyzw`) as `intrinsics`, and `{"position", "rotation_xyzw"}` dictionaries as `pose`, in live MCP observations.

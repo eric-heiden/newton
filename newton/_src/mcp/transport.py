@@ -101,13 +101,20 @@ class SimulationServer:
                 timeout = message.get("timeout", 30.0)
                 if isinstance(timeout, bool) or not isinstance(timeout, int | float):
                     raise ValueError("timeout must be a number")
+                reply_within = message.get("reply_within")
+                if reply_within is not None and (
+                    isinstance(reply_within, bool)
+                    or not isinstance(reply_within, int | float)
+                    or not 0 < reply_within <= 86400
+                ):
+                    raise ValueError("reply_within must be a number of seconds in (0, 86400]")
                 with server._pending_lock:
                     if server._closed:
                         raise RuntimeError("Server is closed")
                     request = server.session.enqueue(operation, arguments, timeout=timeout)
                     server._pending.add(request)
                 try:
-                    response = {"result": request.wait(timeout)}
+                    response = {"result": request.wait(timeout, reply_within)}
                 finally:
                     with server._pending_lock:
                         server._pending.discard(request)
@@ -203,16 +210,22 @@ class SimulationClient:
 
         This entire class may change without a deprecation period. Requests
         wait at most ``timeout`` seconds in the simulation queue. Once execution
-        starts, the client waits for completion: Warp, GL, and arbitrary Python
-        cannot be safely preempted. A transport failure after execution starts
-        has an unknown outcome and must not trigger automatic mutation retries.
+        starts, the client waits for completion, or with ``reply_within`` for
+        that long: Warp, GL, and arbitrary Python cannot be safely preempted, so
+        a call still running then continues in the session. A transport failure
+        after execution starts has an unknown outcome and must not trigger
+        automatic mutation retries.
 
     Args:
         connection_file: Private JSON descriptor written by :class:`SimulationServer`.
         timeout: Maximum queue waiting time [s], in ``(0, 300]``.
+        reply_within: Longest time [s] a request waits for its reply, or ``None`` to wait until it
+            completes. A call still running then continues in the session, and the reply holds
+            ``running`` with its output so far; its result is added to the response of a later call
+            (``finished_calls``). A call that has not started by then is not run.
     """
 
-    def __init__(self, connection_file: str | Path, *, timeout: float = 30.0):
+    def __init__(self, connection_file: str | Path, *, timeout: float = 30.0, reply_within: float | None = None):
         self.connection_file = Path(connection_file)
         if (
             isinstance(timeout, bool)
@@ -221,7 +234,12 @@ class SimulationClient:
             or not 0 < timeout <= 300
         ):
             raise ValueError("timeout must be in (0, 300] seconds")
+        if reply_within is not None and (
+            isinstance(reply_within, bool) or not isinstance(reply_within, int | float) or not 0 < reply_within <= 86400
+        ):
+            raise ValueError("reply_within must be in (0, 86400] seconds")
         self.timeout = timeout
+        self.reply_within = reply_within
         self._descriptor = self._load_descriptor()
 
     def _load_descriptor(self) -> dict:
@@ -289,6 +307,7 @@ class SimulationClient:
                 "operation": operation,
                 "arguments": arguments,
                 "timeout": self.timeout,
+                **({"reply_within": self.reply_within} if self.reply_within is not None else {}),
             },
             _MAX_REQUEST,
         )

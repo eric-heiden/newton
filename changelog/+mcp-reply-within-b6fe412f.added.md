@@ -1,0 +1,1 @@
+Add `--reply-within` (default 240 s) to the stdio MCP adapter: a tool call still running then continues in the live session, its reply carries the output printed so far, and its result arrives with a later call under `finished_calls`; `jobs.result()` and `jobs.wait()` without a timeout return before that limit.

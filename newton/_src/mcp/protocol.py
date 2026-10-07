@@ -10,6 +10,7 @@ endpoint. Device operations occur exclusively in the embedding process.
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.metadata
 import importlib.util
 import json
@@ -66,11 +67,12 @@ _OBSERVE = {
     },
     "up": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
     "pose": {
-        "type": "array",
+        "type": ["array", "object"],
         "items": {"type": "number"},
         "minItems": 7,
         "maxItems": 7,
-        "description": "Position xyz [m] and quaternion xyzw, camera-local -Z forward/+Y up.",
+        "description": "Position xyz [m] and quaternion xyzw, camera-local -Z forward/+Y up, or "
+        "{'position': [...], 'rotation_xyzw': [...]}.",
     },
     "camera_body": {
         "type": ["string", "integer"],
@@ -86,14 +88,15 @@ _OBSERVE = {
     },
     "intrinsics": {
         "type": "object",
-        "description": "Calibrated camera instead of fov_y, with the fields of newton.sensors.SensorCamera.Intrinsics: "
-        "fx, fy, cx, cy [px] (OpenCV image coordinates, integers at pixel centers), optional "
-        "image_width/image_height, OpenCV distortion k1-k6, p1, p2, s1-s4, or "
-        "distortion_model='inverse_brown_conrady' with k1-k3, p1, p2.",
+        "description": "Calibrated camera instead of fov_y: the fields of newton.sensors.SensorCamera.Intrinsics "
+        "(fx, fy, cx, cy [px], OpenCV image coordinates; image_width/image_height; distortion k1-k6, p1, p2, s1-s4; "
+        "distortion_model 'opencv' or 'inverse_brown_conrady'), or a calibration dictionary with K (3x3), D (OpenCV "
+        "order), width, height and distortion_model, whose position/rotation_xyzw is the pose if no camera is given. "
+        "Renders at the calibration size unless width/height are given.",
     },
     "world_id": {"type": "integer", "minimum": 0, "default": 0},
-    "width": {"type": "integer", "minimum": 1, "maximum": 2048, "default": 640},
-    "height": {"type": "integer", "minimum": 1, "maximum": 2048, "default": 480},
+    "width": {"type": "integer", "minimum": 1, "maximum": 2048, "description": "Default 640 (or calibration)."},
+    "height": {"type": "integer", "minimum": 1, "maximum": 2048, "description": "Default 480 (or calibration)."},
     "fov_y": {
         "type": "number",
         "minimum": 1,
@@ -214,7 +217,9 @@ TOOLS = [
     _tool("pause", "Pause playback while continuing to service queued requests."),
     _tool(
         "reset",
-        "Restore the initial state, control and time, reset solver caches and the application callback, and clear contact buffers. Model parameter edits persist.",
+        "Restore the initial state and time and the control and application arrays steps have written, reset solver "
+        "caches and the application callback, and clear contact buffers. Model edits and arrays no step wrote stay; "
+        "the result lists them as kept.",
     ),
     _tool(
         "checkpoint",
@@ -223,7 +228,9 @@ TOOLS = [
     ),
     _tool(
         "restore",
-        "Restore a checkpoint's public arrays and time, reset hidden solver caches, clear contact buffers, and run the application reset callback. Model edits persist.",
+        "Restore a checkpoint's state and time and the control and application arrays steps have written, reset "
+        "hidden solver caches, clear contact buffers, and run the application reset callback. Model edits and arrays "
+        "no step wrote stay; the result lists them as kept.",
         {"name": {"type": "string", "default": "default"}},
     ),
     _tool(
@@ -298,11 +305,10 @@ TOOLS = [
     _tool(
         "execute",
         "Run trusted Python in the live application process (not a sandbox). Variables, imports and functions "
-        "persist across calls and across reset/rebuild. The value of the last expression is returned (large or "
-        "opaque values are summarized; _ keeps the value) together with printed output; show(image, label) returns "
-        "images inline. session.dispatch(op, args) runs observe, filmstrip, step, reset, checkpoint, restore, and "
-        "describe. If the cell raises, the simulation is rolled back to its state before the cell and the error "
-        "lists what was restored; Python variables are kept. Preloaded names are listed in the server instructions.",
+        "persist across calls and across reset/rebuild. Returns the value of the last expression (large or opaque "
+        "values are summarized; _ keeps it) and printed output; show(image, label) returns images inline. If the "
+        "cell raises, the simulation returns to its state before the cell (Python variables are kept) and the error "
+        "lists what was restored. Preloaded names are listed in the server instructions.<<REPLY>>",
         {
             "code": {"type": "string", "maxLength": 65536},
             "reset_namespace": {
@@ -315,12 +321,13 @@ TOOLS = [
     ),
     _tool(
         "rebuild",
-        "Rebuild the scene in the same process through the application's rebuild callback (a hosted script is read "
-        "again from disk and its Example constructed again). The new scene replaces contacts, render caches and "
-        "checkpoints; Python variables survive unless reset_namespace=true. If the rebuild fails, the previous scene "
-        "keeps running and the error shows the traceback. arguments are application-specific (hosted scripts: argv, "
-        "overrides, restart).",
+        "Rebuild the scene in the same process (a hosted script is read again from disk and its Example constructed "
+        "again). The new scene replaces contacts, render caches and checkpoints; Python variables survive unless "
+        "reset_namespace=true. If the rebuild fails, the previous scene keeps running and the error shows the "
+        "traceback. code runs as a newton_execute cell after a successful rebuild. arguments are "
+        "application-specific (hosted scripts: argv, overrides, restart).",
         {
+            "code": {"type": "string", "maxLength": 65536, "description": "Python cell to run after the rebuild."},
             "arguments": {"type": "object"},
             "overrides": {
                 "type": "object",
@@ -334,25 +341,22 @@ TOOLS = [
 ]
 
 
-_HELPERS = """- If a cell raises, the simulation (time, state, control, model arrays) returns to its state before the cell and the error lists what was restored; Python variables are kept.
-- After each cell, and before rollout()/step/filmstrip/example.step() inside it, the model arrays solvers read are checksummed; changes that no later notify_model_changed() call on the session's solver covered are notified with the inferred ModelFlags and listed in `note` (session.watch.mode = 'notify' | 'report' | 'off').
-- rollout(frames or seconds=..., record={'name': 'expr' or fn}, every=k, start=True|'checkpoint', until='expr'): steps and returns NumPy series.
-- session.dispatch('step' | 'reset' | 'checkpoint' | 'restore' | 'describe', {...}): step, return to the initial state, save or restore named states (state, control, time; model edits are kept), or list scene counts and solver.
-- health(solver=None, state=None, per_world=True, twins=False): non-finite values, runaway speeds, full solver buffers, and penetrating shape pairs, by world, for any solver.
-- solver_params(kind='actuator'|'joint'|'geom'|'body'|'equality'|'option', select='label*', world=0): values the solver integrates, the model array and ModelFlags behind each, whether they can differ per world, and unapplied edits (`pending`).
-- solver_contacts(): active contacts per shape pair with the parameters the solver integrates and the material that decided them.
-- contacts_between(a, b=None): contact count, normal and friction force, slip speed, and penetration between two shape sets (label substrings); usable as a rollout() probe."""
+_HELPERS = """- show(image, label) returns an image: an array, figure, path or observe result.
+- rollout(frames or seconds=, record={'name': 'expr' or fn}, every=1, start=False|True|'checkpoint', until=None) steps and returns NumPy series.
+- session.dispatch('reset'|'checkpoint'|'restore'|'step'|'observe'|'filmstrip', {...}).
+- health(), solver_params(kind, select), solver_contacts(select), contacts_between(a, b): values the solver integrates, contacts, and problems per world.
+- A cell that raises is rolled back (Python variables stay). Model edits that no notify_model_changed() covered are notified and named in `note`."""
 
 _INSTRUCTIONS = (
-    """Live Newton simulation running in another process. newton_execute runs Python cells in it; variables persist between calls (preloaded: session, model, state, control, solver, contacts, newton, np, wp, show, and the helpers below).
-- newton_observe renders the scene as an inline image (auto-framed unless a camera is given; views=[...] for a grid; reference='photo.png' adds reference and mismatch panels). newton_filmstrip(times=[...], reset=true) steps to each time and returns a grid of frames.
+    """Live Newton simulation in another process. newton_execute runs Python cells in it; variables persist between calls. Preloaded: session, model, state, control, solver, contacts, newton, np, wp, and:
+- newton_observe renders an image (auto-framed unless a camera is given; reference='photo.png' adds a comparison); newton_filmstrip(times=[...]) a grid over time.
 """
     + _HELPERS
 )
 
 _RTX_NOTE = (
-    "; backend='rtx' path-traces a photographic image (about 1 s, the first call 5-10 s; the default sensor "
-    "backend takes about 20 ms)."
+    "; backend='rtx' path-traces a photographic image in about 1 s, the first call 5-10 s; the default sensor "
+    "backend takes about 20 ms"
 )
 
 
@@ -369,12 +373,11 @@ def rtx_available() -> bool:
 
 
 _INSTRUCTIONS_LEAN = (
-    """Live Newton simulation running in another process. newton_execute runs Python cells in it; variables persist between calls (preloaded: session, model, state, control, solver, contacts, newton, np, wp, show, and the helpers below).
+    """Live Newton simulation in another process. newton_execute runs Python cells in it; variables persist between calls. Preloaded: session, model, state, control, solver, contacts, newton, np, wp, and:
 """
     + _HELPERS
     + """
-- Images: show(x, label) attaches arrays, matplotlib figures, image paths, and observe/filmstrip results. session.dispatch('observe', {...}) renders the scene (auto-framed; view/views, eye/target or pose, fov_y or intrinsics (a dict or newton.sensors.SensorCamera.Intrinsics, with distortion), camera_body and camera_offset, world_id, width/height, reference='photo.png' for a comparison panel, overlay for projected points). session.dispatch('filmstrip', {'times': [...], 'reset': True}) steps to each time and returns a grid (references= scores each frame against video frames). render(**observe_options) returns an RGB array<<RTX>>
-newton_rebuild rebuilds the scene in the same process (a hosted script is read again from disk)."""
+- Cameras for render(**camera) (an RGB array<<RTX>>) and session.dispatch('observe'|'filmstrip', {...}): view or views=[...], eye/target or pose, fov_y or intrinsics (SensorCamera.Intrinsics fields or a calibration dict with K, D), camera_body, world_id, width/height; observe takes reference='photo.png', filmstrip times=[...]."""
 )
 
 
@@ -396,6 +399,24 @@ def _compact(data: dict, *, full: bool = False) -> dict:
     return result
 
 
+RESPONSE_BUDGET = 1_000_000
+"""Default characters per tool result (text plus base64 images), below the 1 MiB some clients accept."""
+
+
+def _tools(reply_within: float | None) -> list[dict]:
+    """The tool list, with the reply limit stated in the execute description."""
+    text = (
+        f" Calls reply within {reply_within:g} s; a cell still running then continues in the background, and its "
+        "result and later output arrive in the response of a later call (which first waits for it)."
+        if reply_within is not None
+        else ""
+    )
+    tools = copy.deepcopy(TOOLS)
+    for tool in tools:
+        tool["description"] = tool["description"].replace("<<REPLY>>", text)
+    return tools
+
+
 class _Protocol:
     _PROFILES: ClassVar[dict[str, set[str] | None]] = {
         "full": None,
@@ -403,15 +424,24 @@ class _Protocol:
         "lean": {"newton_execute", "newton_rebuild"},
     }
 
-    def __init__(self, client: SimulationClient, *, profile: str = "full", app_guide: bool = True):
+    def __init__(
+        self,
+        client: SimulationClient,
+        *,
+        profile: str = "full",
+        app_guide: bool = True,
+        response_budget: int = RESPONSE_BUDGET,
+    ):
         if profile not in self._PROFILES:
             raise ValueError(f"profile must be one of {sorted(self._PROFILES)}")
         self.client = client
         self.initialized = False
         names = self._PROFILES[profile]
-        self.tools = TOOLS if names is None else [tool for tool in TOOLS if tool["name"] in names]
+        tools = _tools(getattr(client, "reply_within", None))
+        self.tools = tools if names is None else [tool for tool in tools if tool["name"] in names]
         self.profile = profile
         self.app_guide = app_guide
+        self.response_budget = response_budget
 
     def handle(self, message: dict) -> dict | None:
         request_id = message.get("id")
@@ -452,38 +482,51 @@ class _Protocol:
                 if name == "newton_rebuild":
                     reset_namespace = arguments.get("reset_namespace", False)
                     overrides = arguments.get("overrides")
+                    code = arguments.get("code")
                     arguments = arguments.get("arguments", {})
                     if not isinstance(arguments, dict):
                         raise ValueError("Rebuild arguments must be an object")
                     arguments = {**arguments, "reset_namespace": reset_namespace}
                     if overrides is not None:
                         arguments["overrides"] = overrides
+                    if code is not None:
+                        arguments["code"] = code
                 data = dict(self.client.request(name.removeprefix("newton_"), **arguments))
-                content = []
-                if "image_base64" in data:
-                    content.append(
-                        {
-                            "type": "image",
-                            "data": data.pop("image_base64"),
-                            "mimeType": data.pop("mime_type", "image/png"),
-                        }
-                    )
-                for image in data.pop("images", None) or []:
-                    content.append({"type": "image", "data": image["image_base64"], "mimeType": image["mime_type"]})
-                text = json.dumps(
-                    _compact(data, full=name == "newton_describe"), allow_nan=False, separators=(",", ":")
-                )
-                content.insert(0, {"type": "text", "text": text})
-                result = {"content": content, "isError": False}
+                result = {"content": self._content(data, full=name == "newton_describe"), "isError": False}
             except Exception as error:
                 result = {"content": [{"type": "text", "text": f"{type(error).__name__}: {error}"}], "isError": True}
         else:
             return self._error(request_id, -32601, "Method not found")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
+    def _content(self, data: dict, *, full: bool) -> list[dict]:
+        """MCP content items: the compact JSON text, then the images, within the response budget."""
+        from .imaging import fit_images  # noqa: PLC0415
+
+        images, notes = [], []
+        if "image_base64" in data:
+            images.append((data.pop("image_base64"), data.pop("mime_type", "image/png")))
+        for image in data.pop("images", None) or []:
+            images.append((image["image_base64"], image.get("mime_type") or "image/png"))
+            if image.get("resized"):
+                notes.append(f"image {len(images)} {image['resized']} to fit the transport")
+        text = json.dumps(_compact(data, full=full), allow_nan=False, separators=(",", ":"))
+        if images:
+            # JSON escaping, item framing and the note itself take a little more than the raw lengths.
+            room = self.response_budget - len(json.dumps(text)) - 64 * (len(images) + 1) - 1024
+            images, note = fit_images(images, max(0, room), stated_budget=self.response_budget)
+            notes += [note] if note else []
+        if notes:
+            data["images_note"] = " ".join(note if note.endswith(".") else f"{note}." for note in notes)
+            text = json.dumps(_compact(data, full=full), allow_nan=False, separators=(",", ":"))
+        return [
+            {"type": "text", "text": text},
+            *({"type": "image", "data": image, "mimeType": kind} for image, kind in images),
+        ]
+
     def _instructions(self) -> str:
         text = _INSTRUCTIONS_LEAN if self.profile == "lean" else _INSTRUCTIONS
-        text = text.replace("<<RTX>>", _RTX_NOTE if rtx_available() else ".")
+        text = text.replace("<<RTX>>", _RTX_NOTE if rtx_available() else "")
         if not self.app_guide:
             return text
         try:
@@ -514,9 +557,24 @@ def main() -> None:
         action="store_true",
         help="Omit the application guide from the server instructions (e.g. when the client prompt already has it)",
     )
+    parser.add_argument(
+        "--reply-within",
+        type=float,
+        default=240.0,
+        help="Reply to a tool call within this many seconds, below the client's tool timeout; a call still running "
+        "continues in the session and its result arrives with a later call (0: wait for completion)",
+    )
+    parser.add_argument(
+        "--response-budget",
+        type=int,
+        default=RESPONSE_BUDGET,
+        help="Largest tool result in characters (text plus base64 images); larger images are re-encoded, "
+        "downscaled, or dropped, with a note",
+    )
     args = parser.parse_args()
+    client = SimulationClient(args.connect, timeout=args.timeout, reply_within=args.reply_within or None)
     protocol = _Protocol(
-        SimulationClient(args.connect, timeout=args.timeout), profile=args.profile, app_guide=not args.no_app_guide
+        client, profile=args.profile, app_guide=not args.no_app_guide, response_budget=args.response_budget
     )
     source, output = sys.stdin.buffer, sys.stdout.buffer
     while True:

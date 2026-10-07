@@ -111,19 +111,30 @@ class TestMcpInstructions(unittest.TestCase):
         self.host = ExampleHost(script)
         # The guide only needs the example's frame time; no scene is built.
         self.host.example = types.SimpleNamespace(frame_dt=1.0 / 60.0)
-        self.lean = protocol._INSTRUCTIONS_LEAN.replace("<<RTX>>", ".")
+        self.lean = protocol._INSTRUCTIONS_LEAN.replace("<<RTX>>", "")
         self.guide = self.host.guide(2, 4)
-        tools = {tool["name"]: tool for tool in protocol.TOOLS}
+        tools = {tool["name"]: tool for tool in protocol._tools(240.0)}
         self.execute_description = tools["newton_execute"]["description"]
         self.descriptions = self.execute_description + "\n" + tools["newton_rebuild"]["description"]
 
     def test_every_helper_is_described(self):
-        """Name each preloaded helper in the instructions or the hosted guide, with its arguments."""
+        """Name each documented helper in the instructions or the hosted guide, with its arguments."""
+        undocumented = ("persist", "persist_source")
         for name in SimulationSession._HELPERS:
-            self.assertRegex(self.lean + self.guide, rf"\b{name}\(", name)
-        for name in ("persist(", "persist_source(", "workers.map(", "workers.sync(", "jobs.start("):
-            self.assertIn(name, self.guide)
-        self.assertIn("overrides", self.guide)
+            if name not in undocumented:
+                self.assertRegex(self.lean + self.guide, rf"\b{name}\(", name)
+        # Worker pools, jobs and writing values back to the script work, but the guide does not describe them.
+        for pattern in (r"\bpersist(_source)?\(", r"\bworkers\b", r"\bjobs\."):
+            self.assertNotRegex(self.lean + self.guide, pattern)
+        for fact in ("overrides", "code", "example.reset()", "only files on disk persist"):
+            self.assertIn(fact, self.guide)
+
+    def test_execute_description_states_the_reply_limit(self):
+        """State the reply limit as a fact when the adapter has one, and nothing without it."""
+        self.assertIn("Calls reply within 240 s", self.execute_description)
+        unlimited = {tool["name"]: tool for tool in protocol._tools(None)}["newton_execute"]["description"]
+        self.assertNotIn("reply within", unlimited)
+        self.assertNotIn("<<", unlimited)
 
     def test_removed_features_and_advice_are_absent(self):
         """Drop removed helpers, structured operations, and workflow coaching from the instructions."""
@@ -138,9 +149,9 @@ class TestMcpInstructions(unittest.TestCase):
         self.assertIsNone(re.search(advice, text), re.search(advice, text))
 
     def test_hosted_guide_fits_the_instruction_budget(self):
-        """Keep the hosted guide well below the 8192 characters the server includes."""
-        self.assertLess(len(self.guide), 5000)
-        self.assertLess(len(self.lean) + len(self.guide), 8000)
+        """Keep the hosted guide and the lean instructions short: agents re-read them on every turn."""
+        self.assertLess(len(self.guide), 1000)
+        self.assertLess(len(self.lean) + len(self.guide), 2000)
 
 
 if __name__ == "__main__":

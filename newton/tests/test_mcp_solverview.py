@@ -203,6 +203,31 @@ class TestMcpModelWatch(unittest.TestCase):
         self.assertEqual(self.gain(session), 50.0)
         self.assertNotIn("note", session.dispatch("execute", {"code": "x = 1"}))
 
+    def test_edits_written_into_the_solver_directly_are_not_reported(self):
+        """Stay silent when the cell also wrote the compiled values itself, as controllers that set gains do."""
+        session = self.make("cpu")
+        servo = _hinge_actuator(session.solver_params("actuator")["rows"])["actuator"]
+        code = (
+            "model.joint_target_ke.fill_(70.0)\n"
+            "gain, bias = solver.mjw_model.actuator_gainprm.numpy(), solver.mjw_model.actuator_biasprm.numpy()\n"
+            f"gain[:, {servo}, 0] = 70.0\nbias[:, {servo}, 1] = -70.0\n"
+            "solver.mjw_model.actuator_gainprm.assign(gain)\nsolver.mjw_model.actuator_biasprm.assign(bias)\n"
+            "rollout(1)"
+        )
+        result = session.dispatch("execute", {"code": code})
+        self.assertNotIn("no notify_model_changed call covered", result.get("note") or "")
+        self.assertEqual(self.gain(session), 70.0)
+        # Writing only one world's compiled values leaves the edit pending, which is reported and notified.
+        code = (
+            "model.joint_target_ke.fill_(30.0)\n"
+            "gain = solver.mjw_model.actuator_gainprm.numpy()\n"
+            f"gain[0, {servo}, 0] = 30.0\n"
+            "solver.mjw_model.actuator_gainprm.assign(gain)\n"
+            "rollout(1)"
+        )
+        result = session.dispatch("execute", {"code": code})
+        self.assertIn("no notify_model_changed call covered", result["note"])
+
     def test_wrong_flag_is_reported_and_completed(self):
         """Complete a gravcomp edit notified with BODY_PROPERTIES, which does not refresh inertial data."""
         session = self.make("cpu")

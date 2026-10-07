@@ -487,7 +487,8 @@ class TestMcpHostWorkers(unittest.TestCase):
                 result = client.request("execute", code="(workers.map(lambda x: x + 1, [1, 2]), workers.status())")
                 values, status = result["result"]
                 self.assertEqual(values, [2, 3])
-                self.assertIn("workers.resize(n) (0 to 2)", client.request("guide")["guide"])
+                # The pool works without being described in the guide.
+                self.assertNotIn("workers", client.request("guide")["guide"])
                 pid = status[0]["pid"]
                 self.assertTrue(_alive(pid))
                 host.send_signal(signal.SIGTERM)

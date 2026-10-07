@@ -91,13 +91,20 @@ class JobQueue:
 
     Args:
         workers: Worker pool for ``where="worker"``, or ``None``.
+        seconds_left: Optional callable returning the seconds left until the running call must
+            reply to its caller (``None`` without a limit); waits without a ``timeout`` end a
+            little earlier.
     """
 
     max_jobs = 512
     """Job records kept; the oldest collected jobs are dropped beyond this."""
 
-    def __init__(self, workers: WorkerPool | None = None):
+    reply_margin = 5.0
+    """Seconds before the reply limit at which waits without a ``timeout`` return [s]."""
+
+    def __init__(self, workers: WorkerPool | None = None, seconds_left: Callable[[], float | None] | None = None):
         self.workers = workers
+        self._seconds_left = seconds_left
         self._backends: dict[str, Callable] = {}
         self._jobs: dict[int, _Job] = {}
         self._next = 1
@@ -159,11 +166,16 @@ class JobQueue:
             self._trim()
         return job_id
 
+    def _default_timeout(self) -> float | None:
+        left = self._seconds_left() if self._seconds_left is not None else None
+        return None if left is None else max(0.0, left - self.reply_margin)
+
     def wait(self, timeout: float | None = None, any: bool = True, ids: list[int] | None = None) -> dict:
         """Wait for jobs that have not been collected yet and collect the finished ones.
 
         Args:
-            timeout: Longest wait [s]; ``None`` waits until the condition holds.
+            timeout: Longest wait [s]; ``None`` waits until the condition holds or, inside a call with a
+                reply limit, until shortly before that limit.
             any: Return when at least one job has finished (``False``: when all have).
             ids: Jobs to consider (default: all uncollected jobs).
 
@@ -177,6 +189,8 @@ class JobQueue:
         with self._lock:
             jobs = [job for job in self._jobs.values() if not job.collected and (ids is None or job.id in ids)]
         pending = [job.future for job in jobs if not job.done()]
+        if timeout is None:
+            timeout = self._default_timeout()
         if pending and not (any and len(pending) < len(jobs)):
             concurrent.futures.wait(
                 pending,
@@ -203,10 +217,27 @@ class JobQueue:
         return {"finished": finished, "running": running}
 
     def result(self, job_id: int, timeout: float | None = None) -> Any:
-        """Wait for one job and return its value (raising its error)."""
+        """Wait for one job and return its value (raising its error).
+
+        Args:
+            job_id: Job id from :meth:`start`.
+            timeout: Longest wait [s]; ``None`` waits until the job finishes or, inside a call with a
+                reply limit, until shortly before that limit.
+
+        Raises:
+            TimeoutError: The job did not finish in time; it keeps running.
+        """
         job = self._job(job_id)
+        limit = self._default_timeout() if timeout is None else timeout
         try:
-            return job.future.result(timeout)
+            return job.future.result(limit)
+        except concurrent.futures.TimeoutError:
+            if job.done():
+                raise  # the job's own error
+            raise TimeoutError(
+                f"Job {job_id} is still running after {job.seconds():.0f} s (waited {limit:.0f} s); "
+                f"jobs.result({job_id}) or jobs.wait() in a later call collects it"
+            ) from None
         finally:
             if job.done():
                 job.collected = job.reported = True

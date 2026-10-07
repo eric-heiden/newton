@@ -1,0 +1,1 @@
+Shorten the live MCP server instructions and hosted-script guide, which no longer describe worker pools, jobs, and `persist()`, and drop notes that carry no news: graph recaptures caused by the cell's own assignments, and model edits whose values `SolverMuJoCo` already integrates. Report instead when the hosted script changed on disk after the last build.

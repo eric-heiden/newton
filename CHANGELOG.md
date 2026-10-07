@@ -12,6 +12,7 @@
 - Add visual feedback to live MCP sessions: inline images from Python via `show()`, auto-framed and multi-view observations, comparison against reference photos, and a `filmstrip` tool that returns frames over time in one image.
 - Add build `overrides` for hosted MCP example scripts, which set module globals before `Example()` is constructed.
 - Add `newton.mcp.WorkerPool` so live MCP sessions can run trusted Python on sibling application sessions in parallel via `workers.broadcast()`, `workers.map()`, and `workers.submit()`. Functions defined in cells are sent by source with the helpers and globals they use, `workers.sync()` copies session values to every worker, and hosted workers start on first use, follow rebuilds in the background, restart after a crash or CUDA error, and can be resized at run time.
+- Add batched evaluation to live MCP sessions: `evaluate()` and `branch()` run candidates, scenarios, and variants as worlds of copies of the hosted scene starting from the live state, with the copies kept across calls and across rebuilds that keep the scene; `branch(sequential=True)` runs variants through the example's own `step()`; and `checkpoint(include=[...])` saves Python objects such as controllers with the state and restores them in place.
 - Add `newton.mcp.JobQueue` (`jobs` in live MCP sessions) to start worker calls in the background and collect their results and printed progress later.
 
 <!-- towncrier release notes start -->

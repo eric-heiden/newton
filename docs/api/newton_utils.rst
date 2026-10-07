@@ -13,10 +13,12 @@ newton.utils
    :toctree: _generated
    :nosignatures:
 
+   BatchRollout
    ColorSpace
    EventTracer
    MeshAdjacency
    MeshAdjacencyData
+   TrajectoryComparison
 
 .. rubric:: Functions
 
@@ -28,6 +30,7 @@ newton.utils
    color_graph
    color_linear_to_srgb
    color_srgb_to_linear
+   compare_trajectories
    compute_world_offsets
    download_asset
    event_scope

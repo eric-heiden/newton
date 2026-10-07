@@ -201,9 +201,10 @@ stale edit before applying it.
 
 ``reset`` restores initial state, controls, session time, and solver/contact
 caches while retaining tuned model parameters. Named checkpoints store public
-state/control arrays and time. They do not capture every hidden solver state,
-so restoring a checkpoint resets solver caches and does not promise bitwise
-replay. Reset and restore clear contact buffers and generation metadata without
+state/control arrays and time, and with ``include`` the Python objects named by
+workspace paths (see :ref:`live-mcp-batch`). They do not capture every hidden
+solver state, so restoring a checkpoint resets solver caches and does not
+promise bitwise replay. Reset and restore clear contact buffers and generation metadata without
 running collision detection. Use ``contacts(refresh=True)`` or ``collide`` to
 regenerate diagnostic contacts, including before an observation with contact
 overlays. The default step path regenerates its contacts before physics;
@@ -286,7 +287,9 @@ in later calls. IPython magics and top-level ``await`` are not implemented.
 
 The reserved names ``session``, ``model``, ``solver``, ``state``, ``state_next``,
 ``control``, ``contacts``, ``viewer``, ``wp``, ``np``, ``newton``, ``show``, and the
-analysis helpers below refresh before each call and after managed state changes. Objects passed as
+analysis helpers below refresh before each call and after managed state changes. A helper name
+that a cell bound to its own value (for example its own ``evaluate`` function) keeps that value;
+the helper stays available as a session method (``session.evaluate``). Objects passed as
 ``SimulationSession(..., namespace={...})`` are also refreshed before each
 call, so applications can expose their own controllers or task objects. Functions that read these globals see the
 current state after an odd number of buffer swaps, including steps initiated
@@ -358,6 +361,11 @@ Trusted cells can use these helpers without imports (``newton``, ``np``, and
   named series (callables or workspace expressions such as
   ``"state.body_q.numpy()[3, 2]"``) in one call, optionally resetting or
   restoring a checkpoint first and stopping on a condition.
+- :meth:`~newton.mcp.SimulationSession.evaluate`,
+  :meth:`~newton.mcp.SimulationSession.branch`, and
+  :meth:`~newton.mcp.SimulationSession.checkpoint` run candidates, scenarios,
+  and variants as worlds of N copies of the live scene and save Python objects
+  with a checkpoint (see :ref:`live-mcp-batch`).
 - :meth:`~newton.mcp.SimulationSession.solver_contacts` groups the solver's
   active contacts by shape pair and lists the parameters the solver actually
   integrates, such as MuJoCo ``solref``, ``solimp``, and friction after geom
@@ -395,6 +403,66 @@ solver objects, or before the edit, are named in the note.
 disables the checks. Edits made by the application's own ``step()``, also when a
 cell calls ``example.step()``, are not reported. Reading the checksums before a
 step waits for the device work queued before it.
+
+.. _live-mcp-batch:
+
+Batched evaluation of the live scene
+------------------------------------
+
+:meth:`~newton.mcp.SimulationSession.evaluate` and
+:meth:`~newton.mcp.SimulationSession.branch` run
+:class:`newton.utils.BatchRollout` (see :doc:`/concepts/batched_evaluation`)
+on a model with N copies of the hosted scene. While ``Example()`` is
+constructed, :class:`~newton.mcp.ExampleHost` records the one-world
+:class:`~newton.ModelBuilder` the example finalized into ``example.model`` and
+the constructor arguments of ``example.solver`` and
+``example.collision_pipeline``; the copies are built from these, so the worlds
+use the same solver settings. Collision-pipeline capacities given as arguments
+(``rigid_contact_max``, ``soft_contact_max``, ``shape_pairs_max``) are
+multiplied by the world count. ``solver=``, ``pipeline=``, ``dt=``, and
+``substeps=`` replace the recorded ones; a frame defaults to one session frame
+(the example's ``sim_dt`` steps per ``frame_dt``).
+
+- Every world starts from ``start``: the live state (default), ``"initial"``
+  (the state after the scene was built), or a checkpoint, with the live (or
+  saved) control values. ``example.step()`` does not run in the worlds;
+  ``control`` (schedules and Warp control functions) and per-world setups
+  drive them. The live session does not change.
+- The N-world model, its solver, and its CUDA graphs are kept for later
+  calls (two models per session), also across ``newton_rebuild`` when the
+  rebuilt scene has the same structure and integer attributes, solver
+  arguments, and steps. Before each call the live model's values that differ
+  from the copies are written into every world and notified; a differing value
+  the copies' solver reads only when it is constructed builds a new model.
+- Results are returned with facts: the start, whether the model was reused or
+  built (and why), the live values copied, and the wall time with the CUDA
+  graph capture and kernel loading of new graphs. A cell whose value is an
+  evaluation, a branch result, an evaluation diff, or a
+  :class:`~newton.utils.TrajectoryComparison` returns its text table.
+
+``branch(n, setup, ...)`` returns ``records`` of shape ``[T, n, ...]`` (row 0
+at the start), their times ``t``, and the ``metrics`` of an optional
+``score(records)``. With ``sequential=True`` the variants run one after
+another through the session's own step (``example.step()`` with its
+controllers): before each variant the start is restored, together with the
+Python objects of the start checkpoint and the example's other objects as they
+were at the call, ``setup(world, i)`` edits the live scene (``world`` has the
+methods of :class:`newton.utils.BatchRollout.WorldSetup` except schedules) or
+Python objects, and its model edits and those of stepping are undone after the
+variant. Records then also accept functions ``fn()`` returning values.
+
+``checkpoint(name, include=["example.controller", ...])`` saves Python
+objects with the state, for example a controller with its warm start. The
+paths name workspace variables or their attributes. The snapshot copies their
+Warp and NumPy arrays and remembers the bindings of their attributes, list
+items, and dictionary entries, four levels deep into objects of the hosted
+script, its helper modules, and cells (and Newton states and controls).
+Other objects, such as solvers and models, and the session's own state,
+control, model, and solver stay bound as they are. Restoring the checkpoint
+(``session.dispatch("restore", ...)``, ``rollout(start=name)``,
+``filmstrip(restore=name)``, or ``branch(start=name)``) writes the copies back
+into the same arrays, so captured CUDA graphs stay valid, and the response
+lists ``objects_restored``.
 
 Writing live results back to the script
 ---------------------------------------

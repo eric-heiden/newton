@@ -154,6 +154,17 @@ def _session_callable(function: Callable) -> Callable:
     return function
 
 
+def _report_text(value: Any) -> str | None:
+    """The text table of Newton's evaluation and comparison results, or ``None`` for other values."""
+    from ..utils.batch_rollout import BatchRollout  # noqa: PLC0415
+    from ..utils.trajectory_comparison import TrajectoryComparison  # noqa: PLC0415
+    from .batch import Branches  # noqa: PLC0415
+
+    if isinstance(value, (BatchRollout.Evaluation, BatchRollout.EvaluationDiff, TrajectoryComparison, Branches)):
+        return value.format()[:60000]
+    return None
+
+
 def _result_summary(value: Any) -> str:
     """Describe an opaque value without calling its repr or iterating its contents."""
     kind = type(value)
@@ -374,6 +385,10 @@ class SimulationSession:
         self.allow_execute = allow_execute
         self.source_path: Path | None = None
         """Script that :meth:`persist` and :meth:`persist_source` edit; :class:`ExampleHost` sets it."""
+        self.scene_source = None
+        """The one-world build of the scene that :meth:`evaluate` and :meth:`branch` copy into worlds;
+        :class:`ExampleHost` records it while the example is constructed."""
+        self._batches = None
         self.revision = 0
         self.replace(
             model,
@@ -514,13 +529,17 @@ class SimulationSession:
         self._resync(snapshot["time"], snapshot["frame"])
         if self.restore_callback is not None and "application" in snapshot:
             self.restore_callback(self, snapshot["application"])
+        objects = snapshot["objects"].restore() if "objects" in snapshot else None
         if self.reset_callback is not None:
             self.reset_callback(self)
         self.valid = True
         self.revision += 1
         self.last_error = None
         self._refresh_workspace()
-        return self._status()
+        status = self._status()
+        if objects:
+            status["objects_restored"] = objects[:32]
+        return status
 
     def enqueue(self, operation: str, arguments: dict, *, timeout: float = 30.0) -> _Request:
         """Queue an operation from a transport thread without touching device data.
@@ -627,6 +646,8 @@ class SimulationSession:
             callback(self)
         if self._renderer is not None:
             self._renderer.close()
+        if self._batches is not None:
+            self._batches.close()
         if self._owns_workers:
             self.workers.close()
         self._clear_workspace()
@@ -936,13 +957,27 @@ class SimulationSession:
                 self._invalidate()
             raise
 
-    def _checkpoint(self, *, name: str = "default") -> dict:
+    def _checkpoint(self, *, name: str = "default", include: list[str] | str | None = None) -> dict:
         if not isinstance(name, str) or not 1 <= len(name) <= 64:
             raise ValueError("Checkpoint name must contain 1 to 64 characters")
         if name not in self._checkpoints and len(self._checkpoints) >= 8:
             raise ValueError("At most eight checkpoints are supported; overwrite an existing name")
-        self._checkpoints[name] = self._snapshot()
-        return {**self._status(), "name": name, "replay": "public arrays plus solver reset; not bitwise"}
+        objects = None
+        if include:
+            if not self.allow_execute:
+                raise PermissionError("include saves Python objects of trusted execution, which is not enabled")
+            from .batch import ObjectSnapshot, session_objects  # noqa: PLC0415
+
+            paths = [include] if isinstance(include, str) else list(include)
+            objects = ObjectSnapshot(self._eval_scope(), paths, exclude=session_objects(self))
+        snapshot = self._snapshot()
+        if objects is not None:
+            snapshot["objects"] = objects
+        self._checkpoints[name] = snapshot
+        result = {**self._status(), "name": name, "replay": "public arrays plus solver reset; not bitwise"}
+        if objects is not None:
+            result["objects"] = objects.summary()
+        return result
 
     def _restore_named(self, *, name: str = "default") -> dict:
         snapshot = self._checkpoints[name]
@@ -1029,6 +1064,9 @@ class SimulationSession:
     _HELPERS: ClassVar[tuple[str, ...]] = (
         "show",
         "rollout",
+        "evaluate",
+        "branch",
+        "checkpoint",
         "health",
         "solver_contacts",
         "solver_params",
@@ -1049,7 +1087,10 @@ class SimulationSession:
         self._workspace.update(self.namespace)
         import newton  # noqa: PLC0415
 
-        self._workspace.update({name: getattr(self, name) for name in self._HELPERS})
+        for name in self._HELPERS:
+            # A cell's own binding of a helper name (e.g. its own evaluate function) takes precedence.
+            if self._workspace.get(name) is None or self._is_helper(name, self._workspace[name]):
+                self._workspace[name] = getattr(self, name)
         self._workspace.update(
             session=self,
             np=np,
@@ -1062,9 +1103,20 @@ class SimulationSession:
             __builtins__=builtins.__dict__,
         )
 
+    def _is_helper(self, name: str, value: Any) -> bool:
+        return getattr(value, "__self__", None) is self and getattr(value, "__name__", None) == name
+
+    def _user_helper_names(self) -> set[str]:
+        """Helper names a cell bound to its own values."""
+        return {
+            name
+            for name in self._HELPERS
+            if self._workspace.get(name) is not None and not self._is_helper(name, self._workspace[name])
+        }
+
     def _session_names(self) -> set[str]:
         """Names bound to this session's own objects, which worker calls resolve in their own session."""
-        return {*self._WORKSPACE_BINDINGS, *self.namespace, "collision_pipeline"}
+        return {*self._WORKSPACE_BINDINGS, *self.namespace, "collision_pipeline"} - self._user_helper_names()
 
     def _background_report(self) -> dict:
         report = {}
@@ -1093,7 +1145,7 @@ class SimulationSession:
         self._refresh_workspace()
 
     def _workspace_info(self) -> dict:
-        reserved = {*self._WORKSPACE_BINDINGS, *self.namespace, "_"}
+        reserved = {*self._WORKSPACE_BINDINGS, *self.namespace, "_"} - self._user_helper_names()
         variables = sorted(
             name
             for name in self._workspace
@@ -1267,7 +1319,8 @@ class SimulationSession:
             scope["_"] = value
         representation = None
         try:
-            result = _result_json(value)
+            report = _report_text(value)
+            result = _result_json(value) if report is None else report
             if len(json.dumps(result)) > 65536:
                 raise ValueError("result exceeds 65536 characters")
         except Exception:
@@ -1676,7 +1729,8 @@ class SimulationSession:
                 available as ``result[name][key]``.
             every: Sample every ``every`` steps (the final step is always sampled).
             start: ``True`` resets to the initial state, a string restores that
-                checkpoint, ``False`` continues from the current state.
+                checkpoint (with the Python objects it saved, see :meth:`checkpoint`),
+                ``False`` continues from the current state.
             until: Stop early once this callable/expression is truthy; the
                 reason is reported in ``stopped``.
 
@@ -1756,6 +1810,205 @@ class SimulationSession:
                 result[name] = np.stack(values)
         result.update(frames=count, stopped=stopped)
         return result
+
+    def _batch(self):
+        self._assert_owner()
+        if self._batches is None:
+            from .batch import LiveBatches  # noqa: PLC0415
+
+            self._batches = LiveBatches(self)
+        return self._batches
+
+    def evaluate(
+        self,
+        candidates: Any,
+        scenarios: Any = None,
+        *,
+        frames: int | None = None,
+        seconds: float | None = None,
+        score: Callable,
+        setup: Callable | None = None,
+        control: Any = None,
+        record: dict[str, Any] | None = None,
+        every: int = 1,
+        passed: Callable | None = None,
+        worst: dict[str, str] | None = None,
+        build: Callable | None = None,
+        start: str | None = None,
+        worlds: int | None = None,
+        solver: Callable | None = None,
+        pipeline: Callable | bool | None = None,
+        dt: float | None = None,
+        substeps: int | None = None,
+    ):
+        """Run every candidate in every scenario as worlds of N copies of the live scene (trusted execution helper).
+
+        :meth:`newton.utils.BatchRollout.evaluate` on a model with one world per
+        case, built from the one-world scene the hosted script constructed (its
+        builder, solver, and collision pipeline, see :attr:`scene_source`).
+        Every world starts from ``start``, with the live control values, then
+        ``setup`` sets its case. The live session itself does not change. The
+        N-world model is kept for later calls, also across rebuilds that keep
+        the scene's structure, solver, and steps; before each call the live
+        model's values are copied into it (a differing value the batch solver
+        reads only when it is constructed builds a new one). Cases beyond
+        ``worlds`` (default: the number of cases, at most 256) run in several
+        batches. See :ref:`live-mcp-batch`.
+
+        Args:
+            candidates: Candidates as a sequence or a mapping of keys to candidates.
+            scenarios: Scenarios as a sequence or mapping, or ``None`` for one.
+            frames: Frames to run per case; a frame is one step of the session
+                (``substeps`` physics steps of ``dt``).
+            seconds: Simulated time per case [s] instead of ``frames``.
+            score: ``score(records, cases)`` returns metrics with one value per case.
+            setup: ``setup(world, candidate, scenario)`` sets one case through a
+                :class:`newton.utils.BatchRollout.WorldSetup`.
+            control: Schedules and control functions shared by all cases (see
+                :meth:`newton.utils.BatchRollout.run`). ``example.step()`` does not
+                run in the worlds.
+            record: Probes by name (see :meth:`newton.utils.BatchRollout.run`).
+            every: Record every ``every`` frames.
+            passed: ``passed(metrics, candidate, scenario)`` decides whether a case passes.
+            worst: Which end of each metric is worse, ``"max"`` or ``"min"``.
+            build: Per-candidate one-world builds (see :meth:`newton.utils.BatchRollout.evaluate`).
+            start: ``None`` for the live state, ``"initial"`` for the state after
+                the scene was built, or a checkpoint name.
+            worlds: Worlds per batch.
+            solver: Function that creates the solver for the batch's model;
+                ``None`` repeats the constructor call of the scene's solver.
+            pipeline: Function that creates the collision pipeline; ``None``
+                repeats the scene's, ``False`` steps without one.
+            dt: Physics time step [s]; ``None`` for the example's ``sim_dt``.
+            substeps: Physics steps per frame; ``None`` for the example's.
+
+        Returns:
+            The :class:`newton.utils.BatchRollout.Evaluation` with ``facts``: the
+            start, the model (reused or built, and why), copied live values, and
+            wall time including CUDA graph warm-up. A cell that returns it shows
+            these and the table as text.
+        """
+        return self._batch().evaluate(
+            candidates,
+            scenarios,
+            frames=frames,
+            seconds=seconds,
+            score=score,
+            setup=setup,
+            control=control,
+            record=record,
+            every=every,
+            passed=passed,
+            worst=worst,
+            build=build,
+            start=start,
+            worlds=worlds,
+            solver=solver,
+            pipeline=pipeline,
+            dt=dt,
+            substeps=substeps,
+        )
+
+    def branch(
+        self,
+        n: int,
+        setup: Callable | None = None,
+        *,
+        frames: int | None = None,
+        seconds: float | None = None,
+        start: str | None = None,
+        record: dict[str, Any] | None = None,
+        control: Any = None,
+        every: int = 1,
+        score: Callable | None = None,
+        sequential: bool = False,
+        worlds: int | None = None,
+        solver: Callable | None = None,
+        pipeline: Callable | bool | None = None,
+        dt: float | None = None,
+        substeps: int | None = None,
+    ):
+        """Run ``n`` variants from the live state or a checkpoint and record them (trusted execution helper).
+
+        By default the variants are worlds of N copies of the live scene, as in
+        :meth:`evaluate`: physics with the given ``control`` (the live control
+        values otherwise); ``example.step()`` does not run in them. With
+        ``sequential=True`` the variants run one after another in this session
+        through its own step (``example.step()`` with its controllers): before
+        each variant the start state is restored, including the Python objects
+        that :meth:`checkpoint` saved with ``include``, and edits made by
+        ``setup`` and by stepping are undone after it. Either way the session
+        returns to its state before the call.
+
+        Args:
+            n: Number of variants.
+            setup: ``setup(world, i)`` sets variant ``i`` through a
+                :class:`newton.utils.BatchRollout.WorldSetup` (sequentially:
+                the same methods applied to the live scene, except schedules);
+                it may also change Python objects.
+            frames: Frames per variant (session frames).
+            seconds: Simulated time per variant [s] instead of ``frames``.
+            start: ``None`` for the live state, ``"initial"``, or a checkpoint name.
+            record: Probes by name: ``"attribute"`` or ``("attribute", labels)``
+                of the state or control; as worlds also ``fn(rollout) -> wp.array``
+                with one row per world, sequentially ``fn()`` returning a value.
+            control: Schedules and control functions for the worlds (see
+                :meth:`newton.utils.BatchRollout.run`).
+            every: Record every ``every`` frames.
+            score: ``score(records)`` returns metrics with one value per variant.
+            sequential: Run the variants one after another through the session's step.
+            worlds: Worlds per batch (as worlds).
+            solver: Solver factory for the worlds (see :meth:`evaluate`).
+            pipeline: Collision pipeline factory for the worlds (see :meth:`evaluate`).
+            dt: Physics time step of the worlds [s].
+            substeps: Physics steps per frame of the worlds.
+
+        Returns:
+            The variants' ``records`` (shape ``[T, n, ...]``, row 0 at the
+            start), their session times ``t`` [s], ``metrics``, and ``facts``.
+            A cell that returns it shows one row per variant.
+        """
+        return self._batch().branch(
+            n,
+            setup,
+            frames=frames,
+            seconds=seconds,
+            start=start,
+            record=record,
+            control=control,
+            every=every,
+            score=score,
+            sequential=sequential,
+            worlds=worlds,
+            solver=solver,
+            pipeline=pipeline,
+            dt=dt,
+            substeps=substeps,
+        )
+
+    def checkpoint(self, name: str = "default", include: list[str] | str | None = None) -> dict:
+        """Save the simulation state under ``name``, optionally with Python objects (trusted execution helper).
+
+        The same as ``session.dispatch("checkpoint", ...)``. ``include`` names
+        workspace variables or attribute paths, such as ``"planner"`` or
+        ``"example.controller"``. Their Warp and NumPy arrays are copied, and
+        their attribute bindings and the contents of their lists and
+        dictionaries are remembered, four levels deep into objects of the
+        hosted script, its helper modules, and cells (other objects, such as
+        solvers and models, stay bound as they are). Restoring the checkpoint,
+        ``rollout(start=name)``, and :meth:`branch` with ``start=name`` write
+        them back in place, so arrays keep their identity and captured CUDA
+        graphs stay valid.
+
+        Args:
+            name: Checkpoint name (at most eight are kept).
+            include: Python objects to save with the state.
+
+        Returns:
+            The session status, plus ``objects`` (saved paths, copied arrays and
+            their size) when ``include`` is given.
+        """
+        return self.dispatch("checkpoint", {"name": name, "include": include})
 
     def _eval_scope(self) -> dict:
         if self._workspace_module is not None:

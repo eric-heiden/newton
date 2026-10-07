@@ -412,6 +412,15 @@ class ModelWatch:
             # E.g. persist() or a rebuild dispatched from a cell.
             self._guard(self._start)
 
+    @contextlib.contextmanager
+    def muted(self):
+        """Ignore ``notify_model_changed`` calls made inside, e.g. on the solvers of batched copies of the scene."""
+        previous, self._notifying = self._notifying, True
+        try:
+            yield
+        finally:
+            self._notifying = previous
+
     def settle(self) -> None:
         """Keep the baseline valid across a revision change that did not touch the model (the end of a cell)."""
         session = self._session()

@@ -84,6 +84,10 @@ Kinematics and dynamics functions
    * - :mod:`newton.controllers`
      - Joint-impedance, differential-IK, and operational-space control laws
        (experimental).
+   * - :class:`newton.utils.BatchRollout`
+     - Rollouts of many control sequences or parameter sets as the worlds of
+       one model, started from the state of another model with the same
+       per-world layout (see :doc:`batched_evaluation`).
 
 :doc:`articulations` defines the ``joint_q`` and ``joint_qd`` layouts and the
 inverse-dynamics terms.

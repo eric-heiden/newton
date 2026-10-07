@@ -163,6 +163,19 @@ __all__ += [
 ]
 
 # ==================================================================================
+# batched evaluation
+# ==================================================================================
+
+from ._src.utils.batch_rollout import BatchRollout  # noqa: E402
+from ._src.utils.trajectory_comparison import TrajectoryComparison, compare_trajectories  # noqa: E402
+
+__all__ += [
+    "BatchRollout",
+    "TrajectoryComparison",
+    "compare_trajectories",
+]
+
+# ==================================================================================
 # diagnostic reports
 # ==================================================================================
 

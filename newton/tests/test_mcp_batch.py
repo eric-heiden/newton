@@ -226,6 +226,27 @@ def test_branch_from_the_live_state_and_a_checkpoint(test, device):
     test.assertIn("checkpoint 'early' (t=0.1 s)", hosted.value("same.format()"))
 
 
+def test_branches_start_from_the_saved_body_state(test, device):
+    """Worlds start from a checkpoint's body poses and velocities, not the model's (vector-valued arrays too)."""
+    hosted = _Hosted(test, device)
+    session = hosted.session
+    hosted.execute("session.dispatch('step', {'count': 6})\ncheckpoint('moving')")
+    body_q = session.state.body_q.numpy().copy()
+    body_qd = session.state.body_qd.numpy().copy()
+    test.assertGreater(abs(body_q[0, 0]), 1.0e-3)  # the controller pushed the puck
+    hosted.execute("session.dispatch('step', {'count': 4})")
+    hosted.execute("b = branch(2, frames=1, start='moving', record={'q': 'body_q', 'qd': 'body_qd'})")
+    for name, expected in (("q", body_q), ("qd", body_qd)):
+        start = np.asarray(hosted.value(f"b.records[{name!r}][0].tolist()"))
+        for variant in range(2):
+            np.testing.assert_allclose(start[variant], expected, atol=1.0e-6)
+    x0 = hosted.value(
+        "evaluate([None], None, frames=1, start='moving', record={'q': 'body_q'}, "
+        "score=lambda r, c: {'x0': r['q'][0, :, 0, 0]}).rows[0]['x0']"
+    )
+    test.assertAlmostEqual(x0, float(body_q[0, 0]), places=6)
+
+
 def test_checkpoint_restores_python_objects_in_place(test, device):
     hosted = _Hosted(test, device)
     hosted.execute("session.dispatch('step', {'count': 3})")

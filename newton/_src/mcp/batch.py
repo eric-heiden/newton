@@ -1134,7 +1134,8 @@ class LiveBatches:
                 for part in parts[:-1]:
                     owner = getattr(owner, part)
                 array = getattr(owner, parts[-1], None)
-                if isinstance(array, wp.array) and array.shape == data.shape:
+                # Snapshots hold NumPy copies, whose shape includes the dtype's (7 per transform).
+                if isinstance(array, wp.array) and (*array.shape, *getattr(array.dtype, "_shape_", ())) == data.shape:
                     array.assign(data)
         return state, control, label, float(snapshot["time"]), snapshot
 

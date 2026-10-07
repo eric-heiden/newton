@@ -593,7 +593,7 @@ class TestPrompt(unittest.TestCase):
             self.assertIn(environment, prompt)
         self.assertNotIn("not installed", run_v4._environment(dict(FACTS, gnu_time=True)))
 
-    def test_both_conditions_name_the_same_newton_utilities(self):
+    def test_both_conditions_name_the_same_newton_docs(self):
         import importlib  # noqa: PLC0415
 
         prompts = [
@@ -603,22 +603,16 @@ class TestPrompt(unittest.TestCase):
         block = run_v4._newton_tools()
         for prompt in prompts:
             self.assertEqual(prompt.count(block), 1)
-        self.assertEqual(block.count("\n"), len(run_v4.NEWTON_UTILITIES) + 1)
-        # Every API a line names exists, so the prompt cannot advertise a removed or renamed symbol.
-        for names, line in run_v4.NEWTON_UTILITIES:
-            for name in names:
-                parts = name.split(".")
-                for split in range(len(parts), 0, -1):
-                    try:
-                        target = importlib.import_module(".".join(parts[:split]))
-                    except ImportError:
-                        continue
-                    for attribute in parts[split:]:
-                        target = getattr(target, attribute)
-                    break
-                else:
-                    self.fail(f"{name} does not resolve")
-                self.assertIn(parts[-1], line)
+        page, names, line = run_v4.NEWTON_DOCS
+        self.assertEqual(block, line + "\n")
+        self.assertIn(page, line)
+        self.assertTrue((run_v4.ROOT / page).is_file())
+        # Every API the line names exists, so the prompt cannot advertise a removed or renamed symbol.
+        for name in names:
+            module, attribute = name.rsplit(".", 1)
+            self.assertTrue(hasattr(importlib.import_module(module), attribute), name)
+            self.assertIn(name, line)
+            self.assertIn(attribute, (run_v4.ROOT / page).read_text())
 
     def test_both_conditions_state_the_verifier_rules_and_shell_facts(self):
         facts = {

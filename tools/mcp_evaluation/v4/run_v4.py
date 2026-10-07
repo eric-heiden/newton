@@ -43,9 +43,9 @@ HERE = Path(__file__).resolve().parent
 PYTHON = ROOT / ".venv/bin/python"
 # MCP tool profile: "lean" advertises only execute and rebuild to keep per-turn context small.
 PROFILE = os.environ.get("NEWTON_MCP_PROFILE", "lean")
-# Sibling live copies the MCP condition may use for parallel sweeps, and the most workers.resize() may set (the
-# host's own default); both reach the host and the guide in the prompt, so the guide describes the hosted pool.
-WORKERS = int(os.environ.get("NEWTON_MCP_WORKERS", "2"))
+# Sibling live copies hosted for the MCP condition, and the most workers.resize() may set (the host's own default).
+# Off unless set: the guide no longer describes worker pools, and in i16 they brought no GPU throughput.
+WORKERS = int(os.environ.get("NEWTON_MCP_WORKERS", "0"))
 MAX_WORKERS = int(os.environ.get("NEWTON_MCP_MAX_WORKERS", max(WORKERS, 4) if WORKERS else 0))
 # Seconds of budget between workspace snapshots (0: none); see snapshots.py.
 SNAPSHOT_SECONDS = float(os.environ.get("NEWTON_SNAPSHOT_SECONDS", snap.PERIOD))
@@ -573,67 +573,21 @@ def _renderers() -> str:
     )
 
 
-# Public Newton APIs named in both prompts, one fact line each: (names the line uses, line). The MCP guide
-# names live wrappers of some of them, so both conditions must learn of the underlying API the same way.
-NEWTON_UTILITIES = (
-    (
-        ("newton.examples.headless",),
-        "`python -m newton.examples.headless SCRIPT [script args] [--frames N] [--call EXPR] [--json OUT] "
-        "[--timeout S]` runs an example script in a fresh process and reports the outcome as JSON.",
-    ),
-    (
-        ("newton.utils.report_solver_params", "newton.utils.report_health"),
-        "newton.utils.report_solver_params(solver, kind) reports the values a solver integrates and the model arrays "
-        "they come from; newton.utils.report_health(model, state, solver) reports non-finite values, full buffers, "
-        "and penetrating shape pairs per world.",
-    ),
-    (
-        (
-            "newton.Model.find_bodies",
-            "newton.Model.find_shapes",
-            "newton.Model.find_joints",
-            "newton.Model.find_joint_dofs",
-            "newton.Model.find_joint_coords",
-        ),
-        "newton.Model.find_bodies, find_shapes, find_joints, find_joint_dofs and find_joint_coords(pattern, "
-        "world=None) return the model indices that label patterns select (full label or last path component); "
-        "SolverMuJoCo.newton_body_to_mjc_body, newton_dof_to_mjc_dof and newton_shape_to_mjc_geom map them to "
-        "compiled MuJoCo ids.",
-    ),
-    (
-        ("newton.selection.WorldView",),
-        "newton.selection.WorldView(model) reads and writes per-world values of model, state and control attributes "
-        "selected by label as [world, row, ...] arrays and copies one world's state into many worlds; with solver= "
-        "it raises for values the solver shares across worlds, reads only when constructed, or does not read.",
-    ),
-    (
-        (
-            "newton.solvers.SolverMuJoCo.convert_joint_coords_to_mujoco",
-            "newton.solvers.SolverMuJoCo.convert_joint_coords_from_mujoco",
-        ),
-        "SolverMuJoCo.convert_joint_coords_to_mujoco(joint_q, joint_qd) and convert_joint_coords_from_mujoco(qpos, "
-        "qvel) convert batches between Newton joint coordinates and MuJoCo qpos/qvel; "
-        "docs/concepts/model_based_control.rst lists Newton's kinematics and dynamics functions and the "
-        "Newton-MuJoCo conventions.",
-    ),
-    (
-        (
-            "newton.sensors.SensorCamera.Intrinsics.from_camera_matrix",
-            "newton.sensors.SensorCamera.Intrinsics.project",
-            "newton.sensors.SensorCamera.Intrinsics.unproject",
-            "newton.sensors.SensorCamera.Intrinsics.unproject_to_plane",
-            "newton.sensors.SensorCamera.Intrinsics.compute_camera_rays",
-        ),
-        "newton.sensors.SensorCamera.Intrinsics (from_camera_matrix, project, unproject, unproject_to_plane, "
-        "compute_camera_rays) maps between world points and image pixels of a calibrated camera with OpenCV or "
-        "inverse Brown-Conrady distortion.",
-    ),
+# The Newton docs page both prompts name, in one fact line: (page, APIs the line names, line). i16 showed that
+# one-line mentions of single utilities were not adopted, so the prompts point to one page with a worked example.
+NEWTON_DOCS = (
+    "docs/concepts/batched_evaluation.rst",
+    ("newton.utils.BatchRollout", "newton.utils.compare_trajectories"),
+    "Newton docs: docs/concepts/batched_evaluation.rst describes newton.utils.BatchRollout, which runs variants of "
+    "one scene (candidates, scenarios, negative controls, branches from a saved state) as the worlds of one model and "
+    "tabulates per-case metrics, and newton.utils.compare_trajectories, which reports per-signal errors between "
+    "trajectories such as a log and a replay.",
 )
 
 
 def _newton_tools() -> str:
-    """Newton utilities that serve both conditions, one line each (see :data:`NEWTON_UTILITIES`)."""
-    return "Newton utilities:\n" + "".join(f"- {line}\n" for _, line in NEWTON_UTILITIES)
+    """The Newton docs line of both conditions (see :data:`NEWTON_DOCS`)."""
+    return NEWTON_DOCS[2] + "\n"
 
 
 def _environment(facts: dict) -> str:

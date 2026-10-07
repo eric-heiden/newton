@@ -660,6 +660,9 @@ class SimulationSession:
             for key, names in (application or {}).items():
                 facts[key] = facts.get(key, []) + list(names)
         objects = snapshot["objects"].restore() if "objects" in snapshot else None
+        if objects and facts.get("kept"):
+            # Arrays of the Python objects the checkpoint included are restored with them, not kept.
+            facts["kept"] = [name for name in facts["kept"] if name not in objects]
         if self.reset_callback is not None:
             self.reset_callback(self)
         self.valid = True

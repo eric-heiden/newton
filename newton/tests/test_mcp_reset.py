@@ -110,6 +110,22 @@ class TestMcpReset(unittest.TestCase):
         self.assertEqual(schedule, 3.0)
         self.assertIn("restore('a'): kept example.schedule", result["note"])
 
+    def test_restore_does_not_report_included_objects_as_kept(self):
+        """Arrays of objects a checkpoint included are restored with them, so restore does not list them as kept."""
+        result = self.execute(
+            "rollout(2)\n"
+            "checkpoint('a', include=['example'])\n"
+            "rollout(2)\n"
+            "example.schedule.fill_(3.0)\n"
+            "r = session.dispatch('restore', {'name': 'a'})\n"
+            "[r.get('kept'), r.get('objects_restored'), float(example.schedule.numpy()[0])]"
+        )
+        kept, restored, schedule = result["result"]
+        self.assertIsNone(kept)
+        self.assertIn("example.schedule", restored)
+        self.assertEqual(schedule, 1.0)
+        self.assertNotIn("kept example.schedule", result.get("note", ""))
+
     def test_cell_steps_teach_writes(self):
         """Steps a cell runs through example.step() count as steps for what reset rewinds."""
         result = self.execute(

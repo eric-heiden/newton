@@ -513,7 +513,7 @@ def convert_newton_contacts_to_mjwarp_kernel(
                 if contact_overflow[2] == 0:
                     wp.printf(
                         "SolverMuJoCo: %d Newton contacts exceed the MuJoCo Warp contact buffer (naconmax %d, shared "
-                        "by %d worlds); contacts past it are dropped. Increase nconmax (printed once per solver, "
+                        "by %d worlds); contacts past it are dropped, increase nconmax (printed once per solver, "
                         "newton.utils.report_health() counts every occurrence and the contacts lost per world)\n",
                         count,
                         naconmax,

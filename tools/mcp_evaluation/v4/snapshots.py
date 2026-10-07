@@ -19,9 +19,11 @@ Layout of ``RUN_DIR/snapshots/``:
   kernels that verification saw (verifiers time setup and rollouts).
 
 After an iteration, ``python -m tools.mcp_evaluation.v4.run_v4 --verify-snapshots RUN_DIR [...] [--all]``
-verifies the snapshots with the task's sandboxed verifier and writes ``RUN_DIR/snapshot_verification.json``.
-:func:`search` is the search it runs. Consecutive snapshots whose submitted files are identical (the task's
-``snapshot_ignore`` patterns name files its verifier does not read) form one version, verified once.
+verifies the snapshots with the task's current sandboxed verifier, on the Newton the trial ran on, and writes
+``RUN_DIR/snapshot_verification.json``. :func:`search` is the search it runs. Consecutive snapshots whose
+submitted files are identical (the task's ``snapshot_ignore`` patterns name files its verifier does not read)
+form one version, verified once. The final snapshot takes the final verdict: ``RUN_DIR/reverify/result.json``
+(reverify.py) if it exists, else the trial's own verification.
 
 ``snapshot_verification.json`` fields:
 
@@ -38,6 +40,9 @@ verifies the snapshots with the task's sandboxed verifier and writes ``RUN_DIR/s
   whether it was verified, equal to a verified version, taken from the trial's own verification, or inferred
   from the monotonicity assumption, in which case ``success`` is ``None`` and ``inferred_success`` is set).
 - ``verifications``: every verification run, in order, with its duration and result.
+- ``final_verdict_source``: ``reverify`` or ``trial``; ``verifier_commit``: the commit the verifier ran from;
+  ``newton_commit`` and ``newton_path``: the trial's commit and the newton package verifications imported;
+  ``newton_dirty``: the trial ran with uncommitted Newton changes, which a verification cannot reproduce.
 """
 
 from __future__ import annotations

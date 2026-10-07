@@ -268,6 +268,7 @@ class TestTrialSnapshots(TemporaryDirectory):
             mock.patch.object(ti, "seed_caches", return_value=caches),
             mock.patch.object(ti, "provenance", return_value={"diff": "", "commit": "test"}),
             mock.patch.object(ti, "live_trials", return_value=set()),
+            mock.patch.object(run_v4, "newton_source", return_value=None),
         ):
             replacement.start()
             self.addCleanup(replacement.stop)
@@ -345,12 +346,192 @@ class TestTrialSnapshots(TemporaryDirectory):
         self.assertEqual(result["snapshots"][-1]["source"], "trial")
         self.assertEqual(result["snapshots"][-1]["success"], summary["verification"]["success"])
 
+    def test_final_snapshot_takes_the_reverified_verdict(self):
+        run_dir = self.root / "loop" / "fake-opus-restart-p0"
+        summary = run_v4.run_trial(run_v4.prepare(run_dir, "fake", "restart", "opus", 60, "test"))
+        self.assertTrue(summary["verification"]["success"])
+        first = run_v4.verify_snapshots(run_dir)
+        self.assertEqual(first["final_verdict_source"], "trial")
+        self.assertIsNotNone(first["first_pass_seconds"])
+        # A later re-verification with a stricter verifier fails the final workspace: it replaces the trial's
+        # verdict, and under the monotonicity assumption no version passed.
+        (run_dir / "reverify").mkdir()
+        rejected = {"success": False, "failed_checks": ["stricter"], "commit": "abc"}
+        (run_dir / "reverify" / "result.json").write_text(json.dumps(rejected))
+        result = run_v4.verify_snapshots(run_dir)
+        self.assertEqual(result["final_verdict_source"], "reverify")
+        final = result["snapshots"][-1]
+        self.assertEqual((final["source"], final["success"]), ("reverify", False))
+        records = [r for r in result["verifications"] if r["digest"] == final["digest"]]
+        self.assertEqual(len(records), 1)
+        self.assertEqual((records[0]["failed_checks"], records[0]["verifier_commit"]), (["stricter"], "abc"))
+        self.assertIsNone(result["first_pass_seconds"])
+        self.assertTrue(result["monotonicity_violated"] is False)
+
+    def test_agents_run_without_auto_memory(self):
+        run_dir = self.root / "loop" / "fake-opus-restart-p0"
+        agent = 'cat > /dev/null; echo "$CLAUDE_CODE_DISABLE_AUTO_MEMORY" > memory.txt'
+        with mock.patch.object(run_v4, "_agent_command", return_value=["bash", "-c", agent]):
+            run_v4.run_trial(run_v4.prepare(run_dir, "fake", "restart", "opus", 60, "test"))
+        self.assertEqual((run_dir / "workspace" / "memory.txt").read_text().strip(), "1")
+
     def test_refuses_while_trials_run(self):
         run_dir = self.root / "loop" / "fake-opus-restart-p0"
         run_v4.run_trial(run_v4.prepare(run_dir, "fake", "restart", "opus", 60, "test"))
         with mock.patch.object(ti, "live_trials", return_value={"abc123"}):
             with self.assertRaisesRegex(RuntimeError, "between iterations"):
                 run_v4.verify_snapshots(run_dir)
+
+
+def _codex_session(path: Path, totals: list[tuple[int, int, int]], images: int = 0) -> None:
+    """A Codex session log with one cumulative token count per (input, cached input, output) and image views."""
+    events = [{"type": "session_meta", "payload": {"id": "s"}}]
+    for _ in range(images):
+        item = {"type": "ImageView", "path": "file:///w/a.png"}
+        events.append({"type": "event_msg", "payload": {"type": "item_completed", "item": item}})
+    for tokens, cached, output in totals:
+        usage = {"input_tokens": tokens, "cached_input_tokens": cached, "cache_write_input_tokens": 0}
+        usage |= {"output_tokens": output, "reasoning_output_tokens": 0, "total_tokens": tokens + output}
+        info = {"total_token_usage": usage, "last_token_usage": usage}
+        events.append({"type": "event_msg", "payload": {"type": "token_count", "info": info}})
+    events.append({"type": "event_msg", "payload": {"type": "turn_aborted", "reason": "interrupted"}})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(event) + "\n" for event in events))
+
+
+class TestUsage(TemporaryDirectory):
+    """Usage of a run the harness interrupted is recovered from Codex's session log or marked unknown, never 0."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_dir = self.root / "run"
+        self.run_dir.mkdir()
+        self.zero = {"input_tokens": 0, "cached_input_tokens": 0, "cache_write_tokens": 0, "output_tokens": 0}
+        self.zero["uncached_input_plus_output"] = 0
+
+    def transcript(self, *events: dict) -> None:
+        (self.run_dir / "agent.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
+
+    def test_interrupted_codex_run_takes_the_session_token_count(self):
+        self.transcript({"type": "thread.started"}, {"type": "turn.started"})
+        home = self.root / "codex-home"
+        _codex_session(home / "sessions/2026/10/07/rollout-a.jsonl", [(100, 0, 5), (230, 110, 9)], images=2)
+        record = run_v4._usage_record(self.run_dir, "codex", dict(self.zero), str(home))
+        self.assertEqual(record["usage_source"], "codex_session")
+        self.assertFalse(record["usage_complete"])
+        self.assertEqual(record["usage"]["input_tokens"], 230)
+        self.assertEqual(record["usage"]["cached_input_tokens"], 110)
+        self.assertEqual(record["usage"]["output_tokens"], 9)
+        self.assertEqual(record["usage"]["uncached_input_plus_output"], 129)
+        self.assertEqual(record["codex_image_views"], 2)
+        self.assertTrue((self.run_dir / "codex-sessions" / "rollout-a.jsonl").exists())
+
+    def test_completed_codex_run_keeps_its_final_usage(self):
+        self.transcript({"type": "turn.completed", "usage": {"input_tokens": 7}})
+        home = self.root / "codex-home"
+        _codex_session(home / "sessions/2026/10/07/rollout-a.jsonl", [(7, 0, 1)], images=1)
+        usage = dict(self.zero, input_tokens=7)
+        record = run_v4._usage_record(self.run_dir, "codex", usage, str(home))
+        self.assertEqual((record["usage_source"], record["usage_complete"]), ("final", True))
+        self.assertEqual(record["usage"], usage)
+        self.assertEqual(record["codex_image_views"], 1)
+
+    def test_unknown_usage_is_none_not_zero(self):
+        self.transcript({"type": "assistant", "message": {"content": []}})
+        record = run_v4._usage_record(self.run_dir, "claude", dict(self.zero), None)
+        self.assertEqual((record["usage_source"], record["usage_complete"]), (None, False))
+        self.assertEqual(set(record["usage"]), set(self.zero))
+        self.assertTrue(all(value is None for value in record["usage"].values()))
+        self.transcript({"type": "turn.started"})
+        record = run_v4._usage_record(self.run_dir, "codex", dict(self.zero), str(self.root / "empty-home"))
+        self.assertIsNone(record["usage"]["output_tokens"])
+        self.assertIsNone(record["codex_image_views"])
+
+    def test_claude_result_is_complete(self):
+        self.transcript({"type": "result", "usage": {}})
+        record = run_v4._usage_record(self.run_dir, "claude", dict(self.zero), None)
+        self.assertEqual((record["usage_source"], record["usage_complete"]), ("final", True))
+        self.assertNotIn("codex_image_views", record)
+
+    def test_codex_keeps_its_session_log_only_with_its_own_home(self):
+        command = run_v4._agent_command({"cli": "codex", "model": "m", "effort": "low"}, self.root, None)
+        self.assertIn("--ephemeral", command)
+        kept = run_v4.keep_codex_session(command, {"CODEX_HOME": str(self.root / "codex-home")})
+        self.assertEqual(kept, [arg for arg in command if arg != "--ephemeral"])
+        self.assertEqual(run_v4.keep_codex_session(command, {}), command)
+        claude = ["claude", "-p", "--ephemeral"]
+        self.assertEqual(run_v4.keep_codex_session(claude, {"CODEX_HOME": "/x"}), claude)
+
+
+class TestNewtonSource(TemporaryDirectory):
+    """Finished trials are verified again on the newton package of the commit they ran on."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.root / "repo"
+        (self.repo / "newton").mkdir(parents=True)
+        (self.repo / "tools").mkdir()
+
+        def git(*args):
+            return subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                cwd=self.repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+
+        self.git = git
+        git("init", "-q")
+        (self.repo / "newton" / "__init__.py").write_text("VERSION = 1\n")
+        (self.repo / "tools" / "verify.py").write_text("RULE = 1\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "one")
+        self.first = git("rev-parse", "HEAD")
+        patcher = mock.patch.object(run_v4, "VERIFY_SOURCES", self.root / "sources")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_same_newton_uses_the_tree(self):
+        (self.repo / "tools" / "verify.py").write_text("RULE = 2\n")  # verifier changes do not matter
+        self.git("commit", "-q", "-am", "verifier fix")
+        self.assertIsNone(run_v4.newton_source(self.first, self.repo))
+        self.assertIsNone(run_v4.newton_source(None, self.repo))
+
+    def test_changed_newton_is_exported_once(self):
+        (self.repo / "newton" / "__init__.py").write_text("VERSION = 2\n")
+        self.git("commit", "-q", "-am", "newton change")
+        source = run_v4.newton_source(self.first, self.repo)
+        self.assertEqual(source, self.root / "sources" / self.git("rev-parse", f"{self.first}:newton"))
+        self.assertEqual((source / "newton" / "__init__.py").read_text(), "VERSION = 1\n")
+        self.assertFalse((source / "tools").exists())
+        (source / "newton" / "marker").write_text("")
+        self.assertTrue((run_v4.newton_source(self.first, self.repo) / "newton" / "marker").exists())
+        # A later commit with the same package (a verifier fix) shares the copy.
+        self.git("checkout", "-q", self.first, "--", "newton")
+        (self.repo / "tools" / "verify.py").write_text("RULE = 2\n")
+        self.git("commit", "-q", "-am", "revert newton, fix verifier")
+        same = self.git("rev-parse", "HEAD")
+        (self.repo / "newton" / "__init__.py").write_text("VERSION = 3\n")
+        self.git("commit", "-q", "-am", "newton change")
+        self.assertEqual(run_v4.newton_source(same, self.repo), source)
+        # Uncommitted and untracked changes of the tree count as well.
+        self.assertIsNone(run_v4.newton_source(self.git("rev-parse", "HEAD"), self.repo))
+        (self.repo / "newton" / "extra.py").write_text("")
+        self.assertIsNotNone(run_v4.newton_source(self.git("rev-parse", "HEAD"), self.repo))
+
+    def test_unknown_commit(self):
+        with self.assertRaisesRegex(RuntimeError, "not in"):
+            run_v4.newton_source("0" * 40, self.repo)
+
+    def test_rerun_env_puts_the_trial_newton_first(self):
+        with mock.patch.object(run_v4, "newton_source", return_value=Path("/sources/c")):
+            env = run_v4.rerun_env({"trial_id": "t", "commit": "c"}, self.root / "sandbox", "snapshot")
+        self.assertEqual(env["PYTHONPATH"], f"/sources/c{os.pathsep}{run_v4.ROOT}")
+        self.assertEqual(env["NEWTON_TRIAL_ID"], "t-snapshot")
+        with mock.patch.object(run_v4, "newton_source", return_value=None):
+            env = run_v4.rerun_env({"trial_id": "t", "commit": "c"}, self.root / "sandbox", "snapshot")
+        self.assertEqual(env["PYTHONPATH"], str(run_v4.ROOT))
 
 
 class TestAgentVisibleText(unittest.TestCase):
@@ -438,6 +619,29 @@ class TestPrompt(unittest.TestCase):
                 else:
                     self.fail(f"{name} does not resolve")
                 self.assertIn(parts[-1], line)
+
+    def test_both_conditions_state_the_verifier_rules_and_shell_facts(self):
+        facts = {
+            "abc_scratch": (
+                "fits of the tray's silhouette in photos/01_top.jpg and photos/11_top.jpg",
+                "no fruit's lowest collision point may rise more than 1 cm above its lowest point at the start",
+                "scans scene_replay.py and the workspace modules it imports",
+            ),
+            "g1_mpc": ("scans every Python file in the workspace",),
+        }
+        for task, lines in facts.items():
+            for cli in ("claude", "codex"):
+                prompts = [
+                    run_v4.prompt_for(task, condition, Path("/w"), 5400, "GUIDE", FACTS, cli)
+                    for condition in ("mcp", "restart")
+                ]
+                for prompt in prompts:
+                    for line in lines:
+                        self.assertIn(line, prompt)
+                    self.assertNotRegex(prompt, r"\{[a-z_]+\}")  # every placeholder filled
+                    self.assertEqual(prompt.count(run_v4.SHELL_FACTS["claude"]), int(cli == "claude"))
+        self.assertIn("120 s", run_v4.SHELL_FACTS["claude"])
+        self.assertIn("`sleep N` with N of 25 or more is refused", run_v4.SHELL_FACTS["claude"])
 
     def test_guide_describes_the_hosted_workers(self):
         workspace = Path(tempfile.mkdtemp())

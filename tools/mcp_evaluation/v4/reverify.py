@@ -3,9 +3,11 @@
 """Re-run the current verifier on finished trials' final workspaces.
 
 Verifier fixes made during an iteration should apply to every trial of a task alike. This restores each run's
-final workspace where its trial ran, runs the task's verifier in the same sandbox as the trial's own verification,
-and writes the result to ``RUN_DIR/reverify/verification.json`` (the trial's original ``verification.json`` is
-kept). Never run it while trials are running: verifiers time submissions.
+final workspace where its trial ran, runs the task's current verifier in the same sandbox as the trial's own
+verification, on the Newton the trial ran on (:func:`run_v4.newton_source`), and writes the result to
+``RUN_DIR/reverify/result.json`` and the verifier's records next to it (the trial's original
+``verification.json`` is kept). ``run_v4 --verify-snapshots`` takes this result as the final snapshot's verdict.
+Never run it while trials are running: verifiers time submissions.
 
 Usage::
 
@@ -22,7 +24,6 @@ import time
 from pathlib import Path
 
 from tools.mcp_evaluation.v4 import run_v4
-from tools.mcp_evaluation.v4 import trial_isolation as ti
 
 
 def reverify(run_dir: Path) -> dict:
@@ -35,18 +36,17 @@ def reverify(run_dir: Path) -> dict:
     records.mkdir(exist_ok=True)
     try:
         shutil.copytree((run_dir / "workspace").resolve(), sandbox_root / "work", symlinks=True)
-        caches = run_dir / "snapshots" / "caches"
-        if not caches.is_dir() and spec.get("cache_seed") and Path(spec["cache_seed"]).is_dir():
-            caches = Path(spec["cache_seed"])
+        caches = run_v4._trial_caches(run_dir, spec)
         if caches.is_dir():
             shutil.copytree(caches, sandbox_root / "caches", symlinks=True)
-        env = ti.trial_env(run_v4.ROOT, sandbox_root / "caches", f"{spec['trial_id']}-reverify")
+        env = run_v4.rerun_env(spec, sandbox_root, "reverify")
         start = time.time()
         result = run_v4.verify(sandbox_root / "work", records, task, env, run_v4._container(sandbox_root, run_dir))
         result["seconds"] = time.time() - start
         result["commit"] = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=run_v4.ROOT, capture_output=True, text=True, check=False
         ).stdout.strip()
+        result["newton_commit"] = spec.get("commit")
         (records / "result.json").write_text(json.dumps(result, indent=1, default=float) + "\n")
         return result
     finally:

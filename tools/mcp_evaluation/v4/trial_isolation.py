@@ -304,6 +304,10 @@ def sandbox(
         if history.is_file():
             args += ["--ro-bind", str(empty), str(history)]
     args += ["--ro-bind", str(root), str(root)]
+    # A worktree's .venv may link to a venv in another checkout, which the hidden ~/apps would otherwise cover.
+    venv = (root / ".venv").resolve()
+    if venv.is_dir() and not venv.is_relative_to(Path(root).resolve()):
+        args += ["--ro-bind", str(venv), str(venv)]
     # Parts of the read-only tree that stay hidden (e.g. verifiers and data generators from agents).
     for path in masked:
         if Path(path).is_dir():

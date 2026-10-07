@@ -230,6 +230,23 @@ class TestApi(unittest.TestCase):
         with self.assertRaisesRegex(AttributeError, "has no attribute 'SolverNoSuchName'"):
             _ = newton.solvers.SolverNoSuchName
 
+    def test_guessed_solver_flag_names_name_model_flags(self):
+        """Solver classes and instances answer guessed flag names with newton.ModelFlags, and hasattr stays False."""
+        import newton  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        builder.add_body()
+        solver = newton.solvers.SolverXPBD(builder.finalize(device="cpu"))
+        for owner in (newton.solvers.SolverMuJoCo, newton.solvers.SolverXPBD, solver):
+            for name in ("ModelFlags", "SolverNotifyFlags"):
+                with self.subTest(owner=owner, name=name):
+                    expected = rf"'{type(owner).__name__ if owner is solver else owner.__name__}' has no attribute "
+                    with self.assertRaisesRegex(AttributeError, expected + r".*newton\.ModelFlags\.ALL") as raised:
+                        getattr(owner, name)
+                    self.assertEqual(raised.exception.name, name)
+                    self.assertFalse(hasattr(owner, name))
+                    self.assertIsNone(getattr(owner, name, None))
+
     def test_model_flags_non_members_name_combination_and_all(self):
         """ModelFlags(0) (as in ``~ModelFlags(0)``) and combined values name ``|`` and ALL in the error."""
         import newton  # noqa: PLC0415

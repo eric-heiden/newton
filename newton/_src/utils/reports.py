@@ -38,6 +38,8 @@ def report_solver_params(
     Args:
         solver: Solver to inspect; its ``model`` is the model reported.
         kind: ``"actuator"``, ``"joint"``, ``"geom"``, ``"body"``, ``"equality"``, or ``"option"``.
+            ``"shape"`` and ``"contact"`` name ``"geom"`` (MuJoCo contact parameters are per geom), and
+            plurals (``"joints"``) name their kind.
         select: Label glob, or list of globs, matched against full labels and their last path
             component; a pattern without wildcards also matches as a substring of the last component.
             ``None`` selects every row.

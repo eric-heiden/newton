@@ -945,6 +945,22 @@ def _dof_world(model) -> np.ndarray:
 
 
 _KINDS = ("actuator", "joint", "geom", "body", "equality", "option")
+# Other names for the kinds: plurals, and the Newton entities whose solver values a kind reports.
+_KIND_ALIASES = {
+    "actuators": "actuator",
+    "joints": "joint",
+    "dof": "joint",
+    "dofs": "joint",
+    "geoms": "geom",
+    "shape": "geom",
+    "shapes": "geom",
+    "contact": "geom",
+    "contacts": "geom",
+    "bodies": "body",
+    "equalities": "equality",
+    "options": "option",
+    "opt": "option",
+}
 
 
 def solver_params(model, solver, kind: str, select=None, *, world: int = 0, limit: int = 64) -> dict:
@@ -953,7 +969,8 @@ def solver_params(model, solver, kind: str, select=None, *, world: int = 0, limi
     Args:
         model: Model the solver was built from.
         solver: Solver instance.
-        kind: ``"actuator"``, ``"joint"``, ``"geom"``, ``"body"``, ``"equality"`` or ``"option"``.
+        kind: ``"actuator"``, ``"joint"``, ``"geom"``, ``"body"``, ``"equality"`` or ``"option"``, or an
+            alias in :data:`_KIND_ALIASES` (e.g. ``"shape"`` or ``"contact"`` for ``"geom"``).
         select: Label pattern(s) selecting rows; see :func:`_matcher`.
         world: World whose rows are reported.
         limit: Maximum number of rows.
@@ -962,8 +979,13 @@ def solver_params(model, solver, kind: str, select=None, *, world: int = 0, limi
         ``{"solver", "kind", "world", "rows", ...}`` with per-row compiled values, their ``from``
         sources, the current Newton values, and ``pending`` names where the two differ.
     """
+    if isinstance(kind, str):
+        kind = _KIND_ALIASES.get(kind.strip().lower(), kind.strip().lower())
     if kind not in _KINDS:
-        raise ValueError(f"kind must be one of {_KINDS}")
+        raise ValueError(
+            f"kind must be one of {_KINDS}, or 'shape' or 'contact' for 'geom' (contact parameters are per geom); "
+            f"got {kind!r}"
+        )
     if isinstance(world, bool) or not isinstance(world, int) or not 0 <= world < max(1, model.world_count):
         raise ValueError(f"world must be an integer in [0, {max(1, model.world_count) - 1}]")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:

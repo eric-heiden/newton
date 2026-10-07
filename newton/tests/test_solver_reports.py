@@ -47,6 +47,25 @@ class TestSolverReports(unittest.TestCase):
         self.assertNotIn("pending", row)
 
     @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
+    def test_solver_params_kind_aliases(self):
+        """'shape' and 'contact' report the geom rows, plurals name their kind, and unknown kinds list the kinds."""
+        from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_mjcf(_MJCF)
+        solver = SolverMuJoCo(builder.finalize(device="cpu"))
+        geoms = newton.utils.report_solver_params(solver, "geom")
+        for kind, expected in (("shape", "geom"), ("Contact", "geom"), ("joints", "joint"), ("bodies", "body")):
+            with self.subTest(kind=kind):
+                report = newton.utils.report_solver_params(solver, kind)
+                self.assertEqual(report["kind"], expected)
+                if expected == "geom":
+                    self.assertEqual(report["rows"], geoms["rows"])
+        with self.assertRaisesRegex(ValueError, r"kind must be one of .*'shape' or 'contact' for 'geom'.*got 'tendon'"):
+            newton.utils.report_solver_params(solver, "tendon")
+
+    @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
     def test_actuator_rows_show_the_joint_effort_limit(self):
         """An effort limit on the joint's actfrcrange is reported on the joint's actuators, not as unlimited."""
         from newton.solvers import SolverMuJoCo  # noqa: PLC0415

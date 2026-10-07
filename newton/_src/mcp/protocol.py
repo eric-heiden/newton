@@ -219,7 +219,15 @@ TOOLS = [
     _tool(
         "checkpoint",
         "Save named public state/control arrays and session time (at most 8 names). Hidden solver state is not saved; restore resets it.",
-        {"name": {"type": "string", "minLength": 1, "maxLength": 64, "default": "default"}},
+        {
+            "name": {"type": "string", "minLength": 1, "maxLength": 64, "default": "default"},
+            "include": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Workspace names or attribute paths (e.g. example.controller) of Python objects whose "
+                "arrays, attributes, and list/dict contents are saved too and restored in place.",
+            },
+        },
     ),
     _tool(
         "restore",
@@ -337,6 +345,9 @@ TOOLS = [
 _HELPERS = """- If a cell raises, the simulation (time, state, control, model arrays) returns to its state before the cell and the error lists what was restored; Python variables are kept.
 - After each cell, and before rollout()/step/filmstrip/example.step() inside it, the model arrays solvers read are checksummed; changes that no later notify_model_changed() call on the session's solver covered are notified with the inferred ModelFlags and listed in `note` (session.watch.mode = 'notify' | 'report' | 'off').
 - rollout(frames or seconds=..., record={'name': 'expr' or fn}, every=k, start=True|'checkpoint', until='expr'): steps and returns NumPy series.
+- evaluate(candidates, scenarios, frames= or seconds=, score=, setup=, start=None|'initial'|'checkpoint', ...): newton.utils.BatchRollout.evaluate (same arguments) on N copies of the hosted scene, one world per case, from the live state; example.step() does not run there. Returns a table with run facts. N-world models are kept across calls and rebuilds that keep the scene's structure; live model values are copied into them.
+- branch(n, setup=fn(world, i), frames=, start=, record=, control=, score=fn(records), sequential=False): n variants as worlds like evaluate, or with sequential=True one after another through example.step(), restoring the example's Python objects before each; returns records [T, n, ...] and a table; the session keeps its state.
+- checkpoint(name, include=['example.controller']): also saves these Python objects in place (arrays, attributes, list/dict contents); restoring it (also rollout/branch start=name) brings them back.
 - session.dispatch('step' | 'reset' | 'checkpoint' | 'restore' | 'describe', {...}): step, return to the initial state, save or restore named states (state, control, time; model edits are kept), or list scene counts and solver.
 - health(solver=None, state=None, per_world=True, twins=False): non-finite values, runaway speeds, full solver buffers, and penetrating shape pairs, by world, for any solver.
 - solver_params(kind='actuator'|'joint'|'geom'|'body'|'equality'|'option', select='label*', world=0): values the solver integrates, the model array and ModelFlags behind each, whether they can differ per world, and unapplied edits (`pending`).
@@ -344,7 +355,7 @@ _HELPERS = """- If a cell raises, the simulation (time, state, control, model ar
 - contacts_between(a, b=None): contact count, normal and friction force, slip speed, and penetration between two shape sets (label substrings); usable as a rollout() probe."""
 
 _INSTRUCTIONS = (
-    """Live Newton simulation running in another process. newton_execute runs Python cells in it; variables persist between calls (preloaded: session, model, state, control, solver, contacts, newton, np, wp, show, and the helpers below).
+    """Live Newton simulation running in another process. newton_execute runs Python cells in it; variables persist between calls (preloaded: session, model, state, control, solver, contacts, newton, np, wp, show, and the helpers below, also available as session methods; a cell's own binding of a helper name takes precedence).
 - newton_observe renders the scene as an inline image (auto-framed unless a camera is given; views=[...] for a grid; reference='photo.png' adds reference and mismatch panels). newton_filmstrip(times=[...], reset=true) steps to each time and returns a grid of frames.
 """
     + _HELPERS
@@ -369,7 +380,7 @@ def rtx_available() -> bool:
 
 
 _INSTRUCTIONS_LEAN = (
-    """Live Newton simulation running in another process. newton_execute runs Python cells in it; variables persist between calls (preloaded: session, model, state, control, solver, contacts, newton, np, wp, show, and the helpers below).
+    """Live Newton simulation running in another process. newton_execute runs Python cells in it; variables persist between calls (preloaded: session, model, state, control, solver, contacts, newton, np, wp, show, and the helpers below, also available as session methods; a cell's own binding of a helper name takes precedence).
 """
     + _HELPERS
     + """

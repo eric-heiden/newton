@@ -10,6 +10,7 @@ import functools
 import hashlib
 import math
 import threading
+import time
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -410,6 +411,7 @@ class BatchRollout:
             raise ValueError(f"substeps must be at least 1, got {substeps}")
         if not dt > 0.0:
             raise ValueError(f"dt must be positive, got {dt}")
+        started = time.perf_counter()
         source = _call_build(build)
         builder, one_world, options = source.builder, source.one_world, source.options
         if device is None:
@@ -467,7 +469,11 @@ class BatchRollout:
         self._schedules: dict[Any, wp.array] = {}
         self._probes: dict[Any, _Probe] = {}
         self._siblings: collections.OrderedDict[Any, BatchRollout] = collections.OrderedDict()
+        # Wall times [s] for callers that report warm-up costs (e.g. the live MCP): construction, and the first
+        # eager frame plus graph capture of each new run signature (kernel loading happens there).
+        self._stats = {"build_seconds": 0.0, "captures": 0, "warmup_seconds": 0.0}
         self.reset()
+        self._stats["build_seconds"] = time.perf_counter() - started
 
     # ------------------------------------------------------------------------------------------------------------------
     # State
@@ -731,9 +737,12 @@ class BatchRollout:
             graph = self._graphs.get(signature)
             done = 0
             if graph is None and self._capture_enabled and self.device.is_cuda:
+                warmup = time.perf_counter()
                 self._frame(schedules, controllers, probes, every)  # loads kernels and lets the solver allocate
                 done = 1
                 graph = self._capture(schedules, controllers, probes, every)
+                self._stats["captures"] += 1
+                self._stats["warmup_seconds"] += time.perf_counter() - warmup
                 if graph is not None:
                     self._graphs[signature] = graph
                     while len(self._graphs) > 16:

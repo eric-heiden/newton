@@ -287,6 +287,8 @@ class ExampleHost:
         self.generation = 0
         self.module = None
         self.example = None
+        self.scene_source = None
+        """The example's one-world scene as :meth:`SimulationSession.evaluate` copies it, recorded by :meth:`build`."""
         self.build_seconds = 0.0
         self.recaptures = 0
         self._fingerprint = {}
@@ -347,7 +349,12 @@ class ExampleHost:
             args.viewer = "null"
             viewer_class = type("RecordingViewerNull", (_RecordingViewer, newton.viewer.ViewerNull), {})
             viewer = viewer_class(num_frames=1 << 62)
-            example = cls(viewer, args)
+            from .batch import SceneCapture  # noqa: PLC0415
+
+            # The one-world builder, solver and pipeline, which evaluate() and branch() copy into worlds.
+            with SceneCapture() as capture:
+                example = cls(viewer, args)
+            scene = capture.source(example)
         except BaseException:
             for name in _local_modules(self.script.parent):
                 sys.modules.pop(name, None)
@@ -355,6 +362,7 @@ class ExampleHost:
             raise
         self.argv, self.overrides = argv, overrides
         self.module, self.example, self.args = module, example, args
+        self.scene_source = scene
         self._class_modules = [("module", module), *_local_modules(self.script.parent).items()]
         self._dynamic_scalars = set()
         self._dynamic_keys = set()
@@ -753,6 +761,7 @@ class ExampleHost:
                 return host.bindings()
             host.build(argv, overrides)
             host._watch_steps()
+            session.scene_source = host.scene_source
             session.namespace.update(example=host.example, module=host.module)
             session.dt = getattr(host.example, "frame_dt", session.dt)
             host.echo(session)
@@ -783,6 +792,7 @@ class ExampleHost:
             sync_callback=self.rebind,
         )
         self._session_ref = weakref.ref(session)
+        session.scene_source = self.scene_source
         self._watch_steps()
         self.echo(session)
         # The session may have adjusted the model (e.g. contact capacity for its collision pipeline).

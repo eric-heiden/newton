@@ -115,9 +115,7 @@ argument parser is reported as an error instead of ending the host. Rebuild
 
    client.request("rebuild", overrides={"SUBSTEPS": 32, "PARAMS": {"dt": 0.001}})
 
-``newton_rebuild(code=...)`` runs a cell after a successful rebuild and returns
-its value and output with the rebuild result; if the rebuild fails, the cell
-does not run. A dictionary merges into a dictionary global (recursively); other
+A dictionary merges into a dictionary global (recursively); other
 values replace the global, keeping a float global a float and a tuple a tuple. Module code that
 already ran while loading, such as a constant computed from the original value
 or a default argument, keeps the original value. The given mapping becomes the
@@ -125,6 +123,10 @@ active set for later rebuilds and restarts; omit ``overrides`` to keep it and
 pass ``{}`` to clear it. Every response, including errors, reports the active
 set as ``overrides``. ``python -m newton.mcp host ... --overrides JSON`` starts
 with an active set.
+
+``newton_rebuild(code=...)`` runs a cell after a successful rebuild and returns
+its value and output with the rebuild result; if the rebuild fails, the cell
+does not run.
 
 ``--workers N`` also hosts ``N`` sibling copies of the script in separate
 processes and exposes them as ``workers`` (see :class:`newton.mcp.WorkerPool`)
@@ -306,7 +308,8 @@ points outside the MCP. In Python cells, ``intrinsics`` may also be a
 :class:`~newton.sensors.SensorCamera.Intrinsics`. A calibration dictionary,
 such as one camera's entry of a ``camera.json`` file with ``K`` (3x3, row
 major), ``D`` (OpenCV coefficient order), ``width``, ``height`` and
-``distortion_model``, is read like ``SensorCamera.Intrinsics.from_dict()``;
+``distortion_model``, is read by
+:meth:`~newton.sensors.SensorCamera.Intrinsics.from_dict`;
 its ``position`` and ``rotation_xyzw`` place the camera when no ``eye``,
 ``pose``, ``view`` or ``camera_body`` is given. ``pose`` also accepts
 ``{"position": [...], "rotation_xyzw": [...]}``. A calibrated camera renders at
@@ -644,8 +647,10 @@ to ``rebuild``; ``rebuild`` with ``restart`` starts a fresh process after a CUDA
 error.
 
 Queue waiting has a deadline and expired pending mutations are cancelled.
-Once an operation starts, the client waits for completion because running
-Python, Warp, and GL cannot safely be preempted. A connection failure during
+Once an operation starts, it runs to completion because running Python, Warp,
+and GL cannot safely be preempted; the client waits for it, or with
+``reply_within`` replies with ``running`` as described in
+`Connect an MCP client`_. A connection failure during
 execution has an unknown outcome; do not automatically retry mutations.
 
 The transport uses TCP and ordinary Python threads for portability. Runtime,

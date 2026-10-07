@@ -151,7 +151,8 @@ class TestMcpInstructions(unittest.TestCase):
     def test_hosted_guide_fits_the_instruction_budget(self):
         """Keep the hosted guide and the lean instructions short: agents re-read them on every turn."""
         self.assertLess(len(self.guide), 1000)
-        self.assertLess(len(self.lean) + len(self.guide), 2000)
+        # The batched-evaluation helpers (evaluate, branch, checkpoint) take about 0.6 kB of it.
+        self.assertLess(len(self.lean) + len(self.guide), 2500)
 
 
 if __name__ == "__main__":

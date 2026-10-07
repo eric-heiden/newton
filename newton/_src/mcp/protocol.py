@@ -236,9 +236,9 @@ TOOLS = [
     ),
     _tool(
         "restore",
-        "Restore a checkpoint's state and time and the control and application arrays steps have written, reset "
-        "hidden solver caches, clear contact buffers, and run the application reset callback. Model edits and arrays "
-        "no step wrote stay; the result lists them as kept.",
+        "Restore a checkpoint's state and time, the control and application arrays steps have written, and the "
+        "Python objects saved with include (in place), reset hidden solver caches, clear contact buffers, and run the "
+        "application reset callback. Model edits and arrays no step wrote stay; the result lists them as kept.",
         {"name": {"type": "string", "default": "default"}},
     ),
     _tool(
@@ -351,7 +351,7 @@ TOOLS = [
 
 _HELPERS = """- show(image, label) returns an image: an array, figure, path or observe result.
 - rollout(frames or seconds=, record={'name': 'expr' or fn}, every=1, start=False|True|'checkpoint', until=None) steps and returns NumPy series.
-- evaluate(candidates, scenarios, frames= or seconds=, score=, setup=, ...): newton.utils.BatchRollout.evaluate with one world per case on copies of the hosted scene (kept across calls), from the live state or start='initial'|'checkpoint'; example.step() does not run in them.
+- evaluate(candidates, scenarios, frames=|seconds=, setup=, control=, score=, ...): newton.utils.BatchRollout.evaluate with one world per case on copies of the hosted scene (kept across calls), from the live state or start='initial'|'checkpoint'; example.step() does not run in them.
 - branch(n, setup=fn(world, i), frames=, start=, score=, sequential=False): n variants as such worlds, or one after another through example.step(); the session keeps its state.
 - checkpoint(name, include=['example.controller']) also saves these Python objects; start=name restores them.
 - session.dispatch('reset'|'restore'|'step'|'observe'|'filmstrip', {...}).

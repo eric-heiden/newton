@@ -147,10 +147,16 @@ def _pose_from_dict(value: dict) -> list[float]:
 
 def _calibration_from_dict(value: dict, width: int | None, height: int | None) -> SensorCamera.Intrinsics:
     """Intrinsics of a calibration dictionary such as a ``camera.json`` entry (``K``, ``D``, ``width``, ...)."""
-    # from_dict uses these sizes only when the dictionary has none.
-    return SensorCamera.Intrinsics.from_dict(
-        value, width=640 if width is None else width, height=480 if height is None else height
-    )
+    # The calibration's own image size wins; the render resizes the intrinsics to a given width/height afterwards.
+    sizes = {
+        name: default if given is None else given
+        for name, keys, given, default in (
+            ("width", ("width", "image_width"), width, 640),
+            ("height", ("height", "image_height"), height, 480),
+        )
+        if not any(key in value for key in keys)
+    }
+    return SensorCamera.Intrinsics.from_dict(value, **sizes)
 
 
 def _camera_inputs(intrinsics, pose, width: int | None, height: int | None):

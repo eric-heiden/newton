@@ -146,11 +146,15 @@ class WorldView:
 
     Args:
         model: The model whose worlds are accessed.
+        solver: Solver that :meth:`set_attribute` checks and notifies for
+            model edits when its ``solver`` argument is ``None``.
     """
 
-    def __init__(self, model: Model):
+    def __init__(self, model: Model, solver: SolverBase | None = None):
         self.model = model
         """The model whose worlds this view accesses."""
+        self.solver = solver
+        """Solver that :meth:`set_attribute` checks and notifies for model edits by default, or ``None``."""
         self.world_count = int(model.world_count)
         """Number of worlds in :attr:`model`."""
         self._layouts: dict[Any, tuple[np.ndarray, list[str] | None]] = {}
@@ -242,9 +246,10 @@ class WorldView:
         collision data :meth:`~newton.ModelBuilder.finalize` computes from
         their scale.
 
-        When ``target`` is the model and ``solver`` is given, the view first
-        calls :meth:`~newton.solvers.SolverBase.check_world_values`, which
-        raises for attributes the solver shares across worlds, reads only at
+        When ``target`` is the model and a solver is given (or bound to the
+        view), the view first calls
+        :meth:`~newton.solvers.SolverBase.check_world_values`, which raises
+        for attributes the solver shares across worlds, reads only at
         construction, or does not read, and after writing calls
         :meth:`~newton.solvers.SolverBase.notify_model_changed` with the
         returned flags.
@@ -257,7 +262,8 @@ class WorldView:
             labels: Label pattern or model indices selecting the rows, or
                 ``None`` for every row that belongs to a world.
             worlds: World indices, a slice of worlds, or ``None`` for all worlds.
-            solver: Solver to check and notify when ``target`` is the model.
+            solver: Solver to check and notify when ``target`` is the model;
+                ``None`` for :attr:`solver`.
 
         Returns:
             :class:`~newton.ModelFlags` bits that cover the edit when ``target``
@@ -270,6 +276,7 @@ class WorldView:
                 per-world values of the selected rows.
         """
         name, frequency = self._resolve(name)
+        solver = self.solver if solver is None else solver
         is_model = isinstance(target, Model)
         if is_model and target is not self.model:
             raise ValueError("target is a different Model than the one this WorldView was created for")

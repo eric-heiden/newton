@@ -1,0 +1,1 @@
+Add `newton.utils.compare_trajectories()`, which compares named time series of a candidate (optionally one per world and resampled to the reference times) against a reference and reports per signal the RMSE, the largest error and its time, the first time an error exceeds a tolerance, and the largest contributing components, with a summed objective for fits.

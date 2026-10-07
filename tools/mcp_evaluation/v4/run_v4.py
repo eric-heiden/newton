@@ -67,6 +67,8 @@ PRIVATE = Path(os.environ.get("NEWTON_VISUAL_PRIVATE", Path.home() / ".newton-vi
 TRIALS = Path(os.environ.get("NEWTON_TRIAL_ROOT", Path.home() / "trials"))
 SANDBOX = os.environ.get("NEWTON_TRIAL_SANDBOX", "1") == "1"
 VERIFY_LOCKS = Path(os.environ.get("NEWTON_VERIFY_LOCKS", Path.home() / ".cache" / "newton-verify-locks"))
+# Copies of the newton package at the commits finished trials ran on, for verifying them later (newton_source).
+VERIFY_SOURCES = Path(os.environ.get("NEWTON_VERIFY_SOURCES", Path.home() / ".cache" / "newton-verify-sources"))
 START = "__START_UTC__"
 # Claude -p waits this long for background shell jobs after the agent's last turn; set explicitly so it does
 # not depend on the launcher's environment (v4 trials inherited 30 min from the operator session).
@@ -133,6 +135,14 @@ def _shape_warmups(script: str, seeds: list) -> list[list[str]]:
     """Warm-up commands that step ``script`` with added objects under each listed solver setting."""
     command = ["-m", "tools.mcp_evaluation.v4.trial_isolation", "warm-solvers", script]
     return [[*command, json.dumps(variants), json.dumps(shapes)] for shapes, variants in seeds]
+
+
+# What the abc_scratch and g1_mpc verifiers' source scans reject (their SUSPICIOUS_* sets), stated in both prompts.
+SCAN_NAMES = (
+    "(the modules inspect, gc, ctypes, atexit, faulthandler, signal, sysconfig, marshal, and _thread; exec, eval, "
+    "compile, and __import__; and frame, trace, and garbage-collector names such as _getframe, f_back, f_locals, "
+    "settrace, and get_objects, also inside strings)"
+)
 
 
 def _task(name: str) -> dict:
@@ -223,7 +233,7 @@ Constraints (checked): do not change the robot model (bodies, masses, armature, 
             "goal": """g1_mpc.py simulates a floating-base Unitree G1 humanoid (29 actuated joints, SolverMuJoCo with 2 ms steps) that should track reference motions: walk.csv, dance.csv, and jumpjack.csv (Kimodo clips in MuJoCo qpos format: root position, root quaternion wxyz, and 29 joint angles at 30 fps). A controller runs at 100 Hz: every 10 ms it gets the robot's state and returns one Command for the joint actuators (position and velocity targets, stiffness, damping, and feedforward torque per joint; the actuators clip the torque to the MJCF limits). The script's tracking report prints the metrics below. Problem: the baseline controller only servos the joints toward the reference angles, and the robot falls within about a second.
 
 Goal: develop a controller that makes the robot track the reference motions; investigate model predictive control methods for this. Verification imports the script's Controller and MotionClip and simulates its own copy of the starter's plant (build_model, make_solver, Robot, Command, and TrackingReport) in a fresh process per clip, on the three given clips, on two unseen clips, and on an unseen slower playback of walk.csv (at {slow_low} to {slow_high} times the original speed, drawn at verification): Controller(model, motion) is built once per clip (model is a copy of the robot model posed at the clip's start, for the controller's own use), then compute(t, joint_q, joint_qd) is called every 10 ms. On every clip the robot must stay on its feet for the whole clip (root above {fall_m} m, up axis within {tilt_deg} degrees of vertical, nothing but the feet touching the floor), with root position RMSE at most {root_cm} cm, root orientation RMSE at most {rot_deg} degrees, joint-angle RMSE at most {joint_rad} rad, and sole position RMSE at most {sole_cm} cm; wrist position errors, foot-lift recall, and jitter are reported as well. Per clip, building the Controller may take at most {setup_s} s and the rollout (all compute() calls and the physics) at most {rollout_s} s of wall time on this machine when it is otherwise idle; verification measures the machine's load (fixed GPU and CPU workloads timed between compute() calls) and allows proportionally more time, at most {load_max}x.
-Constraints (checked): the plant is fixed (robot model, masses, inertias, armature, torque limits, contacts, timestep, and the actuator law), and the controller acts on it only through the Command it returns (gains within the ranges in the script); it may build its own models and solvers, for example for planning, and use the installed Python packages. The controller runs in one Python thread: no threads or subprocesses (GPU and library-internal parallelism are fine), and it may not inspect the verifier (stack frames, garbage collector, raw memory, code objects, trace hooks) or read files outside the workspace. Use only the data in the workspace: do not download motion clips or any other data (the G1 model is already cached). Keep the Controller(model, motion) and compute(t, joint_q, joint_qd) interface and the file runnable (`python g1_mpc.py --motion walk.csv --viewer null` runs the whole clip and prints the tracking report; --num-frames N runs N control periods).""",
+Constraints (checked): the plant is fixed (robot model, masses, inertias, armature, torque limits, contacts, timestep, and the actuator law), and the controller acts on it only through the Command it returns (gains within the ranges in the script); it may build its own models and solvers, for example for planning, and use the installed Python packages. The controller runs in one Python thread: no threads or subprocesses (GPU and library-internal parallelism are fine), and it may not inspect the verifier (stack frames, garbage collector, raw memory, code objects, trace hooks) or read files outside the workspace; verification scans every Python file in the workspace for introspection {scan_names}. Use only the data in the workspace: do not download motion clips or any other data (the G1 model is already cached). Keep the Controller(model, motion) and compute(t, joint_q, joint_qd) interface and the file runnable (`python g1_mpc.py --motion walk.csv --viewer null` runs the whole clip and prints the tracking report; --num-frames N runs N control periods).""",
         },
         "sdf_grind": {
             "files": {"sdf_grinding.py": HERE / "sdf_grind/sdf_grinding.py"},
@@ -403,8 +413,8 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
             ],
             "goal": """scene_replay.py replays a real robot episode from the ABC-130k dataset (https://abc.bot) in Newton, open loop. At a bimanual station (two 6-DoF YAM arms with parallel grippers, filmed from above and from both wrists), a teleoperator picks up three fake fruits one after another, a pear and an orange with the left arm and a dark round fruit with the right, and puts them into a wedge-shaped wooden tray on the table. photos/ holds {photos} frames of the recording (the top camera at the start, before each grasp, after each release, and at the end; the wrist cameras at each grasp; photos/index.json gives the state sample each one shows); episode.npz the measured joint positions, velocities, and torques (including the gripper motor's effort), the gripper openings, and the logged joint and gripper commands (about 30 Hz); camera.json the calibrated cameras (intrinsics with RealSense distortion, the top camera's pose in the world, and the wrist cameras' mounts); station/ the ABC simulator's MJCF of the station (arms, grippers, table, and enclosure; no objects); and arm_logs/ 64 recorded YAM arm logs (32 episodes of various tasks, both arms; measured joints, velocities, torques, and commands) for calibrating the arms. FORMAT.md describes the files and their frames. scene_replay.py builds the station in identical worlds (build_model(num_worlds)), steps them with make_solver(model) and make_pipeline(model), and drives the arms with the logged commands as joint position targets (its docstring states the command rule). Problem: the scene is empty. Only the station is modeled, with the ABC simulator's arm and gripper defaults; the fruits and the tray are missing.
 
-Goal: recreate the scene and its physics from the photos and the logs (the three fruits with their sizes, masses, start poses, and materials; the tray), so that the replay reproduces the real episode: every fruit grasped, carried, and released into the tray, coming to rest where the real one did. Verification imports build_model, make_solver, make_pipeline, and PARAMS and runs its own replay of the whole episode (the starter's command rule, its own loop) in fresh processes, in 8 copies: 2 nominal, and 6 with every fruit's start moved by up to {jitter_mm} mm and turned by up to {jitter_deg} degrees about the vertical. It takes as the fruits the free bodies that start closest to where the top camera saw the real fruits at the start (within {match_cm} cm). Per fruit, in at least {held} of 8 copies: held through the real carry (from 3 state samples after the real lift-off to 2 before the real release), that is, its centre within the real fruit's half-width plus {hold_mm} mm of the midpoint between the grasping gripper's two finger-pad grasp points (25 mm from each pad's centre toward its tip) for at least {held_pct}% of the carry. Per fruit, in at least {placed} of 8 copies: at rest in the real tray at the end of the episode (inside the tray's outline at the start or the end plus {place_cm} cm, its centre within {height_mm} mm of the height of the real fruit lying on the tray floor, slower than {speed_cm} cm/s over the last {window_s} s), and within {rest_cm} cm of where the real fruit came to rest after its release (its final position, or one it rested at before a later fruit pushed it). Two negative controls replay the episode with the gripper commands forced open and with the friction of every arm and fruit collision shape set to {control_mu}: no fruit may rise more than {control_cm} cm, and a copy whose simulation diverges fails its control (MuJoCo Warp's default pyramidal friction cone can diverge at such low friction). Verification runs twice (a third time if they disagree) and the majority decides.
-Constraints (checked): keep the station's arm kinematics, finger collision geometry (within 0.5 mm), the MJCF's arm bases (within 3 mm), table plane, gravity, and the command input; add no shapes, actuators, equality constraints, tendons, or contact pairs to the robot, and keep its actuators plain servos (no bias force, unit gear). All worlds are identical copies. The fruits are exactly three more free, dynamic bodies (any labels), each starting at rest on the table (its lowest point within 1 mm below to 3 mm above it) within {start_cm} cm of where the top camera saw the real fruit, with {mass_g_low} to {mass_g_high} g, principal inertias between 0.8x a solid and 1.2x a thin-shell ellipsoid of its extents, its centre of mass within 2 cm of the centre of its collision geometry, at most {object_shapes} collision shapes whose extents are within 30% of the real fruit's size range (as tracked in the video), collisions with the finger pads, the table, the tray, and the other fruits, and no joint drives, springs, damping, joint friction, armature, gravity compensation, or applied forces. Everything else you add (the tray) is static or one more body (free or welded to the world) of {tray_kg_low} to {tray_kg_high} kg, with at most {tray_shapes} collision shapes inside the real tray's outline plus {tray_cm} cm and at most {tray_top_cm} cm above the table. Tunable: arm joint gains, armature, friction, damping, effort limits (at most 28 N m on joints 1-3 and 10 N m on joints 4-6), and gravity compensation (0 to 1) per link; gripper position gain (100 to 3000 N/m) and squeeze force (5 to 60 N); PARAMS["command_delay"] (0 to 0.2 s) and PARAMS["dt"] (0.25 to 2 ms); the solver (a Newton solver class, not a subclass) and its settings; newton.CollisionPipeline settings or MuJoCo's own contacts; MuJoCo contact stiffness (solref in standard form with a time constant of at least 2 dt and a damping ratio of 0.5 to 2, refsafe on); materials (friction at most 1.5, torsional at most 0.02 m, rolling at most 0.005 m, restitution at most 0.8, margin at most 2 mm, contact gap at most 0.1 m, no adhesion; robot shapes may keep their MJCF values). The verification batch (12 worlds) must replay within about {runtime_s} s. Verification calls build_model, make_solver, and make_pipeline in a copy of the workspace without photos/ and arm_logs/ (with its own episode.npz, camera.json, and station/; links to files outside the workspace are not allowed), so keep fitted values in the script or in a file next to it. It then re-applies the model to SolverMuJoCo (notify_model_changed with all flags) and requires the solver's own arrays to match the model it compiled, so set solver parameters through the model (including its model.mujoco attributes) and the solver's constructor, not by editing the solver's MuJoCo arrays. The submission may not inspect the verifier (stack frames, garbage collector, raw memory, code objects, trace hooks), start processes, or read files outside the workspace while it is built. Use only the data in the workspace: do not download recordings or any other data. Keep the file runnable (`python scene_replay.py --viewer null` replays the whole episode; `--seconds` and `--num-worlds` select shorter runs and more copies).""",
+Goal: recreate the scene and its physics from the photos and the logs (the three fruits with their sizes, masses, start poses, and materials; the tray), so that the replay reproduces the real episode: every fruit grasped, carried, and released into the tray, coming to rest where the real one did. Verification imports build_model, make_solver, make_pipeline, and PARAMS and runs its own replay of the whole episode (the starter's command rule, its own loop) in fresh processes, in 8 copies: 2 nominal, and 6 with every fruit's start moved by up to {jitter_mm} mm and turned by up to {jitter_deg} degrees about the vertical. It takes as the fruits the free bodies that start closest to where the top camera saw the real fruits at the start (within {match_cm} cm). Per fruit, in at least {held} of 8 copies: held through the real carry (from 3 state samples after the real lift-off to 2 before the real release), that is, its centre within the real fruit's half-width plus {hold_mm} mm of the midpoint between the grasping gripper's two finger-pad grasp points (25 mm from each pad's centre toward its tip) for at least {held_pct}% of the carry. Per fruit, in at least {placed} of 8 copies: at rest in the real tray at the end of the episode (inside the tray's outline at the start or the end plus {place_cm} cm, its centre within {height_mm} mm of the height of the real fruit lying on the tray floor, slower than {speed_cm} cm/s over the last {window_s} s), and within {rest_cm} cm of where the real fruit came to rest after its release (its final position, or one it rested at before a later fruit pushed it). Two negative controls replay the episode with the gripper commands forced open and with the friction of every arm and fruit collision shape set to {control_mu}: no fruit's lowest collision point may rise more than {control_cm} cm above its lowest point at the start, and a copy whose simulation diverges fails its control (MuJoCo Warp's default pyramidal friction cone can diverge at such low friction). Verification runs twice (a third time if they disagree) and the majority decides.
+Constraints (checked): keep the station's arm kinematics, finger collision geometry (within 0.5 mm), the MJCF's arm bases (within 3 mm), table plane, gravity, and the command input; add no shapes, actuators, equality constraints, tendons, or contact pairs to the robot, and keep its actuators plain servos (no bias force, unit gear). All worlds are identical copies. The fruits are exactly three more free, dynamic bodies (any labels), each starting at rest on the table (its lowest point within 1 mm below to 3 mm above it) within {start_cm} cm of where the top camera saw the real fruit, with {mass_g_low} to {mass_g_high} g, principal inertias between 0.8x a solid and 1.2x a thin-shell ellipsoid of its extents, its centre of mass within 2 cm of the centre of its collision geometry, at most {object_shapes} collision shapes whose extents are within 30% of the real fruit's size range (as tracked in the video), collisions with the finger pads, the table, the tray, and the other fruits, and no joint drives, springs, damping, joint friction, armature, gravity compensation, or applied forces. Everything else you add (the tray) is static or one more body (free or welded to the world) of {tray_kg_low} to {tray_kg_high} kg, with at most {tray_shapes} collision shapes inside the real tray's outline (at the start or the end) plus {tray_cm} cm and at most {tray_top_cm} cm above the table. The real tray's outlines at the start and the end are fits of the tray's silhouette in photos/{first_top} and photos/{last_top}: a circular sector for placement, and a circular sector with rounded corners for the added shapes. Tunable: arm joint gains, armature, friction, damping, effort limits (at most 28 N m on joints 1-3 and 10 N m on joints 4-6), and gravity compensation (0 to 1) per link; gripper position gain (100 to 3000 N/m) and squeeze force (5 to 60 N); PARAMS["command_delay"] (0 to 0.2 s) and PARAMS["dt"] (0.25 to 2 ms); the solver (a Newton solver class, not a subclass) and its settings; newton.CollisionPipeline settings or MuJoCo's own contacts; MuJoCo contact stiffness (solref in standard form with a time constant of at least 2 dt and a damping ratio of 0.5 to 2, refsafe on); materials (friction at most 1.5, torsional at most 0.02 m, rolling at most 0.005 m, restitution at most 0.8, margin at most 2 mm, contact gap at most 0.1 m, no adhesion; robot shapes may keep their MJCF values). The verification batch (12 worlds) must replay within about {runtime_s} s. Verification calls build_model, make_solver, and make_pipeline in a copy of the workspace without photos/ and arm_logs/ (with its own episode.npz, camera.json, and station/; links to files outside the workspace are not allowed), so keep fitted values in the script or in a file next to it. It then re-applies the model to SolverMuJoCo (notify_model_changed with all flags) and requires the solver's own arrays to match the model it compiled, so set solver parameters through the model (including its model.mujoco attributes) and the solver's constructor, not by editing the solver's MuJoCo arrays. The submission may not inspect the verifier (stack frames, garbage collector, raw memory, code objects, trace hooks), start processes, or read files outside the workspace while it is built; verification scans scene_replay.py and the workspace modules it imports (directly or indirectly) for introspection {scan_names}. Use only the data in the workspace: do not download recordings or any other data. Keep the file runnable (`python scene_replay.py --viewer null` replays the whole episode; `--seconds` and `--num-worlds` select shorter runs and more copies).""",
         },
     }
     if name == "abc_look":
@@ -477,8 +487,13 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
         from tools.mcp_evaluation.v4.abc_scratch import verify as scratch  # noqa: PLC0415
 
         t, b, core = scratch.THRESHOLDS, scratch.BOUNDS, scratch.core
+        photos = json.loads((SCRATCH_DATA / "photos" / "index.json").read_text())
+        tops = [photo["file"] for photo in photos if photo["camera"] == "top"]
         tasks[name]["goal"] = tasks[name]["goal"].format(
-            photos=len(json.loads((SCRATCH_DATA / "photos" / "index.json").read_text())),
+            scan_names=SCAN_NAMES,
+            photos=len(photos),
+            first_top=tops[0],
+            last_top=tops[-1],
             jitter_mm=f"{1000 * scratch.JITTER_XY_M:g}",
             jitter_deg=f"{scratch.JITTER_YAW_DEG:g}",
             match_cm=f"{100 * b['match_m']:g}",
@@ -515,6 +530,7 @@ Constraints (checked): keep the station's arm kinematics, finger collision geome
 
         t = mpc.THRESHOLDS
         tasks[name]["goal"] = tasks[name]["goal"].format(
+            scan_names=SCAN_NAMES,
             fall_m=f"{mpc.plant.FALL_HEIGHT_M:g}",
             tilt_deg=f"{math.degrees(math.acos(mpc.plant.FALL_UP_COS)):.1f}",
             root_cm=f"{100 * t['root_rmse_m']:g}",
@@ -634,8 +650,23 @@ def _environment(facts: dict) -> str:
     return text + "\n"
 
 
+# Shell facts of each agent CLI, the same in both conditions (checked with Claude Code 2.1.284: the blocked sleep
+# and the move to the background happened in i16 trials and in a direct test; the threshold is the CLI's constant).
+SHELL_FACTS = {
+    "claude": "Shell (the Bash tool): a command still running at its timeout (120 s unless the call sets `timeout`, "
+    "at most 600 s) continues in the background, with its output written to a file and a notification when it "
+    "ends; a command whose first part is `sleep N` with N of 25 or more is refused.\n",
+}
+
+
 def prompt_for(
-    name: str, condition: str, workspace: Path, seconds: int, guide: str | None, facts: dict | None = None
+    name: str,
+    condition: str,
+    workspace: Path,
+    seconds: int,
+    guide: str | None,
+    facts: dict | None = None,
+    cli: str | None = None,
 ) -> str:
     task = _task(name)
     common = f"""You are working on a Newton physics simulation task.
@@ -646,7 +677,7 @@ Newton source tree (read-only reference, including docs and examples): {ROOT}
 {task["goal"]}
 
 Deliverable: the edited {task["script"]} in the workspace, then a brief report. You have {seconds // 60} minutes, starting {START} (check with `date -u`); working efficiently matters. Do not modify files outside the workspace, do not look for other trials or hidden verification data, and do not use subagents.
-{_renderers()}{_newton_tools()}{_environment(facts or ti.hardware())}"""
+{_renderers()}{_newton_tools()}{_environment(facts or ti.hardware())}{SHELL_FACTS.get(cli, "")}"""
     run_args = task.get("run_args", "--num-frames <N>")
     run = f"uv run --no-sync --project {ROOT} python {task['script']} --viewer null {run_args} {' '.join(task['host_args'])}"
     run = run.rstrip()
@@ -692,7 +723,7 @@ def prepare(run_dir: Path, name: str, condition: str, model: str, seconds: int |
     if condition == "mcp":
         guide = _host_guide(workspace, task)
     facts = ti.hardware()
-    prompt = prompt_for(name, condition, workspace, seconds, guide, facts)
+    prompt = prompt_for(name, condition, workspace, seconds, guide, facts, MODELS[model]["cli"])
     spec = {
         "task": name,
         "condition": condition,
@@ -758,6 +789,10 @@ def _container(sandbox_root: Path, run_dir: Path):
         hidden = [TRIALS, run_dir.parent]
         # The study's harness (verifiers, data generators) is only for the verifier itself.
         masked = [] if harness else [ROOT / "tools" / "mcp_evaluation"]
+        if harness:
+            extra_ro = [*extra_ro, VERIFY_SOURCES]
+        else:
+            hidden.append(VERIFY_SOURCES)
         return ti.sandbox(
             command, sandbox_root, ROOT, PRIVATE, extra_ro=list(extra_ro), extra_hidden=hidden, masked=masked
         )
@@ -776,6 +811,9 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
     env["MCP_TOOL_TIMEOUT"] = "300000"
     env["MAX_MCP_OUTPUT_TOKENS"] = "60000"
     env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = str(BG_WAIT_CEILING_MS)
+    # No auto-memory: agents spent turns writing notes that no later trial reads (Codex's memories are off by
+    # default, and --ignore-user-config keeps them off).
+    env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
     # `python` and `python3` run the project's environment in both conditions (system Python lacks its packages).
     env["PATH"] = f"{ti.python_wrappers(sandbox_root / 'bin', PYTHON)}{os.pathsep}{env.get('PATH', os.defpath)}"
     contained = _container(sandbox_root, run_dir)
@@ -833,7 +871,7 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
                 # Load the Newton tools up front instead of behind a tool-search round trip (Claude Code only).
                 "alwaysLoad": True,
             }
-        command = _agent_command(spec, workspace, mcp)
+        command = keep_codex_session(_agent_command(spec, workspace, mcp), env)
         if "--mcp-config" in command:
             # Inline the MCP config so no harness file (an empty server list in restart) sits in the workspace.
             index = command.index("--mcp-config") + 1
@@ -916,6 +954,7 @@ def run_trial(prepared: dict, barrier: Path | None = None, parties: int = 2) -> 
             shutil.rmtree(sandbox_root, ignore_errors=True)
     load_end = os.getloadavg()
     activity = parse_events(run_dir / "agent.jsonl", spec["cli"])
+    activity.update(_usage_record(run_dir, spec["cli"], activity.get("usage"), env.get("CODEX_HOME")))
     activity["mcp_available"] = mcp_available(run_dir / "agent.jsonl", spec) if mcp is not None else None
     snapshot_info = None
     if snapshots is not None:
@@ -1008,6 +1047,95 @@ def api_failure(transcript: Path) -> str | None:
             continue
         return message[:300] if API_FAILURE.search(message) else None
     return None
+
+
+def keep_codex_session(command: list[str], env: dict) -> list[str]:
+    """Let Codex write its session log (see :func:`codex_sessions`) when it has the trial's own ``CODEX_HOME``,
+    never into the operator's."""
+    if command[:1] == ["codex"] and "CODEX_HOME" in env:
+        return [arg for arg in command if arg != "--ephemeral"]
+    return command
+
+
+def final_usage_reported(transcript: Path, cli: str) -> bool:
+    """Whether the agent's event stream has the CLI's usage record: Claude Code's ``result``, Codex's
+    ``turn.completed`` (which Codex does not write when the harness interrupts it at the time limit)."""
+    kind = "result" if cli == "claude" else "turn.completed"
+    for line in _read(transcript).splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == kind:
+            return True
+    return False
+
+
+def codex_sessions(paths: list[Path]) -> dict:
+    """Usage and image views from Codex session logs (``$CODEX_HOME/sessions/**/rollout-*.jsonl``).
+
+    The JSON stream reports usage only when the turn completes and does not list image views. The session log has
+    a cumulative token count after every model response and an ``ImageView`` item per viewed image, so an
+    interrupted run keeps the usage of every response that completed.
+
+    Returns:
+        ``usage`` (normalized like :func:`parse_events`, summed over the logs; ``None`` without a token count) and
+        ``image_views``.
+    """
+    totals, views = [], 0
+    for path in paths:
+        last = None
+        for line in _read(path).splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            payload = event.get("payload") if isinstance(event, dict) else None
+            if not isinstance(payload, dict) or event.get("type") != "event_msg":
+                continue
+            if payload.get("type") == "token_count" and (payload.get("info") or {}).get("total_token_usage"):
+                last = payload["info"]["total_token_usage"]
+            elif payload.get("type") == "item_completed" and (payload.get("item") or {}).get("type") == "ImageView":
+                views += 1
+        if last is not None:
+            totals.append(last)
+    if not totals:
+        return {"usage": None, "image_views": views}
+    usage = {
+        "input_tokens": sum(int(t.get("input_tokens", 0)) for t in totals),
+        "cached_input_tokens": sum(int(t.get("cached_input_tokens", 0)) for t in totals),
+        "cache_write_tokens": sum(int(t.get("cache_write_input_tokens", 0)) for t in totals),
+        "output_tokens": sum(int(t.get("output_tokens", 0)) for t in totals),
+    }
+    usage["uncached_input_plus_output"] = usage["input_tokens"] - usage["cached_input_tokens"] + usage["output_tokens"]
+    return {"usage": usage, "image_views": views}
+
+
+def _usage_record(run_dir: Path, cli: str, usage: dict | None, codex_home: str | None) -> dict:
+    """Usage fields of a trial's summary, which say where the usage comes from instead of reporting 0.
+
+    ``usage_source`` is ``final`` (the CLI's own usage record), ``codex_session`` (the last token counts of the
+    Codex session logs, which :func:`run_trial` copies into ``RUN_DIR/codex-sessions``; a response in flight at
+    the interruption is missing), or ``None`` (no usage known: every ``usage`` value is ``None``).
+    ``usage_complete`` is true only for ``final``.
+    """
+    complete = final_usage_reported(run_dir / "agent.jsonl", cli)
+    record = {"usage": usage, "usage_source": "final" if complete else None, "usage_complete": complete}
+    if cli == "codex":
+        record["codex_image_views"] = None
+        sessions = sorted(Path(codex_home).glob("sessions/**/rollout-*.jsonl")) if codex_home else []
+        if sessions:
+            kept = run_dir / "codex-sessions"
+            kept.mkdir(exist_ok=True)
+            for path in sessions:
+                shutil.copyfile(path, kept / path.name)
+            session = codex_sessions(sorted(kept.glob("*.jsonl")))
+            record["codex_image_views"] = session["image_views"]
+            if not complete and session["usage"] is not None:
+                record.update(usage=session["usage"], usage_source="codex_session")
+    if record["usage_source"] is None and usage is not None:
+        record["usage"] = dict.fromkeys(usage)
+    return record
 
 
 def _introspection(workspace: Path) -> list[str]:
@@ -1105,8 +1233,76 @@ def _verify(workspace: Path, run_dir: Path, task: dict, env: dict, contained=Non
     return {k: data[k] for k in ("success", "integrity", "failed_checks", "metrics", "normalized_worst")}
 
 
+def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=root, capture_output=True, check=False)
+
+
+# Lines of harness.diff (git diff, git status --porcelain, untracked files) that change the newton package.
+NEWTON_CHANGE = re.compile(r"^(?:diff --git a/newton/|.. newton/|--- untracked newton/)", re.MULTILINE)
+
+
+def _read(path: Path) -> str:
+    return path.read_text(errors="replace") if path.exists() else ""
+
+
+def newton_source(commit: str | None, root: Path = ROOT) -> Path | None:
+    """A directory holding the ``newton`` package as of ``commit``, for verifying a finished trial on its Newton.
+
+    Verifier fixes should apply to every trial of a task alike, but a later Newton can change the simulation, the
+    API a submission calls, and the kernels a verifier times (the trial's compile caches would no longer match).
+    Verifications of finished trials therefore put this directory before ``root`` on ``PYTHONPATH`` and take the
+    verifier itself from ``root``.
+
+    Args:
+        commit: The trial's commit (``spec["commit"]``).
+        root: The source tree the verifier runs from.
+
+    Returns:
+        ``None`` if ``root``'s ``newton/`` equals the commit's (or no commit is known), else a copy exported once
+        into :data:`VERIFY_SOURCES`, named by the package's git tree (commits with the same package share it).
+
+    Raises:
+        RuntimeError: The commit is not in ``root``'s repository.
+    """
+    if not commit:
+        return None
+    if _git(root, "cat-file", "-e", f"{commit}^{{commit}}").returncode != 0:
+        raise RuntimeError(f"the trial's commit {commit} is not in {root}: cannot verify it on its Newton")
+    same = _git(root, "diff", "--quiet", commit, "--", "newton").returncode == 0
+    untracked = _git(root, "ls-files", "--others", "--exclude-standard", "--", "newton").stdout.strip()
+    if same and not untracked:
+        return None
+    tree = _git(root, "rev-parse", f"{commit}:newton").stdout.decode().strip()
+    target = VERIFY_SOURCES / tree
+    if not (target / "newton").is_dir():
+        temporary = VERIFY_SOURCES / f".{tree}-{os.getpid()}"
+        shutil.rmtree(temporary, ignore_errors=True)
+        temporary.mkdir(parents=True)
+        archive = subprocess.run(["git", "archive", commit, "newton"], cwd=root, capture_output=True, check=True)
+        subprocess.run(["tar", "-x", "-C", str(temporary)], input=archive.stdout, check=True)
+        shutil.rmtree(target, ignore_errors=True)
+        temporary.rename(target)
+    return target
+
+
+def rerun_env(spec: dict, sandbox_root: Path, tag: str) -> dict:
+    """Environment for verifying a finished trial again: its compile caches and its Newton (:func:`newton_source`)."""
+    env = ti.trial_env(ROOT, sandbox_root / "caches", f"{spec['trial_id']}-{tag}")
+    source = newton_source(spec.get("commit"))
+    if source is not None:
+        env["PYTHONPATH"] = f"{source}{os.pathsep}{ROOT}"
+    return env
+
+
+def _trial_caches(run_dir: Path, spec: dict) -> Path:
+    caches = run_dir / "snapshots" / "caches"
+    if not caches.is_dir() and spec.get("cache_seed") and Path(spec["cache_seed"]).is_dir():
+        caches = Path(spec["cache_seed"])  # trials from before caches were kept
+    return caches
+
+
 def _verify_snapshot(run_dir: Path, spec: dict, task: dict, manifest: dict) -> dict:
-    """Verify one snapshot as the trial's own verification ran: same workspace path, sandbox, and caches."""
+    """Verify one snapshot as the trial's own verification ran: same workspace path, sandbox, caches, and Newton."""
     # The submission may name its own absolute paths, so the snapshot is restored where the trial's workspace was.
     sandbox_root = TRIALS / spec["trial_id"]
     if sandbox_root.exists():
@@ -1116,23 +1312,35 @@ def _verify_snapshot(run_dir: Path, spec: dict, task: dict, manifest: dict) -> d
     try:
         workspace = sandbox_root / "work"
         snap.materialize(run_dir / "snapshots", manifest, workspace)
-        caches = run_dir / "snapshots" / "caches"
-        if not caches.is_dir() and spec.get("cache_seed") and Path(spec["cache_seed"]).is_dir():
-            caches = Path(spec["cache_seed"])  # trials from before caches were kept
+        caches = _trial_caches(run_dir, spec)
         if caches.is_dir():
             shutil.copytree(caches, sandbox_root / "caches", symlinks=True)
-        env = ti.trial_env(ROOT, sandbox_root / "caches", f"{spec['trial_id']}-snapshot")
+        env = rerun_env(spec, sandbox_root, "snapshot")
         return verify(workspace, records, task, env, _container(sandbox_root, run_dir))
     finally:
         shutil.rmtree(sandbox_root, ignore_errors=True)
 
 
+def final_verdict(run_dir: Path, summary: dict) -> tuple[dict | None, str]:
+    """The verdict on a trial's final workspace and where it comes from.
+
+    ``RUN_DIR/reverify/result.json`` (the current verifier on the final workspace, see reverify.py) supersedes
+    the trial's own verification, which ran with the verifier of its time.
+    """
+    reverified = run_dir / "reverify" / "result.json"
+    if reverified.exists():
+        return json.loads(reverified.read_text()), "reverify"
+    return summary.get("verification"), "trial"
+
+
 def verify_snapshots(run_dir: Path, exhaustive: bool = False) -> dict:
     """Verify a finished trial's workspace snapshots and write ``snapshot_verification.json`` (see snapshots.py).
 
-    Results already in that file are reused (delete it to verify again), and the final snapshot, taken right
-    before the trial's own verification, takes that verification's result. Refuses to start or continue while
-    any trial process runs on this machine: verifications would compete with it for the GPU.
+    Results already in that file are reused (delete it to verify again). The final snapshot, taken right before
+    the trial's own verification, takes the final verdict (:func:`final_verdict`: the re-verification if there
+    is one, else the trial's own). Snapshots are verified with the current verifier on the trial's Newton
+    (:func:`newton_source`). Refuses to start or continue while any trial process runs on this machine:
+    verifications would compete with it for the GPU.
     """
     run_dir = Path(run_dir).resolve()
     if not (run_dir / "summary.json").exists():
@@ -1152,13 +1360,24 @@ def verify_snapshots(run_dir: Path, exhaustive: bool = False) -> dict:
         # leftover processes were stopped) is dropped.
         final = finals[-1]
         manifests = [m for m in manifests if not m.get("final") and m["seconds"] <= final["seconds"]] + [final]
-    final, trial = manifests[-1], summary.get("verification")
+    final = manifests[-1]
+    verdict, verdict_source = final_verdict(run_dir, summary)
     digests = [snap.submission_digest(manifest, task["snapshot_ignore"]) for manifest in manifests]
-    if final.get("final") and trial is not None and digests[-1] not in known:
-        record = {"snapshot": final["name"], "seconds": final["seconds"], "digest": digests[-1], "source": "trial"}
-        record.update({key: trial.get(key) for key in ("success", "failed_checks", "normalized_worst", "error")})
+    previous = known.get(digests[-1])
+    # A re-verification made after an earlier run of this function replaces the trial's verdict it recorded.
+    stale = previous is not None and previous.get("source") == "trial" and verdict_source == "reverify"
+    if final.get("final") and verdict is not None and (previous is None or stale):
+        record = {"snapshot": final["name"], "seconds": final["seconds"], "digest": digests[-1]}
+        record["source"] = verdict_source
+        record.update({key: verdict.get(key) for key in ("success", "failed_checks", "normalized_worst", "error")})
+        if verdict_source == "reverify":
+            record["verifier_commit"] = verdict.get("commit")
+        if stale:
+            verifications.remove(previous)
         verifications.append(record)
         known[digests[-1]] = record
+    source = newton_source(spec.get("commit"))
+    verifier_commit = _git(ROOT, "rev-parse", "HEAD").stdout.decode().strip()
     report = {
         "task": spec["task"],
         "condition": spec["condition"],
@@ -1169,6 +1388,12 @@ def verify_snapshots(run_dir: Path, exhaustive: bool = False) -> dict:
         "agent_seconds": summary.get("agent_seconds"),
         "snapshot_seconds": spec.get("snapshot_seconds"),
         "snapshot_ignore": task["snapshot_ignore"],
+        "final_verdict_source": verdict_source,
+        "verifier_commit": verifier_commit,
+        "newton_commit": spec.get("commit"),
+        "newton_path": str(source or ROOT),
+        # A trial that ran with uncommitted Newton changes cannot be verified on exactly its Newton.
+        "newton_dirty": bool(NEWTON_CHANGE.search(_read(run_dir / "harness.diff"))),
         "verifications": verifications,
     }
 
@@ -1186,6 +1411,7 @@ def verify_snapshots(run_dir: Path, exhaustive: bool = False) -> dict:
         result = _verify_snapshot(run_dir, spec, task, manifest)
         record = {"snapshot": manifest["name"], "seconds": manifest["seconds"], "digest": digests[index]}
         record.update(source="verifier", verify_seconds=round(time.perf_counter() - started, 1))
+        record["verifier_commit"] = verifier_commit
         record.update({key: result.get(key) for key in ("success", "failed_checks", "normalized_worst", "error")})
         verifications.append(record)
         write(None)
@@ -1261,7 +1487,9 @@ def main() -> int | None:
             verified = sum(record["source"] == "verifier" for record in result["verifications"])
             print(
                 f"{run_dir}: first_pass_seconds={result['first_pass_seconds']} "
-                f"(versions {result['versions']}, verifier runs {verified})"
+                f"(versions {result['versions']}, verifier runs {verified}, "
+                f"final verdict from {result['final_verdict_source']})",
+                flush=True,
             )
         return 1 if failed else 0
     if args.spec is not None:

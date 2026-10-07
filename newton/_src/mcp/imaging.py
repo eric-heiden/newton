@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import struct
 import zlib
 from pathlib import Path
@@ -335,3 +336,99 @@ def compare(simulated: np.ndarray, reference: np.ndarray, threshold: int = 24) -
         **image_metrics(simulated, reference),
     }
     return panel, stats
+
+
+def _encode_jpeg(rgb: np.ndarray, quality: int = 85) -> bytes | None:
+    """JPEG bytes when Pillow is installed, else ``None``."""
+    try:
+        import io  # noqa: PLC0415
+
+        from PIL import Image
+    except ImportError:
+        return None
+    buffer = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(rgb, dtype=np.uint8)).save(buffer, format="JPEG", quality=quality)
+    return buffer.getvalue()
+
+
+def _halved(rgb: np.ndarray) -> np.ndarray:
+    """Half-size image by 2x2 box averaging (odd last rows and columns are dropped)."""
+    height, width = rgb.shape[0] // 2 * 2, rgb.shape[1] // 2 * 2
+    blocks = rgb[:height, :width].astype(np.uint16).reshape(height // 2, 2, width // 2, 2, 3)
+    return (blocks.sum(axis=(1, 3)) // 4).astype(np.uint8)
+
+
+def fit_images(
+    images: list[tuple[str, str]], budget: int, *, stated_budget: int | None = None
+) -> tuple[list[tuple[str, str]], str | None]:
+    """Shrink base64-encoded images until their encoded lengths sum to at most ``budget`` characters.
+
+    Images are re-encoded as JPEG (with Pillow), then the largest are halved in size, and as a
+    last resort images are dropped from the end.
+
+    Args:
+        images: ``(base64 data, MIME type)`` pairs.
+        budget: Characters available for all images.
+        stated_budget: Budget named in the returned sentence (default: ``budget``).
+
+    Returns:
+        The images that fit, and a sentence describing what was changed (``None`` if nothing).
+    """
+    images = list(images)
+    total = sum(len(data) for data, _ in images)
+    if total <= budget:
+        return images, None
+    decoded: dict[int, np.ndarray] = {}
+    changes: dict[int, list[str]] = {}
+
+    def pixels(index: int) -> np.ndarray | None:
+        if index not in decoded:
+            try:
+                decoded[index] = to_rgb(base64.b64decode(images[index][0]))
+            except Exception:
+                decoded[index] = None
+        return decoded[index]
+
+    def replace(index: int, rgb: np.ndarray, note: str) -> None:
+        nonlocal total
+        data = _encode_jpeg(rgb)
+        kind = "image/jpeg"
+        if data is None:
+            data, kind = encode_png(rgb), "image/png"
+        encoded = base64.b64encode(data).decode("ascii")
+        if len(encoded) < len(images[index][0]) or note != "JPEG":
+            total += len(encoded) - len(images[index][0])
+            images[index] = (encoded, kind)
+            decoded[index] = rgb
+            changes.setdefault(index, []).append(note)
+
+    jpeg = _encode_jpeg(np.zeros((1, 1, 3), np.uint8)) is not None
+    order = sorted(range(len(images)), key=lambda index: -len(images[index][0]))
+    for index in order:
+        if total <= budget or not jpeg:
+            break
+        if images[index][1] != "image/jpeg" and pixels(index) is not None:
+            replace(index, pixels(index), "JPEG")
+    while total > budget:
+        candidates = [
+            index for index in range(len(images)) if pixels(index) is not None and min(pixels(index).shape[:2]) >= 64
+        ]
+        if not candidates:
+            break
+        index = max(candidates, key=lambda index: len(images[index][0]))
+        rgb = pixels(index)
+        smaller = _halved(rgb)
+        replace(index, smaller, f"{rgb.shape[1]}x{rgb.shape[0]} -> {smaller.shape[1]}x{smaller.shape[0]}")
+    dropped = 0
+    while total > budget and images:
+        total -= len(images.pop()[0])
+        dropped += 1
+    if not changes and not dropped:
+        return images, None
+    parts = [
+        f"image {index + 1}: {', '.join(notes)}" for index, notes in sorted(changes.items()) if index < len(images)
+    ]
+    if dropped:
+        parts.append(f"last {dropped} image(s) dropped")
+    stated = budget if stated_budget is None else stated_budget
+    return images, f"Images reduced to fit the {stated}-character response budget: {'; '.join(parts)}."

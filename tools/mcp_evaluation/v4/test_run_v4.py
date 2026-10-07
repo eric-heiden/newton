@@ -439,7 +439,7 @@ class TestPrompt(unittest.TestCase):
                     self.fail(f"{name} does not resolve")
                 self.assertIn(parts[-1], line)
 
-    def test_guide_describes_the_hosted_workers(self):
+    def test_host_gets_the_workers_and_the_guide_does_not_describe_them(self):
         workspace = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, workspace)
         (workspace / "s.py").write_text("")
@@ -450,11 +450,9 @@ class TestPrompt(unittest.TestCase):
         self.assertEqual(command[command.index("--workers") + 1], "2")
         self.assertEqual(command[command.index("--max-workers") + 1], "4")
         self.assertEqual(command[-3:], ["--", "--x", "1"])
-        self.assertIn("`workers`: 2 sibling copies", guide)
-        self.assertIn("(0 to 4)", guide)
-        self.assertIn("jobs.start", guide)
-        with mock.patch.object(run_v4, "WORKERS", 0), mock.patch.object(run_v4, "MAX_WORKERS", 0):
-            self.assertNotIn("`workers`", run_v4._host_guide(workspace, task))
+        self.assertIn("Hosted script s.py", guide)
+        self.assertNotIn("workers", guide)
+        self.assertNotIn("jobs.", guide)
 
 
 class TestEnvironment(TemporaryDirectory):

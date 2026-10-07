@@ -98,6 +98,48 @@ def _check_load(script: str, example_class: str, argv: list[str], overrides: dic
 
 
 _SCALARS = (int, float, bool, str, type(None))
+_MISSING = object()
+_UNSAVED = object()
+
+
+# Weak keys: every rebuild loads new classes, which must not stay alive through this cache.
+_RESET_READS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _reset_reads(cls: type) -> frozenset[str]:
+    """Attribute names that ``cls.reset(self)`` reads from ``self`` directly (``self.q0``), from its bytecode."""
+    import dis  # noqa: PLC0415
+
+    with contextlib.suppress(TypeError):
+        if cls in _RESET_READS:
+            return _RESET_READS[cls]
+    function = getattr(cls, "reset", None)
+    code = getattr(function, "__code__", None)
+    names = set()
+    if code is not None and code.co_varnames[: code.co_argcount]:
+        receiver, previous = code.co_varnames[0], None
+        for instruction in dis.get_instructions(code):
+            if instruction.opname == "LOAD_ATTR" and previous is not None:
+                if previous.opname.startswith("LOAD_FAST") and previous.argval == receiver:
+                    names.add(instruction.argval)
+            previous = instruction
+    result = frozenset(names)
+    with contextlib.suppress(TypeError):
+        _RESET_READS[cls] = result
+    return result
+
+
+def _saved_value(value: Any, budget: list[int]) -> Any:
+    """A comparable copy of plain data (scalars, NumPy arrays, small containers), or ``_UNSAVED``."""
+    if type(value) in _SCALARS:
+        return ("value", value if value == value else "nan")
+    if isinstance(value, np.ndarray):
+        budget[0] -= value.nbytes
+        return ("array", value.dtype.str, value.shape, value.tobytes()) if budget[0] >= 0 else _UNSAVED
+    if type(value) in (list, tuple, dict):
+        frozen = _frozen(value, [256])
+        return ("container", frozen) if frozen is not _UNFROZEN else _UNSAVED
+    return _UNSAVED
 
 
 def _overridden(current: Any, value: Any) -> Any:
@@ -299,6 +341,8 @@ class ExampleHost:
         self._class_modules: list[tuple[str, ModuleType]] = []
         self._no_solver = _NoSolver()
         self._session_ref = None
+        self._built_files: dict[str, tuple | None] = {}
+        self._stale_reported: tuple[str, ...] | None = None
         self.restart_requested = False
         self.restart_fallback: dict | None = None
         """Arguments and overrides a restarted host builds with if the requested ones fail."""
@@ -364,6 +408,8 @@ class ExampleHost:
         self.module, self.example, self.args = module, example, args
         self.scene_source = scene
         self._class_modules = [("module", module), *_local_modules(self.script.parent).items()]
+        self._built_files = self._file_signatures()
+        self._stale_reported = None
         self._dynamic_scalars = set()
         self._dynamic_keys = set()
         self.build_seconds = time.perf_counter() - started
@@ -521,6 +567,11 @@ class ExampleHost:
         edited = [key for key in changed if key not in self._dynamic_keys or current.get(key, ("",))[0] == "object"]
         if edited and self.recapture():
             edited = _outermost(edited)
+            # Attributes the running cell assigned itself are no news to it.
+            assigned = getattr(session, "cell_assigned", frozenset())
+            edited = [key for key in edited if key.rsplit(".", 1)[-1] not in assigned]
+            if not edited:
+                return
             public = sorted((key for key in edited if "._" not in key), key=lambda key: (key.count("."), key))
             names = public[:6] + ([f"{len(public) - 6} more"] if len(public) > 6 else [])
             # Private solver bookkeeping (e.g. snapshots refreshed by notify_model_changed) is summarized.
@@ -570,7 +621,11 @@ class ExampleHost:
                 value = original(example, *args, **kwargs)
             else:
                 with session.watch.stepping("example.step()"):
-                    value = original(example, *args, **kwargs)
+                    session.step_writes.before()
+                    try:
+                        value = original(example, *args, **kwargs)
+                    finally:
+                        session.step_writes.after()
             host._learn_advanced(before)
             return value
 
@@ -606,7 +661,41 @@ class ExampleHost:
     def after_execute(self, session) -> str | None:
         self.sync(session)
         notes, self._notes = self._notes, []
+        stale = self.stale_files()
+        if stale and stale != self._stale_reported:
+            notes.append(self._stale_text(stale))
+        self._stale_reported = stale
         return "; ".join(notes) or None
+
+    def _file_signatures(self) -> dict[str, tuple | None]:
+        """Modification time and size of the script and the helper modules it imported from its directory."""
+        files = [self.script]
+        files += [Path(module.__file__) for _, module in self._class_modules[1:] if getattr(module, "__file__", None)]
+        signatures = {}
+        for path in files:
+            try:
+                stat = path.stat()
+                signatures[str(path)] = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                signatures[str(path)] = None
+        return signatures
+
+    def stale_files(self) -> tuple[str, ...]:
+        """Names of the hosted files that changed on disk since the last build."""
+        built = getattr(self, "_built_files", None) or {}
+        current = self._file_signatures() if built else {}
+        return tuple(sorted(Path(path).name for path, signature in built.items() if current.get(path) != signature))
+
+    def _stale_text(self, stale: tuple[str, ...]) -> str:
+        return (
+            f"{', '.join(stale)} changed on disk after the last build; `module` and `example` are the built "
+            "version until newton_rebuild"
+        )
+
+    def error_note(self, session, error) -> str | None:
+        """The fact that the hosted files changed on disk, for errors raised by cells."""
+        stale = self.stale_files()
+        return f"Note: {self._stale_text(stale)}." if stale else None
 
     def _hosted_classes(self) -> list[tuple[str, type]]:
         """Classes defined at the top level of the hosted script and of its helper modules, with labels."""
@@ -683,46 +772,59 @@ class ExampleHost:
         return {name: value for name, value in vars(self.example).items() if type(value) in (int, float, bool)}
 
     def snapshot(self, session) -> dict:
-        """Capture the example's own Warp arrays and scalar attributes (controller phases, timers)."""
+        """Capture the example's own Warp arrays and scalar attributes (controller phases, timers).
+
+        Also copies the other attributes ``example.reset()`` reads (e.g. an initial pose ``q0``), so
+        reset and restore can report the ones that changed: they do not call ``example.reset()``.
+        """
         arrays = {
             name: value.numpy().copy()
             for name, value in vars(self.example).items()
             if isinstance(value, wp.array) and value.ndim >= 1
         }
-        return {"arrays": arrays, "scalars": self._scalars()}
+        budget = [16 * 1024 * 1024]
+        reads = {}
+        for name in _reset_reads(type(self.example)):
+            value = vars(self.example).get(name, _MISSING)
+            if value is _MISSING or isinstance(value, wp.array):
+                continue
+            saved = _saved_value(value, budget)
+            if saved is not _UNSAVED:
+                reads[name] = saved
+        return {"arrays": arrays, "scalars": self._scalars(), "reset_reads": reads}
 
-    def restore(self, session, data: dict) -> None:
-        for name, value in data["arrays"].items():
-            target = getattr(self.example, name, None)
-            if isinstance(target, wp.array) and target.shape == value.shape:
-                target.assign(value)
+    def restore(self, session, data: dict) -> dict:
+        """Rewind the example's arrays that steps write and its step-advanced scalars; report other changes."""
+        from .stepwrites import rewind_arrays  # noqa: PLC0415
+
+        example = self.example
+        current = {name: getattr(example, name, None) for name in data["arrays"]}
+        facts = rewind_arrays(current, data["arrays"], session.step_writes.learned(), "example")
         # Only scalars that step() advances (timers, phase counters) rewind; settings the
         # agent assigned (gains, amplitudes) are not state and survive reset/restore.
         for name, value in data["scalars"].items():
             if name in self._dynamic_scalars:
-                setattr(self.example, name, value)
+                setattr(example, name, value)
+        reads = _reset_reads(type(example))
+        changed = [f"example.{name}" for name in data["arrays"] if name in reads and f"example.{name}" in facts["kept"]]
+        for name, saved in data.get("reset_reads", {}).items():
+            if name not in self._dynamic_scalars and _saved_value(vars(example).get(name), [1 << 62]) != saved:
+                changed.append(f"example.{name}")
+        facts["not_applied"] = sorted(changed)
+        return facts
 
     def guide(self, workers: int = 0, max_workers: int = 0) -> str:
         """Usage notes for this hosted script, sent to MCP clients in the server instructions.
 
         Args:
-            workers: Number of worker sessions (started or not).
-            max_workers: Upper bound of ``workers.resize()``; ``0`` omits the worker and job notes.
+            workers: Number of worker sessions (started or not); not described in the notes.
+            max_workers: Upper bound of ``workers.resize()``; not described in the notes.
         """
-        text = f"""Hosted script {self.script} (class {self.example_class}, args {self.argv}).
-- `example` is the live Example instance and `module` the loaded script module. One step is one example frame ({_frame_dt(self.example)}); example.step() called directly does not advance session.time.
-- reset, checkpoint and restore also rewind the example's Warp arrays and the scalar attributes step() changes (timers, phase counters), also when cells call example.step(); they do not call example.reset(). Assigned settings and model edits are kept; meshes, SDFs and Python containers are not rewound.
-- Before the first step after a cell, the example's attributes, the module globals, and the settings of the solver, model, their option objects and the script's own objects are compared with their values when the CUDA graphs were recorded; if any changed, the graphs are re-recorded (reported in `note`).
-- Rollback after a failed cell also covers the example's attributes and Warp arrays, the module globals (including in-place edits of small dicts and lists), and the attributes of classes defined in the script or its helper modules (e.g. a rebound method); solver internals, meshes and SDFs are not covered.
-- newton_rebuild reads the script (and modules imported from its directory) from disk again and constructs Example in this process; Python variables are kept, arguments={{"argv": [...]}} sets the example arguments, and if loading or construction fails the previous scene keeps running and the error shows file:line.
-- newton_rebuild(overrides={{"NAME": value}}) sets module globals after the script loads and before Example() is constructed (a dict merges into a dict global). The set stays active for later rebuilds and restarts, is echoed as `overrides` in every response, and {{}} clears it. Values computed from a global while the module loaded keep the original value.
-- newton_rebuild(arguments={{"restart": true}}) re-executes the host process (new CUDA context; same script, arguments and overrides); Python variables are lost. It is refused if the script with those overrides and arguments fails to load in a new process; if Example() fails after the restart, the previous arguments and overrides are built and the next `note` says so.
-- persist('NAME', value) writes a module-level literal NAME = ... into the script and persist_source(fn_or_class, target=None) replaces a top-level def or class (or 'Class.method') with the cell's definition; both print a diff, keep a backup, and rebuild."""
-        if max_workers:
-            text += f"""
-- `workers`: {workers} sibling copies of the script in their own processes on this machine (sharing its CPU cores and GPU with this session), started on first use (a workers.map, submit, broadcast, sync or resize call, or jobs.start); workers.resize(n) (0 to {max_workers}), workers.status(). workers.map(fn, items) returns results in input order ({{'error': ...}} for a call that raised), workers.submit(fn, *args) returns a Future, workers.broadcast(fn_or_code) runs on every worker. Cell functions, lambdas and closures are sent by source with the cell definitions and session globals they read; arguments and results are pickled. On a worker, example, model, state and the helpers refer to its own scene, without this session's live edits; workers.sync(name=value) copies values to every worker. Workers follow newton_rebuild, including overrides, without delaying it: started workers rebuild in the background before their next call (listed under `workers_rebuild`). A call that raises rolls its worker's simulation back. A worker whose process exits or whose CUDA context fails is restarted and replays earlier broadcast/sync calls; this is listed under `workers` in the next response.
-- jobs.start(fn_or_code, *args, **kwargs) runs a call on a free worker in the background and returns an id; jobs.wait(timeout=None, any=True) returns finished results and printed lines, with the worker and its `build` (rebuild count) when the job started; jobs.result(id), jobs.cancel(id) (queued jobs), jobs.status(). Jobs that finished are listed under `jobs` in the next response."""
-        return text
+        return f"""Hosted script {self.script.name} (class {self.example_class}, args {self.argv}): `example` is the live instance, `module` the script module; a step is one example.step() ({_frame_dt(self.example)}).
+- reset/restore rewind the state, time, and the arrays and scalars steps write; other edits stay and are listed in `note`. They do not call example.reset().
+- Changed settings re-record the example's CUDA graphs before the next step.
+- newton_rebuild reads the script and its sibling modules from disk again (Python variables stay; a failed build keeps the previous scene); overrides={{'NAME': value}} sets module globals before Example(); code runs a cell afterwards.
+- Live edits are not saved; only files on disk persist after the session."""
 
     def session(self, *, artifact_directory=None, workers=None, allow_execute: bool = True):
         """Create a :class:`SimulationSession` bound to the example on the calling thread."""
@@ -790,9 +892,11 @@ class ExampleHost:
             undo_callback=self.undo_point,
             batch_callback=self.end_batch,
             sync_callback=self.rebind,
+            error_callback=self.error_note,
         )
         self._session_ref = weakref.ref(session)
         session.scene_source = self.scene_source
+        session.step_writes.add_source("example", lambda: host.example)
         self._watch_steps()
         self.echo(session)
         # The session may have adjusted the model (e.g. contact capacity for its collision pipeline).

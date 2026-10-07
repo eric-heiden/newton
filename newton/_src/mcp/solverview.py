@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import fnmatch
 import functools
+import re
 import time
 import weakref
 import zlib
@@ -699,6 +700,10 @@ class ModelWatch:
         mujoco = _is_mujoco(solver)
         flagged = [n for n in changed if n in FIELD_FLAGS and not (mujoco and n in MUJOCO_CONSTRUCTION_ONLY)]
         uncovered = [name for name in flagged if not self._covered(name, digests[name], solver)]
+        if mujoco and uncovered:
+            # Code that writes the solver's compiled arrays itself (instead of notifying) already applied them.
+            applied = applied_in_solver(session.model, solver, uncovered)
+            uncovered = [name for name in uncovered if name not in applied]
         missing = inferred_flags(uncovered)
         # Edits a notify_model_changed call covered are not reported: only facts the cell cannot see itself.
         lines = []
@@ -1093,6 +1098,36 @@ def _generic_params(model, solver, kind, match, world, limit) -> dict:
         return {"options": options, "unsupported": unsupported}
     rows, truncated = _limited(rows, limit)
     return {"rows": rows, "_truncated": truncated, "unsupported": unsupported}
+
+
+def applied_in_solver(model, solver, names: list[str], *, max_worlds: int = 8) -> set[str]:
+    """Edited model fields whose current values a :class:`~newton.solvers.SolverMuJoCo` already integrates.
+
+    A field counts as applied when :func:`solver_params` lists it as the source of some compiled
+    value and none of those values is ``pending`` (differs from the model) in any world, e.g. when
+    application code wrote the compiled arrays directly. Fields no compiled value names, models
+    with more than ``max_worlds`` worlds, and failures count as not applied.
+    """
+    world_count = max(1, int(model.world_count))
+    if world_count > max_worlds:
+        return set()
+    patterns = {name: re.compile(rf"model\.{re.escape(name)}(?=[\[/])") for name in names}
+    seen, pending = set(), set()
+    try:
+        for kind in ("actuator", "joint", "geom", "body"):
+            for world in range(world_count):
+                rows = _MuJoCoParams(model, solver, world).run(kind, lambda _label: True, 1 << 30).get("rows", [])
+                for row in rows:
+                    late = set(row.get("pending", ()))
+                    for key, source in row.get("from", {}).items():
+                        for name, pattern in patterns.items():
+                            if isinstance(source, str) and pattern.search(source):
+                                seen.add(name)
+                                if key in late:
+                                    pending.add(name)
+    except Exception:
+        return set()
+    return seen - pending
 
 
 class _MuJoCoParams:

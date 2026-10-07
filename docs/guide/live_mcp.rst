@@ -68,10 +68,20 @@ Arguments after ``--`` go to the script's own parser. The host
 (:class:`newton.mcp.ExampleHost`) enables trusted execution, exposes the live
 ``example`` and its ``module``, and includes the example's own Warp arrays and
 scalar attributes in checkpoints so controller phases rewind with the physics.
-``reset`` and ``restore`` rewind the scalar attributes that ``step()`` changes
-(timers, phase counters), whether the session stepped or a cell called
-``example.step()``; attributes ``step()`` leaves alone, such as gains a cell
-assigned, keep their values. They do not call the example's own ``reset()``.
+``reset`` and ``restore`` rewind the state and only what stepping changes: the
+scalar attributes ``step()`` advances (timers, phase counters) and the
+example's and the control's Warp arrays a step has written (a command cursor,
+controller memory, targets the controller sets), whether the session stepped
+or a cell called ``example.step()``. Writes are learned from device checksums
+taken around each step of the arrays not yet known to be written; the
+comparison stays on the device until a reset or restore reads it. Everything
+else a cell changed stays: assigned gains, an edited command schedule, a
+perturbation, control inputs no step overwrites. The response lists the
+restored arrays as ``rewound`` and the changed but kept ones as ``kept``.
+Reset and restore do not call the example's own ``reset()``; attributes that
+``reset()`` reads and that changed since the snapshot, such as an initial pose
+``example.q0``, are listed as ``not_applied``. Inside a cell, kept and
+not-applied names also appear once in ``note``.
 
 Before the first step after a cell, the host compares the example's attributes,
 the script's module globals, and the attributes of the objects the example
@@ -80,8 +90,12 @@ controllers, and their option objects, three levels deep) with their values
 when the example's CUDA graphs were recorded. Scalars and small plain-data containers compare by value, other
 objects by identity. If any of them changed (a gain, ``SUBSTEPS``, a solver
 option, a replacement solver), the host re-records the graphs and reports this
-as ``note`` in the execution result; settings that stepping itself advances,
-such as timers, do not count. ``recapture()`` re-records them explicitly.
+as ``note`` in the execution result, unless the cell itself assigned every
+changed attribute (``example.gain = 2.0``); settings that stepping itself
+advances, such as timers, do not count. ``recapture()`` re-records them
+explicitly. When the script or one of its helper modules changed on disk after
+the last build, the next execution result says so once, and errors of cells
+repeat it until a rebuild: ``module`` and ``example`` are the built version.
 
 ``newton_rebuild`` reloads the edited script from disk in the same process,
 together with the modules it imports from its own directory. If loading or
@@ -101,8 +115,10 @@ argument parser is reported as an error instead of ending the host. Rebuild
 
    client.request("rebuild", overrides={"SUBSTEPS": 32, "PARAMS": {"dt": 0.001}})
 
-A dictionary merges into a dictionary global (recursively); other values replace
-the global, keeping a float global a float and a tuple a tuple. Module code that
+``newton_rebuild(code=...)`` runs a cell after a successful rebuild and returns
+its value and output with the rebuild result; if the rebuild fails, the cell
+does not run. A dictionary merges into a dictionary global (recursively); other
+values replace the global, keeping a float global a float and a tuple a tuple. Module code that
 already ran while loading, such as a constant computed from the original value
 or a default argument, keeps the original value. The given mapping becomes the
 active set for later rebuilds and restarts; omit ``overrides`` to keep it and
@@ -131,6 +147,19 @@ file path when the MCP client's working directory differs:
 .. code-block:: bash
 
    uv run -m newton.mcp --connect /absolute/path/session.json
+
+Tool calls reply within ``--reply-within`` seconds (default 240, below the
+300 s tool timeout of common clients; ``0`` waits for completion). A call
+still running then continues in the session, and the reply holds ``running``
+with its call number and the output printed so far. The session runs one call
+at a time: a later call waits for the running one (up to its own reply limit,
+otherwise it is not run and says so), and its response carries the earlier
+call's value, remaining output, images, or error under ``finished_calls``.
+``jobs.result()`` and ``jobs.wait()`` without a ``timeout`` return shortly
+before the running call's reply limit. Each tool result stays within
+``--response-budget`` characters (default 1,000,000, below the 1 MiB some
+clients accept): larger images are re-encoded as JPEG (with Pillow), halved in
+size, or dropped, and ``images_note`` says which.
 
 The default ``--profile full`` advertises every structured tool. Add
 ``--profile code`` to advertise only ``newton_describe``, ``newton_execute``,
@@ -199,12 +228,14 @@ and update inverse mass/inertia. Notifications reach the top-level solver once;
 coupled solvers forward them to children. ``expected_revision`` can reject a
 stale edit before applying it.
 
-``reset`` restores initial state, controls, session time, and solver/contact
-caches while retaining tuned model parameters. Named checkpoints store public
-state/control arrays and time, and with ``include`` the Python objects named by
-workspace paths (see :ref:`live-mcp-batch`). They do not capture every hidden
-solver state, so restoring a checkpoint resets solver caches and does not
-promise bitwise replay. Reset and restore clear contact buffers and generation metadata without
+``reset`` restores the initial state, session time, and solver/contact caches
+while retaining tuned model parameters; control arrays return to their initial
+values only if a step has written them (``rewound``), so inputs set between
+steps stay (``kept``). Named checkpoints store public state/control arrays and
+time and restore them the same way, and with ``include`` the Python objects
+named by workspace paths (see :ref:`live-mcp-batch`). They do not capture every
+hidden solver state, so restoring a checkpoint resets solver caches and does
+not promise bitwise replay. Reset and restore clear contact buffers and generation metadata without
 running collision detection. Use ``contacts(refresh=True)`` or ``collide`` to
 regenerate diagnostic contacts, including before an observation with contact
 overlays. The default step path regenerates its contacts before physics;
@@ -272,7 +303,14 @@ Calibrated ``intrinsics``, ``pick``, and overlay pixels use the image
 coordinates of :class:`~newton.sensors.SensorCamera.Intrinsics` (x right, y
 down, integer values at pixel centers), which also projects and unprojects
 points outside the MCP. In Python cells, ``intrinsics`` may also be a
-:class:`~newton.sensors.SensorCamera.Intrinsics`.
+:class:`~newton.sensors.SensorCamera.Intrinsics`. A calibration dictionary,
+such as one camera's entry of a ``camera.json`` file with ``K`` (3x3, row
+major), ``D`` (OpenCV coefficient order), ``width``, ``height`` and
+``distortion_model``, is read like ``SensorCamera.Intrinsics.from_dict()``;
+its ``position`` and ``rotation_xyzw`` place the camera when no ``eye``,
+``pose``, ``view`` or ``camera_body`` is given. ``pose`` also accepts
+``{"position": [...], "rotation_xyzw": [...]}``. A calibrated camera renders at
+its calibration size unless ``width``/``height`` are given.
 
 Persistent Python workspace
 ---------------------------
@@ -367,9 +405,11 @@ Trusted cells can use these helpers without imports (``newton``, ``np``, and
   and variants as worlds of N copies of the live scene and save Python objects
   with a checkpoint (see :ref:`live-mcp-batch`).
 - :meth:`~newton.mcp.SimulationSession.solver_contacts` groups the solver's
-  active contacts by shape pair and lists the parameters the solver actually
-  integrates, such as MuJoCo ``solref``, ``solimp``, and friction after geom
-  priority and material mixing, next to the authored shape materials.
+  active contacts by shape pair (short labels, counts, smallest distance),
+  optionally only pairs whose shape or body label matches ``select``; with
+  ``detail=True`` it lists the parameters the solver actually integrates, such
+  as MuJoCo ``solref``, ``solimp``, and friction after geom priority and
+  material mixing, next to the authored shape materials.
 - :meth:`~newton.mcp.SimulationSession.contacts_between` reports the contact
   count, normal and friction force, slip speed, and penetration between two
   shape sets; it also works as a ``rollout`` probe.
@@ -396,7 +436,10 @@ flags, and the execution result's ``note`` has one line naming those fields and
 flags, plus one line per edited field the current solver configuration does not
 read (for example ``mujoco.actuator_gainprm`` of actuators driven by
 ``joint_target_ke``), each such line once per scene. Edits a ``notify_model_changed`` call covered are not
-reported. A call covers a changed array only if it was made on the session's
+reported, nor are edits whose values :class:`~newton.solvers.SolverMuJoCo`
+already integrates in every world because the cell also wrote its compiled
+arrays (as :meth:`~newton.mcp.SimulationSession.solver_params` shows without
+``pending``). A call covers a changed array only if it was made on the session's
 solver with the array's category after the array's last change; calls on other
 solver objects, or before the edit, are named in the note.
 ``session.watch.mode = "report"`` reports without notifying and ``"off"``

@@ -620,6 +620,44 @@ class TestMcpObservation(unittest.TestCase):
         result = self.renderer.observe(channel="depth", intrinsics=realsense, **self.camera)
         self.assertEqual(result["camera"]["intrinsics"]["distortion_model"], "inverse_brown_conrady")
 
+    def test_intrinsics_accept_calibration_dictionaries(self):
+        """A camera.json-style entry (K, D, size, model, pose) renders like the equivalent Intrinsics and pose."""
+        focal = 32.5 / math.tan(math.radians(30.0))
+        entry = {
+            "width": 65,
+            "height": 65,
+            "K": [focal, 0.0, 32.0, 0.0, focal, 32.0, 0.0, 0.0, 1.0],
+            "D": [0.1, 0.0, 0.0, 0.01, 0.0],
+            "distortion_model": "inverse_brown_conrady",
+            "position": [0.0, 0.0, 3.0],
+            "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "body": "ignored mount name",
+        }
+        camera = newton.sensors.SensorCamera.Intrinsics(
+            65, 65, focal, focal, 32.0, 32.0, k1=0.1, p2=0.01, distortion_model="inverse_brown_conrady"
+        )
+        expected = self.renderer.observe(channel="depth", raw=True, intrinsics=camera, pose=[0, 0, 3, 0, 0, 0, 1])
+        # The entry's size and pose apply when no camera and size are given.
+        result = self.renderer.observe(channel="depth", raw=True, intrinsics=entry)
+        self.assertEqual(result["camera"]["intrinsics"], expected["camera"]["intrinsics"])
+        self.assertEqual(result["camera"]["pose_from"], "intrinsics position and rotation_xyzw")
+        self.assertEqual((result["width"], result["height"]), (65, 65))
+        with np.load(expected["raw_artifact"]) as a, np.load(result["raw_artifact"]) as b:
+            np.testing.assert_array_equal(a["depth"], b["depth"])
+        # A pose dictionary, and an explicit camera that takes precedence over the entry's pose.
+        posed = self.renderer.observe(
+            channel="depth", intrinsics=entry, pose={"position": [0, 0, 3], "rotation_xyzw": [0, 0, 0, 1]}
+        )
+        self.assertEqual(posed["camera"]["pose"], expected["camera"]["pose"])
+        moved = self.renderer.observe(channel="depth", intrinsics=entry, eye=[0, 0, 4], target=[0, 0, 0], up=[0, 1, 0])
+        self.assertNotIn("pose_from", moved["camera"])
+        self.assertAlmostEqual(moved["camera"]["pose"][2], 4.0)
+        # Several cameras need a selection; a size differing from the calibration rescales it.
+        with self.assertRaisesRegex(ValueError, "intrinsics"):
+            self.renderer.observe(intrinsics={"top": entry, "left": entry})
+        half = self.renderer.observe(channel="depth", intrinsics=entry, width=33, height=33)
+        self.assertEqual(_decode_png(half).shape, (33, 33, 3))
+
     @unittest.skipUnless(rtx_available() and wp.is_cuda_available(), "requires ovrtx and CUDA")
     def test_rtx_backend_renders_selected_world(self):
         """Path-trace one world with the rtx backend and rebuild after a color edit."""

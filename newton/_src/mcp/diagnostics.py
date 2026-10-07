@@ -21,24 +21,42 @@ def _label(labels, index: int) -> str:
     return labels[index] if labels is not None and index < len(labels) else str(index)
 
 
-def solver_contacts(session, *, limit: int = 20) -> dict:
-    """Active solver contacts grouped by shape pair, with effective parameters.
+def _pair_summary(row: dict) -> dict:
+    """One shape pair as short labels and counts."""
+    names = " | ".join(str(side["label"]).rsplit("/", 1)[-1] for side in row["shapes"])
+    summary = {"pair": names, "shapes": [side["shape"] for side in row["shapes"]], "count": row["count"]}
+    for key in ("active", "min_dist"):
+        if key in row:
+            summary[key] = round(row[key], 6) if isinstance(row[key], float) else row[key]
+    return summary
 
-    For :class:`~newton.solvers.SolverMuJoCo` this reports what MuJoCo
-    integrates after geom priority and material mixing: ``solref``
-    (positive: time constant [s] and damping ratio; negative: stiffness and
-    damping), ``solimp``, friction (sliding, torsional, rolling), and the
-    signed distance [m]; ``active`` counts rows inside the contact margin.
-    Authored Newton shape materials of both sides are listed for comparison.
-    Other solvers report Newton collision contacts.
+
+def solver_contacts(session, select=None, *, detail: bool = False, active: bool = True, limit: int = 20) -> dict:
+    """Solver contacts grouped by shape pair: a summary, or the effective parameters with ``detail``.
+
+    The summary row of a pair is its short shape labels, contact ``count``, ``active`` rows (inside
+    the contact margin; MuJoCo only) and the smallest signed distance ``min_dist`` [m]. With
+    ``detail``, :class:`~newton.solvers.SolverMuJoCo` rows also show what MuJoCo integrates after
+    geom priority and material mixing: ``solref`` (positive: time constant [s] and damping ratio;
+    negative: stiffness and damping), ``solimp``, friction (sliding, torsional, rolling), and the
+    authored Newton shape materials of both sides. Other solvers report Newton collision contacts.
 
     Args:
         session: Live :class:`SimulationSession`.
+        select: Label pattern(s) of a shape or its body on either side of a pair: globs matched
+            against the full label or its last path component, or substrings of the last component;
+            ``None`` keeps every pair.
+        detail: Return the full per-pair parameters.
+        active: Only pairs with an active row (MuJoCo; other solvers report every pair).
         limit: Maximum number of shape pairs returned.
 
     Returns:
-        ``{"source", "count", "pairs": [...]}`` sorted by contact count.
+        ``{"source", "count", "active", "pair_count", "pairs": [...]}``, pairs sorted by active and
+        total contact count.
     """
+    from .solverview import _matcher  # noqa: PLC0415
+
+    match = _matcher(select)
     model, solver = session.model, session.solver
     shape_labels = getattr(model, "shape_label", None)
     body_labels = getattr(model, "body_label", None)
@@ -131,8 +149,19 @@ def solver_contacts(session, *, limit: int = 20) -> dict:
                 row = pairs.setdefault(key, {"shapes": [side(key[0]), side(key[1])], "count": 0})
                 row["count"] += 1
     rows = sorted(pairs.values(), key=lambda r: (-r.get("active", r["count"]), -r["count"]))
-    result = {"source": source, "count": count, "pairs": rows[:limit], "pairs_truncated": len(rows) > limit}
-    if source == "mujoco":
+    if active and source == "mujoco":
+        rows = [row for row in rows if row["active"]]
+    if select is not None:
+        rows = [row for row in rows if any(match(side["label"]) or match(side["body"]) for side in row["shapes"])]
+    result = {
+        "source": source,
+        "count": count,
+        **({"active": sum(row["active"] for row in pairs.values())} if source == "mujoco" else {}),
+        "pair_count": len(rows),
+        "pairs": rows[:limit] if detail else [_pair_summary(row) for row in rows[:limit]],
+        "pairs_truncated": len(rows) > limit,
+    }
+    if source == "mujoco" and detail:
         result["rules"] = (
             "solref/solimp/friction are the values MuJoCo integrates. decided_by names the material source: a "
             "higher geom_priority wins outright, equal priorities mix by solmix. By default each shape's ke/kd map to "

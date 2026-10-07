@@ -84,11 +84,17 @@ class TestMcpHost(unittest.TestCase):
             return float(session.state.body_q.numpy()[0, 0]) - x0
 
         self.assertAlmostEqual(advance(), 0.1, places=4)
-        # The speed is a kernel argument inside the captured graph.
+        # The speed is a kernel argument inside the captured graph. A cell that assigns it is not told.
+        recaptures = host.recaptures
         result = session.dispatch("execute", {"code": "example.speed = 2.0"})
-        if host.example.graph is not None:
-            self.assertIn("recaptured", result["note"])
+        self.assertNotIn("note", result)
         self.assertAlmostEqual(advance(), 0.2, places=4)
+        if host.example.graph is not None:
+            self.assertEqual(host.recaptures, recaptures + 1)
+            # A change the cell made without assigning the attribute itself is reported.
+            result = session.dispatch("execute", {"code": "setattr(example, 'sp' + 'eed', 2.5)"})
+            self.assertIn("recaptured after changes to example.speed", result["note"])
+            session.dispatch("execute", {"code": "example.speed = 2.0"})
         session.dispatch("execute", {"code": "example.solver = newton.solvers.SolverSemiImplicit(example.model)"})
         self.assertAlmostEqual(advance(), 0.2, places=4)
 
@@ -236,7 +242,11 @@ class TestMcpHelpers(unittest.TestCase):
         report = self.session.solver_contacts()
         self.assertEqual(report["source"], "newton")
         self.assertGreater(report["count"], 0)
-        self.assertIn("ke", report["pairs"][0]["shapes"][0])
+        self.assertIn("|", report["pairs"][0]["pair"])
+        detail = self.session.solver_contacts(detail=True)
+        self.assertIn("ke", detail["pairs"][0]["shapes"][0])
+        self.assertEqual(self.session.solver_contacts(select="no such shape")["pairs"], [])
+        self.assertEqual(self.session.solver_contacts(limit=1)["pair_count"], report["pair_count"])
         self.assertTrue(self.session.health()["ok"])
         body_q = self.session.state.body_q.numpy()
         body_q[0, 2] = np.nan

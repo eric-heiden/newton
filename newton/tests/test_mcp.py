@@ -65,7 +65,7 @@ class TestMcp(unittest.TestCase):
         self.assertTrue(base64.b64decode(result["image_base64"]).startswith(b"\x89PNG\r\n\x1a\n"))
 
     def test_live_edit_affects_dynamics_and_reset(self):
-        """Change live gravity in place and restore state/control without losing tuning."""
+        """Change live gravity in place and restore the state, keeping tuning and control no step wrote."""
         session = self.session
         initial = session.state.body_q.numpy().copy()
         gravity_pointer = session.model.gravity.ptr
@@ -74,10 +74,13 @@ class TestMcp(unittest.TestCase):
         session.dispatch("edit", {"patches": [{"field": "gravity", "values": [[0, 0, 0]]}]})
         self.assertEqual(session.model.gravity.ptr, gravity_pointer)
         session.control.joint_f.fill_(8)
-        session.dispatch("reset")
+        result = session.dispatch("reset")
         self.assertEqual(session.time, 0)
         self.assertEqual(session.frame, 0)
-        np.testing.assert_array_equal(session.control.joint_f.numpy(), 0)
+        # The session's own steps never write control, so the edit stays and is listed.
+        self.assertEqual(result["kept"], ["control.joint_f"])
+        np.testing.assert_array_equal(session.control.joint_f.numpy(), 8)
+        session.control.joint_f.zero_()
         session.dispatch("step", {"count": 6})
         np.testing.assert_allclose(session.state.body_q.numpy(), initial)
 
@@ -745,13 +748,16 @@ class TestMcpCheckpoint(unittest.TestCase):
             }
             session.dispatch("step", {"count": 3})
             session.control.joint_f.zero_()
-            session.dispatch("restore", {"name": "moving"})
+            result = session.dispatch("restore", {"name": "moving"})
             self.assertEqual(session.frame, 5)
             self.assertAlmostEqual(session.time, 0.05)
             for field, data in saved.items():
                 np.testing.assert_array_equal(getattr(session.state, field).numpy(), data, err_msg=field)
                 np.testing.assert_array_equal(getattr(session.state_next, field).numpy(), data, err_msg=field)
-            np.testing.assert_allclose(session.control.joint_f.numpy(), 0.1)
+            # No step wrote the control, so the later edit stays and is listed.
+            self.assertEqual(result["kept"], ["control.joint_f"])
+            np.testing.assert_allclose(session.control.joint_f.numpy(), 0.0)
+            session.control.joint_f.fill_(0.1)
             session.dispatch("step")
             for field, data in expected.items():
                 np.testing.assert_allclose(getattr(session.state, field).numpy(), data, atol=1e-6, err_msg=field)

@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import traceback
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
@@ -165,6 +166,39 @@ def _report_text(value: Any) -> str | None:
     return None
 
 
+def _assigned_attributes(tree: ast.AST) -> frozenset[str]:
+    """Attribute names assigned in a cell: ``a.b.name = ...``, ``a.name[i] = ...``, ``a.name += ...``."""
+    names = set()
+
+    def target(node: ast.AST) -> None:
+        if isinstance(node, ast.Tuple | ast.List):
+            for element in node.elts:
+                target(element)
+        elif isinstance(node, ast.Starred):
+            target(node.value)
+        elif isinstance(node, ast.Subscript):
+            target(node.value)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for item in node.targets:
+                target(item)
+        elif isinstance(node, ast.AugAssign | ast.AnnAssign):
+            target(node.target)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "setattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+        ):
+            names.add(node.args[1].value)
+    return frozenset(names)
+
+
 def _result_summary(value: Any) -> str:
     """Describe an opaque value without calling its repr or iterating its contents."""
     kind = type(value)
@@ -219,7 +253,10 @@ class SimulationSession:
             application-owned state (controller phases, timers, targets) with
             every checkpoint and the initial reset snapshot.
         restore_callback: Optional ``callback(session, data)`` restoring what
-            ``snapshot_callback`` captured, before ``reset_callback`` runs.
+            ``snapshot_callback`` captured, before ``reset_callback`` runs. It
+            may return ``{"rewound": [...], "kept": [...], "not_applied": [...]}``
+            names, which the reset or restore result lists with the session's
+            own (see :attr:`step_writes`).
         workers: Connection files of sibling sessions (usually more instances
             of the same application), or a :class:`WorkerPool`. Trusted
             execution receives it as ``workers``, whose ``map``/``submit``/
@@ -241,32 +278,99 @@ class SimulationSession:
             call or one :meth:`rollout`) or a rebuild.
         close_callback: Optional ``callback(session)`` called once on the
             owning thread when the session closes.
+        sync_callback: Optional ``callback(session)`` that rebinds ``solver``
+            and ``state`` when application code replaced them.
+        error_callback: Optional ``callback(session, error)`` called when a
+            cell raises; a returned string is added to the error message.
     """
 
     class _Request:
-        def __init__(self, operation: str, arguments: dict, timeout: float):
+        def __init__(self, operation: str, arguments: dict, timeout: float, session: Any = None):
             self.operation = operation
             self.arguments = arguments
-            self.deadline = time.monotonic() + timeout
+            self.received = time.monotonic()
+            self.deadline = self.received + timeout
+            self.reply_deadline: float | None = None
+            """Monotonic time by which the caller must have a reply, or ``None`` to wait for completion."""
             self.lock = threading.Lock()
             self.done = threading.Event()
             self.started = False
+            self.started_at: float | None = None
             self.cancelled = False
+            self.detached = False
+            self.call = 0
+            self.output = None
+            """Printed output of a running cell (an ``_Output``), for replies before it finishes."""
+            self.reported = 0
+            """Characters of ``output`` already returned in earlier replies."""
             self.result = None
             self.error = None
+            self._session = weakref.ref(session) if session is not None else None
 
-        def wait(self, timeout: float) -> Any:
-            if not self.done.wait(timeout):
+        def wait(self, timeout: float, reply_within: float | None = None) -> Any:
+            """Wait for the result; with ``reply_within`` [s], reply by then even if the call still runs.
+
+            A call that started and is still running at ``reply_within`` keeps running on the
+            simulation thread and is detached: the reply says so with the output printed so far,
+            and the session adds its result to a later response. A call that has not started by
+            then is cancelled.
+            """
+            if reply_within is not None:
+                self.reply_deadline = self.received + reply_within
+            limit = timeout if reply_within is None else min(timeout, reply_within)
+            if not self.done.wait(max(0.0, limit - (time.monotonic() - self.received))):
                 with self.lock:
                     if not self.started:
                         self.cancelled = True
-                        raise TimeoutError("Request expired before execution; it will not be applied")
-                # Running Warp/GL/Python cannot be safely interrupted. Only queue
-                # waiting has a deadline, and completion remains observable.
-                self.done.wait()
+                        raise TimeoutError(self._not_started())
+                if self.reply_deadline is None:
+                    # Running Warp/GL/Python cannot be safely interrupted. Only queue
+                    # waiting has a deadline, and completion remains observable.
+                    self.done.wait()
+                elif not self.done.wait(max(0.0, self.reply_deadline - time.monotonic())):
+                    with self.lock:
+                        if not self.done.is_set():
+                            self.detached = True
+                            return self.running_reply()
             if self.error is not None:
                 raise self.error
             return self.result
+
+        def take_output(self) -> str:
+            """Output printed since the previous reply."""
+            output = self.output
+            if output is None:
+                return ""
+            text = "".join(list(output.parts))
+            new, self.reported = text[self.reported :], len(text)
+            return new
+
+        def running_reply(self) -> dict:
+            seconds = time.monotonic() - (self.started_at or self.received)
+            return {
+                "running": {
+                    "call": self.call,
+                    "operation": self.operation,
+                    "seconds": round(seconds, 1),
+                    "stdout": self.take_output(),
+                },
+                "note": f"Call {self.call} ({self.operation}) is still running in the live process after "
+                f"{seconds:.0f} s. Its result and later output are added to the response of a later call, which "
+                "first waits for it.",
+            }
+
+        def _not_started(self) -> str:
+            session = self._session() if self._session is not None else None
+            running = getattr(session, "_running_request", None)
+            if running is None or self.reply_deadline is None:
+                return "Request expired before execution; it will not be applied"
+            seconds = time.monotonic() - (running.started_at or running.received)
+            stdout = running.take_output()
+            return (
+                f"Not run: call {running.call} ({running.operation}) is still running in the live process after "
+                f"{seconds:.0f} s, and calls run one at a time. Its result is added to the response of a later "
+                f"call. Output printed since the previous reply: {stdout[-4096:]!r}"
+            )
 
     class _Output(io.TextIOBase):
         def __init__(self, limit: int):
@@ -310,6 +414,7 @@ class SimulationSession:
         batch_callback: Callable | None = None,
         close_callback: Callable | None = None,
         sync_callback: Callable | None = None,
+        error_callback: Callable | None = None,
     ):
         self._owner = threading.get_ident()
         self._queue = queue.Queue(maxsize=64)
@@ -371,7 +476,7 @@ class SimulationSession:
             self._owns_workers = True
         from .jobs import JobQueue  # noqa: PLC0415
 
-        self.jobs = JobQueue(self.workers)
+        self.jobs = JobQueue(self.workers, seconds_left=self._reply_seconds_left)
         """Background jobs, exposed as ``jobs`` in trusted execution."""
         if self.workers is not None:
             self.workers.attach(lambda: self._workspace, self._session_names)
@@ -389,6 +494,23 @@ class SimulationSession:
         """The one-world build of the scene that :meth:`evaluate` and :meth:`branch` copy into worlds;
         :class:`ExampleHost` records it while the example is constructed."""
         self._batches = None
+
+        from .stepwrites import StepWrites  # noqa: PLC0415
+
+        self.step_writes = StepWrites()
+        """Control and application arrays the steps write; reset and restore rewind only those (and the state)."""
+        self.step_writes.add_source("control", lambda: self.control)
+        self._reset_notes: list[str] = []
+        self._reported_reset_note: str | None = None
+        self._call_count = 0
+        self._running_request = None
+        self._finished_calls: list[dict] = []
+        self.cell_assigned: frozenset[str] = frozenset()
+        """Attribute names the running cell assigns (``x.name = ...``, ``x.name[i] = ...``), e.g. to skip notes
+        about changes the cell made itself."""
+        self.error_callback = error_callback
+        """Called as ``error_callback(session, error)`` when a cell raises; a returned string is added to the
+        error message (e.g. that the hosted script changed on disk)."""
         self.revision = 0
         self.replace(
             model,
@@ -466,6 +588,8 @@ class SimulationSession:
         self.frame = 0
         self.revision += 1
         self._checkpoints.clear()
+        self.step_writes.clear()
+        self._reported_reset_note = None
         self._initial = self._snapshot()
         self._contact_frame = None
         self._contact_revision = None
@@ -521,14 +645,20 @@ class SimulationSession:
         self._contact_frame = self._contact_revision = None
         self.time, self.frame = time, frame
 
-    def _restore(self, snapshot: dict) -> dict:
+    def _restore(self, snapshot: dict, *, operation: str = "reset") -> dict:
+        from .stepwrites import rewind_arrays  # noqa: PLC0415
+
         self.paused = True
-        for root in ("state", "control"):
-            for field, data in snapshot[root].items():
-                _field(getattr(self, root), field).assign(data)
+        for field, data in snapshot["state"].items():
+            _field(self.state, field).assign(data)
+        learned = self.step_writes.learned()
+        controls = {field: _field(self.control, field) for field in snapshot["control"]}
+        facts = rewind_arrays(controls, snapshot["control"], learned, "control")
         self._resync(snapshot["time"], snapshot["frame"])
         if self.restore_callback is not None and "application" in snapshot:
-            self.restore_callback(self, snapshot["application"])
+            application = self.restore_callback(self, snapshot["application"])
+            for key, names in (application or {}).items():
+                facts[key] = facts.get(key, []) + list(names)
         objects = snapshot["objects"].restore() if "objects" in snapshot else None
         if self.reset_callback is not None:
             self.reset_callback(self)
@@ -537,9 +667,26 @@ class SimulationSession:
         self.last_error = None
         self._refresh_workspace()
         status = self._status()
+        status.update({key: names[:32] for key, names in facts.items() if names})
         if objects:
             status["objects_restored"] = objects[:32]
+        self._note_reset(operation, facts)
         return status
+
+    def _note_reset(self, operation: str, facts: dict) -> None:
+        """Queue a note for the running cell about edits a reset or restore kept or did not apply."""
+        parts = []
+        if facts.get("kept"):
+            parts.append(f"kept {', '.join(facts['kept'][:8])} (changed, and no step wrote them)")
+        if facts.get("not_applied"):
+            names = ", ".join(facts["not_applied"][:8])
+            parts.append(f"{names} changed, which {operation} does not apply (example.reset() reads it)")
+        note = f"{operation}: {'; '.join(parts)}." if parts else None
+        # A fact is repeated only when it changes; outside a cell, the response itself lists the names.
+        if note is not None and note != self._reported_reset_note and self._transaction_depth:
+            if note not in self._reset_notes:
+                self._reset_notes.append(note)
+        self._reported_reset_note = note
 
     def enqueue(self, operation: str, arguments: dict, *, timeout: float = 30.0) -> _Request:
         """Queue an operation from a transport thread without touching device data.
@@ -554,7 +701,7 @@ class SimulationSession:
         """
         if not math.isfinite(timeout) or not 0 < timeout <= 300:
             raise ValueError("Queue timeout must be in (0, 300] seconds")
-        request = self._Request(operation, arguments, timeout)
+        request = self._Request(operation, arguments, timeout, self)
         with self._queue_lock:
             if self._closed:
                 raise RuntimeError("Session is closed")
@@ -580,13 +727,21 @@ class SimulationSession:
                 break
             count += 1
             with request.lock:
-                if request.cancelled or time.monotonic() >= request.deadline:
+                now = time.monotonic()
+                expired = now >= request.deadline or (
+                    request.reply_deadline is not None and now >= request.reply_deadline
+                )
+                if request.cancelled or expired:
                     request.error = request.error or TimeoutError(
                         "Request expired before execution; it was not applied"
                     )
                     request.done.set()
                     continue
                 request.started = True
+                request.started_at = now
+                self._call_count += 1
+                request.call = self._call_count
+            self._running_request = request
             try:
                 request.result = self.dispatch(request.operation, request.arguments)
             except SystemExit as error:
@@ -599,8 +754,42 @@ class SimulationSession:
                         error.newton_status = _json(self.status_fields)
                 request.error = error
             finally:
-                request.done.set()
+                self._running_request = None
+                with request.lock:
+                    request.done.set()
+                    detached = request.detached
+                if detached:
+                    self._finished_calls.append(self._finished_entry(request))
         return count
+
+    def _finished_entry(self, request: _Request) -> dict:
+        """The outcome of a call whose caller already received a reply, for a later response."""
+        entry = {
+            "call": request.call,
+            "operation": request.operation,
+            "seconds": round(time.monotonic() - (request.started_at or request.received), 1),
+        }
+        if request.error is not None:
+            entry["error"] = f"{type(request.error).__name__}: {str(request.error)[:16384]}"
+            return entry
+        result = dict(request.result or {})
+        if "stdout" in result:
+            result["stdout"] = str(result["stdout"])[request.reported :]
+        for key in ("result", "result_repr", "stdout", "truncated", "note", "images", "image_base64", "mime_type"):
+            if result.get(key) not in (None, "", False):
+                entry[key] = result[key]
+        if request.operation != "execute":
+            for key, value in result.items():
+                if key not in entry and key not in ("workspace", "revision", "paused", "closed", "valid"):
+                    entry[key] = value
+        return entry
+
+    def _reply_seconds_left(self) -> float | None:
+        """Seconds until the running call must reply to its caller, or ``None`` without such a limit."""
+        request = self._running_request
+        if request is None or request.reply_deadline is None or request.detached:
+            return None
+        return request.reply_deadline - time.monotonic()
 
     def run(self, until: Callable[[], bool] | None = None) -> None:
         """Pump requests and advance playback until closed, interrupted, or ``until()`` is true.
@@ -920,23 +1109,28 @@ class SimulationSession:
         """Step ``count`` times; ``first``/``last`` mark the ends of a batch of consecutive steps."""
         if not self.valid:
             raise RuntimeError(self._invalid_message())
-        for index in range(count):
-            self._batch_step = 0 if first and index == 0 else self._batch_step + 1
-            if self.step_callback is None:
-                self.state.clear_forces()
-                self.collision_pipeline.collide(self.state, self.contacts, dt=dt)
-                self._contact_frame, self._contact_revision = self.frame, self.revision
-                self.solver.step(self.state, self.state_next, self.control, self.contacts, dt)
-                self.state, self.state_next = self.state_next, self.state
-            else:
-                self._contact_frame = self._contact_revision = None
-                self.step_callback(self, dt)
-            self.time += dt
-            self.frame += 1
-            self.revision += 1
-            self._refresh_workspace()
-            if self._renderer is not None:
-                self._renderer.after_step()
+        # One checksum pair per batch: nothing but the steps runs between them.
+        self.step_writes.before()
+        try:
+            for index in range(count):
+                self._batch_step = 0 if first and index == 0 else self._batch_step + 1
+                if self.step_callback is None:
+                    self.state.clear_forces()
+                    self.collision_pipeline.collide(self.state, self.contacts, dt=dt)
+                    self._contact_frame, self._contact_revision = self.frame, self.revision
+                    self.solver.step(self.state, self.state_next, self.control, self.contacts, dt)
+                    self.state, self.state_next = self.state_next, self.state
+                else:
+                    self._contact_frame = self._contact_revision = None
+                    self.step_callback(self, dt)
+                self.time += dt
+                self.frame += 1
+                self.revision += 1
+                self._refresh_workspace()
+                if self._renderer is not None:
+                    self._renderer.after_step()
+        finally:
+            self.step_writes.after()
         if last and self.batch_callback is not None:
             self.batch_callback(self)
 
@@ -950,7 +1144,7 @@ class SimulationSession:
 
     def _reset(self) -> dict:
         try:
-            return self._restore(self._initial)
+            return self._restore(self._initial, operation="reset")
         except Exception:
             # Inside a cell, the cell's rollback repairs the state.
             if not self._transaction_depth:
@@ -982,7 +1176,7 @@ class SimulationSession:
     def _restore_named(self, *, name: str = "default") -> dict:
         snapshot = self._checkpoints[name]
         try:
-            return self._restore(snapshot)
+            return self._restore(snapshot, operation=f"restore({name!r})")
         except Exception:
             if not self._transaction_depth:
                 self._invalidate()
@@ -1009,6 +1203,8 @@ class SimulationSession:
         return {"guide": self.guide}
 
     _MAX_SHOWN_IMAGES: ClassVar[int] = 8
+    _SHOWN_BUDGET: ClassVar[int] = 24 * 1024 * 1024
+    """Base64 characters of the images shown in one call; larger images are halved in size until they fit."""
     _MAX_CELL_SOURCES: ClassVar[int] = 512
 
     def show(self, image: Any, label: str | None = None) -> None:
@@ -1044,11 +1240,24 @@ class SimulationSession:
         if label:
             rgb = rgb.copy()
             draw_label(rgb, str(label))
+        encoded = base64.b64encode(encode_png(rgb)).decode("ascii")
+        # The response must fit the transport; MCP adapters shrink images further to their client's budget.
+        room = self._SHOWN_BUDGET - sum(len(image["image_base64"]) for image in self._shown_images)
+        size = f"{rgb.shape[1]}x{rgb.shape[0]}"
+        while len(encoded) > room and min(rgb.shape[:2]) >= 64:
+            from .imaging import _halved  # noqa: PLC0415
+
+            rgb = _halved(rgb)
+            encoded = base64.b64encode(encode_png(rgb)).decode("ascii")
+        if len(encoded) > room:
+            raise ValueError(f"The images shown in this call exceed {self._SHOWN_BUDGET} characters; show fewer")
+        resized = f"{size} -> {rgb.shape[1]}x{rgb.shape[0]}" if size != f"{rgb.shape[1]}x{rgb.shape[0]}" else None
         self._shown_images.append(
             {
-                "image_base64": base64.b64encode(encode_png(rgb)).decode("ascii"),
+                "image_base64": encoded,
                 "mime_type": "image/png",
                 "label": label,
+                **({"resized": resized} if resized else {}),
             }
         )
 
@@ -1120,6 +1329,8 @@ class SimulationSession:
 
     def _background_report(self) -> dict:
         report = {}
+        if self._finished_calls:
+            report["finished_calls"], self._finished_calls = self._finished_calls, []
         jobs = self.jobs.report()
         if jobs:
             report["jobs"] = jobs
@@ -1265,7 +1476,11 @@ class SimulationSession:
         completed = False
         if not nested:
             self._cell_undo = undo
+            self._reset_notes = []
+            self.cell_assigned = _assigned_attributes(tree)
             self.watch.begin()
+            if self._running_request is not None and self._running_request.output is None:
+                self._running_request.output = output
         try:
             try:
                 with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -1278,7 +1493,8 @@ class SimulationSession:
             note = self.execute_callback(self) if self.execute_callback is not None and self.valid else None
             if not nested:
                 edits = self.watch.end() if self.valid else self.watch.abort()
-                note = "\n".join(part for part in (note, edits) if part) or None
+                resets, self._reset_notes = self._reset_notes, []
+                note = "\n".join(part for part in (note, edits, *resets) if part) or None
         except (Exception, SystemExit) as error:
             self._shown_images = None
             self._execution_error = self._execution_diagnostic(error, filename)
@@ -1294,6 +1510,10 @@ class SimulationSession:
                 # The rollback restores model arrays itself; the next cell starts from a fresh baseline.
                 self.watch.abort()
             outcome = self._roll_back(undo, nested=nested)
+            if self.error_callback is not None:
+                with contextlib.suppress(Exception):
+                    extra = self.error_callback(self, error)
+                    outcome = f"{outcome} {extra}" if extra else outcome
             raise RuntimeError(
                 f"{message}. {outcome} Python variables assigned before the error are kept. "
                 f"frames={json.dumps(diagnostic['frames'])}; stdout={''.join(output.parts)!r}"
@@ -1303,6 +1523,7 @@ class SimulationSession:
             self._transaction_depth -= 1
             if not nested:
                 self._cell_undo = None
+                self.cell_assigned = frozenset()
         self.revision += 1
         if not nested:
             # Nothing touched the model since the check that ended the cell.
@@ -1327,25 +1548,49 @@ class SimulationSession:
             # The cell completed; a value that cannot be converted is summarized instead of failing it.
             result = None
             representation = _result_summary(value)
-        return {
-            **self._status(),
-            "result": result,
-            "result_repr": representation,
-            "stdout": "".join(output.parts),
-            "truncated": output.truncated,
-            "workspace": self._workspace_info(),
-            **({"note": str(note)[:4096]} if note else {}),
-            **({"images": images} if images else {}),
-            **self._background_report(),
-        }
+        return self._with_background(
+            {
+                **self._status(),
+                "result": result,
+                "result_repr": representation,
+                "stdout": "".join(output.parts),
+                "truncated": output.truncated,
+                "workspace": self._workspace_info(),
+                **({"note": str(note)[:4096]} if note else {}),
+                **({"images": images} if images else {}),
+            }
+        )
+
+    def _with_background(self, response: dict) -> dict:
+        """Add finished background work to a response; images of finished calls join its ``images``."""
+        report = self._background_report()
+        images = list(response.get("images") or [])
+        for entry in report.get("finished_calls", []):
+            images += entry.pop("images", None) or []
+            if "image_base64" in entry:
+                images.append({"image_base64": entry.pop("image_base64"), "mime_type": entry.pop("mime_type", "")})
+        if images:
+            response["images"] = images
+        response.update(report)
+        return response
 
     def _background_suffix(self) -> str:
         report = self._background_report()
+        for entry in report.get("finished_calls", []):
+            # Images cannot travel in an error message; their count is kept.
+            count = len(entry.pop("images", None) or []) + int(entry.pop("image_base64", None) is not None)
+            entry.pop("mime_type", None)
+            if count:
+                entry["images_dropped"] = count
         return f"; background={json.dumps(_result_json(report))}" if report else ""
 
-    def _rebuild(self, *, reset_namespace: bool = False, **kwargs) -> dict:
+    def _rebuild(self, *, reset_namespace: bool = False, code: str | None = None, **kwargs) -> dict:
         if self.rebuild_callback is None:
             raise ValueError("No rebuild callback was registered")
+        if code is not None and (not isinstance(code, str) or len(code) > 65536):
+            raise ValueError("code must be a string of at most 65536 characters")
+        if code is not None and kwargs.get("restart"):
+            raise ValueError("code runs in this process after the rebuild, so it cannot follow a restart")
         from .rollback import describe_exception  # noqa: PLC0415
 
         try:
@@ -1373,17 +1618,31 @@ class SimulationSession:
             workers = workers if workers["pending"] else None
         # Rebuilds repeat often while iterating on a script; the full describe payload (guide,
         # operation list, limits) would be re-sent into the agent's context every time.
-        return {
+        counts = {
+            name: int(getattr(self.model, name))
+            for name in ("world_count", "body_count", "shape_count", "joint_count", "joint_dof_count")
+        }
+        response = {
             **self._status(),
             "dt": self.dt,
-            "counts": {
-                name: int(getattr(self.model, name))
-                for name in ("world_count", "body_count", "shape_count", "joint_count", "joint_dof_count")
-            },
+            "counts": counts,
             "solver": self._describe_solver(self.solver),
             **({"workers_rebuild": workers} if workers is not None else {}),
-            **self._background_report(),
         }
+        if code is not None:
+            try:
+                cell = self._execute(code=code)
+            except Exception as error:
+                raise RuntimeError(
+                    f"The rebuild succeeded (counts {json.dumps(counts)}); then the cell failed: {error}"
+                ) from error
+            response.update(self._status())
+            for key in ("result", "result_repr", "stdout", "truncated", "note", "images"):
+                if key in cell:
+                    response[key] = cell[key]
+            response.update({key: value for key, value in cell.items() if key in ("finished_calls", "jobs", "workers")})
+            return response
+        return self._with_background(response)
 
     def _query(
         self,
@@ -1778,16 +2037,21 @@ class SimulationSession:
             elif isinstance(start, str):
                 self._restore_named(name=start)
             sample()
-            for index in range(frames):
-                # One batch for the whole rollout: application settings are checked before its first step.
-                self._advance(1, self.dt, first=index == 0, last=False)
-                last = index == frames - 1
-                done = bool(stop(self)) if stop is not None else False
-                if done or last or (index + 1) % every == 0:
-                    sample()
-                if done:
-                    stopped = f"until at t={self.time:.4g} s"
-                    break
+            # The arrays the steps (and probes) write are learned once for the whole rollout.
+            self.step_writes.before()
+            try:
+                for index in range(frames):
+                    # One batch for the whole rollout: application settings are checked before its first step.
+                    self._advance(1, self.dt, first=index == 0, last=False)
+                    last = index == frames - 1
+                    done = bool(stop(self)) if stop is not None else False
+                    if done or last or (index + 1) % every == 0:
+                        sample()
+                    if done:
+                        stopped = f"until at t={self.time:.4g} s"
+                        break
+            finally:
+                self.step_writes.after()
             if self.batch_callback is not None:
                 self.batch_callback(self)
             return index + 1
@@ -2199,11 +2463,18 @@ class SimulationSession:
         self._assert_owner()
         return persist_source(self, obj, target=target, rebuild=rebuild, check=check, tolerance=tolerance, path=path)
 
-    def solver_contacts(self, limit: int = 20) -> dict:
-        """Active solver contacts grouped by shape pair, with the effective solver parameters."""
+    def solver_contacts(self, select=None, *, detail: bool = False, active: bool = True, limit: int = 20) -> dict:
+        """Solver contacts per shape pair: short labels and counts, or with ``detail`` the solver's parameters.
+
+        Args:
+            select: Label pattern(s) of a shape or body on either side of a pair.
+            detail: Include the parameters the solver integrates and the authored materials.
+            active: Only pairs with contacts inside the margin (MuJoCo).
+            limit: Maximum number of pairs.
+        """
         from .diagnostics import solver_contacts  # noqa: PLC0415
 
-        return solver_contacts(self, limit=limit)
+        return solver_contacts(self, select, detail=detail, active=active, limit=limit)
 
     def contact_data(
         self,

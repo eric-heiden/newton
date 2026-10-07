@@ -130,6 +130,55 @@ def _camera_pose(eye, target, up, pose, up_axis: int, frame=None, view=None, fov
 
 
 _DISTORTION = ("k1", "k2", "k3", "k4", "k5", "k6", "p1", "p2", "s1", "s2", "s3", "s4")
+_INTRINSICS_FIELDS = frozenset(
+    {"fx", "fy", "cx", "cy", "image_width", "image_height", "distortion_model", *_DISTORTION}
+)
+_POSE_KEYS = ("position", "rotation_xyzw")
+
+
+def _pose_from_dict(value: dict) -> list[float]:
+    """``[x, y, z, qx, qy, qz, qw]`` from ``{"position": [x, y, z], "rotation_xyzw": [qx, qy, qz, qw]}``."""
+    missing = [key for key in _POSE_KEYS if key not in value]
+    if missing:
+        raise ValueError(f"A pose dictionary needs 'position' and 'rotation_xyzw'; missing {missing}")
+    position = _vector("position", value["position"], 3)
+    return [*position.tolist(), *_vector("rotation_xyzw", value["rotation_xyzw"], 4).tolist()]
+
+
+def _calibration_from_dict(value: dict, width: int | None, height: int | None) -> SensorCamera.Intrinsics:
+    """Intrinsics of a calibration dictionary such as a ``camera.json`` entry (``K``, ``D``, ``width``, ...)."""
+    # from_dict uses these sizes only when the dictionary has none.
+    return SensorCamera.Intrinsics.from_dict(
+        value, width=640 if width is None else width, height=480 if height is None else height
+    )
+
+
+def _camera_inputs(intrinsics, pose, width: int | None, height: int | None):
+    """Accept calibration dictionaries and pose dictionaries for ``intrinsics`` and ``pose``.
+
+    Returns:
+        ``(intrinsics, pose, pose_from_intrinsics)``: intrinsics as given or as
+        :class:`~newton.sensors.SensorCamera.Intrinsics`, the pose as seven numbers (or ``None``),
+        and the pose an intrinsics dictionary carried in ``position``/``rotation_xyzw`` (or ``None``).
+    """
+    if isinstance(pose, dict):
+        pose = _pose_from_dict(pose)
+    carried = None
+    if isinstance(intrinsics, dict):
+        if all(key in intrinsics for key in _POSE_KEYS):
+            carried = _pose_from_dict(intrinsics)
+        calibration = {key: value for key, value in intrinsics.items() if key not in _POSE_KEYS}
+        if not set(calibration) <= _INTRINSICS_FIELDS:
+            try:
+                intrinsics = _calibration_from_dict(calibration, width, height)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"intrinsics: {error}. Accepted: the fields of newton.sensors.SensorCamera.Intrinsics, or a "
+                    "calibration dictionary with K (3x3), D (OpenCV order), width, height and distortion_model"
+                ) from None
+        else:
+            intrinsics = calibration
+    return intrinsics, pose, carried
 
 
 def _intrinsics(value, width: int, height: int) -> dict | None:
@@ -542,8 +591,8 @@ class ObservationRenderer:
         view: str | None = None,
         backend: str = "sensor",
         channel: str = "color",
-        width: int = 640,
-        height: int = 480,
+        width: int | None = None,
+        height: int | None = None,
         world_id: int = 0,
         eye=None,
         target=None,
@@ -594,6 +643,17 @@ class ObservationRenderer:
         """
         self._check_thread()
         model = self.session.model
+        intrinsics, pose, carried_pose = _camera_inputs(intrinsics, pose, width, height)
+        if carried_pose is not None and all(value is None for value in (pose, eye, target, view, camera_body)):
+            pose = carried_pose
+        else:
+            carried_pose = None
+        if width is None or height is None:
+            # A calibrated camera renders at its calibration size unless a size is given.
+            size = _intrinsics(intrinsics, 640, 480) if intrinsics is not None else None
+            calibrated = (int(size["image_width"]), int(size["image_height"])) if size else (640, 480)
+            width = calibrated[0] if width is None else width
+            height = calibrated[1] if height is None else height
         width = _integer("width", width, 1, 2048)
         height = _integer("height", height, 1, 2048)
         world_id = _integer("world_id", world_id, 0, model.world_count - 1)
@@ -681,6 +741,7 @@ class ObservationRenderer:
                 "fov_y": float(fov_y),
                 **({"intrinsics": intrinsics} if intrinsics is not None else {}),
                 **({"mount": mount} if mount is not None else {}),
+                **({"pose_from": "intrinsics position and rotation_xyzw"} if carried_pose is not None else {}),
                 "convention": "xyzw, -Z forward, +Y up, top-left",
                 "coordinates": "simulation world coordinates [m]",
             },

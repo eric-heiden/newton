@@ -379,6 +379,40 @@ def eval_mujoco_coupling_effective_mass_block_kernel(
     out_inertia[tid] = inertia
 
 
+@wp.func
+def _newton_contact_world(
+    shape_a: int,
+    shape_b: int,
+    shape_body: wp.array[int],
+    body_flags: wp.array[int],
+    geom_bodyid: wp.array[int],
+    body_weldid: wp.array[int],
+    body_dofnum: wp.array[int],
+    newton_shape_to_mjc_geom: wp.array[wp.int32],
+    bodies_per_world: int,
+):
+    """World of a Newton contact that MuJoCo receives, or -1 for contacts the conversion skips.
+
+    Skipped are contacts without two shapes and contacts between two immovable sides, for which MuJoCo
+    produces degenerate efc_D. Immovable means the weld group has no dofs (welded to the worldbody, or
+    mocap, which is how Newton represents fixed roots) or BodyFlags.KINEMATIC; ``body < 0`` guards
+    body_flags.
+    """
+    if shape_a < 0 or shape_b < 0:
+        return -1
+    body_a = shape_body[shape_a]
+    body_b = shape_body[shape_b]
+    a_dofless = body_dofnum[body_weldid[geom_bodyid[newton_shape_to_mjc_geom[shape_a]]]] == 0
+    b_dofless = body_dofnum[body_weldid[geom_bodyid[newton_shape_to_mjc_geom[shape_b]]]] == 0
+    a_immovable = body_a < 0 or (body_flags[body_a] & BodyFlags.KINEMATIC) != 0 or a_dofless
+    b_immovable = body_b < 0 or (body_flags[body_b] & BodyFlags.KINEMATIC) != 0 or b_dofless
+    if a_immovable and b_immovable:
+        return -1
+    if body_a < 0:
+        return body_b // bodies_per_world
+    return body_a // bodies_per_world
+
+
 # Kernel functions
 @wp.kernel
 def convert_newton_contacts_to_mjwarp_kernel(
@@ -445,6 +479,8 @@ def convert_newton_contacts_to_mjwarp_kernel(
     last_contact_generation: wp.array[wp.int32],
     tid_to_cid: wp.array[wp.int32],
     last_nacon_count: wp.array[wp.int32],
+    # Overflow bookkeeping, see SolverMuJoCo._newton_contact_overflow
+    contact_overflow: wp.array[wp.int32],
 ):
     # nacon_out must be zeroed before this kernel is launched so that
     # wp.atomic_add below produces the correct compacted count.
@@ -471,11 +507,21 @@ def convert_newton_contacts_to_mjwarp_kernel(
 
         if tid == 0:
             if count > naconmax:
-                wp.printf(
-                    "Number of Newton contacts (%d) exceeded MJWarp limit (%d). Increase nconmax.\n",
-                    count,
-                    naconmax,
-                )
+                contact_overflow[0] = contact_overflow[0] + 1
+                contact_overflow[1] = wp.max(contact_overflow[1], count)
+                contact_overflow[3] = count - naconmax
+                if contact_overflow[2] == 0:
+                    wp.printf(
+                        "SolverMuJoCo: %d Newton contacts exceed the MuJoCo Warp contact buffer (naconmax %d, shared "
+                        "by %d worlds); contacts past it are dropped. Increase nconmax (printed once per solver, "
+                        "newton.utils.report_health() counts every occurrence and the contacts lost per world)\n",
+                        count,
+                        naconmax,
+                        nworld_in,
+                    )
+                    contact_overflow[2] = 1
+            else:
+                contact_overflow[3] = 0
             ncollision_out[0] = 0
 
         if count > naconmax:
@@ -488,7 +534,18 @@ def convert_newton_contacts_to_mjwarp_kernel(
         shape_a = rigid_contact_shape0[tid]
         shape_b = rigid_contact_shape1[tid]
 
-        if shape_a < 0 or shape_b < 0:
+        worldid = _newton_contact_world(
+            shape_a,
+            shape_b,
+            shape_body,
+            body_flags,
+            geom_bodyid,
+            body_weldid,
+            body_dofnum,
+            newton_shape_to_mjc_geom,
+            bodies_per_world,
+        )
+        if worldid < 0:
             tid_to_cid[tid] = -1
             return
 
@@ -500,18 +557,6 @@ def convert_newton_contacts_to_mjwarp_kernel(
 
         mj_body_a = geom_bodyid[geom_a]
         mj_body_b = geom_bodyid[geom_b]
-
-        # Skip pairs where both sides are immovable; MuJoCo produces degenerate efc_D for them.
-        # Immovable means the weld group has no dofs (welded to the worldbody, or mocap, which is
-        # how Newton represents fixed roots) or BodyFlags.KINEMATIC. `body < 0` guards body_flags.
-        a_dofless = body_dofnum[body_weldid[mj_body_a]] == 0
-        b_dofless = body_dofnum[body_weldid[mj_body_b]] == 0
-        a_immovable = body_a < 0 or (body_flags[body_a] & BodyFlags.KINEMATIC) != 0 or a_dofless
-        b_immovable = body_b < 0 or (body_flags[body_b] & BodyFlags.KINEMATIC) != 0 or b_dofless
-
-        if a_immovable and b_immovable:
-            tid_to_cid[tid] = -1
-            return
 
         X_wb_a = wp.transform_identity()
         X_wb_b = wp.transform_identity()
@@ -545,10 +590,6 @@ def convert_newton_contacts_to_mjwarp_kernel(
         frame = make_frame(n)
 
         geoms = wp.vec2i(geom_a, geom_b)
-
-        worldid = body_a // bodies_per_world
-        if body_a < 0:
-            worldid = body_b // bodies_per_world
 
         margin, _gap, condim, friction, solref, solreffriction, solimp, mix = contact_params(
             geom_condim,
@@ -739,6 +780,44 @@ def convert_newton_contacts_to_mjwarp_kernel(
 
         for i in range(contact_efc_address_out.shape[1]):
             contact_efc_address_out[cid, i] = -1
+
+
+@wp.kernel(enable_backward=False)
+def count_lost_newton_contacts_kernel(
+    rigid_contact_count: wp.array[wp.int32],
+    rigid_contact_shape0: wp.array[wp.int32],
+    rigid_contact_shape1: wp.array[wp.int32],
+    shape_body: wp.array[int],
+    body_flags: wp.array[int],
+    geom_bodyid: wp.array[int],
+    body_weldid: wp.array[int],
+    body_dofnum: wp.array[int],
+    newton_shape_to_mjc_geom: wp.array[wp.int32],
+    bodies_per_world: int,
+    naconmax: int,
+    contact_generation: wp.array[wp.int32],
+    last_contact_generation: wp.array[wp.int32],
+    # in/out
+    lost_per_world: wp.array[wp.int32],
+):
+    """Count, per world, the Newton contacts past ``naconmax`` that :func:`convert_newton_contacts_to_mjwarp_kernel`
+    drops, once per contact set (launch it before :func:`_snapshot_nacon_count`)."""
+    tid = wp.tid() + naconmax
+    if contact_generation[0] == last_contact_generation[0] or tid >= rigid_contact_count[0]:
+        return
+    world = _newton_contact_world(
+        rigid_contact_shape0[tid],
+        rigid_contact_shape1[tid],
+        shape_body,
+        body_flags,
+        geom_bodyid,
+        body_weldid,
+        body_dofnum,
+        newton_shape_to_mjc_geom,
+        bodies_per_world,
+    )
+    if world >= 0 and world < lost_per_world.shape[0]:
+        wp.atomic_add(lost_per_world, world, 1)
 
 
 @wp.kernel(enable_backward=False)

@@ -77,6 +77,7 @@ from .kernels import (
     convert_solref,
     convert_warp_coords_to_mj_kernel,
     copy_qpos_and_detect_tree_change_kernel,
+    count_lost_newton_contacts_kernel,
     count_mjw_overflow_kernel,
     create_convert_mjw_contacts_to_newton_kernel,
     create_inverse_shape_mapping_kernel,
@@ -4434,6 +4435,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # notify_model_changed() may invalidate them during conversion. The
         # contact map is allocated below once the converted capacity is known.
         self._contact_tid_to_cid: wp.array[wp.int32] | None = None
+        # Newton contacts past naconmax (Newton-contacts MuJoCo Warp path only): [0] contact sets that
+        # overflowed, [1] the largest such contact count, [2] whether the overflow line was printed, and
+        # [3] contacts past naconmax in the latest contact set; and the dropped contacts summed per world.
+        self._newton_contact_overflow: wp.array[wp.int32] | None = None
+        self._newton_contacts_lost: wp.array[wp.int32] | None = None
         self._last_contact_generation = wp.full(1, _GENERATION_SENTINEL, dtype=wp.int32, device=self.device)
         self._last_nacon_count = wp.zeros(1, dtype=wp.int32, device=self.device)
         # Track the Contacts instance and its capacity.  Any change to these
@@ -4526,6 +4532,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._create_inverse_shape_mapping()
         if not use_mujoco_cpu and not use_mujoco_contacts:
             self._contact_tid_to_cid = wp.full(self.mjw_data.naconmax, -1, dtype=wp.int32, device=self.device)
+            self._newton_contact_overflow = wp.zeros(4, dtype=wp.int32, device=self.device)
+            self._newton_contacts_lost = wp.zeros(max(int(self.mjw_data.nworld), 1), dtype=wp.int32, device=self.device)
         self._initial_model_sync = False
         self.update_data_interval = update_data_interval
         self._step = 0
@@ -5127,9 +5135,32 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self._last_contact_generation,
                 self._contact_tid_to_cid,
                 self._last_nacon_count,
+                self._newton_contact_overflow,
             ],
             device=model.device,
         )
+        if contacts.rigid_contact_max > naconmax:
+            wp.launch(
+                count_lost_newton_contacts_kernel,
+                dim=contacts.rigid_contact_max - naconmax,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    model.shape_body,
+                    model.body_flags,
+                    self.mjw_model.geom_bodyid,
+                    self.mjw_model.body_weldid,
+                    self.mjw_model.body_dofnum,
+                    self.newton_shape_to_mjc_geom,
+                    bodies_per_world,
+                    naconmax,
+                    contacts.contact_generation,
+                    self._last_contact_generation,
+                ],
+                outputs=[self._newton_contacts_lost],
+                device=model.device,
+            )
 
         # Snapshot the final nacon count and generation so the fast path can
         # restore them on subsequent substeps.  Runs as a separate dim=1

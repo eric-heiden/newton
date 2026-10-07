@@ -264,6 +264,70 @@ class TestMuJoCoWarpOverflowCounts(unittest.TestCase):
         self.assertGreater(report["stats"]["overflow_counts"]["ITERATIONS"], 0)
         self.assertEqual(report["worlds"]["overflow_flags"]["1"], ["ITERATIONS", "LS_ITERATIONS"])
 
+    def test_newton_contact_overflow_prints_once_and_counts_losses_per_world(self):
+        """Newton contacts past naconmax print one line per solver and are counted per world in report_health."""
+        from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+
+        template = newton.ModelBuilder()
+        for i in range(3):
+            box = template.add_body(xform=wp.transform(wp.vec3(0.3 * i, 0.0, 0.049), wp.quat_identity()))
+            template.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        builder.replicate(template, 4)
+        model = builder.finalize(device="cpu")
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=6)
+        naconmax = int(solver.mjw_data.naconmax)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        pipeline.collide(state_0, contacts)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertGreater(count, naconmax)
+        # The worlds of the contacts the conversion drops: each contact has one box, of one world.
+        shape_body = model.shape_body.numpy()
+        pairs = np.stack([contacts.rigid_contact_shape0.numpy(), contacts.rigid_contact_shape1.numpy()], axis=1)
+        boxes = np.max(shape_body[pairs[naconmax:count]], axis=1)
+        expected = np.bincount(model.body_world.numpy()[boxes], minlength=model.world_count)
+
+        collisions, substeps = 2, 3
+        capture = StdOutCapture()
+        capture.begin()
+        try:
+            for collision in range(collisions):
+                if collision:
+                    pipeline.collide(state_0, contacts)
+                for _ in range(substeps):
+                    solver.step(state_0, state_1, control, contacts, 0.002)
+                    state_0, state_1 = state_1, state_0
+            wp.synchronize()
+        finally:
+            output = capture.end()
+        lines = [line for line in output.splitlines() if "Newton contacts" in line]
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn(f"{count} Newton contacts exceed the MuJoCo Warp contact buffer (naconmax {naconmax}", lines[0])
+        self.assertNotIn("exceeded MJWarp limit", output)
+
+        report = newton.utils.report_health(model, state_0, solver)
+        overflow = report["stats"]["newton_contact_overflow"]
+        # One count per contact set: substeps reusing a contact set do not count again.
+        self.assertEqual(overflow["contact_sets"], collisions)
+        self.assertGreaterEqual(overflow["max_contacts"], count)
+        self.assertEqual(overflow["naconmax"], naconmax)
+        if int(contacts.rigid_contact_count.numpy()[0]) == count:
+            self.assertEqual(overflow["contacts_lost"], collisions * (count - naconmax))
+            self.assertEqual(
+                report["stats"]["contacts_lost_per_world"],
+                {str(w): collisions * int(n) for w, n in enumerate(expected) if n},
+            )
+        self.assertEqual(report["worlds"]["contacts_lost"], [int(w) for w in np.flatnonzero(expected)])
+        self.assertTrue(any("contacts were dropped in worlds" in warning for warning in report["warnings"]))
+
+        # No overflow, no report.
+        roomy = SolverMuJoCo(model, use_mujoco_contacts=False)
+        roomy.step(state_0, state_1, control, contacts, 0.002)
+        self.assertNotIn("newton_contact_overflow", newton.utils.report_health(model, state_1, roomy)["stats"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -8,6 +8,7 @@ from __future__ import annotations
 import collections
 import functools
 import hashlib
+import itertools
 import math
 import threading
 import time
@@ -18,7 +19,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from ..sim import CollisionPipeline, Control, Model, ModelBuilder, State, StateFlags, eval_fk
+from ..sim import CollisionPipeline, Control, Model, ModelBuilder, ModelFlags, State, StateFlags, eval_fk, eval_ik
 from .world_view import Frequency, WorldView, _attribute_owner, _pattern_key, _row_words, _value_shape
 
 # ModelBuilder settings that finalize() reads, copied to the builder of the batch.
@@ -35,7 +36,17 @@ _BUILDER_SETTINGS = (
 # Name parts of model arrays that hold indices, counts, or pointers rather than per-entity values.
 _INDEX_NAME_PARTS = ("_start", "_end", "_world", "_count", "_index", "_indices", "_ptr", "_offset", "_parent", "_child")
 
+# State arrays that define articulations: joint coordinates, and the body states that follow from them.
+_JOINT_STATE = ("joint_q", "joint_qd")
+_BODY_STATE = ("body_q", "body_qd")
+
+# Separate models kept per rollout (more while one evaluate() call uses them), and device buffers of probes and
+# schedules kept per rollout.
+_MAX_SIBLINGS = 8
+_MAX_BUFFERS = 32
+
 _build_lock = threading.RLock()
+_evaluate_calls = itertools.count(1)
 
 LabelsLike = str | list[str] | Any | None
 
@@ -213,13 +224,14 @@ def _is_value_attribute(view: WorldView, name: str, frequency: Any, array: wp.ar
 
 
 def _copy_world_values(source: Model, target: Model) -> list[str]:
-    """Copy the values of ``source``'s single world into every world of ``target`` where they differ.
+    """Copy the values of world 0 of ``source`` into every world of ``target`` where they differ.
 
-    Picks up edits that a build function made to its Model after finalize(). Returns the copied attributes.
+    Picks up edits that a build function made to its Model after finalize(), including float settings such as
+    :attr:`~newton.Model.soft_contact_ke`. Returns the copied attributes.
     """
+    copied = _copy_model_scalars(source, target)
     source_view, target_view = WorldView(source), WorldView(target)
     target_arrays = _model_arrays(target)
-    copied = []
     for name, array in _model_arrays(source).items():
         destination = target_arrays.get(name)
         if destination is None or not array.size or not destination.size or destination.dtype != array.dtype:
@@ -252,6 +264,214 @@ def _copy_world_values(source: Model, target: Model) -> list[str]:
         target_view.set_attribute(name, target, np.broadcast_to(values, (target.world_count, *values.shape)))
         copied.append(name)
     return copied
+
+
+def _copy_model_scalars(source: Model, target: Model) -> list[str]:
+    """Copy the public float settings of ``source`` (e.g. ``soft_contact_ke``, ``particle_mu``) that differ."""
+    copied = []
+    for name, value in vars(source).items():
+        # Counts and flags are ints and bools; float settings are not derived from the worlds' arrays.
+        if name.startswith("_") or type(value) is not float:
+            continue
+        current = getattr(target, name, None)
+        if type(current) is float and (current == value or (math.isnan(current) and math.isnan(value))):
+            continue
+        setattr(target, name, value)
+        copied.append(name)
+    return copied
+
+
+def _control_arrays(control: Control) -> dict[str, wp.array]:
+    return {name: array for name, array in WorldView._state_arrays(control).items() if array.size}
+
+
+def _snapshot_arrays(arrays: Mapping[str, wp.array]) -> list[tuple[wp.array, wp.array]]:
+    return [(array, wp.clone(array, requires_grad=False)) for array in arrays.values()]
+
+
+def _restore_arrays(snapshot: list[tuple[wp.array, wp.array]]) -> None:
+    for array, copy in snapshot:
+        array.assign(copy)
+
+
+def _row_articulations(model: Model, name: str, rows: np.ndarray) -> np.ndarray:
+    """Articulations of the joints of ``joint_q``/``joint_qd`` rows or of the bodies of ``body_q``/``body_qd`` rows."""
+    rows = np.asarray(rows, dtype=np.int64).ravel()
+    if not rows.size or not model.articulation_count:
+        return np.zeros(0, dtype=np.int64)
+    if name in _BODY_STATE:
+        child = model.joint_child.numpy()
+        body_joint = np.full(model.body_count, -1, dtype=np.int64)
+        valid = child >= 0
+        body_joint[child[valid]] = np.flatnonzero(valid)
+        joints = body_joint[rows]
+        joints = joints[joints >= 0]
+    else:
+        starts = (model.joint_q_start if name == "joint_q" else model.joint_qd_start).numpy()
+        joints = np.searchsorted(starts, rows, side="right") - 1
+    articulations = model.joint_articulation.numpy()[joints]
+    return np.unique(articulations[articulations >= 0])
+
+
+def _articulation_mask(model: Model, articulations: np.ndarray) -> wp.array:
+    mask = np.zeros(model.articulation_count, dtype=bool)
+    mask[articulations] = True
+    return wp.array(mask, dtype=wp.bool, device=model.device)
+
+
+@wp.kernel(enable_backward=False)
+def _differs_u32(
+    a: wp.array2d[wp.uint32],
+    a_rows: wp.array[wp.int32],
+    b: wp.array2d[wp.uint32],
+    b_rows: wp.array[wp.int32],
+    slot: int,
+    flags: wp.array[wp.int32],
+):
+    i, j = wp.tid()
+    if a[a_rows[i], j] != b[b_rows[i], j]:
+        flags[slot] = 1
+
+
+@wp.kernel(enable_backward=False)
+def _differs_u8(
+    a: wp.array2d[wp.uint8],
+    a_rows: wp.array[wp.int32],
+    b: wp.array2d[wp.uint8],
+    b_rows: wp.array[wp.int32],
+    slot: int,
+    flags: wp.array[wp.int32],
+):
+    i, j = wp.tid()
+    if a[a_rows[i], j] != b[b_rows[i], j]:
+        flags[slot] = 1
+
+
+class _ValueSync:
+    """Copies the values of one world of a source model into every world of a rollout's model.
+
+    The comparison of the source values with every world of the rollout is
+    planned once per pair of models and runs on the device (one flag per
+    attribute, one host read), so a call whose values did not change costs a
+    few kernel launches. ``exclude`` lists ``(name, labels)`` selections that
+    the rollout's model sets itself (the shared values of a separate model).
+    """
+
+    def __init__(self, rollout: BatchRollout, source: Model, world: int = 0, exclude: Sequence[tuple] = ()):
+        self.rollout, self.source, self.world = rollout, source, int(world)
+        self.target_view, self.source_view = WorldView(rollout.model), WorldView(source)
+        self.entries: list[tuple] = []
+        self.problem: str | None = None
+        excluded: dict[str, list[Any]] = {}
+        for name, labels in exclude:
+            excluded.setdefault(name.replace(".", ":", 1), []).append(_labels(labels))
+        world_count = rollout.model.world_count
+        target_arrays = _model_arrays(rollout.model)
+        for name, array in _model_arrays(source).items():
+            destination = target_arrays.get(name)
+            if destination is None or not array.size or not destination.size or destination.dtype != array.dtype:
+                continue
+            try:
+                frequency = Frequency.WORLD if name == "gravity" else source.get_attribute_frequency(name)
+            except (KeyError, AttributeError):
+                continue
+            if frequency == Frequency.ONCE:
+                if name not in excluded and destination.shape == array.shape:
+                    rows = np.arange(array.shape[0])
+                    self._add(name, frequency, array, rows, rows, destination, rows[None])
+                continue
+            if not _is_value_attribute(self.target_view, name, frequency, destination):
+                continue
+            try:
+                source_rows = self.source_view._rows(name, frequency, None, [self.world])[0]
+                target_rows = self.target_view._rows(name, frequency, None, None)
+            except (KeyError, ValueError):
+                continue
+            if source_rows.shape[0] != target_rows.shape[1]:
+                self.problem = (
+                    f"{name} has {source_rows.size} rows in the source world, {target_rows.shape[1]} per world"
+                )
+                return
+            if name in excluded:
+                keep = np.ones(source_rows.shape[0], dtype=bool)
+                for labels in excluded[name]:
+                    try:
+                        keep &= ~np.isin(source_rows, self.source_view._rows(name, frequency, labels, [self.world])[0])
+                    except (KeyError, ValueError):
+                        keep[:] = False
+                source_rows, target_rows = source_rows[keep], target_rows[:, keep]
+                if not source_rows.size:
+                    continue
+            self._add(name, frequency, array, source_rows, np.tile(source_rows, world_count), destination, target_rows)
+        self.flags = wp.zeros(max(len(self.entries), 1), dtype=wp.int32, device=rollout.device)
+
+    def _add(self, name, frequency, source, source_rows, tiled_rows, target, target_rows) -> None:
+        index = self.target_view._device_index
+        self.entries.append(
+            (
+                name,
+                frequency,
+                source,
+                _row_words(source),
+                index(tiled_rows),
+                source_rows,
+                _row_words(target),
+                index(target_rows.ravel()),
+                target_rows,
+            )
+        )
+
+    def changed(self) -> list[tuple]:
+        """Entries whose source values differ from any world of the rollout."""
+        if not self.entries:
+            return []
+        self.flags.zero_()
+        for slot, (_, _, _, source_words, source_index, _, target_words, target_index, _) in enumerate(self.entries):
+            wp.launch(
+                _differs_u32 if source_words.dtype == wp.uint32 else _differs_u8,
+                dim=(source_index.shape[0], source_words.shape[1]),
+                inputs=[source_words, source_index, target_words, target_index, slot],
+                outputs=[self.flags],
+                device=self.rollout.device,
+            )
+        flags = self.flags.numpy()
+        return [entry for entry, flag in zip(self.entries, flags, strict=False) if flag]
+
+    def apply(self) -> tuple[list[str], str | None]:
+        """Copy changed values into every world and notify the solver.
+
+        Returns:
+            The copied attributes, or the reason the rollout must be built
+            again (a changed value that its solver reads only when it is
+            constructed or shares across worlds).
+        """
+        if self.problem is not None:
+            return [], self.problem
+        rollout = self.rollout
+        unread = getattr(rollout.solver, "_UNREAD_ATTRIBUTES", {})
+        writes = []
+        for name, frequency, source, _, _, source_rows, _, _, target_rows in self.changed():
+            if frequency == Frequency.ONCE:
+                return [], f"{name} differs (one value for all worlds of a model)"
+            notify = True
+            try:
+                rollout.solver.check_world_values(name, target_rows.ravel())
+            except ValueError as error:
+                if name not in unread:
+                    return [], f"{name} differs ({error})"
+                notify = False
+            values = source.numpy()[source_rows]
+            writes.append(
+                (name, target_rows, np.broadcast_to(values[None], (target_rows.shape[0], *values.shape)), notify)
+            )
+        flags = 0
+        for name, target_rows, values, notify in writes:
+            written = rollout._scatter(rollout.model, name, target_rows.ravel(), values.reshape(-1, *values.shape[2:]))
+            if notify:
+                flags |= written
+        if flags:
+            rollout.solver.notify_model_changed(flags)
+        return [name for name, _, _, _ in writes], None
 
 
 def _fingerprint(model: Model) -> str:
@@ -466,12 +686,17 @@ class BatchRollout:
         """Times [s] since :meth:`reset` of the rows of the last :meth:`run`'s records, shape [T]."""
 
         self._graphs: dict[Any, Any] = {}
-        self._schedules: dict[Any, wp.array] = {}
-        self._probes: dict[Any, _Probe] = {}
+        self._schedules: collections.OrderedDict[Any, wp.array] = collections.OrderedDict()
+        self._probes: collections.OrderedDict[Any, _Probe] = collections.OrderedDict()
         self._siblings: collections.OrderedDict[Any, BatchRollout] = collections.OrderedDict()
+        self._sibling_syncs: dict[Any, _ValueSync] = {}
+        # The evaluate() call that last used this rollout (its separate models are kept while it runs), and the
+        # worlds of separate models (this rollout's world count unless a caller that only needs them sets it).
+        self._call = 0
+        self._separate_worlds: int | None = None
         # Wall times [s] for callers that report warm-up costs (e.g. the live MCP): construction, and the first
         # eager frame plus graph capture of each new run signature (kernel loading happens there).
-        self._stats = {"build_seconds": 0.0, "captures": 0, "warmup_seconds": 0.0}
+        self._stats = {"build_seconds": 0.0, "captures": 0, "warmup_seconds": 0.0, "synced": []}
         self.reset()
         self._stats["build_seconds"] = time.perf_counter() - started
 
@@ -595,48 +820,95 @@ class BatchRollout:
 
         Writes like :meth:`newton.selection.WorldView.set_attribute` (values
         of shape ``[len(worlds), k, ...]`` for the ``k`` selected rows of each
-        world, broadcasting). After a write to ``joint_q`` or ``joint_qd``,
-        the body poses and velocities of the written worlds follow from
-        :func:`~newton.eval_fk`. The solver's internal buffers of the written
-        worlds are cleared.
+        world, broadcasting). The state stays consistent for solvers that
+        integrate joint coordinates (e.g.
+        :class:`~newton.solvers.SolverMuJoCo`) and for solvers that integrate
+        body states (e.g. :class:`~newton.solvers.SolverXPBD`):
+
+        - after a write to ``joint_q`` or ``joint_qd``, the body poses and
+          velocities of the written articulations follow from
+          :func:`~newton.eval_fk`;
+        - after a write to ``body_q`` or ``body_qd``, the joint coordinates
+          of the written bodies' articulations follow from
+          :func:`~newton.eval_ik`, and their body states then from
+          :func:`~newton.eval_fk` (a pose that a joint does not allow is
+          projected onto it).
+
+        The solver's internal buffers of the written worlds are cleared.
 
         Args:
-            name: State attribute, e.g. ``"joint_q"``, ``"joint_qd"``, or
-                ``"particle_q"``.
+            name: State attribute, e.g. ``"joint_q"``, ``"joint_qd"``,
+                ``"body_q"``, or ``"particle_q"``.
             values: Per-world values.
             labels: Label pattern or model indices selecting the rows, or
                 ``None`` for every row of a world.
             worlds: Worlds to write; ``None`` for all worlds.
         """
-        self._write_states([(name, labels, values, worlds)])
+        view = self.view
+        name, frequency = view._resolve(name)
+        array = view._array(self.state_0, name)
+        rows = view._rows(name, frequency, labels, worlds)
+        view._check_rows_fit(name, array, rows)
+        self._write_state_rows([(name, rows.ravel(), view._values(values, array, rows.shape))])
 
-    def _write_states(self, writes: list[tuple[str, Any, Any, Any]]) -> None:
-        worlds_written: set[int] = set()
-        kinematic = False
-        for name, labels, values, worlds in writes:
-            self.view.set_attribute(name, self.state_0, values, labels=labels, worlds=worlds)
-            selected = self.view._world_indices(worlds)
-            worlds_written.update(int(w) for w in selected)
-            kinematic |= name.replace(".", ":", 1) in ("joint_q", "joint_qd")
-        if not worlds_written:
+    def _write_state_rows(self, writes: list[tuple[str, np.ndarray, Any]]) -> None:
+        """Write ``(name, model rows, values)`` to the current state and keep it consistent (see :meth:`set_state`).
+
+        Writes of joint coordinates and other arrays apply first, then writes of body states.
+        """
+        model, state, view = self.model, self.state_0, self.view
+        worlds: set[int] = set()
+        for bodies in (False, True):
+            articulations = []
+            for name, rows, values in writes:
+                if (name in _BODY_STATE) != bodies:
+                    continue
+                self._scatter(state, name, rows, values)
+                row_world = view._layout(view._resolve(name)[1])[0][np.asarray(rows, dtype=np.int64)]
+                worlds.update(np.maximum(row_world, 0).tolist() if self.world_count == 1 else row_world.tolist())
+                if name in _JOINT_STATE or name in _BODY_STATE:
+                    articulations.append(_row_articulations(model, name, rows))
+            written = np.unique(np.concatenate(articulations)) if articulations else np.zeros(0, dtype=np.int64)
+            if written.size:
+                mask = _articulation_mask(model, written)
+                if bodies:
+                    eval_ik(model, state, state.joint_q, state.joint_qd, mask=mask)
+                eval_fk(model, state.joint_q, state.joint_qd, state, mask=mask)
+        worlds.discard(-1)
+        if not worlds:
             return
-        model = self.model
+        self.state_1.assign(state)
         world_mask_host = np.zeros(self.world_count + 1, dtype=bool)
-        world_mask_host[sorted(worlds_written)] = True
-        if kinematic and model.articulation_count:
-            articulation_world = model.articulation_world.numpy()
-            mask = np.isin(articulation_world, sorted(worlds_written))
-            if self.world_count == 1:
-                mask |= articulation_world < 0
-            eval_fk(
-                model,
-                self.state_0.joint_q,
-                self.state_0.joint_qd,
-                self.state_0,
-                mask=wp.array(mask, dtype=wp.bool, device=self.device),
-            )
-        self.state_1.assign(self.state_0)
+        world_mask_host[sorted(worlds)] = True
         self._reset_solver(wp.array(world_mask_host, dtype=wp.bool, device=self.device))
+
+    def _scatter(self, target: Model | State | Control, name: str, rows: np.ndarray, values: Any) -> int:
+        """Write one value per model row (``values`` of the attribute's dtype or NumPy values) to an attribute.
+
+        For model attributes, keeps inverse masses, inertias, and collision radii consistent and returns the
+        :class:`~newton.ModelFlags` of the edit; the caller notifies the solver.
+        """
+        rows = np.asarray(rows, dtype=np.int64).ravel()
+        if not rows.size:
+            return 0
+        view = self.view
+        array = view._array(target, name)
+        view._check_rows_fit(name, array, rows[None])
+        if wp.types.is_array(values):
+            buffer = values
+        else:
+            host = np.ascontiguousarray(np.asarray(values).reshape(rows.size, *_value_shape(array)))
+            buffer = wp.array(host, dtype=array.dtype, device=array.device)
+        # Row sets of writes vary from call to call, so their device indices are not cached.
+        index = wp.array(rows.astype(np.int32), dtype=wp.int32, device=array.device)
+        if not isinstance(target, Model):
+            view._copy_rows(buffer, None, array, index)
+            return 0
+        if name == "shape_scale":
+            view._check_shape_scale_rows(rows)
+        view._copy_rows(buffer, None, array, index)
+        view._update_derived(name, buffer, rows, index)
+        return int(ModelFlags.from_attributes(name))
 
     def _write_shared(self, name: str, labels: Any, value: Any) -> None:
         """Write one value to every world (or the single shared array) before the solver is built."""
@@ -782,7 +1054,7 @@ class BatchRollout:
             for fn in controllers:
                 fn(self)
             if self.pipeline is not None:
-                self.pipeline.collide(self.state_0, self.contacts)
+                self.pipeline.collide(self.state_0, self.contacts, dt=self.dt)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.dt)
             if self.substeps % 2 == 1 and substep == self.substeps - 1:
                 self.state_0.assign(self.state_1)
@@ -895,6 +1167,11 @@ class BatchRollout:
                     (frames * world_count * row_count, *target.shape[1:]), dtype=target.dtype, device=self.device
                 )
                 self._schedules[buffer_key] = buffer
+                # Graphs that captured an evicted buffer's address are only replayed for an identical plan.
+                while len(self._schedules) > _MAX_BUFFERS:
+                    self._schedules.popitem(last=False)
+            else:
+                self._schedules.move_to_end(buffer_key)
             buffer.assign(typed.reshape(frames * world_count * row_count, *value_shape))
             words = _row_words(buffer)
             device_values = wp.array(
@@ -914,11 +1191,14 @@ class BatchRollout:
                 array = spec(self)
                 if not isinstance(array, wp.array):
                     raise TypeError(f"probe '{name}' must return a Warp array, got {type(array)!r}")
-                key = ("probe", name, id(spec), array.ptr, array.shape, array.dtype)
+                # Keyed by what the buffer holds, so a probe function defined again (e.g. in a new cell) reuses it.
+                key = ("probe", name, array.ptr, array.shape, array.dtype)
                 probe = self._probes.get(key)
                 if probe is None:
                     probe = _Probe(name, functools.partial(spec, self), None, tuple(array.shape))
                     self._probes[key] = probe
+                elif probe.source.func is not spec:
+                    probe.source = functools.partial(spec, self)
                 sample = array
             else:
                 attribute, labels = _split_key(spec)
@@ -944,7 +1224,15 @@ class BatchRollout:
                     copy=False,
                 )
                 probe.typed._ref = probe.buffer
+            self._probes.move_to_end(key)
             probes.append(probe)
+        # Graphs that captured an evicted buffer's address are only replayed for an identical plan.
+        used = {id(probe) for probe in probes}
+        while len(self._probes) > _MAX_BUFFERS:
+            stale = next((k for k, probe in self._probes.items() if id(probe) not in used), None)
+            if stale is None:
+                break
+            del self._probes[stale]
         return probes
 
     # ------------------------------------------------------------------------------------------------------------------
@@ -1244,17 +1532,20 @@ class BatchRollout:
         worst: Mapping[str, str] | None = None,
         build: Callable[[Any], ModelBuilder | Model] | None = None,
         initial_state: State | None = None,
+        initial_control: Control | None = None,
         initial_model: Model | None = None,
         initial_world: int = 0,
     ) -> BatchRollout.Evaluation:
         """Run every candidate in every scenario, one world per case, and score the cases.
 
         Each case (candidate, scenario) gets a world. Every world starts from
-        the same state (``initial_state``, else the model's initial state),
-        then ``setup(world, candidate, scenario)`` sets the case's values
-        through a :class:`WorldSetup`: model values (e.g. friction or gains),
+        the same state (``initial_state``, else the model's initial state)
+        and control (``initial_control``, else :attr:`control`), then
+        ``setup(world, candidate, scenario)`` sets the case's values through
+        a :class:`WorldSetup`: model values (e.g. friction or gains),
         start-state values (e.g. perturbed poses), constant controls, and
-        per-frame schedules. Writes of all worlds of a batch are applied
+        per-frame schedules. A case's writes apply in the order its setup
+        made them, and the writes of all worlds of a batch are applied
         together. The rollout runs ``frames`` frames with ``control`` (shared
         schedules and control functions, see :meth:`run`) and ``record``,
         and ``score(records, cases)`` returns metrics per world: a mapping of
@@ -1267,18 +1558,23 @@ class BatchRollout:
 
         - Cases run in the worlds of this rollout, :attr:`world_count` at a
           time; unused worlds of the last batch run unchanged and are not
-          scored.
+          scored. Every batch starts from the same model values and control;
+          a case's values do not carry over to later batches.
         - A case whose setup sets a model attribute that the solver does not
           take per world (for example a solver option, or a value it reads
           only when it is constructed) runs in a separate model that has the
-          value in every world. Values equal to the model's are not a change.
+          model values of world 0 of this rollout and the case's value in
+          every world. Values equal to the model's are not a change.
         - With ``build``, each candidate's world is ``build(candidate)``
           (one world, as for the constructor), and candidates whose builds
           differ run in separate models.
 
-        Separate models are kept for later calls (up to 8). Model and control
-        values that setups changed are restored afterwards. The state is
-        left at the end of the last batch.
+        Separate models start with the control of world 0 (of
+        ``initial_control``, else of :attr:`control`) where their worlds have
+        the same control rows, and are kept for later calls (up to 8, or as
+        many as the last call used). Model values that setups changed and
+        the control are restored afterwards. The state is left at the end of
+        the last batch.
 
         Args:
             candidates: Candidates as a sequence (keyed by index) or a mapping
@@ -1299,9 +1595,12 @@ class BatchRollout:
             build: Per-candidate builds, for candidates that change the
                 model's structure or values the solver shares.
             initial_state: State every case starts from.
-            initial_model: Model of ``initial_state`` if it is not this
-                rollout's (see :meth:`reset`).
-            initial_world: World of ``initial_state`` to start from.
+            initial_control: Control every case starts from: its world
+                ``initial_world`` is copied into every world.
+            initial_model: Model of ``initial_state`` and ``initial_control``
+                if it is not this rollout's (see :meth:`reset`).
+            initial_world: World of ``initial_state`` and ``initial_control``
+                to start from.
 
         Returns:
             The table, per-candidate summary, and batches.
@@ -1311,9 +1610,38 @@ class BatchRollout:
         if worst is not None and any(value not in ("max", "min") for value in worst.values()):
             raise ValueError("worst values must be 'max' or 'min'")
         cases = [(c, s) for c in range(len(candidate_keys)) for s in range(len(scenario_keys))]
+        self._call = next(_evaluate_calls)
+        self._stats["synced"] = []
+
+        # The control every world starts from: world ``initial_world`` of ``initial_control``, or world 0 of this
+        # rollout's control before the call (separate models; this rollout keeps its own per-world control).
+        own_arrays = _control_arrays(self.control)
+        own_control = _snapshot_arrays(own_arrays)
+        own_copies = {name: copy for name, (_, copy) in zip(own_arrays, own_control, strict=True)}
+        if initial_control is not None:
+            start_control = (_control_arrays(initial_control), initial_model or self.model, int(initial_world))
+        else:
+            start_control = None
+        touched: dict[int, tuple[BatchRollout, dict, list, list]] = {}
+
+        def touch(target: BatchRollout) -> tuple[BatchRollout, dict, list, list]:
+            """Model values to restore, control to restore, and start control of each chunk, per rollout."""
+            entry = touched.get(id(target))
+            if entry is None:
+                before = own_control if target is self else _snapshot_arrays(_control_arrays(target.control))
+                if start_control is not None:
+                    target._copy_control(*start_control)
+                elif target is not self:
+                    target._copy_control(own_copies, self.model, 0)
+                start = before if target is self and start_control is None else None
+                if start is None:
+                    start = _snapshot_arrays(_control_arrays(target.control))
+                entry = touched[id(target)] = (target, {}, before, start)
+            return entry
 
         # Build groups: this rollout, or one rollout per distinct candidate build.
         groups: list[tuple[BatchRollout, str, list[tuple[int, int]]]] = []
+        separate_worlds = self._separate_worlds or self.world_count
         if build is None:
             groups.append((self, "rollout", cases))
         else:
@@ -1327,16 +1655,17 @@ class BatchRollout:
                 entry[1].append(c)
             for fingerprint, (source, members) in by_fingerprint.items():
                 group_cases = [case for case in cases if case[0] in members]
-                world_count = min(self.world_count, len(group_cases))
+                world_count = min(separate_worlds, len(group_cases))
                 rollout = self._sibling(("build", fingerprint, world_count), source, world_count)
                 groups.append((rollout, f"of candidate {candidate_keys[members[0]]}", group_cases))
 
         rows: dict[tuple[int, int], dict[str, Any]] = {}
         batches: list[dict[str, Any]] = []
         metrics: list[str] = []
-        touched: dict[int, tuple[BatchRollout, dict]] = {}
         try:
             for rollout, build_name, group_cases in groups:
+                rollout._call = self._call
+                touch(rollout)
                 rollout.reset(initial_state, model=initial_model, world=initial_world)
                 start = rollout.model.state()
                 start.assign(rollout.state_0)
@@ -1347,11 +1676,11 @@ class BatchRollout:
                         setup(world, candidate_values[case[0]], scenario_values[case[1]])
                     setups[case] = world
                 for target, shared, reason, subgroup in rollout._split_shared(setups, group_cases):
-                    base = touched.setdefault(id(target), (target, {}))[1]
+                    _, base, _, chunk_start = touch(target)
                     for first in range(0, len(subgroup), target.world_count):
                         chunk = subgroup[first : first + target.world_count]
                         chunk_control = target._apply_setups(
-                            chunk, setups, control, base, initial_state, initial_model, initial_world
+                            chunk, setups, control, base, chunk_start, initial_state, initial_model, initial_world
                         )
                         records = target.run(frames, control=chunk_control, record=record, every=every)
                         active = {name: array[:, : len(chunk)] for name, array in records.items()}
@@ -1390,10 +1719,44 @@ class BatchRollout:
                             }
                         )
         finally:
-            for target, base in touched.values():
-                target._restore(base)
+            for target, base, before, _ in touched.values():
+                target._restore(base, before)
+            for rollout in (self, *(group[0] for group in groups)):
+                rollout._trim_siblings()
         ordered = [rows[case] for case in cases]
         return BatchRollout.Evaluation(ordered, candidate_keys, scenario_keys, batches, metrics, worst)
+
+    def _copy_control(self, arrays: Mapping[str, wp.array], model: Model, world: int) -> None:
+        """Copy world ``world`` of the control arrays of ``model`` into every world of :attr:`control`.
+
+        Attributes whose worlds have different row counts (another build) are left as they are.
+        """
+        view = self.view
+        source_view = view if model is self.model else view._source_view(model)
+        if not 0 <= world < source_view.world_count:
+            raise ValueError(f"initial_world {world} is out of range [0, {source_view.world_count})")
+        for name, destination in _control_arrays(self.control).items():
+            source = arrays.get(name)
+            if source is None or source.dtype != destination.dtype:
+                continue
+            try:
+                frequency = view._resolve(name)[1]
+                dst_rows = view._rows(name, frequency, None, None)
+                src_rows = source_view._rows(name, frequency, None, [world])
+            except (KeyError, ValueError):
+                continue
+            if src_rows.shape[1] != dst_rows.shape[1]:
+                continue
+            if int(src_rows.max()) >= source.shape[0]:
+                raise ValueError(
+                    f"Control.{name} has {source.shape[0]} rows; pass the model of initial_control as initial_model"
+                )
+            view._copy_rows(
+                source,
+                view._device_index(np.tile(src_rows[0], dst_rows.shape[0])),
+                destination,
+                view._device_index(dst_rows),
+            )
 
     def _sibling(self, key: Any, source: _BuildSource, world_count: int) -> BatchRollout:
         """A rollout of another build or with shared values, with this rollout's solver, pipeline, and steps."""
@@ -1410,11 +1773,41 @@ class BatchRollout:
                 capture=self._capture_enabled,
             )
             self._siblings[key] = rollout
-            while len(self._siblings) > 8:
-                self._siblings.popitem(last=False)
         else:
             self._siblings.move_to_end(key)
+        rollout._call = self._call
         return rollout
+
+    def _trim_siblings(self) -> None:
+        """Drop the least recently used separate models beyond the limit, keeping those of the last call.
+
+        A call that needs more separate models than the limit keeps them all, so repeating it builds none.
+        """
+        while len(self._siblings) > _MAX_SIBLINGS:
+            stale = next((k for k, r in self._siblings.items() if r._call != self._call), None)
+            if stale is None:
+                break
+            del self._siblings[stale]
+            self._sibling_syncs.pop(stale, None)
+
+    def _shared_sibling(self, key: tuple, shared: tuple, world_count: int) -> BatchRollout:
+        """The separate model of the shared values ``shared``, with the model values of world 0 of this rollout."""
+        cache_key = ("shared", key, world_count)
+        rollout = self._siblings.get(cache_key)
+        if rollout is not None:
+            sync = self._sibling_syncs.get(cache_key)
+            if sync is None or sync.rollout is not rollout:
+                exclude = [(name, labels) for name, labels, _ in shared]
+                sync = self._sibling_syncs[cache_key] = _ValueSync(rollout, self.model, 0, exclude)
+            copied, reason = sync.apply()
+            if reason is None:
+                self._stats["synced"].extend(name for name in copied if name not in self._stats["synced"])
+                return self._sibling(cache_key, rollout._source, world_count)
+            del self._siblings[cache_key]
+            self._sibling_syncs.pop(cache_key, None)
+        base = self._source
+        source = _BuildSource(base.builder, self.model, base.options, base.presets + tuple(shared))
+        return self._sibling(cache_key, source, world_count)
 
     def _split_shared(self, setups: dict, cases: list) -> list[tuple[BatchRollout, tuple, str | None, list]]:
         """Group cases by the model values they need in every world (attributes the solver shares)."""
@@ -1454,6 +1847,7 @@ class BatchRollout:
         for case in cases:
             groups.setdefault(keys[case], []).append(case)
         result = []
+        separate_worlds = self._separate_worlds or self.world_count
         for key, members in groups.items():
             shared = tuple(setups[members[0]]._shared)
             if not key:
@@ -1462,10 +1856,8 @@ class BatchRollout:
             reasons = []
             for name, labels, value in shared:
                 reasons.append(f"{name}={_describe(value)} ({verdicts[_selection_key(name, labels)]})")
-            world_count = min(self.world_count, len(members))
-            base = self._source
-            source = _BuildSource(base.builder, base.one_world, base.options, base.presets + shared)
-            rollout = self._sibling(("shared", key, world_count), source, world_count)
+            # Built (or synchronized) before any chunk of this group writes per-world values into this model.
+            rollout = self._shared_sibling(key, shared, min(separate_worlds, len(members)))
             result.append((rollout, shared, "; ".join(reasons), members))
         return result
 
@@ -1494,62 +1886,114 @@ class BatchRollout:
             return getattr(owner, leaf).numpy()
         return self.view.get_attribute(name, self.model, labels=labels, worlds=[0])[0]
 
-    def _apply_setups(self, chunk, setups, control, base, initial_state, initial_model, initial_world) -> list:
+    def _merge(self, name: str, source: Model | State | Control, per_world: Mapping[int, list]) -> tuple:
+        """Model rows (sorted) and values of per-world edits ``{world: [(labels, value), ...]}``.
+
+        Edits apply in order, so a later edit of a row wins.
+        """
+        view = self.view
+        array = view._array(source, name)
+        value_shape = _value_shape(array)
+        frequency = view._resolve(name)[1]
+        rows_parts, value_parts = [], []
+        for world, items in per_world.items():
+            for labels, value in items:
+                rows = view._rows(name, frequency, labels, [world])[0]
+                try:
+                    values = np.broadcast_to(np.asarray(value), (rows.size, *value_shape))
+                except ValueError:
+                    raise ValueError(
+                        f"'{name}' value of shape {np.shape(value)} does not broadcast to the {rows.size} selected "
+                        f"row(s) of shape {value_shape}"
+                    ) from None
+                rows_parts.append(rows)
+                value_parts.append(values)
+        if not rows_parts:
+            return np.zeros(0, dtype=np.int64), np.zeros((0, *value_shape))
+        rows = np.concatenate(rows_parts).astype(np.int64)
+        values = np.concatenate(value_parts)
+        unique, first_from_end = np.unique(rows[::-1], return_index=True)
+        last = rows.size - 1 - first_from_end
+        return unique, values[last]
+
+    def _base_rows(self, base: dict, name: str, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Rows of ``name`` that setups of this call wrote and their values before the call, extended by ``rows``."""
+        entry = base.get(name)
+        if entry is None:
+            entry = (np.zeros(0, dtype=np.int64), None)
+        known, values = entry
+        new = np.setdiff1d(rows, known)
+        if values is None or new.size:
+            # Rows are read before the first write to them in this call.
+            current = self.view._array(self.model, name).numpy()
+            added = current[new]
+            values = added if values is None else np.concatenate([values, added])
+            known = np.concatenate([known, new])
+            order = np.argsort(known, kind="stable")
+            known, values = known[order], values[order]
+            base[name] = (known, values)
+        return known, values
+
+    def _apply_setups(
+        self, chunk, setups, control, base, start_control, initial_state, initial_model, initial_world
+    ) -> list:
         """Write the setups of a chunk of cases (case ``i`` in world ``i``), reset, and return the chunk's control."""
-        writes: dict[str, dict[tuple, list]] = {"model": {}, "control": {}, "state": {}, "schedule": {}}
+        view = self.view
+        edits: dict[str, dict[str, dict[int, list]]] = {"model": {}, "control": {}, "state": {}}
+        schedule_edits: dict[tuple, list] = {}
         for world, case in enumerate(chunk):
             setup = setups[case]
-            shared = setup._skip
-            for kind, edits in (
+            for kind, items in (
                 ("model", setup._model_edits),
                 ("control", setup._control_edits),
                 ("state", setup._state_edits),
-                ("schedule", setup._schedule_edits),
             ):
-                for name, labels, value in edits:
-                    selection = _selection_key(name, labels)
-                    if kind == "model" and selection in shared:
+                for name, labels, value in items:
+                    if kind == "model" and _selection_key(name, labels) in setup._skip:
                         continue
-                    writes[kind].setdefault(selection, [name, labels, {}])[2][world] = value
+                    attribute = view._resolve(name)[0]
+                    edits[kind].setdefault(attribute, {}).setdefault(world, []).append((labels, value))
+            for name, labels, values in setup._schedule_edits:
+                schedule_edits.setdefault(_selection_key(name, labels), [name, labels, {}])[2][world] = values
 
-        # Model and control values: the base value in every world whose case does not set one. Keys that an earlier
-        # chunk wrote are written back to the base value.
-        for kind, target in (("model", self.model), ("control", self.control)):
-            kind_writes = writes[kind]
-            for (entry_kind, *selection), (name, labels, _) in base.items():
-                if entry_kind == kind and tuple(selection) not in kind_writes:
-                    kind_writes[tuple(selection)] = [name, labels, {}]
-            for selection, (name, labels, per_world) in kind_writes.items():
-                entry = base.get((kind, *selection))
-                if entry is None:
-                    entry = (name, labels, self.view.get_attribute(name, target, labels=labels))
-                    base[(kind, *selection)] = entry
-                values = entry[2].copy()
-                for world, value in per_world.items():
-                    values[world] = np.broadcast_to(value, values.shape[1:])
-                self.view.set_attribute(name, target, values, labels=labels)
+        # Model values: rows that setups of this call wrote start from their values before the call, so values of
+        # earlier chunks (and overlapping selections) do not carry over; then this chunk's edits apply.
+        flags = 0
+        for name in [*edits["model"], *(name for name in base if name not in edits["model"])]:
+            rows, values = self._merge(name, self.model, edits["model"].get(name, {}))
+            known, before = self._base_rows(base, name, rows)
+            merged = before.copy()
+            if rows.size:
+                merged[np.searchsorted(known, rows)] = values
+            flags |= self._scatter(self.model, name, known, merged)
+        if flags:
+            self.solver.notify_model_changed(flags)
+
+        # Control: the call's start control (which also undoes schedules and control functions of earlier chunks),
+        # then this chunk's constant values.
+        _restore_arrays(start_control)
+        for name, per_world in edits["control"].items():
+            rows, values = self._merge(name, self.control, per_world)
+            self._scatter(self.control, name, rows, values)
 
         # Model values such as joint_q define the initial state, so the reset follows the model writes.
         self.reset(initial_state, model=initial_model, world=initial_world)
         state_writes = []
-        for name, labels, per_world in writes["state"].values():
-            worlds = sorted(per_world)
-            values = self.view.get_attribute(name, self.state_0, labels=labels, worlds=worlds)
-            for index, world in enumerate(worlds):
-                values[index] = np.broadcast_to(per_world[world], values.shape[1:])
-            state_writes.append((name, labels, values, worlds))
+        for name, per_world in edits["state"].items():
+            rows, values = self._merge(name, self.state_0, per_world)
+            state_writes.append((name, rows, values))
         if state_writes:
-            self._write_states(state_writes)
+            self._write_state_rows(state_writes)
 
         # Schedules: the shared ones in every world, replaced in a world by its case's own.
         shared_schedules, controllers = self._split_control(control)
         schedules = {
             selection: (name, labels, values) for selection, (name, labels, values) in shared_schedules.items()
         }
-        for selection, (name, labels, edits) in writes["schedule"].items():
-            constant = self.view.get_attribute(name, self.control, labels=labels)  # [W, k, ...]
+        for selection, (name, labels, edits_by_world) in schedule_edits.items():
+            constant = view.get_attribute(name, self.control, labels=labels)  # [W, k, ...]
             row_shape = constant.shape[1:]
-            per_world = {world: self._schedule_rows(values, row_shape) for world, values in edits.items()}
+            per_world = {world: self._schedule_rows(values, row_shape) for world, values in edits_by_world.items()}
             frames = max(values.shape[0] for values in per_world.values())
             shared = shared_schedules.get(selection)
             if shared is not None:
@@ -1561,7 +2005,8 @@ class BatchRollout:
             for world, values in per_world.items():
                 fill[:, world] = _hold(values, frames)
             schedules[selection] = (name, labels, fill)
-        return [{(name, labels): values for name, labels, values in schedules.values()}, *controllers]
+        # Keys with hashable labels (a list of labels becomes a tuple, as run() accepts it).
+        return [{(name, _pattern_key(labels)): values for name, labels, values in schedules.values()}, *controllers]
 
     @staticmethod
     def _schedule_rows(values: np.ndarray, row_shape: tuple) -> np.ndarray:
@@ -1600,10 +2045,15 @@ class BatchRollout:
                 raise TypeError(f"control items must be mappings of schedules or functions, got {type(item)!r}")
         return schedules, controllers
 
-    def _restore(self, base: dict) -> None:
-        for (kind, *_), (name, labels, values) in base.items():
-            target = self.model if kind == "model" else self.control
-            self.view.set_attribute(name, target, values, labels=labels)
+    def _restore(self, base: dict, control: list) -> None:
+        """Write back the model values that setups changed and the control before the call."""
+        flags = 0
+        for name, (rows, values) in base.items():
+            flags |= self._scatter(self.model, name, rows, values)
+        if flags:
+            self.solver.notify_model_changed(flags)
+        base.clear()
+        _restore_arrays(control)
 
 
 # ----------------------------------------------------------------------------------------------------------------------

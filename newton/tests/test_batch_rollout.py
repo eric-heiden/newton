@@ -350,6 +350,252 @@ def test_evaluate_per_candidate_builds(test, device):
     test.assertEqual(result.batches[1]["build"], "of candidate 2")
 
 
+def _mu_seen(rollout):
+    """A score that reads the puck friction each case ran with (the model during its batch)."""
+
+    def score(records, cases):
+        mu = rollout.view.get_attribute("shape_material_mu", rollout.model, labels="puck_geom")
+        return {"mu": mu[: len(cases), 0]}
+
+    return score
+
+
+def test_evaluate_overlapping_selections(test, device):
+    """A case's writes apply in its order, and no case's values carry over to later batches or calls."""
+
+    def setup(world, case, _):
+        if case == "all":
+            world.set_model("shape_material_mu", 0.1)
+        elif case == "puck":
+            world.set_model("shape_material_mu", 2.0, labels="puck_geom")
+        elif case == "all_then_puck":
+            world.set_model("shape_material_mu", 0.1)
+            world.set_model("shape_material_mu", 2.0, labels=["puck_geom"])
+        elif case == "puck_then_all":
+            world.set_model("shape_material_mu", 2.0, labels="puck_geom")
+            world.set_model("shape_material_mu", 0.1)
+
+    cases = ["all", "puck", "none", "all_then_puck", "puck_then_all"]
+    expected = [0.1, 2.0, 1.0, 2.0, 0.1]
+    for world_count in (1, 2, 5):
+        rollout = BatchRollout(_puck, world_count, solver=_xpbd, dt=DT, device=device)
+        before = rollout.model.shape_material_mu.numpy().copy()
+        result = rollout.evaluate(cases, frames=1, setup=setup, score=_mu_seen(rollout))
+        np.testing.assert_allclose([row["mu"] for row in result.rows], expected, rtol=1e-6)
+        np.testing.assert_array_equal(rollout.model.shape_material_mu.numpy(), before)
+        again = rollout.evaluate(list(range(world_count)), frames=1, score=_mu_seen(rollout))
+        np.testing.assert_allclose([row["mu"] for row in again.rows], 1.0)
+
+
+def test_evaluate_schedules_and_control_do_not_carry_over(test, device):
+    """A case's schedule and constant controls stay in its batch; the control is restored afterwards."""
+    rollout = BatchRollout(_puck, 1, solver=_xpbd, dt=DT, device=device)
+    target = rollout.view.get_indices("joint_target_q", "hinge")[0, 0]
+
+    def setup(world, case, _):
+        if case == "swing":
+            world.set_schedule("joint_target_q", np.full((5, 1), 1.0), labels="hinge")
+        elif case == "hold":
+            world.set_control("joint_target_q", 0.5, labels=["hinge"])
+
+    def push(r):  # a control function that writes the control every step
+        r.control.joint_f.fill_(0.0)
+
+    before = rollout.control.joint_target_q.numpy().copy()
+    result = rollout.evaluate(
+        ["none", "swing", "none_again", "hold", "none_last"],
+        frames=10,
+        setup=setup,
+        control=push,
+        record={"t": ("joint_target_q", "hinge")},
+        score=lambda records, cases: {"target": records["t"][-1, :, 0]},
+    )
+    test.assertEqual([row["target"] for row in result.rows], [0.0, 1.0, 0.0, 0.5, 0.0])
+    np.testing.assert_array_equal(rollout.control.joint_target_q.numpy(), before)
+    test.assertEqual(rollout.control.joint_target_q.numpy()[target], 0.0)
+
+    # Labels given as lists or tuples, in shared and per-case schedules.
+    shared = {("joint_target_q", ("hinge",)): np.full((3, 1), 0.25, dtype=np.float32)}
+    for control, labels in ((shared, ["hinge"]), (None, ("hinge",))):
+        result = rollout.evaluate(
+            [0.0, 0.75],
+            frames=3,
+            control=control,
+            setup=lambda world, value, _, labels=labels: world.set_schedule("joint_target_q", [[value]], labels=labels),
+            record={"t": ("joint_target_q", "hinge")},
+            score=lambda records, cases: {"target": records["t"][-1, :, 0]},
+        )
+        test.assertEqual([row["target"] for row in result.rows], [0.0, 0.75])
+
+
+def test_body_state_edits_reach_joint_coordinate_solvers(test, device):
+    """Edits of body_q and body_qd move the bodies for solvers that integrate joint coordinates."""
+    rollout = BatchRollout(lambda: _puck(mujoco=True), 2, solver=_mujoco, dt=DT, device=device)
+
+    def setup(world, shift, _):
+        q = world.get_state("body_q", "puck")
+        q[0, 0] += shift
+        world.set_state("body_q", q, labels="puck")
+        world.set_state("body_qd", [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], labels="puck")
+
+    result = rollout.evaluate(
+        [0.0, 0.5],
+        frames=3,
+        setup=setup,
+        record={"puck": ("body_q", "puck"), "q": ("joint_q", "puck*")},
+        score=lambda records, cases: {
+            "start": records["puck"][0, :, 0, 0],
+            "end": records["puck"][-1, :, 0, 0],
+            "joint": records["q"][0, :, 0],
+        },
+    )
+    rows = {row["candidate"]: row for row in result.rows}
+    test.assertAlmostEqual(rows[1]["start"], 0.5, places=5)
+    test.assertAlmostEqual(rows[1]["joint"], 0.5, places=5)
+    test.assertAlmostEqual(rows[1]["end"], 0.5, places=3)
+    test.assertAlmostEqual(rows[0]["end"], 0.0, places=3)
+
+    # set_state(): a body velocity reaches the joint velocities; other articulations keep their state.
+    rollout.reset()
+    arm_before = rollout.view.get_attribute("joint_q", rollout.state, "hinge").copy()
+    velocity = np.zeros((1, 1, 6), dtype=np.float32)
+    velocity[..., 0] = 1.0
+    rollout.set_state("body_qd", velocity, labels="puck", worlds=[1])
+    qd = rollout.view.get_attribute("joint_qd", rollout.state, "puck*")
+    np.testing.assert_allclose(qd[:, 0], [0.0, 1.0], atol=1e-6)
+    np.testing.assert_array_equal(rollout.view.get_attribute("joint_q", rollout.state, "hinge"), arm_before)
+    x = rollout.run(30, record={"puck": ("body_q", "puck")})["puck"][-1, :, 0, 0]
+    test.assertGreater(x[1], x[0] + 0.02)
+
+
+def test_evaluate_separate_models_start_like_this_rollout(test, device):
+    """Separate models take world 0's model values and control, also after the rollout's values change."""
+    rollout = BatchRollout(lambda: _puck(mujoco=True), 2, solver=_mujoco, dt=DT, substeps=2, device=device)
+    record = {"arm": ("joint_q", "hinge"), "puck": ("body_q", "puck")}
+
+    def setup(world, case, _):
+        world.set_state("joint_qd", [2.0, 0.0, 0.0, 0.0, 0.0, 0.0], labels="puck*")
+        if case == "separate":
+            world.set_model("mujoco:condim", 4, labels=["puck_geom", "floor"])  # torsional friction: no slide change
+
+    def score(records, cases):
+        x = records["puck"][:, :, 0, 0]
+        return {"arm": records["arm"][-1, :, 0], "slide": x[-1] - x[0]}
+
+    cases = {"same": "same", "separate": "separate"}
+
+    def run():
+        result = rollout.evaluate(cases, frames=40, setup=setup, record=record, score=score)
+        test.assertIsNotNone(result.batches[-1]["reason"])
+        return {row["candidate"]: row for row in result.rows}
+
+    # The rollout's control drives the hinge to 1 rad in every world, also in the separate model.
+    target = rollout.control.joint_target_q.numpy()
+    target[rollout.view.get_indices("joint_target_q", "hinge").ravel()] = 1.0
+    rollout.control.joint_target_q.assign(target)
+    rows = run()
+    test.assertGreater(rows["same"]["arm"], 0.3)
+    test.assertAlmostEqual(rows["separate"]["arm"], rows["same"]["arm"], places=4)
+    test.assertAlmostEqual(rows["separate"]["slide"], rows["same"]["slide"], delta=0.01)
+    separate = next(iter(rollout._siblings.values()))
+
+    # A later edit of the rollout's friction reaches the kept separate model.
+    rollout.view.set_attribute("shape_material_mu", rollout.model, 0.05, labels=["puck_geom", "floor"])
+    slippery = run()
+    test.assertIs(next(iter(rollout._siblings.values())), separate)
+    test.assertIn("shape_material_mu", rollout._stats["synced"])
+    test.assertGreater(slippery["same"]["slide"], 1.5 * rows["same"]["slide"])
+    test.assertAlmostEqual(slippery["separate"]["slide"], slippery["same"]["slide"], delta=0.01)
+
+    # initial_control: world 0 of another control in every world of every model; the rollout keeps its own.
+    plant = _puck(mujoco=True).finalize(device=device)
+    plant_control = plant.control()
+    still = np.zeros(plant.joint_coord_count, dtype=np.float32)
+    plant_control.joint_target_q.assign(still)
+    result = rollout.evaluate(
+        cases,
+        frames=40,
+        setup=setup,
+        record=record,
+        score=score,
+        initial_control=plant_control,
+        initial_model=plant,
+    )
+    np.testing.assert_allclose([row["arm"] for row in result.rows], 0.0, atol=1e-4)
+    np.testing.assert_array_equal(rollout.control.joint_target_q.numpy(), target)
+
+
+def test_evaluate_keeps_the_separate_models_of_a_call(test, device):
+    """A call with more separate models than the cache limit keeps them, so repeating it builds none."""
+    rollout = BatchRollout(lambda: _puck(mujoco=True), 2, solver=_mujoco, dt=DT, device=device)
+    values = np.linspace(1.5, 4.0, 10)
+
+    def setup(world, index, _):
+        world.set_model("mujoco:impratio", values[index])
+
+    kwargs = {"frames": 1, "setup": setup, "score": lambda records, cases: {"n": [0] * len(cases)}}
+    rollout.evaluate(list(range(10)), **kwargs)
+    kept = dict(rollout._siblings)
+    test.assertEqual(len(kept), 10)
+    rollout.evaluate(list(range(10)), **kwargs)
+    test.assertEqual(len(rollout._siblings), 10)
+    test.assertTrue(all(rollout._siblings[key] is model for key, model in kept.items()))
+    # A smaller call afterwards trims the cache to its limit.
+    rollout.evaluate([0], **kwargs)
+    test.assertEqual(len(rollout._siblings), 8)
+
+
+def test_buffers_scalars_and_speculative_contacts(test, device):
+    """Probe buffers are reused and bounded, scalar model settings are copied, and speculative pipelines run."""
+
+    def build():
+        model = _puck().finalize(device=device)
+        model.soft_contact_ke = 123.0
+        model.particle_mu = 0.9
+        return model
+
+    rollout = BatchRollout(
+        build,
+        2,
+        solver=_xpbd,
+        pipeline=lambda model: newton.CollisionPipeline(model, speculative_contact_gap_max=0.01),
+        dt=DT,
+        device=device,
+    )
+    test.assertEqual((rollout.model.soft_contact_ke, rollout.model.particle_mu), (123.0, 0.9))
+    test.assertIn("soft_contact_ke", rollout.copied_attributes)
+    for _ in range(5):
+        rollout.reset()
+        records = rollout.run(5, record={"q": lambda r: r.state.body_q})  # a new function every run
+    test.assertEqual(records["q"].shape[0], 6)
+    test.assertEqual(len(rollout._probes), 1)
+    for index in range(40):
+        rollout.run(1, record={f"probe{index}": "body_q"})
+    test.assertLessEqual(len(rollout._probes), 32)
+
+
+def test_value_sync_ignores_ids_offset_per_world(test, device):
+    """IDs that replication offsets per world (MJCF collision mask domains) are structure, not world values."""
+    from newton._src.utils.batch_rollout import _ValueSync  # noqa: PLC0415
+
+    mjcf = """<mujoco><worldbody><body name="box" pos="0 0 0.2"><freejoint/>
+    <geom type="box" size="0.05 0.05 0.05" contype="2" conaffinity="2"/></body></worldbody></mujoco>"""
+
+    def build():
+        builder = newton.ModelBuilder()
+        builder.add_mjcf(mjcf)
+        builder.add_ground_plane()
+        return builder.finalize(device=device)
+
+    one_world = build()
+    rollout = BatchRollout(build, 3, solver=_mujoco, dt=DT, device=device)
+    domains = rollout.model.mujoco.collision_mask_domain.numpy()
+    test.assertGreater(len(set(domains[domains >= 0].tolist())), 1)  # one domain per world
+    test.assertEqual(_ValueSync(rollout, one_world).changed(), [])
+    with test.assertRaisesRegex(ValueError, "structure"):
+        rollout.view.set_attribute("mujoco:collision_mask_domain", rollout.model, 0, labels="*")
+
+
 def test_compare_trajectories(test, device):
     del device
     t = np.linspace(0.0, 1.0, 11)
@@ -405,6 +651,13 @@ for _name, _func in (
     ("test_evaluate_table_summary_and_compare", test_evaluate_table_summary_and_compare),
     ("test_evaluate_groups_shared_values", test_evaluate_groups_shared_values),
     ("test_evaluate_per_candidate_builds", test_evaluate_per_candidate_builds),
+    ("test_evaluate_overlapping_selections", test_evaluate_overlapping_selections),
+    ("test_evaluate_schedules_and_control_do_not_carry_over", test_evaluate_schedules_and_control_do_not_carry_over),
+    ("test_body_state_edits_reach_joint_coordinate_solvers", test_body_state_edits_reach_joint_coordinate_solvers),
+    ("test_evaluate_separate_models_start_like_this_rollout", test_evaluate_separate_models_start_like_this_rollout),
+    ("test_evaluate_keeps_the_separate_models_of_a_call", test_evaluate_keeps_the_separate_models_of_a_call),
+    ("test_buffers_scalars_and_speculative_contacts", test_buffers_scalars_and_speculative_contacts),
+    ("test_value_sync_ignores_ids_offset_per_world", test_value_sync_ignores_ids_offset_per_world),
 ):
     add_function_test(TestBatchRollout, _name, _func, devices=devices)
 add_function_test(

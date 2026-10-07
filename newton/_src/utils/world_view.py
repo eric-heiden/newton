@@ -27,9 +27,19 @@ Frequency = Model.AttributeFrequency
 # Shape types whose collision data ModelBuilder.finalize() derives from shape_scale.
 _SCALE_BAKED_SHAPE_TYPES = (int(GeoType.MESH), int(GeoType.CONVEX_MESH), int(GeoType.HFIELD), int(GeoType.GAUSSIAN))
 
-# Attributes that define model structure rather than per-entity values.
+# Attributes that define model structure rather than per-entity values. The MuJoCo equality targets and collision
+# mask domains are IDs that ModelBuilder.add_builder() offsets per world.
 _STRUCTURAL_ATTRIBUTES = frozenset(
-    {"shape_type", "shape_source_ptr", "shape_heightfield_index", "shape_edge_range", "joint_type", "joint_dof_dim"}
+    {
+        "shape_type",
+        "shape_source_ptr",
+        "shape_heightfield_index",
+        "shape_edge_range",
+        "joint_type",
+        "joint_dof_dim",
+        "mujoco:equality_constraint_target",
+        "mujoco:collision_mask_domain",
+    }
 )
 
 # State arrays without an attribute spec on the model.

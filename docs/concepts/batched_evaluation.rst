@@ -67,8 +67,11 @@ batch. It checks model edits against the solver
 (:meth:`~newton.solvers.SolverBase.check_world_values`), so it raises for
 attributes the solver shares across worlds or reads only when it is
 constructed, and it notifies the solver after a write.
-:meth:`BatchRollout.set_state` writes per-world start values and keeps body
-poses consistent with edited joint coordinates.
+:meth:`BatchRollout.set_state` writes per-world start values and keeps the
+state consistent for every solver: body poses follow edited joint coordinates
+(:func:`~newton.eval_fk`), and joint coordinates follow edited body poses and
+velocities (:func:`~newton.eval_ik`), which solvers that integrate joint
+coordinates, such as :class:`~newton.solvers.SolverMuJoCo`, start from.
 
 .. testcode:: batched-evaluation
 
@@ -186,19 +189,25 @@ Cases are grouped into batches, which :attr:`~BatchRollout.Evaluation.batches`
 lists with the reason for each separate one:
 
 - The rollout runs ``world_count`` cases at a time; unused worlds of the last
-  batch run unchanged and are not scored.
+  batch run unchanged and are not scored. Every batch starts from the same
+  model values and control, so a case's values and schedules do not carry
+  over to later batches.
 - A setup that sets a model attribute the solver does not take per world (a
   value it reads only when it is constructed, or shares across worlds, for
   example ``mujoco:condim`` or a solver option of
-  :class:`~newton.solvers.SolverMuJoCo`) runs in a separate model with that
-  value in every world. Values equal to the model's are not a change.
+  :class:`~newton.solvers.SolverMuJoCo`) runs in a separate model with the
+  values of world 0 of the rollout's model and that value in every world.
+  Values equal to the model's are not a change.
 - With ``build=``, each candidate's world is ``build(candidate)``, and
   candidates whose builds differ (for example in geometry) run in separate
   models.
 
-Model and control values that setups changed are restored afterwards.
-``initial_state`` (with ``initial_model`` and ``initial_world``) starts every
-case from a saved state instead of the model's initial state.
+A case's writes apply in the order its setup made them, so a later write of an
+overlapping selection wins. Model values that setups changed and the control
+are restored afterwards. ``initial_state`` and ``initial_control`` (with
+``initial_model`` and ``initial_world``) start every case, also in separate
+models, from a saved state and control instead of the model's initial state
+and the rollout's control.
 
 Comparing trajectories
 ----------------------

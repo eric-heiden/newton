@@ -102,7 +102,11 @@ def report_health(
         :class:`~newton.solvers.SolverMuJoCo` on MuJoCo Warp, ``stats["overflow_counts"]`` maps each
         MuJoCo Warp overflow type raised since the solver was created (e.g. ``"LS_ITERATIONS"``, the
         linesearch iteration limit) to the number of (world, step) pairs that raised it; the solver
-        prints each type once instead of once per world and step.
+        prints each type once instead of once per world and step. With Newton contacts
+        (``use_mujoco_contacts=False``), ``stats["newton_contact_overflow"]`` counts the contact sets
+        that held more contacts than the MuJoCo Warp buffer (``naconmax``), and
+        ``stats["contacts_lost_per_world"]`` and ``worlds["contacts_lost"]`` name the worlds whose
+        contacts past the buffer were dropped, summed over those contact sets.
     """
     from ..mcp.diagnostics import health_report  # noqa: PLC0415
 

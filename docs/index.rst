@@ -33,6 +33,7 @@ Newton Physics
    Articulations <concepts/articulations>
    Deformable Objects <concepts/deformable_objects>
    Model-Based Control <concepts/model_based_control>
+   Batched Evaluation <concepts/batched_evaluation>
    Mass and Inertia <concepts/mass_inertia>
    Sites <concepts/sites>
    Sensors <concepts/sensors>

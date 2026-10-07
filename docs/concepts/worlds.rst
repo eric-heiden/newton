@@ -487,6 +487,11 @@ single-world model into every world of a model with the same per-world layout,
 for example from a plant into a planning model that rolls out many candidate
 controls.
 
+:class:`newton.utils.BatchRollout` combines these steps: it builds the
+replicated model, the solver, and the collision pipeline once, chunks
+candidates and scenarios over its worlds, and records per-world probes (see
+:doc:`batched_evaluation`).
+
 
 .. _World-entity partitioning:
 

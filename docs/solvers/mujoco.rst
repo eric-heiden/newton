@@ -1158,7 +1158,9 @@ actuators, and for ``shape_scale`` of cones, of sites in models
 with several worlds, and, with ``use_mujoco_contacts=True``, of mesh,
 convex-mesh, and heightfield shapes, whose MuJoCo assets are built from the
 first world. :meth:`newton.selection.WorldView.set_attribute` calls it when
-given the solver.
+given the solver. :class:`newton.utils.BatchRollout` runs cases that set such
+attributes in separate models built with the value in every world (see
+:doc:`/concepts/batched_evaluation`).
 
 Actuator gains and control source
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

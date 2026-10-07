@@ -12,7 +12,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from newton.examples.headless import _resolve, _split, run_headless
+from newton.examples.headless import _parse_override, _resolve, _split, run_headless
 
 _SCRIPT = textwrap.dedent(
     """
@@ -24,12 +24,20 @@ _SCRIPT = textwrap.dedent(
 
     import newton.examples
 
+    GAIN = 1.0
+    SEED = -1
+    PARAMS = {"horizon": 10, "mode": "slow"}
+    WEIGHTS = np.array([1.0, 2.0], dtype=np.float32)
+
 
     class Example:
+        label = "default"
+
         def __init__(self, viewer, args):
             self.args = args
             self.count = 0
             self.sim_time = 0.0
+            self.gain = GAIN
             if args.spawn:
                 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
                 with open(args.spawn, "w") as file:
@@ -39,6 +47,7 @@ _SCRIPT = textwrap.dedent(
         def step(self):
             self.count += 1
             self.sim_time += 0.25
+            time.sleep(self.args.sleep)
             if self.count == self.args.fail_at:
                 raise RuntimeError(f"failure in frame {self.count}")
             if self.count == self.args.hang_at:
@@ -60,6 +69,7 @@ _SCRIPT = textwrap.dedent(
             parser.add_argument("--fail-at", type=int, default=-1)
             parser.add_argument("--hang-at", type=int, default=-1)
             parser.add_argument("--spawn", default=None)
+            parser.add_argument("--sleep", type=float, default=0.0)
             return parser
 
 
@@ -169,12 +179,87 @@ class TestHeadlessRunner(unittest.TestCase):
         self.assertEqual((report["status"], report["phase"], report["signal"]), ("crashed", "call", "SIGABRT"))
         self.assertIn("Fatal Python error", report["stderr_tail"])
 
+    def test_set_assigns_globals_attributes_and_keys(self):
+        """--set assigns existing module globals, class attributes, and dictionary keys before the example is built."""
+        call = (
+            "{'gain': example.gain, 'params': module.PARAMS, 'label': example.label, "
+            "'weights': module.WEIGHTS, 'dtype': str(module.WEIGHTS.dtype)}"
+        )
+        overrides = ["GAIN=2.5", "PARAMS.horizon=20", "PARAMS.mode=quick", "Example.label='fast'", "WEIGHTS=[3, 4]"]
+        process, report = self.cli(*[item for text in overrides for item in ("--set", text)], "--call", call)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(
+            report["value"],
+            {
+                "gain": 2.5,
+                "params": {"horizon": 20, "mode": "quick"},
+                "label": "fast",
+                "weights": [3.0, 4.0],
+                "dtype": "float32",
+            },
+        )
+        self.assertEqual(
+            report["overrides"],
+            {"GAIN": 2.5, "PARAMS.horizon": 20, "PARAMS.mode": "quick", "Example.label": "fast", "WEIGHTS": [3, 4]},
+        )
+        self.assertEqual(report["realtime_factor"], round(1.0 / report["seconds"]["step"], 4))
+        # A name the script does not define stops the run before the example is built.
+        process, report = self.cli("--set", "GAINN=2")
+        self.assertEqual(process.returncode, 1)
+        self.assertEqual((report["status"], report["phase"]), ("error", "load"))
+        self.assertEqual(report["exception"]["type"], "AttributeError")
+        self.assertIn("the script has no name 'GAINN'; did you mean 'GAIN'?", report["exception"]["message"])
+        _, report = self.cli("--set", "PARAMS.horizn=3")
+        self.assertIn("'PARAMS' has no key 'horizn'; did you mean 'horizon'?", report["exception"]["message"])
+
+    def test_repeat_runs_fresh_processes_and_reports_progress(self):
+        """--repeat runs one process per run with {run} in --set values; --progress prints lines while it runs."""
+        process, report = self.cli(
+            "--repeat", "3", "--set", "SEED={run}", "--call", "(module.SEED, example.count)", "--progress", "0"
+        )
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual((report["status"], report["repeat"], report["status_counts"]), ("ok", 3, {"ok": 3}))
+        self.assertEqual(report["values"], [[0, 4], [1, 4], [2, 4]])
+        self.assertEqual([run["run"] for run in report["runs"]], [0, 1, 2])
+        walls = [run["wall_seconds"] for run in report["runs"]]
+        self.assertEqual(report["wall_seconds"]["total"], round(sum(walls), 3))
+        self.assertEqual((report["wall_seconds"]["min"], report["wall_seconds"]["max"]), (min(walls), max(walls)))
+        self.assertIn("headless: run 2/3: ok", process.stderr)
+        self.assertIn("headless: 3 of 3 runs: 3 ok", process.stderr)
+        self.assertNotIn(", phase step, frame", process.stderr)
+        # A failing run sets the overall status and exit code.
+        process, report = self.cli("--repeat", "2", "--set", "Example.label={run}", "--fail-at", "2", "--progress", "0")
+        self.assertEqual(process.returncode, 1)
+        self.assertEqual((report["status"], report["status_counts"]), ("error", {"error": 2}))
+        # Progress lines name the phase and frame of a run in flight.
+        process, report = self.cli("--sleep", "0.25", "--frames", "12", "--progress", "0.5")
+        self.assertEqual(report["status"], "ok", process.stderr)
+        self.assertRegex(process.stderr, r"headless: \d+ s, phase step, frame \d+/12")
+
+    def test_python_api_overrides_must_be_literals(self):
+        """run_headless() takes overrides as Python literals and rejects other values and names before starting."""
+        report = run_headless(self.script, frames=1, overrides={"GAIN": 3, "PARAMS.mode": "x"}, call="example.gain")
+        self.assertEqual((report["status"], report["value"]), ("ok", 3))
+        self.assertEqual(report["overrides"], {"GAIN": 3, "PARAMS.mode": "x"})
+        with self.assertRaisesRegex(ValueError, "Python literal"):
+            run_headless(self.script, overrides={"GAIN": object()})
+        with self.assertRaisesRegex(ValueError, "global name"):
+            run_headless(self.script, overrides={"GAIN[0]": 1})
+        with self.assertRaisesRegex(ValueError, "progress"):
+            run_headless(self.script, progress=0)
+        self.assertEqual(_parse_override("A={run}", 3), ("A", 3))
+        self.assertEqual(_parse_override("B = 'x=1'"), ("B", "x=1"))
+        self.assertEqual(_parse_override("C=fast mode"), ("C", "fast mode"))
+        with self.assertRaisesRegex(ValueError, "NAME=VALUE"):
+            _parse_override("C")
+
     def test_command_line_splitting_and_script_resolution(self):
         """Take runner options anywhere after SCRIPT, pass everything after -- to the script."""
-        runner, script, script_args = _split(
-            ["--timeout", "5", "s.py", "--seed", "3", "--frames=7", "--render", "--", "--frames", "2"]
+        options = ["--frames=7", "--render", "--set", "A=1", "--repeat", "2", "--progress=0"]
+        runner, script, script_args = _split(["--timeout", "5", "s.py", "--seed", "3", *options, "--", "--frames", "2"])
+        self.assertEqual(
+            runner, ["--timeout", "5", "--frames=7", "--render", "--set", "A=1", "--repeat", "2", "--progress=0"]
         )
-        self.assertEqual(runner, ["--timeout", "5", "--frames=7", "--render"])
         self.assertEqual(script, "s.py")
         self.assertEqual(script_args, ["--seed", "3", "--frames", "2"])
         self.assertEqual(_resolve("basic_pendulum"), {"module": "newton.examples.basic.example_basic_pendulum"})

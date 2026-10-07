@@ -271,3 +271,44 @@ is positive.  For the full inertia tensor expressions, see
 Hollow shapes (``ShapeConfig.is_solid=False``) compute shell inertia by
 subtracting the inner volume's contribution, using
 :attr:`ShapeConfig.margin <newton.ModelBuilder.ShapeConfig.margin>` as shell thickness.
+
+Inertia for a known mass
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+For a fixed geometry, mass and inertia both scale with density, so the inertia
+of a shape with a measured mass is its inertia at any density times the mass
+ratio. :func:`~newton.geometry.compute_inertia_shape` gives both for solid
+shapes and for hollow ones with a shell ``thickness`` [m]. A thin shell has
+larger moments than a solid of the same mass: :math:`\tfrac{2}{3} m r^2`
+against :math:`\tfrac{2}{5} m r^2` for a sphere. This example computes both for
+an ellipsoid of semi-axes :math:`a, b, c`, checks the solid one against
+:math:`I_{xx} = \tfrac{m}{5}(b^2 + c^2)`, and assigns it to a body whose
+collision shape adds no mass:
+
+.. testcode:: inertia-for-mass
+
+   import numpy as np
+   import warp as wp
+
+   import newton
+   from newton.geometry import compute_inertia_shape
+
+   mass, (a, b, c) = 0.15, (0.04, 0.035, 0.05)  # [kg], semi-axes [m]
+   inertia = {}
+   for name, is_solid in (("solid", True), ("shell", False)):
+       unit_mass, _, unit_inertia = compute_inertia_shape(
+           newton.GeoType.ELLIPSOID, (a, b, c), None, density=1.0, is_solid=is_solid, thickness=0.0005
+       )
+       inertia[name] = np.array(unit_inertia).reshape(3, 3) * (mass / unit_mass)  # [kg m^2]
+
+   solid = mass / 5.0 * np.array([b * b + c * c, a * a + c * c, a * a + b * b])
+   assert np.allclose(np.diag(inertia["solid"]), solid, rtol=1e-5)
+   print((np.diag(inertia["shell"]) / solid).round(2).tolist())
+
+   builder = newton.ModelBuilder()
+   body = builder.add_body(mass=mass, inertia=wp.mat33(inertia["solid"]))
+   builder.add_shape_ellipsoid(body, rx=a, ry=b, rz=c, cfg=newton.ModelBuilder.ShapeConfig(density=0.0))
+
+.. testoutput:: inertia-for-mass
+
+   [1.6, 1.58, 1.7]

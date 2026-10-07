@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import json
 import math
-from collections.abc import Sequence
+import os
+from collections.abc import Mapping, Sequence
 from enum import IntEnum
 from typing import Any
 
@@ -29,6 +31,22 @@ _FOLD_SEARCH_SAMPLES = 20001
 _COEFFICIENTS = ("k1", "k2", "k3", "k4", "k5", "k6", "p1", "p2", "s1", "s2", "s3", "s4")
 # OpenCV's distCoeffs order; RealSense coefficients use its first five entries.
 _OPENCV_ORDER = ("k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6", "s1", "s2", "s3", "s4")
+
+# Calibration-dictionary keys read by Intrinsics.from_dict(), in lookup order: OpenCV and camera.json files,
+# ROS CameraInfo messages and calibration YAML, and RealSense rs2_intrinsics.
+_DICT_KEYS = {
+    "width": ("width", "image_width"),
+    "height": ("height", "image_height"),
+    "camera_matrix": ("K", "k", "camera_matrix"),
+    "fx": ("fx",),
+    "fy": ("fy",),
+    "cx": ("cx", "ppx"),
+    "cy": ("cy", "ppy"),
+    "distortion": ("D", "d", "dist_coeffs", "distortion_coefficients", "coeffs"),
+}
+# Distortion model names of calibration files that are the OpenCV pinhole model (OpenCV coefficient order).
+_OPENCV_MODEL_NAMES = ("opencv", "plumb_bob", "rational_polynomial", "brown_conrady", "radtan")
+_NO_DISTORTION_NAMES = ("none", "pinhole")
 
 
 def transform_values(xform: Any, name: str = "camera_transform") -> np.ndarray:
@@ -80,6 +98,63 @@ def _image_size(name: str, value: Any) -> int:
     return int(value)
 
 
+def _has_camera_keys(calibration: Mapping) -> bool:
+    return any(key in calibration for key in (*_DICT_KEYS["camera_matrix"], "fx"))
+
+
+def _select_camera(calibration: Mapping, camera: str | None) -> Mapping:
+    """The calibration of one camera, from a dictionary of one camera or of several cameras keyed by name."""
+    names = [name for name, value in calibration.items() if isinstance(value, Mapping) and _has_camera_keys(value)]
+    if camera is not None:
+        if not isinstance(calibration.get(camera), Mapping):
+            raise ValueError(f"calibration has no camera {camera!r}; cameras: {names}")
+        return calibration[camera]
+    if _has_camera_keys(calibration):
+        return calibration
+    if len(names) == 1:
+        return calibration[names[0]]
+    if names:
+        raise ValueError(f"calibration holds cameras {names}; select one with camera=...")
+    raise ValueError(
+        "calibration has no camera matrix (K, k, or camera_matrix) or focal lengths (fx, fy); "
+        f"keys: {sorted(str(key) for key in calibration)}"
+    )
+
+
+def _calibration_entry(calibration: Mapping, keys: Sequence[str]) -> tuple[str, Any] | None:
+    """The first of ``keys`` in ``calibration`` and its value; aliases given together must agree."""
+    found = [(key, calibration[key]) for key in keys if key in calibration]
+    if not found:
+        return None
+    key, value = found[0]
+    for other, other_value in found[1:]:
+        if not np.array_equal(_calibration_array(value, key), _calibration_array(other_value, other)):
+            raise ValueError(f"calibration keys {key!r} and {other!r} disagree")
+    return key, value
+
+
+def _calibration_array(value: Any, key: str) -> np.ndarray:
+    """Float64 values of a calibration entry; mappings hold them in ``data`` (OpenCV FileStorage, ROS YAML)."""
+    if isinstance(value, Mapping):
+        if "data" not in value:
+            raise ValueError(f"calibration {key!r} must hold numbers or a mapping with 'data'")
+        value = value["data"]
+    try:
+        array = np.asarray(value, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        raise ValueError(f"calibration {key!r} must hold numbers, got {value!r}") from None
+    if not np.isfinite(array).all():
+        raise ValueError(f"calibration {key!r} must hold finite numbers")
+    return array
+
+
+def _calibration_number(value: Any, key: str) -> float:
+    array = _calibration_array(value, key)
+    if array.size != 1:
+        raise ValueError(f"calibration {key!r} must be one number, got {array.size} values")
+    return float(array[0])
+
+
 @dataclasses.dataclass(frozen=True)
 class Intrinsics:
     """Calibrated pinhole camera: image size, focal lengths, principal point, and lens distortion.
@@ -120,6 +195,7 @@ class Intrinsics:
         camera = SensorCamera.Intrinsics.from_camera_matrix(
             K, D, width=640, height=480, distortion_model="inverse_brown_conrady"
         )
+        # or from a calibration file: SensorCamera.Intrinsics.from_json("camera.json", camera="top")
         pixels, forward_depth = camera.project(points, camera_transform)
         on_table = camera.unproject_to_plane(pixels, camera_transform, plane=(0.0, 0.0, 1.0, -0.75))
         rays = camera.compute_camera_rays(device=model.device)
@@ -257,6 +333,195 @@ class Intrinsics:
             **named,
             distortion_model=distortion_model,
         )
+
+    @classmethod
+    def from_dict(
+        cls,
+        calibration: Mapping[str, Any],
+        camera: str | None = None,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> Intrinsics:
+        """Create intrinsics from a calibration dictionary, such as a parsed ``camera.json`` file.
+
+        Reads the keys below and ignores all others, such as camera poses.
+        Where several keys name one value, the first one present is used and
+        the others must agree with it.
+
+        * Image size [px]: ``width`` and ``height``, or ``image_width`` and
+          ``image_height``.
+        * Camera matrix [px]: ``K``, ``k``, or ``camera_matrix`` (nine
+          row-major values, a 3x3 nested list, or a mapping whose ``data``
+          holds them, as in OpenCV ``FileStorage`` and ROS calibration files),
+          or the separate values ``fx``, ``fy``, ``cx`` (or ``ppx``), and
+          ``cy`` (or ``ppy``).
+        * Distortion coefficients in OpenCV order ``(k1, k2, p1, p2[, k3[, k4,
+          k5, k6[, s1, s2, s3, s4]]])``: ``D``, ``d``, ``dist_coeffs``,
+          ``distortion_coefficients``, or RealSense's ``coeffs``; or the
+          separate values ``k1`` to ``k6``, ``p1``, ``p2``, and ``s1`` to
+          ``s4``. Without coefficients the camera has no distortion.
+        * Distortion model: ``distortion_model`` (or ``model`` next to
+          ``coeffs``), case-insensitive: ``"inverse_brown_conrady"``
+          (RealSense ``RS2_DISTORTION_INVERSE_BROWN_CONRADY``) for
+          :attr:`DistortionModel.INVERSE_BROWN_CONRADY`; ``"opencv"``,
+          ``"plumb_bob"`` and ``"rational_polynomial"`` (ROS),
+          ``"brown_conrady"`` (RealSense), or ``"radtan"`` for
+          :attr:`DistortionModel.OPENCV`; ``"none"`` for an undistorted
+          camera; or a :class:`DistortionModel` value. Defaults to
+          :attr:`DistortionModel.OPENCV`.
+
+        Example:
+
+        .. code-block:: python
+
+            calibration = {
+                "width": 640,
+                "height": 480,
+                "K": [600.0, 0.0, 319.5, 0.0, 600.0, 239.5, 0.0, 0.0, 1.0],
+                "D": [0.05, -0.02, 0.001, -0.0005, 0.0],
+                "distortion_model": "inverse_brown_conrady",
+            }
+            intrinsics = SensorCamera.Intrinsics.from_dict(calibration)
+
+        Args:
+            calibration: Calibration of one camera, or of several cameras keyed
+                by name.
+            camera: Name of the camera to read from a dictionary of several
+                cameras. May be omitted when ``calibration`` holds one camera.
+            width: Image width [px] if the calibration has none.
+            height: Image height [px] if the calibration has none.
+
+        Returns:
+            The camera intrinsics.
+
+        Raises:
+            ValueError: If a required value is missing, values disagree, the
+                distortion model is not a pinhole model listed above, or a
+                value is invalid.
+        """
+        if not isinstance(calibration, Mapping):
+            raise TypeError(f"calibration must be a mapping, got {type(calibration).__name__}")
+        calibration = _select_camera(calibration, camera)
+
+        size = {}
+        for name, given in (("width", width), ("height", height)):
+            entry = _calibration_entry(calibration, _DICT_KEYS[name])
+            if entry is None:
+                if given is None:
+                    keys = " or ".join(_DICT_KEYS[name])
+                    raise ValueError(f"calibration has no image {name} ({keys}); pass {name}=...")
+                size[name] = _image_size(name, given)
+                continue
+            value = _image_size(entry[0], _calibration_number(entry[1], entry[0]))
+            if given is not None and _image_size(name, given) != value:
+                raise ValueError(
+                    f"{name}={given} differs from the calibration's {entry[0]} {value}; "
+                    "use resize() for another image size"
+                )
+            size[name] = value
+
+        separate = {}
+        for name in ("fx", "fy", "cx", "cy"):
+            entry = _calibration_entry(calibration, _DICT_KEYS[name])
+            if entry is not None:
+                separate[name] = _calibration_number(entry[1], entry[0])
+        entry = _calibration_entry(calibration, _DICT_KEYS["camera_matrix"])
+        if entry is not None:
+            matrix = _calibration_array(entry[1], entry[0])
+            if matrix.size != 9:
+                raise ValueError(f"calibration {entry[0]!r} must hold the 9 values of a 3x3 camera matrix")
+            in_matrix = dict(zip(("fx", "fy", "cx", "cy"), matrix[[0, 4, 2, 5]].tolist(), strict=True))
+            for name, value in separate.items():
+                if not math.isclose(value, in_matrix[name], rel_tol=1.0e-9, abs_tol=1.0e-12):
+                    raise ValueError(f"calibration {name} {value} disagrees with {entry[0]!r} ({in_matrix[name]})")
+        else:
+            missing = [name for name in ("fx", "fy", "cx", "cy") if name not in separate]
+            if missing:
+                raise ValueError(
+                    f"calibration has no camera matrix (K, k, or camera_matrix) and lacks {', '.join(missing)}"
+                )
+            matrix = [[separate["fx"], 0.0, separate["cx"]], [0.0, separate["fy"], separate["cy"]], [0.0, 0.0, 1.0]]
+
+        named = {name: _calibration_number(calibration[name], name) for name in _COEFFICIENTS if name in calibration}
+        entry = _calibration_entry(calibration, _DICT_KEYS["distortion"])
+        coefficients = None
+        if entry is not None:
+            coefficients = _calibration_array(entry[1], entry[0])
+            listed = dict(zip(_OPENCV_ORDER, coefficients.tolist(), strict=False))
+            for name, value in named.items():
+                if value != listed.get(name, 0.0):
+                    raise ValueError(f"calibration {name} {value} disagrees with {entry[0]!r}")
+        elif named:
+            coefficients = np.array([named.get(name, 0.0) for name in _OPENCV_ORDER])
+
+        model = Intrinsics.DistortionModel.OPENCV
+        key = "distortion_model" if "distortion_model" in calibration else "model" if "coeffs" in calibration else None
+        value = calibration.get(key) if key is not None else None
+        if isinstance(value, str):
+            name = value.strip().lower().replace(" ", "_").replace("-", "_")
+            for prefix in ("rs2_distortion_", "distortion."):
+                name = name.removeprefix(prefix)
+            if name == "inverse_brown_conrady":
+                model = Intrinsics.DistortionModel.INVERSE_BROWN_CONRADY
+            elif name in _NO_DISTORTION_NAMES:
+                if coefficients is not None and np.any(coefficients != 0.0):
+                    raise ValueError(f"calibration {key!r} is {value!r}, but its distortion coefficients are nonzero")
+                coefficients = None
+            elif name not in _OPENCV_MODEL_NAMES:
+                raise ValueError(
+                    f"calibration {key!r} {value!r} is not a pinhole distortion model of SensorCamera.Intrinsics "
+                    "(inverse_brown_conrady, opencv, plumb_bob, rational_polynomial, brown_conrady, radtan, or "
+                    "none); render fisheye lenses with the SensorCamera.compute_camera_rays_fisheye_*() helpers"
+                )
+        elif value is not None:
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(f"calibration {key!r} must be a distortion model name, got {value!r}")
+            model = Intrinsics.DistortionModel(int(value))
+
+        return cls.from_camera_matrix(
+            matrix, coefficients, width=size["width"], height=size["height"], distortion_model=model
+        )
+
+    @classmethod
+    def from_json(
+        cls,
+        path: str | os.PathLike,
+        camera: str | None = None,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> Intrinsics:
+        """Create intrinsics from a JSON calibration file, such as ``camera.json``.
+
+        Reads the file's object with :meth:`from_dict`, which lists the keys
+        it reads; other keys, such as camera poses, are ignored.
+
+        Example:
+
+        .. code-block:: python
+
+            top = SensorCamera.Intrinsics.from_json("camera.json", camera="top")
+
+        Args:
+            path: Path of the JSON file.
+            camera: Name of the camera to read from a file of several cameras.
+                May be omitted when the file holds one camera.
+            width: Image width [px] if the calibration has none.
+            height: Image height [px] if the calibration has none.
+
+        Returns:
+            The camera intrinsics.
+
+        Raises:
+            ValueError: As in :meth:`from_dict`, naming the file.
+        """
+        with open(path, encoding="utf-8") as file:
+            calibration = json.load(file)
+        try:
+            return cls.from_dict(calibration, camera, width=width, height=height)
+        except (TypeError, ValueError) as error:
+            raise type(error)(f"{os.fspath(path)}: {error}") from error
 
     @classmethod
     def from_fov(cls, width: int, height: int, camera_fov: float) -> Intrinsics:

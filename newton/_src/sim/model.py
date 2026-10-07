@@ -65,6 +65,27 @@ def _unpack_shape_pair_codes(codes: np.ndarray) -> np.ndarray:
     return pairs
 
 
+def _similar_attribute_names(name: str, known: Iterable[str], limit: int = 5) -> list[str]:
+    """Known custom attribute names (``namespace:name`` or ``name``) that a mistyped ``name`` probably meant.
+
+    Covers ``.`` instead of ``:`` as the namespace separator, a missing namespace, a missing prefix or
+    suffix of the attribute name (``mujoco:solimp`` for ``mujoco:geom_solimp``), and close spellings.
+    """
+    known = sorted(set(known))
+    key = name if ":" in name or "." not in name else name.replace(".", ":", 1)
+    namespace, _, attribute = key.rpartition(":")
+    found = [key] if key != name and key in known else []
+    for candidate in known:
+        candidate_namespace, _, candidate_attribute = candidate.rpartition(":")
+        if (namespace and candidate_namespace != namespace) or candidate in found or len(attribute) < 3:
+            continue
+        if attribute == candidate_attribute or attribute in candidate_attribute.split("_"):
+            found.append(candidate)
+    if not found:
+        found = difflib.get_close_matches(key, known, n=limit, cutoff=0.75)
+    return found[:limit]
+
+
 class _ShapeCollisionFilterPairs(AbstractSet[tuple[int, int]]):
     """Read-only set view over sorted, unique packed filter-pair codes."""
 
@@ -562,7 +583,13 @@ class Model:
                 getter, message = aliases[name]
                 warnings.warn(message, DeprecationWarning, stacklevel=2)
                 return getter()
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+            hint = ""
+            if not name.startswith("_"):
+                known = [key for key in self.__dict__ if not key.startswith("_")]
+                similar = _similar_attribute_names(name, known)
+                if similar:
+                    hint = f"; {self._name} has {', '.join(repr(key) for key in similar)}"
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'{hint}")
 
         def __setattr__(self, name: str, value: Any) -> None:
             if not name.startswith("_"):

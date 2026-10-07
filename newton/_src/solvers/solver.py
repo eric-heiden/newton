@@ -189,6 +189,27 @@ def _update_effective_inv_mass_inertia(
         eff_inv_inertia[tid] = model_inv_inertia[tid]
 
 
+class _GuessedName:
+    # A class attribute that does not exist but is often guessed: reading it raises an AttributeError
+    # naming the actual API, so `hasattr()` stays False. No docstring keeps it out of the API docs.
+    __doc__ = None
+
+    def __init__(self, hint: str):
+        self.hint = hint
+        self.name = ""
+
+    def __set_name__(self, owner: type, name: str):
+        self.name = name
+
+    def __get__(self, instance: Any, owner: type | None = None):
+        cls = owner if owner is not None else type(instance)
+        raise AttributeError(
+            f"type object {cls.__name__!r} has no attribute {self.name!r}; {self.hint}",
+            name=self.name,
+            obj=cls if instance is None else instance,
+        )
+
+
 class SolverBase:
     """Generic base class for solvers.
 
@@ -235,6 +256,15 @@ class SolverBase:
     """
 
     _module_options_revision = 0
+
+    ModelFlags = _GuessedName(
+        "notify_model_changed() takes newton.ModelFlags, e.g. newton.ModelFlags.SHAPE_PROPERTIES, or "
+        "newton.ModelFlags.ALL for every flag"
+    )
+    SolverNotifyFlags = _GuessedName(
+        "newton.solvers.SolverNotifyFlags was removed in Newton 1.5; notify_model_changed() takes newton.ModelFlags, "
+        "e.g. newton.ModelFlags.SHAPE_PROPERTIES, or newton.ModelFlags.ALL for every flag"
+    )
 
     def __init__(
         self,

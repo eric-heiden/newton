@@ -254,6 +254,26 @@ The MuJoCo model of the solver
   :meth:`~newton.solvers.SolverMuJoCo.notify_model_changed` updates only
   ``solver.mjw_model``, and ``solver.mj_model`` keeps its values from
   construction.
+- MuJoCo names are the Newton labels with ``/`` replaced by ``_``, so the
+  forearm of the model above is ``worldbody_torso_arm_forearm``: with its MJCF
+  name, ``mujoco.mj_name2id`` returns -1 and ``mj_model.body("forearm")``
+  raises a ``KeyError``. :meth:`Model.find_bodies` and
+  :meth:`Model.find_joint_dofs` match the last label component, and the
+  solver's ``newton_*_to_mjc_*`` arrays (see :ref:`Newton and MuJoCo indices
+  <mujoco-newton-mujoco-indices>`) give the MuJoCo ids:
+
+  .. testcode:: model-based-control
+
+      (forearm,) = model.find_bodies("forearm")
+      body_id = int(planner.newton_body_to_mjc_body.numpy()[forearm])
+      (elbow,) = model.find_joint_dofs("elbow")
+      joint_id = int(planner.mj_model.dof_jntid[planner.newton_dof_to_mjc_dof.numpy()[elbow]])
+      print(planner.mj_model.body(body_id).name, planner.mj_model.joint(joint_id).name)
+
+  .. testoutput:: model-based-control
+
+      worldbody_torso_arm_forearm worldbody_torso_arm_forearm_elbow
+
 - ``mj_model.opt.timestep`` is MuJoCo's default of 0.002 s after construction;
   :meth:`~newton.solvers.SolverMuJoCo.step` with ``use_mujoco_cpu=True`` sets
   it to ``dt``.

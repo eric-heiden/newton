@@ -1111,6 +1111,37 @@ class TestCustomAttributes(unittest.TestCase):
         self.assertAlmostEqual(temperatures[body1], 37.5, places=5)
         self.assertAlmostEqual(temperatures[body2], 40.0, places=5)
 
+    def test_unknown_attribute_names_suggest_declared_ones(self):
+        """Undeclared custom attributes name the declared attributes, config fields, or solver they probably mean."""
+        builder = ModelBuilder()
+        newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
+        body = builder.add_body()
+        for key, expected in (
+            ("mujoco:solimp", r"Did you mean 'mujoco:geom_solimp'\? Please declare"),
+            ("mujoco.solref", r"Did you mean 'mujoco:solref'"),
+            ("condim", r"Did you mean 'mujoco:condim'"),
+            ("mujoco:condm", r"Did you mean 'mujoco:condim'"),
+            ("mujoco:gap", r"'gap' is a ModelBuilder.ShapeConfig field: cfg=ShapeConfig\(gap=...\)"),
+            ("mujoco:frobnicate", r"is not defined\. Please declare it first"),
+        ):
+            with self.subTest(key=key), self.assertRaisesRegex(AttributeError, expected):
+                builder.add_shape_sphere(body, radius=0.1, custom_attributes={key: 1})
+        with self.assertRaisesRegex(AttributeError, "Did you mean 'mujoco:solimplimit'"):
+            builder.add_joint_revolute(-1, body, custom_attributes={"mujoco:solimp": [0.9, 0.95, 0.001, 0.5, 2.0]})
+        with self.assertRaisesRegex(AttributeError, "Did you mean .*'mujoco:pair_geom1'"):
+            builder.add_custom_values(**{"mujoco:pair_geom": 0})
+
+        bare = ModelBuilder()
+        with self.assertRaisesRegex(AttributeError, r"No 'mujoco' attribute is declared.*SolverMuJoCo"):
+            bare.add_shape_sphere(bare.add_body(), radius=0.1, custom_attributes={"mujoco:condim": 6})
+
+        model = builder.finalize(device="cpu")
+        with self.assertRaisesRegex(AttributeError, r"no attribute 'solimp'; mujoco has 'eq_solimp', 'geom_solimp'"):
+            _ = model.mujoco.solimp
+        with self.assertRaisesRegex(AttributeError, r"no attribute 'xyz'$"):
+            _ = model.mujoco.xyz
+        self.assertFalse(hasattr(model.mujoco, "__deepcopy__"))
+
     def test_attribute_uniqueness_constraints(self):
         """Test uniqueness constraints for custom attributes based on full identifier (namespace:name)."""
 

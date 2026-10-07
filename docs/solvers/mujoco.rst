@@ -377,6 +377,35 @@ torsional and rolling rows share the same per-contact ``solreffriction`` and
 MuJoCo scales their regularization by the corresponding friction-coefficient
 ratios, so their effective damping deviates from ``kf`` accordingly.
 
+.. _mujoco-torsional-rolling-friction:
+
+Torsional and rolling friction
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:attr:`~newton.Model.shape_material_mu`,
+:attr:`~newton.Model.shape_material_mu_torsional`, and
+:attr:`~newton.Model.shape_material_mu_rolling` become the geom's ``friction``.
+MuJoCo applies torsional and rolling friction only in contacts of high enough
+dimension: ``condim`` 3, the default of the ``mujoco:condim`` shape attribute,
+has the normal and sliding friction rows, 4 adds torsional friction, and 6 adds
+rolling friction. A contact takes the ``condim`` and ``friction`` of the geom
+with the higher ``mujoco:geom_priority``; at equal priority, it takes the larger
+``condim`` and the element-wise larger ``friction`` of the two geoms. The
+torsional and rolling friction of a shape with ``condim`` 3 therefore act only
+in its contacts with shapes of higher ``condim``.
+
+``mujoco:condim`` is read at construction (see `Runtime updates`_). When shapes
+set torsional or rolling friction that their ``condim`` leaves out, other than
+the :class:`~newton.ModelBuilder.ShapeConfig` defaults (0.005 and 0.0001, also
+MuJoCo's defaults), the solver warns once at construction, and the ``geom`` rows
+of :func:`newton.utils.report_solver_params` list the left-out components in
+``friction_inactive``. To apply them, set the attribute per shape:
+
+.. code-block:: python
+
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.8, mu_torsional=0.02, mu_rolling=0.005)
+    builder.add_shape_sphere(body, radius=0.04, cfg=cfg, custom_attributes={"mujoco:condim": 6})
+
 .. _mujoco-actuators:
 
 Actuators
@@ -1213,6 +1242,20 @@ the (world, step) pairs that raise each type. :func:`newton.utils.report_health`
 reports the counts as ``stats["overflow_counts"]``. To do so, the solver sets
 ``solver.mjw_model.opt.warn_overflow`` to ``False``, so MuJoCo Warp functions
 called directly on ``solver.mjw_model`` set the overflow bits without printing.
+
+With Newton contacts (``use_mujoco_contacts=False``), the solver copies the
+contacts of the collision pipeline into the MuJoCo Warp buffer. When a contact
+set holds more contacts than ``naconmax``, the contacts past it are dropped
+before contacts that MuJoCo does not receive (both sides immovable) are skipped,
+so ``nacon`` can stay below ``naconmax`` while contacts are lost. The solver
+prints one line per solver the first time this happens and counts each contact
+set that overflowed. :func:`newton.utils.report_health` reports the counts as
+``stats["newton_contact_overflow"]`` and the dropped contacts per world as
+``stats["contacts_lost_per_world"]``. The collision pipeline keeps contact
+points whose separation is below the summed gaps of the two shapes
+(:attr:`ModelBuilder.ShapeConfig.gap <newton.ModelBuilder.ShapeConfig.gap>`,
+or ``builder.rigid_gap``, 0.1 m by default; see :doc:`/concepts/collisions`), so
+the contact count grows with the gap even for shapes at rest.
 
 MuJoCo Warp limits
 ~~~~~~~~~~~~~~~~~~

@@ -18,7 +18,7 @@ from bisect import bisect_left
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import numpy as np
@@ -72,7 +72,7 @@ from .graph_coloring import (
     combine_independent_coloring_plan,
     construct_particle_graph,
 )
-from .model import Model, _pack_shape_pair_codes
+from .model import Model, _pack_shape_pair_codes, _similar_attribute_names
 from .rod import Rod
 
 if TYPE_CHECKING:
@@ -2535,9 +2535,7 @@ class ModelBuilder:
         for key, value in kwargs.items():
             attr = self.custom_attributes.get(key)
             if attr is None:
-                raise AttributeError(
-                    f"Custom attribute '{key}' is not defined. Please declare it first using add_custom_attribute()."
-                )
+                raise self._unknown_custom_attribute(key)
             if not attr.is_custom_frequency:
                 raise TypeError(
                     f"Custom attribute '{key}' has frequency={attr.frequency}, "
@@ -2586,6 +2584,43 @@ class ModelBuilder:
             out.append(self.add_custom_values(**row))
         return out
 
+    def _unknown_custom_attribute(self, key: str, frequencies: Any = None) -> AttributeError:
+        """AttributeError for an undeclared custom attribute, naming what was probably meant.
+
+        Suggests declared attributes of ``frequencies`` (one frequency or a tuple; ``None`` for any), the
+        builder argument of the same name, or the solver that declares an absent namespace.
+        """
+        if frequencies is not None and not isinstance(frequencies, tuple):
+            frequencies = (frequencies,)
+        same_kind = [
+            name
+            for name, attribute in self.custom_attributes.items()
+            if frequencies is None or attribute.frequency in frequencies
+        ]
+        normalized = key if ":" in key or "." not in key else key.replace(".", ":", 1)
+        namespace, _, attribute = normalized.rpartition(":")
+        hints = []
+        similar = _similar_attribute_names(key, same_kind)
+        if similar:
+            hints.append(f"Did you mean {', '.join(repr(name) for name in similar)}?")
+        elif namespace and not any(name.startswith(namespace + ":") for name in same_kind):
+            hints.append(
+                f"No {namespace!r} attribute is declared for this kind of entity; a solver's "
+                "register_custom_attributes(builder) declares its namespace (e.g. newton.solvers.SolverMuJoCo for "
+                "'mujoco')."
+            )
+        if frequencies is not None and Model.AttributeFrequency.SHAPE in frequencies:
+            if attribute in {field.name for field in fields(ModelBuilder.ShapeConfig)}:
+                hints.append(f"{attribute!r} is a ModelBuilder.ShapeConfig field: cfg=ShapeConfig({attribute}=...).")
+        elif frequencies is not None and Model.AttributeFrequency.JOINT in frequencies:
+            if attribute in inspect.signature(ModelBuilder.add_joint).parameters:
+                hints.append(f"{attribute!r} is an argument of ModelBuilder.add_joint() and the add_joint_*() methods.")
+        hint = " ".join(hints)
+        return AttributeError(
+            f"Custom attribute '{key}' is not defined. {hint + ' ' if hint else ''}"
+            "Please declare it first using add_custom_attribute()."
+        )
+
     def _process_custom_attributes(
         self,
         entity_index: int | list[int],
@@ -2614,10 +2649,7 @@ class ModelBuilder:
             # Ensure the custom attribute is defined
             custom_attr = self.custom_attributes.get(full_key)
             if custom_attr is None:
-                raise AttributeError(
-                    f"Custom attribute '{full_key}' is not defined. "
-                    f"Please declare it first using add_custom_attribute()."
-                )
+                raise self._unknown_custom_attribute(full_key, expected_frequency)
 
             # Validate frequency matches
             if custom_attr.frequency != expected_frequency:
@@ -2743,9 +2775,14 @@ class ModelBuilder:
             # Look up the attribute to determine its frequency
             custom_attr = self.custom_attributes.get(attr_key)
             if custom_attr is None:
-                raise AttributeError(
-                    f"Custom attribute '{attr_key}' is not defined. "
-                    f"Please declare it first using add_custom_attribute()."
+                raise self._unknown_custom_attribute(
+                    attr_key,
+                    (
+                        Model.AttributeFrequency.JOINT,
+                        Model.AttributeFrequency.JOINT_DOF,
+                        Model.AttributeFrequency.JOINT_COORD,
+                        Model.AttributeFrequency.JOINT_CONSTRAINT,
+                    ),
                 )
 
             # Process based on declared frequency

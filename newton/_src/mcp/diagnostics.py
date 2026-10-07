@@ -282,6 +282,7 @@ def _mujoco_health(model, solver, report: dict, *, per_world: bool, threshold: f
         if overflow is not None:
             _overflow_flags(overflow.numpy(), report)
         _overflow_counts(solver, stats)
+        _newton_contacts_lost(solver, report, per_world=per_world)
         if getattr(data, "solver_niter", None) is not None:
             niter = data.solver_niter.numpy()
             cap = int(solver.mj_model.opt.iterations)
@@ -345,6 +346,36 @@ def _overflow_counts(solver, stats: dict) -> None:
     raised = {names.get(bit, f"bit {bit}"): int(count) for bit, count in enumerate(counts.numpy()) if count}
     if raised:
         stats["overflow_counts"] = raised
+
+
+def _newton_contacts_lost(solver, report: dict, *, per_world: bool) -> None:
+    """Newton contacts that ``SolverMuJoCo`` dropped past ``naconmax`` since it was created, summed per world."""
+    overflow = getattr(solver, "_newton_contact_overflow", None)
+    lost = getattr(solver, "_newton_contacts_lost", None)
+    if overflow is None or lost is None:
+        return
+    contact_sets, largest, _printed, latest = (int(value) for value in overflow.numpy())
+    if not contact_sets:
+        return
+    lost = lost.numpy()
+    worlds = np.flatnonzero(lost)
+    capacity = int(solver.mjw_data.naconmax)
+    report["stats"]["newton_contact_overflow"] = {
+        "contact_sets": contact_sets,
+        "max_contacts": largest,
+        "naconmax": capacity,
+        "contacts_lost": int(lost.sum()),
+        "latest_contacts_past_naconmax": latest,
+    }
+    if per_world and len(worlds):
+        report["worlds"]["contacts_lost"] = worlds[:64].tolist()
+        report["stats"]["contacts_lost_per_world"] = {str(w): int(lost[w]) for w in worlds[:64]}
+    latest_text = f"{latest} past it in the latest contact set" if latest else "the latest contact set fit"
+    report["warnings"].append(
+        f"Newton contacts exceeded the MuJoCo Warp contact buffer (naconmax {capacity}, SolverMuJoCo nconmax per "
+        f"world, shared by all worlds) in {contact_sets} contact sets, with up to {largest} contacts; "
+        f"{int(lost.sum())} contacts were dropped in worlds {_worlds_text(worlds)}; {latest_text}"
+    )
 
 
 def _newton_contacts_health(model, state, contacts, report: dict, *, threshold: float) -> None:

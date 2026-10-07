@@ -6,6 +6,7 @@
 import importlib.util
 import re
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
@@ -46,6 +47,25 @@ class TestSolverReports(unittest.TestCase):
         self.assertNotIn("pending", row)
 
     @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
+    def test_solver_params_kind_aliases(self):
+        """'shape' and 'contact' report the geom rows, plurals name their kind, and unknown kinds list the kinds."""
+        from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_mjcf(_MJCF)
+        solver = SolverMuJoCo(builder.finalize(device="cpu"))
+        geoms = newton.utils.report_solver_params(solver, "geom")
+        for kind, expected in (("shape", "geom"), ("Contact", "geom"), ("joints", "joint"), ("bodies", "body")):
+            with self.subTest(kind=kind):
+                report = newton.utils.report_solver_params(solver, kind)
+                self.assertEqual(report["kind"], expected)
+                if expected == "geom":
+                    self.assertEqual(report["rows"], geoms["rows"])
+        with self.assertRaisesRegex(ValueError, r"kind must be one of .*'shape' or 'contact' for 'geom'.*got 'tendon'"):
+            newton.utils.report_solver_params(solver, "tendon")
+
+    @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
     def test_actuator_rows_show_the_joint_effort_limit(self):
         """An effort limit on the joint's actfrcrange is reported on the joint's actuators, not as unlimited."""
         from newton.solvers import SolverMuJoCo  # noqa: PLC0415
@@ -74,6 +94,56 @@ class TestSolverReports(unittest.TestCase):
         for row in newton.utils.report_solver_params(solver, "actuator")["rows"]:
             self.assertEqual(row["joint_actfrcrange"], [-5.0, 5.0])
             self.assertNotIn("pending", row)
+
+    @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
+    def test_inactive_torsional_and_rolling_friction(self):
+        """Friction a shape's condim leaves out triggers one warning and is marked on the shape's geom row."""
+        from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_ground_plane()
+        balls = {
+            "default": (None, None, 3),
+            "torsional3": (0.02, None, 3),
+            "rolling4": (None, 0.01, 4),
+            "both6": (0.02, 0.01, 6),
+            "zero3": (0.0, 0.0, 3),
+        }
+        for i, (name, (torsional, rolling, condim)) in enumerate(balls.items()):
+            cfg = newton.ModelBuilder.ShapeConfig()
+            cfg.mu_torsional = cfg.mu_torsional if torsional is None else torsional
+            cfg.mu_rolling = cfg.mu_rolling if rolling is None else rolling
+            body = builder.add_body(xform=wp.transform(wp.vec3(float(i), 0.0, 0.5), wp.quat_identity()))
+            builder.add_shape_sphere(
+                body, radius=0.1, cfg=cfg, label=f"{name}/ball", custom_attributes={"mujoco:condim": condim}
+            )
+        model = builder.finalize(device="cpu")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            solver = SolverMuJoCo(model)
+        messages = [str(w.message) for w in caught if "mu_torsional or mu_rolling" in str(w.message)]
+        self.assertEqual(len(messages), 1, messages)
+        self.assertIn("SolverMuJoCo: 2 shapes", messages[0])
+        self.assertIn("'torsional3/ball' (condim 3", messages[0])
+        self.assertIn("'rolling4/ball' (condim 4", messages[0])
+        self.assertNotIn("default/ball", messages[0])
+        self.assertNotIn("both6/ball", messages[0])
+        report = newton.utils.report_solver_params(solver, "geom", select="*/ball")
+        inactive = {
+            model.shape_label[row["shape"]].split("/")[0]: row.get("friction_inactive") for row in report["rows"]
+        }
+        self.assertEqual(
+            inactive,
+            {
+                "default": ["torsional", "rolling"],
+                "torsional3": ["torsional", "rolling"],
+                "rolling4": ["rolling"],
+                "both6": None,
+                "zero3": None,
+            },
+        )
+        self.assertIn("condim >= 4", report["friction_inactive"])
 
     @unittest.skipUnless(_HAS_MUJOCO, "Requires sim extra")
     def test_health_skips_overlap_between_static_shapes(self):
@@ -212,6 +282,70 @@ class TestMuJoCoWarpOverflowCounts(unittest.TestCase):
         self.assertEqual(report["stats"]["overflow_counts"]["LS_ITERATIONS"], steps * model.world_count)
         self.assertGreater(report["stats"]["overflow_counts"]["ITERATIONS"], 0)
         self.assertEqual(report["worlds"]["overflow_flags"]["1"], ["ITERATIONS", "LS_ITERATIONS"])
+
+    def test_newton_contact_overflow_prints_once_and_counts_losses_per_world(self):
+        """Newton contacts past naconmax print one line per solver and are counted per world in report_health."""
+        from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+
+        template = newton.ModelBuilder()
+        for i in range(3):
+            box = template.add_body(xform=wp.transform(wp.vec3(0.3 * i, 0.0, 0.049), wp.quat_identity()))
+            template.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        builder.replicate(template, 4)
+        model = builder.finalize(device="cpu")
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=6)
+        naconmax = int(solver.mjw_data.naconmax)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        pipeline.collide(state_0, contacts)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertGreater(count, naconmax)
+        # The worlds of the contacts the conversion drops: each contact has one box, of one world.
+        shape_body = model.shape_body.numpy()
+        pairs = np.stack([contacts.rigid_contact_shape0.numpy(), contacts.rigid_contact_shape1.numpy()], axis=1)
+        boxes = np.max(shape_body[pairs[naconmax:count]], axis=1)
+        expected = np.bincount(model.body_world.numpy()[boxes], minlength=model.world_count)
+
+        collisions, substeps = 2, 3
+        capture = StdOutCapture()
+        capture.begin()
+        try:
+            for collision in range(collisions):
+                if collision:
+                    pipeline.collide(state_0, contacts)
+                for _ in range(substeps):
+                    solver.step(state_0, state_1, control, contacts, 0.002)
+                    state_0, state_1 = state_1, state_0
+            wp.synchronize()
+        finally:
+            output = capture.end()
+        lines = [line for line in output.splitlines() if "Newton contacts" in line]
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn(f"{count} Newton contacts exceed the MuJoCo Warp contact buffer (naconmax {naconmax}", lines[0])
+        self.assertNotIn("exceeded MJWarp limit", output)
+
+        report = newton.utils.report_health(model, state_0, solver)
+        overflow = report["stats"]["newton_contact_overflow"]
+        # One count per contact set: substeps reusing a contact set do not count again.
+        self.assertEqual(overflow["contact_sets"], collisions)
+        self.assertGreaterEqual(overflow["max_contacts"], count)
+        self.assertEqual(overflow["naconmax"], naconmax)
+        if int(contacts.rigid_contact_count.numpy()[0]) == count:
+            self.assertEqual(overflow["contacts_lost"], collisions * (count - naconmax))
+            self.assertEqual(
+                report["stats"]["contacts_lost_per_world"],
+                {str(w): collisions * int(n) for w, n in enumerate(expected) if n},
+            )
+        self.assertEqual(report["worlds"]["contacts_lost"], [int(w) for w in np.flatnonzero(expected)])
+        self.assertTrue(any("contacts were dropped in worlds" in warning for warning in report["warnings"]))
+
+        # No overflow, no report.
+        roomy = SolverMuJoCo(model, use_mujoco_contacts=False)
+        roomy.step(state_0, state_1, control, contacts, 0.002)
+        self.assertNotIn("newton_contact_overflow", newton.utils.report_health(model, state_1, roomy)["stats"])
 
 
 if __name__ == "__main__":

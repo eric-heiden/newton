@@ -1,0 +1,1 @@
+Add `SensorCamera.Intrinsics.from_dict()` and `from_json()` to read camera intrinsics from calibration dictionaries and JSON files: OpenCV-style `K`, `D`, and `distortion_model` entries (including RealSense inverse Brown-Conrady), ROS `CameraInfo` and calibration files, and RealSense `rs2_intrinsics`, selecting one camera from files that hold several.

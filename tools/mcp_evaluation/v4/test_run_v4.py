@@ -638,10 +638,19 @@ class TestPrompt(unittest.TestCase):
                 for prompt in prompts:
                     for line in lines:
                         self.assertIn(line, prompt)
+                    self.assertIn(run_v4.SCAN_NAMES, prompt)
                     self.assertNotRegex(prompt, r"\{[a-z_]+\}")  # every placeholder filled
                     self.assertEqual(prompt.count(run_v4.SHELL_FACTS["claude"]), int(cli == "claude"))
         self.assertIn("120 s", run_v4.SHELL_FACTS["claude"])
         self.assertIn("`sleep N` with N of 25 or more is refused", run_v4.SHELL_FACTS["claude"])
+
+    def test_scan_names_cover_the_verifiers_rules(self):
+        from tools.mcp_evaluation.v4.abc_scratch import verify as scratch  # noqa: PLC0415
+        from tools.mcp_evaluation.v4.g1_mpc import verify as mpc  # noqa: PLC0415
+
+        for verifier in (scratch, mpc):
+            for name in verifier.SUSPICIOUS_MODULES | verifier.SUSPICIOUS_BUILTINS | {"__import__"}:
+                self.assertIn(name, run_v4.SCAN_NAMES)
 
     def test_guide_describes_the_hosted_workers(self):
         workspace = Path(tempfile.mkdtemp())

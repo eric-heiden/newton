@@ -441,8 +441,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 to the `step` function.
 
             iterations: Number of VBD iterations per step.
-            friction_epsilon: Threshold to smooth small relative velocities in friction computation (used for both particle
-                and rigid body contacts).
+            friction_epsilon: Threshold [m/s] to smooth small relative velocities in friction computation (used for both
+                particle and rigid body contacts).
             dat_conservative_bound_relaxation: Relaxation factor in (0, 1) shared by every Divide-and-Truncate
                 (DAT) truncation: soft self-contact (``particle_enable_self_contact``) and rigid-soft
                 (``rigid_soft_enable_dat``). It scales every truncation scalar, and each side's motion

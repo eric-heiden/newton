@@ -101,6 +101,10 @@ class Example:
         self.robot_contact_mu = 1.5
 
         self.self_contact_friction = 0.25
+        #       friction smoothing velocity [cm/s]; the solver default (1e-2) assumes
+        #       meters and makes cloth-cloth friction chatter at this scale, while
+        #       larger values let the shirt creep on the table and out of the gripper
+        self.friction_epsilon = 0.2
 
         #   elasticity
         self.tri_ke = 1e4
@@ -219,6 +223,7 @@ class Example:
             self.cloth_solver = SolverVBD(
                 self.model,
                 iterations=self.iterations,
+                friction_epsilon=self.friction_epsilon,
                 integrate_with_external_rigid_solver=True,
                 particle_self_contact_margin=self.particle_self_contact_margin,
                 particle_self_contact_gap=self.particle_self_contact_gap,

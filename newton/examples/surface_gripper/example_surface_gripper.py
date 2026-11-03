@@ -26,7 +26,8 @@ What this example decides (this file)
       engaged    - sealed to a body. The seal carries load and resists drift from the pose it
                    formed at; the seal-quality metric reports how far the surface has since pulled off.
       disengaged - neither of the above. No seal force, and the quality metric reports -1.
-    The drive targets and the mode of each pad are read from assets/palletizer_trajectory.csv.
+    Cartesian waypoints and a timed vacuum schedule in robot_ik.py drive these modes.
+    Newton IK solves the arm joint targets at each physics sub-step.
   - Which body and shape to grab: a fixed pick order -- one wide panel, then six crates -- advanced
     on each release.
   - When the seal fractures under load, via one of two interchangeable criteria (BREAK_ON_SEAL_QUALITY):
@@ -76,19 +77,21 @@ Building a multi-world gripper (the classes mirror Newton's Builder -> Model -> 
     state_in_prev, state_in_curr = state_in_curr, state_in_prev
 
 The scene: a fixed-base FANUC M-710iD/50M arm (fanuc_m710id_50m in newton-assets) with four suction pads on its flange,
-two pallets, and the pick boxes -- one wide panel and six crates (assets/palletizer_scene.usda).
+a grounded pedestal, two grounded platforms, and the pick boxes -- one wide panel and six crates
+(assets/palletizer_scene.usda).
 The panel is picked first, then each crate in turn; every crate waits out of reach until its turn
-comes, when it is teleported onto the pick pallet. Arm joint targets are interpolated from the
-recorded timestamps before every physics sub-step, so the arm follows the recorded motion at its
-true speed. Everything runs on device and is CUDA-graph capturable, and the whole scene can be
-replicated across parallel environments with --world-count.
+comes, when it is teleported onto the pick pallet. Cartesian flange waypoints closely follow the original FANUC cycle,
+with continuous-velocity interpolation and the same grip/release timing. Newton IK computes the
+arm joint targets; no trajectory recording is loaded at runtime. Everything runs on device and is
+CUDA-graph capturable, and the whole scene can be replicated across parallel environments with --world-count.
 
 Success criteria:
 - All four pads latch onto one body after the first engagement.
 - The gripped panel lifts clear of the pallet.
 - The seal quality stays below the break threshold once the seal has settled.
-- The crates are placed in turn after the panel.
+- The crates are placed in turn after the panel, finishing upright on it.
 - The arm bodies stay at or above the ground.
+- The robot pedestal and both platforms meet the ground; the tool follows its IK targets.
 
 Runs:
 - `python -m newton.examples surface_gripper`
@@ -104,7 +107,7 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.surface_gripper.robot_playback import RobotPlayback, recording_duration
+from newton.examples.surface_gripper.robot_ik import CYCLE_DURATION, GRIP_TIMES, PalletizerIK
 from newton.examples.surface_gripper.surface_gripper import (
     SurfaceGripper,
     SurfaceGripperBuilder,
@@ -138,8 +141,6 @@ ROBOT_ROOT_NAME = "m710id_50m"
 ROBOT_ARTICULATION_PATTERN = f"*{ROBOT_ROOT_NAME}*"
 # Pick scene (2 static pallets + panel + 6 crates as box colliders at their waiting poses).
 PICK_SCENE_USD = ASSETS / "palletizer_scene.usda"
-# recording of the robot arm motion and surface gripper engagement/disengagement.
-RECORDING_CSV = ASSETS / "palletizer_trajectory.csv"
 
 # rendered frames per second
 FPS = 60
@@ -152,13 +153,7 @@ SIM_HZ = 120
 # for rendering only. Set to None to overlap them.
 WORLD_RENDER_SPACING = (7.0, 7.0, 0.0)
 
-# Gaussian smoothing of the recorded drive targets [s]. The recording is a coarse waypoint staircase
-# (values held, then stepped ~17 deg), so smoothing recovers a continuous motion. 0 = raw recording;
-# larger = smoother (and further from the exact recorded knots). ~1 waypoint interval (~0.08 s) is a
-# reasonable start.
-SMOOTHING_SIGMA = 0.06
-
-# J1-J6; recorded joints 6-8 are unused finger DOFs
+# Six arm joint coordinates (J1-J6).
 NUM_ARM_DOFS = 6
 
 # USD prim path of the panel rigid body (the 1st picked box) in pick_scene.usda.
@@ -174,7 +169,7 @@ CRATE_PRIMS = (
 )
 # Each crate is authored at a waiting pose, where it cannot be reached by the surface gripper, and then moved
 # to a grip pose (wp.transform, position [m] + quat), where it can be reached. At each disengagement signal in
-# RECORDING_CSV, the next crate to be gripped is teleported from the waiting pose to the grip pose.
+# GRIP_TIMES, the next crate to be gripped is teleported from the waiting pose to the grip pose.
 CRATE_GRIP_POSES = (
     wp.transform(
         wp.vec3(-1.53891122341156, -1.339923620223999, 0.7991625070571899),
@@ -219,7 +214,7 @@ PAD_PERIMETER_SAMPLES = 16
 # curved gripped objects, where each iteration re-samples the SDF at the updated pose to converge.
 SEAT_ITERS = 4
 # Grip force (vacuum) [N] per pad. Static hold of the 30 kg panel needs ~74 N/pad, but the
-# recorded palletizer motion drives the normal load to ~384 N/pad, so the vacuum must clear that.
+# reference FANUC motion reached ~384 N/pad; retain its vacuum capacity for the IK cycle.
 F_GRIP_MAX = 450.0
 # Per-DOF seal modes (angular natural frequency mu [rad/s], damping ratio). Converted to stiffness/
 # damping against the crate by SurfaceGripper.set_natural_frequency_damping_ratio (translation DOFs use
@@ -525,8 +520,8 @@ def broadcast_arm_targets_kernel(
     world_stride: int,  # per-world stride in joint_target_q
     joint_target_q: wp.array[float],
 ):
-    """Copy world 0's recorded arm drive targets into every other world's arm DOFs (the worlds are
-    identical replicas, so they all follow the same recording). One thread per (world >= 1, arm DOF)."""
+    """Copy world 0's IK arm drive targets into every other world's arm DOFs (the worlds are
+    identical replicas, so they all follow the same Cartesian path). One thread per (world >= 1, arm DOF)."""
     tid = wp.tid()  # dim = (num_worlds - 1) * num_arm_dofs
     w = tid // num_arm_dofs + 1  # target worlds 1..num_worlds-1 (world 0 is the source)
     d = tid % num_arm_dofs
@@ -535,11 +530,11 @@ def broadcast_arm_targets_kernel(
 
 @wp.kernel
 def broadcast_gripper_command_kernel(
-    gripper_command_engaged: wp.array[wp.bool],  # in/out: index 0 written by the playback, copied to 1..n-1
+    gripper_command_engaged: wp.array[wp.bool],  # in/out: index 0 written by IK, copied to 1..n-1
     gripper_command_preparing: wp.array[wp.bool],  # in/out: same
 ):
-    """Copy world 0's sampled engaged/preparing commands to every other gripper. The playback only
-    writes index 0, but every world replays the same recording. One thread per gripper >= 1."""
+    """Copy world 0's sampled engaged/preparing commands to every other gripper. The controller only
+    writes index 0, but every world follows the same Cartesian path. One thread per gripper >= 1."""
     g = wp.tid() + 1  # dim = n_grippers - 1; gripper 0 is the source
     gripper_command_engaged[g] = gripper_command_engaged[0]
     gripper_command_preparing[g] = gripper_command_preparing[0]
@@ -676,7 +671,7 @@ def update_engagement_signals(
 ) -> None:
     """Fan per-gripper engaged/preparing signals out to per-pad state with edge detection and box advance.
 
-    Reads the current and previous per-gripper recording signals from ``example_state_curr/prev``,
+    Reads the current and previous per-gripper vacuum signals from ``example_state_curr/prev``,
     applies rising-edge latching, sustained carry-forward, and falling-edge clearing to the per-pad
     input state arrays (both body-ID and shape-ID), and advances
     ``example_state_curr.gripper_curr_box_wp`` on the falling edge of engage.
@@ -708,7 +703,7 @@ def update_engagement_signals(
 
 
 class ExampleState:
-    """Per-gripper recording signals, double-buffered as example_state_prev / example_state_curr.
+    """Per-gripper vacuum signals, double-buffered as example_state_prev / example_state_curr.
 
     Only signals whose rising or falling edge matters live here -- the break-logic counters do not,
     because each pad is written by exactly one thread and so can be updated in place.
@@ -727,9 +722,9 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         newton.examples.add_world_count_arg(parser)
-        # Default --num-frames to the whole recorded cycle (one panel pick, then six crate picks) so a
+        # Default --num-frames to the whole Cartesian cycle (one panel pick, then six crate picks) so a
         # plain run does not stop partway through the first pick.
-        parser.set_defaults(num_frames=round(recording_duration(RECORDING_CSV) * FPS))
+        parser.set_defaults(num_frames=round(CYCLE_DURATION * FPS))
         return parser
 
     def __init__(self, viewer: ViewerBase, args: argparse.Namespace):
@@ -739,7 +734,7 @@ class Example:
         self.viewer = viewer
 
         # Number of replicated environments (--world-count). Every world holds a full copy of the
-        # scene, so pads, boxes and recording signals are all sized from this.
+        # scene, so pads, boxes and vacuum signals are all sized from this.
         self.world_count = args.world_count
 
         # FPS and sim step dt
@@ -755,16 +750,7 @@ class Example:
         else:
             self.break_threshold = BREAK_THRESHOLD_LOAD_RATIO  # demanded/supplied load ratio
 
-        # sim_step_count_wp stores the number of completed simulation steps.
-        # last_lo_wp is used to iterate through the recording of the robot arm.
         self.sim_step_count_wp = wp.zeros(1, dtype=wp.int32)
-        self.last_lo_wp = wp.zeros(1, dtype=wp.int32)
-
-        # RECORDING_CSV contains time-stamped joint drive target positions and pad engagement
-        # states. Load and extract the time-stamps, the joint drive target positions and the
-        # pad engagement states.
-        # Apply gaussian smoothing to the raw drive target after loading.
-        self.robot_arm_playback = RobotPlayback(RECORDING_CSV, SMOOTHING_SIGMA, NUM_ARM_DOFS)
 
         # Build ONE environment (arm with pad cylinders + pick boxes + pallets), then replicate it across
         # self.world_count worlds. The copies overlap at the origin (Newton's broad phase never collides across
@@ -779,6 +765,8 @@ class Example:
         # Load the robot arm.
         robot = env.add_usd(str(get_robot_usd()), xform=ROBOT_BASE_XFORM, floating=False, collapse_fixed_joints=True)
         ee_body_local = env.body_count - 1  # last arm link (J6_link), the flange, within one env
+        # IK only needs the arm, before the dynamic boxes are added to the environment.
+        self.robot_ik = PalletizerIK(env.finalize(), ee_body_local)
         # The pad geometry lives in the robot arm USD: four visual cylinders under J6_link/GripperPads (see the
         # asset). Read each pad's placement transform and its radius/half-height.
         pad_transforms = read_pad_transforms(env, robot)
@@ -970,8 +958,8 @@ class Example:
         self.arm_coord_offset = arm_coord_layout.offset  # into state.joint_q / control.joint_target_q
         self.arm_coord_stride = arm_coord_layout.stride_between_worlds
 
-        # Start each world's arm at the first recorded pose.
-        initial_arm_q = self.robot_arm_playback.rec_targets_wp.numpy()[0]  # drive target at t=0, the start pose
+        # Start each world at the solved home pose.
+        initial_arm_q = self.robot_ik.joint_q.numpy()[0]
         joint_q = self.state_0.joint_q.numpy()
         for w in range(self.world_count):
             start = self.arm_coord_offset + w * self.arm_coord_stride
@@ -988,6 +976,8 @@ class Example:
         # worlds); lay them out on a visual grid so every world can be seen side by side.
         if WORLD_RENDER_SPACING is not None:
             self.viewer.set_world_offsets(WORLD_RENDER_SPACING)
+        if self.world_count == 1:
+            self.viewer.set_camera(wp.vec3(7.0, -5.0, 5.5), pitch=-27.367, yaw=156.975)
 
     def capture(self):
         self.graph = None
@@ -998,20 +988,16 @@ class Example:
 
     def simulate(self):
         for _ in range(self.sim_substeps):
-            # Interpolate the arm drive targets (joint_target_q) and sample the engagement command
-            # (gripper_command_engaged_curr_wp) at the current sim time (sim_step_count_wp*sim_dt)
-            # Advance the search index (last_lo_wp) through the recording,
-            # and advance sim time (sim_step_count_wp) for the next sub-step.
-            self.robot_arm_playback.step(
-                self.sim_step_count_wp,  # in/out: read as the current time, then advanced in place
-                self.last_lo_wp,  # in/out: forward-search index, resumed and cached
+            # Solve the Cartesian flange target and sample the vacuum schedule at this sub-step.
+            self.robot_ik.step(
+                self.sim_step_count_wp,
                 self.sim_dt,
                 self.arm_coord_offset,
                 self.control.joint_target_q,
-                self.example_state_curr.gripper_command_engaged_wp,  # out: engagement command (gripper_close) for world 0
-                self.example_state_curr.gripper_command_preparing_wp,  # out: preparing flag (prepare_to_engage) for world 0
+                self.example_state_curr.gripper_command_engaged_wp,
+                self.example_state_curr.gripper_command_preparing_wp,
             )
-            # The playback only fills world 0; fan its arm targets and gripper commands out to the rest.
+            # The IK controller only fills world 0; fan its arm targets and gripper commands out to the rest.
             if self.world_count > 1:
                 wp.launch(
                     broadcast_arm_targets_kernel,
@@ -1135,7 +1121,7 @@ class Example:
             self.example_state_prev, self.example_state_curr = self.example_state_curr, self.example_state_prev
 
     def step(self):
-        # the target kernel interpolates and applies the drive targets and advances the sub-step
+        # The IK controller computes drive targets and advances the sub-step
         # counter before each physics sub-step, so step() just runs one frame.
         if self.graph:
             wp.capture_launch(self.graph)
@@ -1151,14 +1137,14 @@ class Example:
         self.viewer.end_frame()
 
     def gui(self, ui):
-        # commanded grip (recorded gripper_close, sampled per sub-step by sample_playback_kernel) vs the
+        # Commanded grip (sampled from the timed vacuum schedule) vs the
         # actual latched seal (command AND-ed with the break/proximity logic in update_seal_break_kernel /
         # attach_seal) -- the two differ if a seal fractured or failed to grab.
         commanded = bool(self.example_state_prev.gripper_command_engaged_wp.numpy()[0])
         preparing = bool(self.example_state_prev.gripper_command_preparing_wp.numpy()[0])
         pad_engaged_bs = self.gripper_state_input_prev.pad_engaged_bs.numpy()
         held = int((pad_engaged_bs[:, 0] >= 0).sum())
-        ui.text(f"Grip cmd:  {'On' if commanded else 'Off'}  (recording)")
+        ui.text(f"Grip cmd:  {'On' if commanded else 'Off'}  (IK schedule)")
         ui.text(f"Preparing: {'On' if preparing else 'Off'}  (lead-in before engage)")
         ui.text(f"Seal engaged: {held}/{len(PAD_PRIMS)} pads  (actual)")
         # Seal quality, per pad: each pad's RMS deviation of its current perimeter signed distances from their
@@ -1193,6 +1179,29 @@ class Example:
             ui.text(f"  {name:7s} wn={mu:6.1f} rad/s  zeta={zeta:.3f}")
 
     def test_final(self):
+        # Check the solved flange pose, independently of actuator tracking error in the simulation.
+        ik_model = self.robot_ik.model
+        ik_state = ik_model.state()
+        newton.eval_fk(ik_model, self.robot_ik.joint_q.flatten(), ik_model.joint_qd, ik_state)
+        flange = ik_state.body_q.numpy()[self.robot_ik.position_objective.link_index]
+        position_error = np.linalg.norm(flange[:3] - self.robot_ik.position.numpy()[0])
+        target_rotation = self.robot_ik.rotation.numpy()[0]
+        rotation_error = 2.0 * np.arccos(np.clip(abs(np.dot(flange[3:], target_rotation)), 0.0, 1.0))
+        if position_error > 0.002 or rotation_error > 0.01:
+            raise ValueError(f"IK flange error: {position_error} m, {rotation_error} rad")
+
+        # The platforms and robot support must meet the ground without changing their working heights.
+        shape_q = self.model.shape_transform.numpy()
+        shape_scale = self.model.shape_scale.numpy()
+        for name in ("pallet_panel", "pallet_crate", "robot_pedestal"):
+            shapes = [i for i, label in enumerate(self.model.shape_label) if label.endswith("/" + name)]
+            if len(shapes) != self.world_count:
+                raise ValueError(f"expected one grounded {name} per world, got {len(shapes)}")
+            for shape in shapes:
+                bottom = shape_q[shape, 2] - shape_scale[shape, 2]
+                if abs(bottom) > 1.0e-5:
+                    raise ValueError(f"{name} must meet the ground, got bottom {bottom} m")
+
         # the fixed-base arm should hold together on its stiff joint drives: bodies stay at or above
         # the ground (no explosion, no fall-through).
         newton.examples.test_body_state(
@@ -1202,43 +1211,51 @@ class Example:
             lambda q, qd: q[2] > -0.05,
         )
 
-        if not self.robot_arm_playback.rising:
-            raise ValueError("surface gripper recording has no engagement event")
-
-        # The recording alternates between grips and releases, so what to expect depends on the run length.
-        # Read the recorded engagement command at the last executed sub-step, and again two sub-steps
-        # earlier. If they differ the run stopped on an edge, where the pad state lags the command by a
-        # sub-step, so nothing is asserted.
+        # Validate the vacuum state at the last simulated sub-step, except at command edges.
         step_count = int(self.sim_step_count_wp.numpy()[0])
-        rec_times = self.robot_arm_playback.rec_times_wp.numpy()
-        rec_engaged = self.robot_arm_playback.rec_engaged_wp.numpy()
-        last_frame = np.searchsorted(rec_times, (step_count - 1) * self.sim_dt, side="right") - 1
-        earlier_frame = np.searchsorted(rec_times, (step_count - 3) * self.sim_dt, side="right") - 1
-        if last_frame < 0 or earlier_frame < 0 or rec_engaged[last_frame] != rec_engaged[earlier_frame]:
+        time = (step_count - 1) * self.sim_dt
+        earlier_time = (step_count - 3) * self.sim_dt
+        if time >= CYCLE_DURATION - self.frame_dt:
+            # A released seal alone is not evidence of a successful placement.
+            body_q = self.state_0.body_q.numpy()
+            box_ids = self.gripper_box_body_ids_wp.numpy().reshape(self.world_count, self.n_boxes_per_world)
+            shape_ids = self.gripper_box_shape_ids_wp.numpy().reshape(self.world_count, self.n_boxes_per_world)
+            for bodies, shapes in zip(box_ids, shape_ids, strict=True):
+                panel = body_q[bodies[0]]
+                panel_top = panel[2] + shape_scale[shapes[0], 2]
+                for body, shape in zip(bodies[1:], shapes[1:], strict=True):
+                    pose = body_q[body]
+                    up = wp.quat_rotate(wp.quat(*pose[3:]), wp.vec3(0.0, 0.0, 1.0))
+                    bottom = pose[2] - shape_scale[shape, 2]
+                    if abs(bottom - panel_top) > 0.01 or up[2] < 0.995:
+                        raise ValueError(f"crate {body} did not finish upright on the panel")
+
+        engaged = any(start <= time < end for _, start, end in GRIP_TIMES)
+        earlier_engaged = any(start <= earlier_time < end for _, start, end in GRIP_TIMES)
+        if engaged != earlier_engaged:
             return
 
-        pad_engaged_bs = self.gripper_state_input_prev.pad_engaged_bs.numpy()[: len(PAD_PRIMS)]
-        body_ids = pad_engaged_bs[:, 0]
+        pad_engaged_bs = self.gripper_state_input_prev.pad_engaged_bs.numpy()
+        body_ids = pad_engaged_bs[:, 0].reshape(self.world_count, len(PAD_PRIMS))
 
-        if not rec_engaged[last_frame]:
+        if not engaged:
             if not np.all(body_ids < 0):
                 raise ValueError(f"expected all surface-gripper pads released, got {body_ids.tolist()}")
             return
 
         # Engaged: the checks below only hold once the seal has settled after its latest engage event.
-        latest_rising = max((i for i in self.robot_arm_playback.rising if i <= last_frame), default=0)
-        if (step_count - 1) * self.sim_dt < rec_times[latest_rising] + BREAK_SETTLE_TIME:
+        latest_engagement = max(start for _, start, _ in GRIP_TIMES if start <= time)
+        if time < latest_engagement + BREAK_SETTLE_TIME:
             return
 
         if not np.all(body_ids >= 0):
             raise ValueError(f"expected all surface-gripper pads engaged after settling, got {body_ids.tolist()}")
 
-        unique_body_ids = set(body_ids.tolist())
-        if len(unique_body_ids) != 1:
+        if not np.all(body_ids == body_ids[:, :1]):
             raise ValueError(f"expected all surface-gripper pads on one body, got {body_ids.tolist()}")
 
         # A seal that is still flush on the pads means the body is held, wherever the arm has carried it.
-        seal_rms = self.gripper_state_output.pad_seal_quality_rms.numpy()[: len(PAD_PRIMS)]
+        seal_rms = self.gripper_state_output.pad_seal_quality_rms.numpy()
         seal_rms_valid = np.isfinite(seal_rms) & (seal_rms >= 0.0) & (seal_rms < BREAK_THRESHOLD_SEAL_RMS)
         if not np.all(seal_rms_valid):
             raise ValueError(f"expected settled seal RMS below threshold, got {seal_rms.tolist()}")

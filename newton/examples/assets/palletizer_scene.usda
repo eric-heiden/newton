@@ -8,13 +8,22 @@ def Xform "pick_scene"
 {
     def Scope "Pallets"
     {
+        def Cube "robot_pedestal" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double3 xformOp:translate = (-0.9548298500297838, 0.2817000725962616, 0.3747580647468572)
+            float3 xformOp:scale = (0.35, 0.35, 0.3747580647468572)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            color3f[] primvars:displayColor = [(0.25, 0.28, 0.32)]
+        }
         def Cube "pallet_panel" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            double3 xformOp:translate = (-0.49305665493011475, 1.5848422050476074, 0.8042582869529724)
+            double3 xformOp:translate = (-0.49305665493011475, 1.5848422050476074, 0.6521291434764862)
             quatf xformOp:orient = (1.0, 0.0, 0.0, 0.0)
-            float3 xformOp:scale = (0.54, 0.54, 0.5)
+            float3 xformOp:scale = (0.54, 0.54, 0.6521291434764862)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
             color3f[] primvars:displayColor = [(0.8, 0.15, 0.15)]
         }
@@ -22,9 +31,9 @@ def Xform "pick_scene"
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            double3 xformOp:translate = (-1.5389111042022705, -1.339923620223999, 0.16216252744197845)
+            double3 xformOp:translate = (-1.5389111042022705, -1.339923620223999, 0.3310812637209892)
             quatf xformOp:orient = (1.0, 0.0, 0.0, 0.0)
-            float3 xformOp:scale = (0.206, 0.282, 0.5)
+            float3 xformOp:scale = (0.206, 0.282, 0.3310812637209892)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
             color3f[] primvars:displayColor = [(0.8, 0.15, 0.15)]
         }

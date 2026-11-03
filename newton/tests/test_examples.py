@@ -1944,7 +1944,7 @@ add_example_test(
 )
 # 120 frames reaches the first engagement (~1.0 s) and holds the panel well past the seal settling,
 # so test_final can assert that the pads latched and the seal quality stayed healthy. test_final is valid
-# for any run length, but the default plays the whole ~26 s recording, which is too slow for CI.
+# for any run length, but the default plays the whole ~26 s cycle, which is too slow for CI.
 add_example_test(
     TestUSDDependentExamples,
     name="surface_gripper.example_surface_gripper",
